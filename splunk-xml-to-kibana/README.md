@@ -44,13 +44,14 @@ When SPL uses macros/lookups: `macros.json`, optionally `lookup_samples.json`.
 Typical package under a customer repo:
 
 ```
+# Generators: data_factories package (pip install -e …/data_factories)
 elastic/<use_case>/
   ANALYSIS.md
   MAPPING.md
   manifest.json
   splunk_queries.json
   kibana/
-  data_factories/
+  data_factories/   # thin wrappers + local out/
   setup_*.py
 ```
 

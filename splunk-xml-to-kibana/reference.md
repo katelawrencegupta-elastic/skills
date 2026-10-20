@@ -178,7 +178,11 @@ Breakdown: `"breakdown_by": { "column": "status" }`.
 
 ## Factory contract
 
-Minimal `factories.yaml` entry:
+Implementations live in `/Users/klg/Documents/GItHub/data_factories`
+(`data_factories.blackstone.*` + `catalog.yaml`). Customer use-case trees keep
+thin wrappers under `elastic/<use_case>/data_factories/` that write local `out/`.
+
+Minimal catalog / `factories.yaml` entry:
 
 ```yaml
 factories:

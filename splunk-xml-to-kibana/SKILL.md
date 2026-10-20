@@ -110,14 +110,19 @@ For **each** panel query, list required data:
 - minimal ECS (or `bx.*`) fields the ES\|QL references
 - volume hint (rows for tables; cardinality for charts)
 
-Then implement or extend factories under `elastic/<use_case>/data_factories/`:
+Implement generator logic in the shared **`data_factories`** package
+(`/Users/klg/Documents/GItHub/data_factories`, module `data_factories.blackstone.*`).
+Keep a thin wrapper under `elastic/<use_case>/data_factories/` that calls the package
+and writes NDJSON → local `out/` (so existing `setup_*.py` subprocess paths keep working).
 
-1. Generator writes NDJSON → `out/`
+1. Generator (in `data_factories`) writes NDJSON → `out/` via wrapper
 2. Setup/bulk push to destination ES (Gate 0 URL+key)
 3. Lookups: `index.mode=lookup` when `LOOKUP JOIN` needed
 4. Presence/entity rollups: transform **or** factory-built metrics stream if transform is overkill for POC
 
-Wire `factories.yaml` (or use-case manifest) so each dashboard id lists P0 factories. **Every panel must have a P0 producer** or an explicit “empty until real data” note to the user.
+Wire `data_factories.blackstone.catalog` (YAML) **or** a use-case manifest so each dashboard id lists P0 factories. Customer trees may keep a pointer `factories.yaml`. **Every panel must have a P0 producer** or an explicit “empty until real data” note to the user.
+
+Install once: `pip install -e /Users/klg/Documents/GItHub/data_factories`.
 
 Validate: run each panel ES\|QL via `POST {ES}/_query` before declaring done.
 
@@ -143,6 +148,10 @@ Template & example: [reference.md](reference.md#mappingmd-template) · worked ex
 ## 6 — Package layout
 
 ```
+# Shared implementations:
+#   data_factories/src/data_factories/blackstone/<factory>.py
+#   data_factories/.../blackstone/catalog.yaml
+
 elastic/<use_case>/
   ANALYSIS.md              # short: Splunk source → Elastic map (+ link MAPPING.md)
   MAPPING.md               # required: SPL ↔ ES|QL + why per panel
@@ -151,7 +160,7 @@ elastic/<use_case>/
   macros_resolved.json     # optional when macros used
   kibana/<id>.json         # per dashboard (exported or built)
   kibana/*_dashboards.json # bundle + source stamp
-  data_factories/
+  data_factories/          # thin wrappers → data_factories package + local out/
   esql/                    # optional panel query catalog
   setup_*.py               # deploy lookups/data/dashboards
 ```
