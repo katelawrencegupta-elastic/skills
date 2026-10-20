@@ -111,7 +111,7 @@ For **each** panel query, list required data:
 - volume hint (rows for tables; cardinality for charts)
 
 Implement generator logic in the shared **`data_factories`** package
-(`/Users/klg/Documents/GItHub/data_factories`, module `data_factories.blackstone.*`).
+(`/Users/klg/Documents/GItHub/data_factories`, modules grouped by data domain, e.g. `data_factories.network.dns_hunt`, `data_factories.identity.hdsi_user`).
 Keep a thin wrapper under `elastic/<use_case>/data_factories/` that calls the package
 and writes NDJSON → local `out/` (so existing `setup_*.py` subprocess paths keep working).
 
@@ -120,7 +120,7 @@ and writes NDJSON → local `out/` (so existing `setup_*.py` subprocess paths ke
 3. Lookups: `index.mode=lookup` when `LOOKUP JOIN` needed
 4. Presence/entity rollups: transform **or** factory-built metrics stream if transform is overkill for POC
 
-Wire `data_factories.blackstone.catalog` (YAML) **or** a use-case manifest so each dashboard id lists P0 factories. Customer trees may keep a pointer `factories.yaml`. **Every panel must have a P0 producer** or an explicit “empty until real data” note to the user.
+Wire a customer catalog YAML (e.g. `customers/<name>/elastic/data_factories/factories.yaml`) **or** a use-case manifest so each dashboard id lists P0 factories. **Every panel must have a P0 producer** or an explicit “empty until real data” note to the user.
 
 Install once: `pip install -e /Users/klg/Documents/GItHub/data_factories`.
 
@@ -149,8 +149,9 @@ Template & example: [reference.md](reference.md#mappingmd-template) · worked ex
 
 ```
 # Shared implementations:
-#   data_factories/src/data_factories/blackstone/<factory>.py
-#   data_factories/.../blackstone/catalog.yaml
+#   data_factories/src/data_factories/<data_domain>/<factory>.py
+#     (network, threat_intel, identity, cloud_audit, cloud_billing, llm, apm, ...)
+# Customer catalog: elastic/data_factories/factories.yaml
 
 elastic/<use_case>/
   ANALYSIS.md              # short: Splunk source → Elastic map (+ link MAPPING.md)

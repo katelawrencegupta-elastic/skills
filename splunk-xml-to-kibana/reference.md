@@ -179,7 +179,7 @@ Breakdown: `"breakdown_by": { "column": "status" }`.
 ## Factory contract
 
 Implementations live in `/Users/klg/Documents/GItHub/data_factories`
-(`data_factories.blackstone.*` + `catalog.yaml`). Customer use-case trees keep
+(grouped by data domain: `data_factories.network.*`, `threat_intel.*`, `identity.*`, `cloud_audit.*`, …). Customer use-case trees keep
 thin wrappers under `elastic/<use_case>/data_factories/` that write local `out/`.
 
 Minimal catalog / `factories.yaml` entry:
