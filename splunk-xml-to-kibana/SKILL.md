@@ -2,12 +2,12 @@
 name: splunk-xml-to-kibana
 description: >-
   Migrates a Splunk dashboard (Classic Simple XML or Dashboard Studio JSON) into
-  Elastic: Splunk-faithful HTML mockup → Kibana Dashboards API panels → data
-  factories that populate every panel → MAPPING.md (SPL↔ES|QL + why) → deploy
-  with user-supplied Kibana/ES URL and API key. Use when the user provides Splunk
-  dashboard XML, asks to mock up a Splunk dashboard in Kibana/Elastic, recreate
-  Employee Safety / hunt dashboards, or wire Splunk panels to ES|QL + synthetic
-  data factories.
+  Elastic: Splunk-faithful HTML mockup (preserved under mockup/) → Kibana
+  Dashboards API panels → data factories that populate every panel → MAPPING.md
+  (SPL↔ES|QL + why) → deploy with user-supplied Kibana/ES URL and API key. Use
+  when the user provides Splunk dashboard XML, asks to mock up a Splunk
+  dashboard in Kibana/Elastic, recreate Employee Safety / hunt dashboards, or
+  wire Splunk panels to ES|QL + synthetic data factories.
 ---
 
 # Splunk XML → Mockup → Kibana → Data Factories
@@ -39,7 +39,7 @@ Skip Gate 0 only for **mockup-only** work (no cluster writes).
 
 ```
 - [ ] 1 Parse Splunk XML → panel inventory
-- [ ] 2 HTML mockup (visualize skill)
+- [ ] 2 HTML mockup site → elastic/<use_case>/mockup/ (required artifact)
 - [ ] 3 Map panels → ES|QL + chart types
 - [ ] 4 Data factories for every index/stream
 - [ ] 5 Build Kibana dashboards via API
@@ -63,14 +63,31 @@ Run a local script; return **only** a compact inventory:
 
 Do **not** dump full SPL into the reply. Keep queries in `elastic/<use_case>/splunk_queries.json` or similar.
 
-## 2 — Mockup
+## 2 — Mockup (required artifact)
 
-Read `/visualize` skill → `references/mockups.md` + foundations.
+Build a **Splunk-faithful HTML mockup site** and **keep it on disk** as part of the
+conversion package. Chat-only previews are optional extras — they do **not**
+replace the durable files.
+
+**Write to:** `elastic/<use_case>/mockup/`
+
+| Path | Purpose |
+|------|---------|
+| `mockup/index.html` | Entry point (open in browser; tab nav if multi-tab) |
+| `mockup/tabs/<slug>.html` | Optional per-tab pages when Studio tabs exist |
+| `mockup/assets/` | Optional shared CSS/JS/images (prefer inline CSS for portability) |
+| `mockup/README.md` | One-liner: how to open (`open index.html` / local static server) |
+
+Rules:
 
 - Match Splunk chrome (Classic dark vs Studio light).
 - Show **real chart affordances** (bars/lines/KPIs), not tables-only.
+- Cover **every panel** from the inventory (same titles / layout intent).
 - Illustrative data OK; label as such only if asked.
-- Emit visualization content-reference tag; keep prose ≤3 sentences.
+- Self-contained: no build step; works via `file://` or a static file server.
+- Do **not** delete or overwrite `mockup/` when building Kibana JSON or deploying.
+- Optional: also emit a `/visualize` content-reference in chat; keep prose ≤3 sentences.
+- Link `mockup/` from `ANALYSIS.md` and from `MAPPING.md` § Links.
 
 ## 3 — Elastic panel map
 
@@ -133,14 +150,15 @@ After panels and factories exist (before or right after deploy), write
 
 **Must include:**
 
-1. **Header** — Splunk app/id, Elastic dashboard id, demo tokens, package path  
+1. **Header** — Splunk app/id, Elastic dashboard id, demo tokens, package path, **mockup path** (`mockup/index.html`)  
 2. **DIMA / audit JSON used** — which files under the Splunk/DIMA export (e.g. `dashboard_to_migrate.json`, `macros.json`, `lookup_samples.json`) were used, consulted-only, or unused — and for what  
 3. **Data factories** — generator script(s), setup/deploy script, NDJSON outputs → ES indices/streams → panels; note shared factories **not** used  
 4. **Inputs** — Splunk tokens → Elastic time/filters (and why)  
 5. **Knowledge objects** — lookups, macros (expand from `macros.json` when present), datamodels → streams/indexes + why  
 6. **Panel-by-panel** — for each panel: original **SPL** (from `splunk_queries.json`), **ES|QL**, viz type, **why** (incl. stand-ins and omissions)  
 7. **Data layout** — which stream/index/lookup feeds which panel (may cross-ref factories section)  
-8. **Gaps / non-goals** — placeholders skipped, macros missing, map→bar, etc.
+8. **Gaps / non-goals** — placeholders skipped, macros missing, map→bar, etc.  
+9. **Links** — include `mockup/` (Splunk HTML site) alongside Kibana URLs and `splunk_queries.json`
 
 Keep `ANALYSIS.md` short; point it at `MAPPING.md` for full SPL rationale.  
 Template & example: [reference.md](reference.md#mappingmd-template) · worked example `elastic/hdsi_user_investigation/MAPPING.md`.
@@ -154,11 +172,16 @@ Template & example: [reference.md](reference.md#mappingmd-template) · worked ex
 # Customer catalog: elastic/data_factories/factories.yaml
 
 elastic/<use_case>/
-  ANALYSIS.md              # short: Splunk source → Elastic map (+ link MAPPING.md)
+  ANALYSIS.md              # short: Splunk source → Elastic map (+ link MAPPING.md + mockup/)
   MAPPING.md               # required: SPL ↔ ES|QL + why per panel
   manifest.json
   splunk_queries.json      # full SPL offline
   macros_resolved.json     # optional when macros used
+  mockup/                  # required: Splunk-faithful HTML site (before Elastic)
+    index.html
+    tabs/                  # optional per Studio tab
+    assets/                # optional
+    README.md              # how to open
   kibana/<id>.json         # per dashboard (exported or built)
   kibana/*_dashboards.json # bundle + source stamp
   data_factories/          # thin wrappers → data_factories package + local out/
@@ -173,11 +196,13 @@ elastic/<use_case>/
 3. Bulk factory data
 4. `PUT /api/dashboards/{id}` for each tab dashboard
 5. Ensure `MAPPING.md` is written/updated to match deployed ES|QL
-6. Print open URLs + which factory feeds which panel + path to `MAPPING.md`
+6. Print open URLs + which factory feeds which panel + paths to `MAPPING.md` and `mockup/index.html`
 
 ## Anti-patterns
 
 - Deploying without asking for destination credentials
+- Chat-only mockup with no files under `elastic/<use_case>/mockup/`
+- Deleting the Splunk mockup after Kibana deploy (“cleanup”)
 - Classic Simple XML paste-as-dashboard when content is hunts → prefer saved ES\|QL / Timeline
 - One mega-dashboard with overlapping `y` from fake tabs
 - Committing `.env`, API keys, or real customer PII samples

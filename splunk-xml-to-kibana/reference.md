@@ -236,6 +236,7 @@ when available. Do not paste the full doc into chat.
 **Elastic target:** `<kibana_dashboard_id>`
 **Demo tokens:** …
 **Package:** `elastic/<use_case>/`
+**Splunk mockup:** `elastic/<use_case>/mockup/index.html`
 
 ## 0. DIMA / Splunk audit JSON used
 | JSON file | Used? | How |
@@ -274,8 +275,8 @@ mark Yes / Consulted / No)
 | Splunk pattern | Elastic pattern |
 
 ## 7. Links
-Dashboard URL · ANALYSIS.md · splunk_queries.json · source.xml ·
-factory script · DIMA JSON paths
+Dashboard URL · ANALYSIS.md · mockup/index.html · splunk_queries.json ·
+source.xml · factory script · DIMA JSON paths
 ```
 
 Worked example: Blackstone `elastic/hdsi_user_investigation/MAPPING.md`.

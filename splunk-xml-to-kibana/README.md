@@ -3,7 +3,7 @@
 Token-first Cursor Agent skill that migrates a Splunk dashboard (Classic Simple XML or Dashboard Studio) into Elastic:
 
 1. Parse Splunk → panel inventory  
-2. HTML mockup (via `/visualize`)  
+2. Splunk-faithful HTML mockup site → `elastic/<use_case>/mockup/` (required artifact; optional `/visualize` preview)  
 3. Kibana Dashboards API panels (ES|QL `vis` types)  
 4. Data factories for demo/synthetic data  
 5. **`MAPPING.md`** — SPL ↔ ES|QL + why, DIMA/audit JSON used, factories  
@@ -50,6 +50,7 @@ elastic/<use_case>/
   MAPPING.md
   manifest.json
   splunk_queries.json
+  mockup/           # required: Splunk HTML site (index.html + optional tabs/)
   kibana/
   data_factories/   # thin wrappers + local out/
   setup_*.py
