@@ -166,6 +166,171 @@ Breakdown: `"breakdown_by": { "column": "status" }`.
 }
 ```
 
+### ES|QL Controls (`pinned_panels`)
+
+Put Controls on the dashboard root as `pinned_panels` (not inside `panels`).
+`variable_name` becomes `?variable_name` in every panel / Vega ES|QL query.
+
+```json
+{
+  "title": "Example",
+  "time_range": { "from": "now-15m", "to": "now" },
+  "pinned_panels": [
+    {
+      "type": "esql_control",
+      "id": "ctl_target_ip",
+      "width": "medium",
+      "grow": false,
+      "config": {
+        "title": "AWS Analysis Target IP",
+        "variable_name": "target_ip",
+        "variable_type": "values",
+        "control_type": "STATIC_VALUES",
+        "available_options": ["10.40.12.88", "10.40.20.11"],
+        "selected_options": ["10.40.12.88"],
+        "single_select": true
+      }
+    },
+    {
+      "type": "esql_control",
+      "id": "ctl_side",
+      "config": {
+        "title": "Toggle Source/Dest",
+        "variable_name": "pivot_side",
+        "variable_type": "values",
+        "control_type": "STATIC_VALUES",
+        "available_options": ["source", "destination"],
+        "selected_options": ["source"],
+        "single_select": true
+      }
+    }
+  ],
+  "panels": []
+}
+```
+
+`control_type` may also be `VALUES_FROM_QUERY` with `esql_query` returning the option column.
+Required: `variable_type` (`values` | `fields` | …) — omitting it fails validation.
+
+### Vega (Sankey / force) via saved visualization + `ref_id`
+
+Dashboards API `vis` discriminators on some clusters **do not** include inline
+`"type": "vega"`. Create a Visualize library object, then reference it:
+
+```http
+POST {KIBANA}/api/saved_objects/visualization/{id}?overwrite=true
+```
+
+```json
+{
+  "attributes": {
+    "title": "My Sankey",
+    "visState": "{\"title\":\"My Sankey\",\"type\":\"vega\",\"aggs\":[],\"params\":{\"spec\":\"<stringified Vega JSON>\"}}",
+    "uiStateJSON": "{}",
+    "description": "",
+    "version": 1,
+    "kibanaSavedObjectMeta": {
+      "searchSourceJSON": "{\"query\":{\"query\":\"\",\"language\":\"kuery\"},\"filter\":[]}"
+    }
+  }
+}
+```
+
+Dashboard panel (temporary — see rewire note):
+
+```json
+{
+  "type": "vis",
+  "id": "vega_sankey",
+  "grid": { "x": 0, "y": 9, "w": 24, "h": 16 },
+  "config": {
+    "title": "Visual Representation of Flow (VPC Interaction Quantities)",
+    "ref_id": "bx-blast-vega-sankey"
+  }
+}
+```
+
+**Critical — rewire lens → visualization:** Dashboards API `config.ref_id` stores
+the reference as saved-object type **`lens`**. Classic Vega objects are type
+**`visualization`**, so the UI shows **"visualization type not found"** until you
+rewire after every PUT:
+
+1. `GET /api/saved_objects/dashboard/{id}`
+2. For each Vega panel: set `type: "visualization"`, `panelRefName: "panel_<id>"`,
+   `id: "<viz-id>"`
+3. Replace lens refs with
+   `{ "name": "panel_<id>", "type": "visualization", "id": "<viz-id>" }`
+4. `PUT /api/saved_objects/dashboard/{id}` with updated `panelsJSON` + `references`
+
+Bake this into `build_dashboard.py` (see Blackstone
+`elastic/secops_aws_blast_radius/build_dashboard.py` → `rewire_vega_panel_refs`).
+
+Inside the Vega spec, use ES|QL data + Control defaults. **Alias dotted columns
+in ES|QL** (or copy with bracket formulas) before any Vega aggregate/encode:
+
+```json
+{
+  "data": [{
+    "name": "raw",
+    "url": {
+      "%type%": "esql",
+      "%timefield%": "@timestamp",
+      "query": "FROM logs-* | WHERE source.ip == TO_IP(?target_ip) | STATS count = COUNT(*) BY src = source.ip, dst = destination.ip, community = bx.aws.community",
+      "params": [{ "target_ip": "10.40.12.88" }]
+    },
+    "transform": [
+      {"type": "formula", "expr": "datum.src", "as": "src"},
+      {"type": "formula", "expr": "datum.dst", "as": "dst"}
+    ]
+  }]
+}
+```
+
+Bad (throws `reading 'aws'`): `"fields": ["bx.aws.community"]`  
+Good: alias `community = bx.aws.community` in ES|QL, then `"fields": ["community"]`.
+
+### Force-directed / particle graph → heatmap (P0)
+
+**Hard rule:** Map Splunk `force_directed*` / Verlet particle graphs to a Dashboards
+API **`heatmap`** (src×dest flow counts) + companion edge **`data_table`**. Keep the
+Splunk panel title. Note in `MAPPING.md` that true force/network Vega is deferred
+(see skill `BUGS.md` / GitHub tracking issue).
+
+```json
+{
+  "type": "vis",
+  "id": "heatmap_force_paths",
+  "grid": { "x": 24, "y": 9, "w": 24, "h": 16 },
+  "config": {
+    "title": "Force-Directed Verlet Integration Particle Graph",
+    "type": "heatmap",
+    "data_source": {
+      "type": "esql",
+      "query": "FROM logs-* | WHERE … | STATS count = COUNT(*) BY source.ip, destination.ip | SORT count DESC | LIMIT 40"
+    },
+    "x": { "column": "destination.ip" },
+    "y": { "column": "source.ip" },
+    "metric": { "column": "count" }
+  }
+}
+```
+
+Do **not** spend conversion time on Kibana Vega `force` / `linkpath` for these
+panels until the tracking bug is resolved. Prior attempts failed with
+`reading 'aws'|'id'`, Invalid SVG path, and empty panels (Blast Radius).
+
+### Custom viz catalog (P0 → fallback)
+
+| Splunk `custom_viz` / intent | Elastic P0 | Fallback (label **GAP**) | Factory fields |
+|---|---|---|---|
+| `sankey_diagram*` | Vega Sankey (alluvial / link paths) | heatmap / path xy | edge endpoints + count |
+| `force_directed*` | **`heatmap`** src×dest + edge `data_table` | edge `data_table` only | edges + community/account/vpc |
+| `*3d_graph*` / LabelPropagation | Vega network by community or community table | table-only | `bx.*.community` (or equiv.) |
+| GraphCentrality | `xy` bar by weight | — | `bx.*.centrality.weight` |
+
+**Ban:** collapsing **Sankey** to table/heatmap without a GAP note and a Vega-first attempt.  
+**Ban:** shipping Kibana Vega `force` for `force_directed*` until `BUGS.md` is closed.
+
 ## Grid
 
 48 columns. Typical: KPI `w=12 h=6`, chart `w=24–48 h=10–14`, table `w=48 h=12–16`. Next row `y = prev.y + prev.h`.
@@ -248,8 +413,8 @@ mark Yes / Consulted / No)
 | Factory NDJSON | → ES index/stream | → panels |
 (Note shared factories.yaml entries not used, if any.)
 
-## 1. Inputs
-| Splunk | Elastic | Why |
+## 1. Inputs → Controls matrix (required)
+| Splunk input / token | Elastic Control / time / GAP | Drives (`?param`) | Why |
 
 ## 2. Knowledge objects
 ### Lookups

@@ -83,6 +83,9 @@ Rules:
 - Match Splunk chrome (Classic dark vs Studio light).
 - Show **real chart affordances** (bars/lines/KPIs), not tables-only.
 - Cover **every panel** from the inventory (same titles / layout intent).
+- **Control strip checklist:** the mockup top strip must show the **same labels and
+  control types** as Splunk `inputs[]` (text / dropdown / radio / time). Do not
+  omit pivots that will become Kibana Controls.
 - Illustrative data OK; label as such only if asked.
 - Self-contained: no build step; works via `file://` or a static file server.
 - Do **not** delete or overwrite `mockup/` when building Kibana JSON or deploying.
@@ -104,6 +107,67 @@ Hard constraints (Kibana **9.4+** Dashboards API, serverless included):
 | radial / gauge | `vis` `gauge` |
 | punchcard | `vis` `heatmap` |
 | markdown/html | `markdown` |
+| Form **inputs** (text/dropdown/radio/multiselect) | Dashboard **Controls** (`pinned_panels`: `esql_control` / `options_list_control` / …) bound to ES\|QL `?params` — see **Inputs → Controls** below |
+| Custom graph / flow viz | Prefer **Vega** (table below) — never silently collapse |
+
+### Inputs → Controls (hard rule)
+
+After panel inventory, every Splunk `input` must appear in an **Inputs → Controls
+matrix** in `MAPPING.md`. Each row is one of:
+
+1. Dashboard **time picker** (`?_tstart` / `?_tend`)
+2. Options list / range / **ES|QL variable Control** (`pinned_panels` + `?name` in queries)
+3. Explicit **GAP** with user-visible markdown (not a silent hard-coded demo value)
+
+**Ban:** documenting the token in markdown and hard-coding the demo value in every
+`WHERE` as the default for text / dropdown / radio pivots.
+
+Wire panels like:
+
+```esql
+FROM logs-* 
+| WHERE source.ip == TO_IP(?target_ip)
+| WHERE TO_STRING(?aws_account) == "*" OR cloud.account.id == TO_STRING(?aws_account)
+| WHERE @timestamp <= ?_tend AND @timestamp > ?_tstart
+```
+
+Cast Control values with `TO_STRING` / `TO_IP` when the field is `keyword` / `ip` —
+STATIC_VALUES that look numeric are often bound as non-keyword and break every panel.
+
+### Custom viz → Vega (hard rule)
+
+| Splunk `custom_viz` / intent | Elastic target (P0) | Allowed fallback (must label **GAP**) |
+|---|---|---|
+| `sankey_diagram*` / flow quantities | **Vega Sankey** (saved viz + `config.ref_id` if inline `type:vega` unsupported) | heatmap or path `xy` + GAP note |
+| `force_directed*` / node-link | **`heatmap`** (src×dest count) + companion edge `data_table` — keep Splunk title | edge `data_table` only + GAP |
+| `*3d_graph*` / GraphLabelPropagation | Vega network colored by community **or** community table + scatter | table-only + GAP |
+| GraphCentrality / weighted ARNs | `xy` bar by weight (OK) | — |
+
+**Force-directed → heatmap (hard rule):** Do **not** attempt Kibana Vega `force`
+layouts for Splunk `force_directed*` / particle graphs. They fail on current
+Dashboards/Vega embeds (see tracking bug in skill `BUGS.md`). Ship heatmap +
+edge table and note the GAP in `MAPPING.md` (true force viz deferred).
+
+**Do not** silently collapse **Sankey** to table/heatmap — prefer Vega Sankey
+first and label any fallback as GAP. Embed Vega via Visualize saved object
+(`POST /api/saved_objects/visualization/{id}?overwrite=true`) + dashboard panel
+`{"type":"vis","config":{"ref_id":"…","title":"…"}}` when the Dashboards API
+`vis` discriminator does not accept `"type":"vega"` inline.
+**Always rewire** `ref_id` lens stubs → SO type `visualization` after dashboard PUT
+(see [reference.md](reference.md#vega-sankey--force-via-saved-visualization--ref_id)).
+
+**Vega hard constraints (Blast Radius lessons):**
+
+1. **No dotted field paths in Vega transforms/encodes** — ES|QL columns like
+   `bx.aws.community` / `source.ip` must be aliased flat in the query
+   (`community = bx.aws.community`) or copied with `datum['source.ip']` → `src`.
+   Leaving `fields: ["bx.aws.community"]` throws
+   `Cannot read properties of undefined (reading 'aws')`.
+2. **Do not use Vega `force` for `force_directed*`** — mark-level and data-transform
+   attempts still failed on serverless (id / Invalid SVG path / empty panels).
+   Default to heatmap; track a proper force recipe in `BUGS.md`.
+3. After every Dashboards API PUT that includes Vega `ref_id` panels, run the
+   visualization-ref rewire or the UI shows **"visualization type not found"**.
 
 **Forbidden:** Lens-only `lnsDatatable` NDJSON with `gridData.tabId` / attributes `tabs` — API rejects or UI ignores; yields tables-only.
 
@@ -115,7 +179,8 @@ Elastic-Api-Version: 2023-10-31
 kbn-xsrf: true
 ```
 
-Body: `{ title, description?, time_range, panels[] }` — inline `config` (prefer over `ref_id`). Details: [reference.md](reference.md).
+Body: `{ title, description?, time_range, panels[], pinned_panels? }` — inline
+`config` for Lens-style `vis`; Vega via `ref_id`. Details: [reference.md](reference.md).
 
 After user UI edits: `GET` each id → write `kibana/*_dashboards.json` with `"source":"exported_from_kibana"`. Redeploy from that file; do not regenerate from templates unless asked.
 
@@ -126,6 +191,15 @@ For **each** panel query, list required data:
 - data stream / index / lookup
 - minimal ECS (or `bx.*`) fields the ES\|QL references
 - volume hint (rows for tables; cardinality for charts)
+
+**Graph / custom-viz support fields** (emit in the factory **before** panel build):
+
+| Splunk custom_viz | Required factory fields (examples) |
+|---|---|
+| `sankey_diagram*` | Edge endpoints + count (`source.ip`, `destination.ip`, …) |
+| `force_directed*` | Same edges + optional size/color dims (`bx.aws.vpc_id`, `cloud.account.name`, `bx.aws.community`) |
+| `*3d_graph*` / LabelPropagation | Community / color field (e.g. `bx.aws.community`) |
+| GraphCentrality | Weight field (e.g. `bx.aws.centrality.weight`) on entity/ARN docs |
 
 Implement generator logic in the shared **`data_factories`** package
 (`/Users/klg/Documents/GItHub/data_factories`, modules grouped by data domain, e.g. `data_factories.network.dns_hunt`, `data_factories.identity.hdsi_user`).
@@ -153,7 +227,7 @@ After panels and factories exist (before or right after deploy), write
 1. **Header** — Splunk app/id, Elastic dashboard id, demo tokens, package path, **mockup path** (`mockup/index.html`)  
 2. **DIMA / audit JSON used** — which files under the Splunk/DIMA export (e.g. `dashboard_to_migrate.json`, `macros.json`, `lookup_samples.json`) were used, consulted-only, or unused — and for what  
 3. **Data factories** — generator script(s), setup/deploy script, NDJSON outputs → ES indices/streams → panels; note shared factories **not** used  
-4. **Inputs** — Splunk tokens → Elastic time/filters (and why)  
+4. **Inputs → Controls matrix** — every Splunk token → Control / time picker / **GAP** (required; see §3)  
 5. **Knowledge objects** — lookups, macros (expand from `macros.json` when present), datamodels → streams/indexes + why  
 6. **Panel-by-panel** — for each panel: original **SPL** (from `splunk_queries.json`), **ES|QL**, viz type, **why** (incl. stand-ins and omissions)  
 7. **Data layout** — which stream/index/lookup feeds which panel (may cross-ref factories section)  
@@ -194,9 +268,16 @@ elastic/<use_case>/
 1. Confirm Gate 0 URL+key
 2. Templates / data streams / lookups
 3. Bulk factory data
-4. `PUT /api/dashboards/{id}` for each tab dashboard
-5. Ensure `MAPPING.md` is written/updated to match deployed ES|QL
-6. Print open URLs + which factory feeds which panel + paths to `MAPPING.md` and `mockup/index.html`
+4. Create/update Vega saved visualizations when needed, then `PUT /api/dashboards/{id}` (include `pinned_panels`)
+5. **Rewire** Vega `ref_id` panels from lens → `visualization` SO refs
+6. Ensure `MAPPING.md` is written/updated to match deployed ES|QL + Controls matrix
+7. Print open URLs + which factory feeds which panel + paths to `MAPPING.md` and `mockup/index.html`
+8. **Spot-check (required):**
+   - [ ] Every Splunk input has a working Control or documented GAP
+   - [ ] Changing Control values changes panel queries (no leftover hard-coded demo IP / token)
+   - [ ] Sankey panels are visual flow (Vega), not only tables — unless GAP is explicit
+   - [ ] Force-directed panels are `heatmap` (src×dest) + edge table (not broken Vega force)
+   - [ ] Vega Sankey panels render (no “visualization type not found” / dotted-field errors)
 
 ## Anti-patterns
 
@@ -206,6 +287,11 @@ elastic/<use_case>/
 - Classic Simple XML paste-as-dashboard when content is hunts → prefer saved ES\|QL / Timeline
 - One mega-dashboard with overlapping `y` from fake tabs
 - Committing `.env`, API keys, or real customer PII samples
+- Silent Sankey → heatmap/table collapse without GAP + Vega-first attempt
+- Attempting Kibana Vega `force` for Splunk `force_directed*` (use heatmap + edge table; see `BUGS.md`)
+- Hard-coding Splunk input defaults into every `WHERE` instead of Controls
+- Leaving Dashboards API `ref_id` as lens refs for classic Vega visualizations
+- Feeding dotted ECS paths (`bx.aws.*`, `source.ip`) into Vega aggregate/encode field lists
 
 ## References
 
