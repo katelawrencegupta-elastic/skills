@@ -10,7 +10,7 @@
 | **Severity** | High (blocks Splunk-parity for `force_directed*`) |
 | **Skill impact** | Skill defaults `force_directed*` → `heatmap` + edge table (GAP) |
 | **GitHub** | https://github.com/katelawrencegupta-elastic/skills/issues/2 |
-| **Repro package** | Blackstone `elastic/secops_aws_blast_radius` (klgdimapoc) |
+| **Repro package** | Customer AWS blast-radius style dashboards (VPC edges + Vega) |
 
 **Summary**
 
@@ -25,7 +25,7 @@ stable recipe via the Dashboards API (`2023-10-31`).
 | `vis` + `config.ref_id` to classic Vega SO | Stored as `lens` → “visualization type not found” (needs SO rewire to `visualization`) |
 | Mark-level `force` + `linkpath` / path on `datum.source.x` | `reading 'id'`; `Invalid SVG path, incorrect parameter type` |
 | Data-transform `force` + `rule` lookup + `static: false` | Still failed to render a usable particle graph on target cluster |
-| Dotted ES|QL fields (`bx.aws.community`) in Vega aggregates | `Cannot read properties of undefined (reading 'aws')` |
+| Dotted ES|QL fields (e.g. `cloud.account.name`) in Vega aggregates | `Cannot read properties of undefined (reading '…')` |
 
 **Current skill workaround**
 
@@ -47,4 +47,4 @@ Then flip skill P0 from heatmap → that recipe and close this bug.
 **References**
 
 - Skill: `SKILL.md` § Custom viz → Vega; `reference.md` § Force-directed → heatmap
-- Worked GAP example: `customers/blackstone/elastic/secops_aws_blast_radius/`
+- See adapter notes for customer-specific GAP examples

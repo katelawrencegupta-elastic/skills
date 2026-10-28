@@ -245,7 +245,7 @@ Dashboard panel (temporary — see rewire note):
   "grid": { "x": 0, "y": 9, "w": 24, "h": 16 },
   "config": {
     "title": "Visual Representation of Flow (VPC Interaction Quantities)",
-    "ref_id": "bx-blast-vega-sankey"
+    "ref_id": "example-vega-sankey"
   }
 }
 ```
@@ -262,8 +262,7 @@ rewire after every PUT:
    `{ "name": "panel_<id>", "type": "visualization", "id": "<viz-id>" }`
 4. `PUT /api/saved_objects/dashboard/{id}` with updated `panelsJSON` + `references`
 
-Bake this into `build_dashboard.py` (see Blackstone
-`elastic/secops_aws_blast_radius/build_dashboard.py` → `rewire_vega_panel_refs`).
+Bake this into `build_dashboard.py`, or run `scripts/rewire_vega_refs.py` after PUT.
 
 Inside the Vega spec, use ES|QL data + Control defaults. **Alias dotted columns
 in ES|QL** (or copy with bracket formulas) before any Vega aggregate/encode:
@@ -275,8 +274,8 @@ in ES|QL** (or copy with bracket formulas) before any Vega aggregate/encode:
     "url": {
       "%type%": "esql",
       "%timefield%": "@timestamp",
-      "query": "FROM logs-* | WHERE source.ip == TO_IP(?target_ip) | STATS count = COUNT(*) BY src = source.ip, dst = destination.ip, community = bx.aws.community",
-      "params": [{ "target_ip": "10.40.12.88" }]
+      "query": "FROM logs-* | WHERE source.ip == TO_IP(?target_ip) | STATS count = COUNT(*) BY src = source.ip, dst = destination.ip, community = cloud.account.name",
+      "params": [{ "target_ip": "10.0.0.10" }]
     },
     "transform": [
       {"type": "formula", "expr": "datum.src", "as": "src"},
@@ -286,8 +285,8 @@ in ES|QL** (or copy with bracket formulas) before any Vega aggregate/encode:
 }
 ```
 
-Bad (throws `reading 'aws'`): `"fields": ["bx.aws.community"]`  
-Good: alias `community = bx.aws.community` in ES|QL, then `"fields": ["community"]`.
+Bad (throws on dotted paths): `"fields": ["cloud.account.name"]` without alias  
+Good: alias `community = cloud.account.name` in ES|QL, then `"fields": ["community"]`.
 
 ### Force-directed / particle graph → heatmap (P0)
 
@@ -325,8 +324,8 @@ panels until the tracking bug is resolved. Prior attempts failed with
 |---|---|---|---|
 | `sankey_diagram*` | Vega Sankey (alluvial / link paths) | heatmap / path xy | edge endpoints + count |
 | `force_directed*` | **`heatmap`** src×dest + edge `data_table` | edge `data_table` only | edges + community/account/vpc |
-| `*3d_graph*` / LabelPropagation | Vega network by community or community table | table-only | `bx.*.community` (or equiv.) |
-| GraphCentrality | `xy` bar by weight | — | `bx.*.centrality.weight` |
+| `*3d_graph*` / LabelPropagation | Vega network by community or community table | table-only | community field |
+| GraphCentrality | `xy` bar by weight | — | centrality weight field |
 
 **Ban:** collapsing **Sankey** to table/heatmap without a GAP note and a Vega-first attempt.  
 **Ban:** shipping Kibana Vega `force` for `force_directed*` until `BUGS.md` is closed.
@@ -343,9 +342,9 @@ panels until the tracking bug is resolved. Prior attempts failed with
 
 ## Factory contract
 
-Implementations live in `/Users/klg/Documents/GItHub/data_factories`
-(grouped by data domain: `data_factories.network.*`, `threat_intel.*`, `identity.*`, `cloud_audit.*`, …). Customer use-case trees keep
-thin wrappers under `elastic/<use_case>/data_factories/` that write local `out/`.
+Prefer a shared `data_factories` package when the project has one (domain modules +
+thin wrappers under `PACKAGE_ROOT/data_factories/`). Otherwise use
+`templates/factories/minimal_ndjson.py` from this skill.
 
 Minimal catalog / `factories.yaml` entry:
 
@@ -355,14 +354,13 @@ factories:
     priority: P0
     purpose: Feed Employees by Entrance + Badge KPIs
     writes:
-      - data_stream: logs-bx.badge-default
+      - data_stream: logs-demo.badge-default
     feeds_panels:
-      - bx-es-office-metrics/om_entrance
-      - bx-employee-safety-dashboard/ea_kpi
+      - demo-office-metrics/om_entrance
     ecs_schema:
       "@timestamp": date
       user.full_name: keyword
-      bx.badge.entrance: keyword
+      badge.entrance: keyword
 ```
 
 Generator must emit fields named exactly as ES\|QL columns. After bulk, `GET {ES}/{stream}/_count` and sample `_query`.
@@ -370,7 +368,7 @@ Generator must emit fields named exactly as ES\|QL columns. After bulk, `GET {ES
 ## Export / promote UI edits
 
 ```bash
-# pattern used by employee_safety/build_tabbed_dashboard.py
+# scripts/put_dashboard.py --export / default PUT
 GET /api/dashboards/{id}  →  kibana/{id}.json + bundle source=exported_from_kibana
 PUT /api/dashboards/{id}  ←  that JSON (default redeploy path)
 ```
@@ -444,4 +442,4 @@ Dashboard URL · ANALYSIS.md · mockup/index.html · splunk_queries.json ·
 source.xml · factory script · DIMA JSON paths
 ```
 
-Worked example: Blackstone `elastic/hdsi_user_investigation/MAPPING.md`.
+Template copy: `templates/MAPPING.md`. Customer adapters may point at worked examples.

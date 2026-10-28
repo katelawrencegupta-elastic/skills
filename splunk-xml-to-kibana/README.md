@@ -1,72 +1,84 @@
-# Splunk XML → Kibana (Cursor Agent Skill)
+# splunk-xml-to-kibana
 
-Token-first Cursor Agent skill that migrates a Splunk dashboard (Classic Simple XML or Dashboard Studio) into Elastic:
+Portable Agent Skill: migrate Splunk dashboards (Classic Simple XML or Dashboard Studio) to Elastic — mockup → ES|QL panels → data factories → `MAPPING.md` → deploy.
 
-1. Parse Splunk → panel inventory  
-2. Splunk-faithful HTML mockup site → `elastic/<use_case>/mockup/` (required artifact; optional `/visualize` preview)  
-3. Kibana Dashboards API panels (ES|QL `vis` types)  
-4. Data factories for demo/synthetic data  
-5. **`MAPPING.md`** — SPL ↔ ES|QL + why, DIMA/audit JSON used, factories  
-6. Deploy with user-supplied Kibana/ES URL + API key (Gate 0)
+Works in **Claude Code** and **Cursor** (same `SKILL.md` format).
 
-## Install (Cursor Desktop)
+## Layout
 
-Copy this folder into your personal skills directory:
+```
+splunk-xml-to-kibana/
+  SKILL.md                 # parameterized workflow (no customer absolute paths)
+  reference.md             # Dashboards API snippets, Vega, MAPPING template detail
+  BUGS.md                  # platform limitations (e.g. Vega force)
+  adapters/
+    blackstone.md          # optional one-page customer adapter
+  scripts/
+    parse_inventory.py     # XML → inventory.json + splunk_queries.json
+    put_dashboard.py       # PUT/GET Dashboards API
+    rewire_vega_refs.py    # lens → visualization SO rewire
+    scaffold_use_case.py   # create PACKAGE_ROOT skeleton
+  templates/
+    mockup/                # Splunk-faithful HTML starter
+    MAPPING.md
+    factories/minimal_ndjson.py
+    vega_panel_map.example.json
+```
+
+## Install
+
+### Claude Code
+
+```bash
+git clone https://github.com/katelawrencegupta-elastic/skills.git
+ln -s "$(pwd)/skills/splunk-xml-to-kibana" ~/.claude/skills/splunk-xml-to-kibana
+```
+
+Or copy the folder into a project: `.claude/skills/splunk-xml-to-kibana/`.
+
+### Cursor
 
 ```bash
 mkdir -p ~/.cursor/skills
-cp -R . ~/.cursor/skills/splunk-xml-to-kibana
+ln -s /path/to/skills/splunk-xml-to-kibana ~/.cursor/skills/splunk-xml-to-kibana
 ```
 
-Or clone and symlink:
+### claude.ai
+
+Zip this folder (must include `SKILL.md` at the zip root) → Settings → Features → upload skill.  
+Note: claude.ai code execution may have limited network — treat Gate 0 deploy as optional; mockup + MAPPING still apply.
+
+## Quick start
 
 ```bash
-git clone <this-repo-url> ~/src/splunk-xml-to-kibana
-ln -s ~/src/splunk-xml-to-kibana ~/.cursor/skills/splunk-xml-to-kibana
+# 1) Scaffold
+python scripts/scaffold_use_case.py --use-case my_dash --out ./elastic
+
+# 2) Drop Splunk XML in place, parse
+cp /path/to/dashboard.xml ./elastic/my_dash/source.xml
+python scripts/parse_inventory.py --source ./elastic/my_dash/source.xml --out-dir ./elastic/my_dash
+
+# 3) Follow SKILL.md checklist (mockup → ES|QL → factories → MAPPING → Gate 0 deploy)
+python scripts/put_dashboard.py --body ./elastic/my_dash/kibana/my-dash.json
 ```
 
-Restart or start a new Agent chat so Cursor picks up the skill. Trigger by asking to migrate a Splunk dashboard XML to Kibana/Elastic.
+## Parameters
 
-## Contents
+Resolved per conversion (see `SKILL.md`):
 
-| File | Purpose |
-|------|---------|
-| `SKILL.md` | Main skill instructions (workflow, Gate 0, package layout, MAPPING.md) |
-| `reference.md` | Dashboards API panel snippets, factory notes, MAPPING.md template |
-
-## Expected inputs (DIMA / Splunk audit)
-
-Minimum: dashboard XML (or `dashboard_to_migrate.json` with `eai:data`).  
-When SPL uses macros/lookups: `macros.json`, optionally `lookup_samples.json`.
-
-## Outputs (per use case)
-
-Typical package under a customer repo:
-
-```
-# Generators: data_factories package (pip install -e …/data_factories)
-elastic/<use_case>/
-  ANALYSIS.md
-  MAPPING.md
-  manifest.json
-  splunk_queries.json
-  mockup/           # required: Splunk HTML site (index.html + optional tabs/)
-  kibana/
-  data_factories/   # thin wrappers + local out/
-  setup_*.py
-```
-
-## Worked examples (Blackstone POC)
-
-Examples live in customer repos (not this skill package), e.g.:
-
-- `elastic/hdsi_user_investigation/` — lookups + macros + datamodels + MAPPING.md  
-- `elastic/network_egress_exfil/` — lookups + macros  
-- `elastic/ioc_threat_hunt/`, `elastic/secops_aws_blast_radius/`
+| Param | Meaning |
+|-------|---------|
+| `USE_CASE` | Package slug |
+| `PACKAGE_ROOT` | `./elastic/<USE_CASE>/` by default |
+| `STREAM` / `DASH_ID` | Data + Kibana ids |
+| `DATA_FACTORIES` | Shared package path, or skill templates |
+| `ADAPTER` | e.g. `adapters/blackstone.md` when applicable |
 
 ## Sharing
 
-This Cursor-hosted copy is **not public**. Manage who can access it from the repo page on Cursor. Teammates install via clone + the steps above.
+- **Share this skill folder / git repo** with Claude and Cursor users.
+- Keep customer trees, `.env`, and PII **out** of the skill.
+- Customer-specific env and naming go in `adapters/<name>.md`.
 
 ## License
 

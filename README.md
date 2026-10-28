@@ -6,7 +6,7 @@ Three agent skills for Elastic account work. Each one packages a repeatable work
 |---|---|---|---|
 | [account-status-update](#account-status-update) | Claude (`.skill`) | Account status summary + activity timeline, optionally as a Google Doc | Slack, Gmail, Google Calendar (Drive for docs) |
 | [customer-tech-research](#customer-tech-research) | Claude (`.skill`) | Confidence-rated tech-stack report + Elastic opportunity assessment | Web search, web fetch |
-| [splunk-xml-to-kibana](#splunk-xml-to-kibana) | Cursor Agent | Splunk dashboard migrated to Kibana: mockup, ES\|QL panels, data factories, `MAPPING.md`, deploy | Kibana/ES URL + API key, `data_factories` package |
+| [splunk-xml-to-kibana](#splunk-xml-to-kibana) | Claude Code + Cursor | Splunk dashboard migrated to Kibana: mockup, ES\|QL panels, data factories, `MAPPING.md`, deploy | Kibana/ES URL + API key (optional shared `data_factories`) |
 
 ---
 
@@ -18,15 +18,25 @@ account-status-update/
 customer-tech-research/
   customer-tech-research.skill       # zip: SKILL.md + references/industry-angles.md
 splunk-xml-to-kibana/
-  SKILL.md                           # workflow, gates, layout, MAPPING.md rules
-  reference.md                       # Dashboards API snippets, factory notes, MAPPING.md template
-  README.md                          # Cursor install notes
+  SKILL.md                           # parameterized workflow (Claude Code + Cursor)
+  reference.md / BUGS.md             # API snippets + platform gaps
+  adapters/                          # optional customer one-pagers (e.g. blackstone.md)
+  scripts/                           # parse_inventory, put_dashboard, rewire_vega_refs, scaffold
+  templates/                         # mockup, MAPPING.md, minimal factory
+  README.md                          # install for Claude Code / Cursor / claude.ai
 .cursor/rules/commits.mdc            # commit conventions for agents working in this repo
 ```
 
 ## Installing
 
 **Claude skills (`.skill`).** Open the `.skill` file in Claude and click **Save skill**. A `.skill` file is a zip, so you can rename it to `.zip` to inspect or edit its contents, then re-zip it with the `.skill` extension.
+
+**Claude Code (filesystem skill).** Symlink or copy folders that ship `SKILL.md` (not only `.skill` zips):
+
+```bash
+mkdir -p ~/.claude/skills
+ln -s "$(pwd)/splunk-xml-to-kibana" ~/.claude/skills/splunk-xml-to-kibana
+```
 
 **Cursor skill.** Copy or symlink the folder into your personal skills directory, then start a new Agent chat:
 
@@ -126,17 +136,17 @@ Examples: `status update GE Vernova 3m`, `status update Merck 2w googledoc=y`. T
 
 **What it does:** Migrates a Splunk dashboard (Classic Simple XML or Dashboard Studio JSON) into Elastic. It builds a mockup that looks like the original Splunk dashboard, Kibana dashboards built through the Dashboards API with ES|QL panels, synthetic data factories that populate every panel, a required `MAPPING.md`, and deploys everything to a cluster you choose.
 
-**Usage:** In Cursor Agent, give it Splunk dashboard XML (or a DIMA/audit export such as `dashboard_to_migrate.json`, plus `macros.json` and `lookup_samples.json` when the SPL uses them) and ask to migrate it to Kibana.
+**Usage:** In Claude Code or Cursor, give it Splunk dashboard XML (or a DIMA/audit export such as `dashboard_to_migrate.json`, plus `macros.json` and `lookup_samples.json` when the SPL uses them) and ask to migrate it to Kibana. Optional customer adapters live under `adapters/` (e.g. Blackstone).
 
 **How it works**
 
-1. **Gate 0, credentials.** Asks once for the Kibana URL and API key before any cluster write. It never guesses, reuses another project's key, or reads `.env` without permission. Mockup-only work skips this gate.
-2. **Parse offline.** A local script turns the XML into a compact panel inventory (kind, title, theme, tabs, inputs, panels). Full SPL goes to `splunk_queries.json`, not the chat.
-3. **Mockup.** An HTML mockup that matches Splunk's look, with real chart types.
-4. **Panel map.** Splunk chart types map to Kibana 9.4+ `vis` types (data_table, xy, metric, gauge, heatmap, markdown). Studio tabs become one dashboard per tab joined by a `links` panel, because Kibana has no native tabs.
-5. **Data factories.** Every panel gets a P0 data producer from the shared `data_factories` package, called through thin per-use-case wrappers. Each panel's ES|QL is validated with `POST /_query`.
-6. **MAPPING.md (required).** For every panel: original SPL, ES|QL, chart type, and why. Also covers inputs, macros, lookups, data layout, the DIMA files that were used, and gaps.
-7. **Deploy.** Templates, data streams and lookups, then bulk data, then `PUT /api/dashboards/{id}` per tab. Prints dashboard URLs, which factory feeds each panel, and the `MAPPING.md` path. If you edit dashboards in the Kibana UI, it exports them and redeploys from the export.
+1. **Parameters + Gate 0.** Resolves `PACKAGE_ROOT` / `USE_CASE` / streams; asks once for Kibana URL and API key before any cluster write. Never guesses credentials or reads `.env` without permission. Mockup-only work skips Gate 0.
+2. **Parse offline.** `scripts/parse_inventory.py` turns XML into a compact inventory. Full SPL goes to `splunk_queries.json`, not the chat.
+3. **Mockup.** HTML under `PACKAGE_ROOT/mockup/` (from `templates/mockup/` if needed).
+4. **Panel map.** Splunk chart types map to Kibana 9.4+ `vis` types. Studio tabs → one dashboard per tab + `links` nav. Inputs → Controls (`?params`).
+5. **Data factories.** Shared package when available, else `templates/factories/`. Every panel needs a P0 producer; validate with `POST /_query`.
+6. **MAPPING.md (required).** SPL ↔ ES|QL + why, Controls matrix, gaps. Template: `templates/MAPPING.md`.
+7. **Deploy.** `scripts/put_dashboard.py`; Vega panels via saved viz + `scripts/rewire_vega_refs.py`.
 
 **Token optimizations**
 

@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Splunk Dashboard Mockup</title>
+<style>
+:root {
+  --bg: #1a1c20; --bg2: #22252b; --bg3: #2b3038; --border: #3a414c;
+  --text: #e8eaed; --muted: #9aa0a6; --accent: #5ccfe6; --bar: #5ccfe6;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); font: 13px/1.4 var(--font); }
+.topbar {
+  display: flex; align-items: center; gap: 16px; padding: 10px 16px;
+  background: #111318; border-bottom: 1px solid var(--border);
+}
+.brand { font-weight: 700; color: var(--accent); }
+.title { font-size: 15px; font-weight: 600; }
+.meta { margin-left: auto; color: var(--muted); font-size: 12px; }
+.inputs {
+  display: flex; flex-wrap: wrap; gap: 10px; padding: 10px 16px;
+  background: var(--bg2); border-bottom: 1px solid var(--border);
+}
+.input { display: flex; flex-direction: column; gap: 4px; min-width: 140px; }
+.input label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.input .ctl {
+  background: var(--bg3); border: 1px solid var(--border); color: var(--text);
+  border-radius: 3px; padding: 6px 8px; min-height: 28px;
+}
+.page { padding: 14px 16px 40px; }
+.grid { display: grid; gap: 12px; grid-template-columns: repeat(4, 1fr); }
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+.panel {
+  background: var(--bg2); border: 1px solid var(--border); border-radius: 4px;
+  min-height: 120px; overflow: hidden;
+}
+.panel h3 {
+  margin: 0; padding: 8px 12px; font-size: 12px; font-weight: 600;
+  border-bottom: 1px solid var(--border); background: var(--bg3);
+}
+.panel .body { padding: 12px; }
+.kpi-val { font-size: 28px; font-weight: 700; color: var(--accent); }
+.bars { display: flex; align-items: flex-end; gap: 4px; height: 80px; }
+.bars span { flex: 1; background: linear-gradient(180deg, var(--bar), #2a6f7c); border-radius: 2px 2px 0 0; }
+.footer { margin-top: 24px; color: var(--muted); font-size: 11px; border-top: 1px solid var(--border); padding-top: 12px; }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">SPLUNK</div>
+  <div class="title"><!-- TITLE --></div>
+  <div class="meta">Classic dark · mockup template</div>
+</header>
+<div class="inputs">
+  <!-- CONTROL STRIP: mirror Splunk inputs[] labels/types -->
+  <div class="input"><label>Example Token</label><div class="ctl">demo-value</div></div>
+  <div class="input"><label>Time Range</label><div class="ctl">Last 24 hours</div></div>
+</div>
+<main class="page">
+  <p style="color:var(--muted)">Replace this scaffold with one panel section per inventory title. Keep control strip labels identical to Splunk.</p>
+  <div class="grid">
+    <section class="panel"><h3>KPI example</h3><div class="body"><div class="kpi-val">0</div></div></section>
+    <section class="panel" style="grid-column: span 3"><h3>Chart example</h3><div class="body"><div class="bars"><span style="height:40%"></span><span style="height:70%"></span><span style="height:55%"></span><span style="height:90%"></span></div></div></section>
+  </div>
+  <footer class="footer">Open via <code>open index.html</code>. Illustrative layout only.</footer>
+</main>
+</body>
+</html>

@@ -6,13 +6,30 @@ description: >-
   Dashboards API panels → data factories that populate every panel → MAPPING.md
   (SPL↔ES|QL + why) → deploy with user-supplied Kibana/ES URL and API key. Use
   when the user provides Splunk dashboard XML, asks to mock up a Splunk
-  dashboard in Kibana/Elastic, recreate Employee Safety / hunt dashboards, or
+  dashboard in Kibana/Elastic, recreate hunt / investigation dashboards, or
   wire Splunk panels to ES|QL + synthetic data factories.
 ---
 
 # Splunk XML → Mockup → Kibana → Data Factories
 
 Token-first migration. Prefer scripts/APIs over narrating. Do not paste large XML into chat—parse offline.
+
+**Harness-agnostic.** Works in Cursor Agent and Claude Code. Customer-specific paths live in [`adapters/`](adapters/) — load only when relevant.
+
+## Parameters (ask once per conversion)
+
+| Param | Example | Meaning |
+|-------|---------|---------|
+| `USE_CASE` | `aws_user_investigation` | Slug for this dashboard package |
+| `PACKAGE_ROOT` | `./elastic/<USE_CASE>/` | Where artifacts are written (relative to customer/project repo) |
+| `STREAM` | `logs-<tenant>.<dataset>-*` | Primary ES data stream / index pattern for panels |
+| `DASH_ID` | `acme-aws-user-investigation` | Kibana dashboard id |
+| `DATA_FACTORIES` | path or empty | Shared factory package root if present; else use `templates/factories/` |
+| `ADAPTER` | `adapters/blackstone.md` or none | Optional customer adapter (env path, naming, DIMA layout) |
+
+Defaults if the user does not specify: `PACKAGE_ROOT=./elastic/<USE_CASE>/`, factories from this skill’s `templates/factories/`.
+
+**Never** hard-code machine-absolute paths (`/Users/…`) in queries, scripts, or docs produced for a customer.
 
 ## Gate 0 — Credentials (required before any deploy)
 
@@ -22,9 +39,10 @@ Token-first migration. Prefer scripts/APIs over narrating. Do not paste large XM
 2. API key (same key for ES + Kibana on serverless is fine)
 
 Rules:
+
 - Never invent, reuse another project's, or read `.env` for **destination** without explicit user OK.
-- If user says use project `.env`, confirm path; still echo which URL you will hit before deploy.
-- Store for the session only; do not commit keys. Prefer env vars `KIBANA_URL` / `ELASTICSEARCH_URL` / `ELASTICSEARCH_API_KEY` set by user for the run.
+- If user says use a project `.env`, confirm path; still echo which URL you will hit before deploy.
+- Store for the session only; do not commit keys. Prefer env vars `KIBANA_URL` / `ELASTICSEARCH_URL` / `ELASTICSEARCH_API_KEY`.
 
 ```text
 Need destination to deploy:
@@ -38,19 +56,29 @@ Skip Gate 0 only for **mockup-only** work (no cluster writes).
 ## Workflow checklist
 
 ```
-- [ ] 1 Parse Splunk XML → panel inventory
-- [ ] 2 HTML mockup site → elastic/<use_case>/mockup/ (required artifact)
+- [ ] 0 Resolve Parameters (+ optional ADAPTER)
+- [ ] 1 Parse Splunk XML → panel inventory (scripts/parse_inventory.py)
+- [ ] 2 HTML mockup site → PACKAGE_ROOT/mockup/ (required artifact)
 - [ ] 3 Map panels → ES|QL + chart types
 - [ ] 4 Data factories for every index/stream
-- [ ] 5 Build Kibana dashboards via API
+- [ ] 5 Build Kibana dashboards via API (scripts/put_dashboard.py)
 - [ ] 6 Write MAPPING.md (SPL ↔ ES|QL + why) — required
 - [ ] 7 Prompt URL+key → deploy artifacts + data
 - [ ] 8 Spot-check panels; --export if user edits UI
+- [ ] 9 Rewire Vega ref_id panels if any (scripts/rewire_vega_refs.py)
 ```
 
 ## 1 — Parse Splunk (minimal tokens)
 
-Run a local script; return **only** a compact inventory:
+Run the bundled parser; return **only** a compact inventory:
+
+```bash
+python scripts/parse_inventory.py \
+  --source path/to/source.xml \
+  --out-dir "$PACKAGE_ROOT"
+```
+
+Writes `inventory.json` + `splunk_queries.json` under `PACKAGE_ROOT`.
 
 | Field | Source |
 |-------|--------|
@@ -61,36 +89,29 @@ Run a local script; return **only** a compact inventory:
 | `inputs[]` | token, type, default |
 | `panels[]` | tab, title, viz type (table/bar/line/single/punchcard/…), search id / query tail |
 
-Do **not** dump full SPL into the reply. Keep queries in `elastic/<use_case>/splunk_queries.json` or similar.
+Do **not** dump full SPL into the reply.
 
 ## 2 — Mockup (required artifact)
 
-Build a **Splunk-faithful HTML mockup site** and **keep it on disk** as part of the
-conversion package. Chat-only previews are optional extras — they do **not**
-replace the durable files.
-
-**Write to:** `elastic/<use_case>/mockup/`
+Build a **Splunk-faithful HTML mockup site** under `PACKAGE_ROOT/mockup/`.
+Start from [`templates/mockup/`](templates/mockup/) if helpful.
 
 | Path | Purpose |
 |------|---------|
 | `mockup/index.html` | Entry point (open in browser; tab nav if multi-tab) |
 | `mockup/tabs/<slug>.html` | Optional per-tab pages when Studio tabs exist |
-| `mockup/assets/` | Optional shared CSS/JS/images (prefer inline CSS for portability) |
-| `mockup/README.md` | One-liner: how to open (`open index.html` / local static server) |
+| `mockup/assets/` | Optional shared CSS/JS (prefer inline CSS) |
+| `mockup/README.md` | How to open |
 
 Rules:
 
 - Match Splunk chrome (Classic dark vs Studio light).
 - Show **real chart affordances** (bars/lines/KPIs), not tables-only.
 - Cover **every panel** from the inventory (same titles / layout intent).
-- **Control strip checklist:** the mockup top strip must show the **same labels and
-  control types** as Splunk `inputs[]` (text / dropdown / radio / time). Do not
-  omit pivots that will become Kibana Controls.
-- Illustrative data OK; label as such only if asked.
+- **Control strip checklist:** same labels and control types as Splunk `inputs[]`.
 - Self-contained: no build step; works via `file://` or a static file server.
-- Do **not** delete or overwrite `mockup/` when building Kibana JSON or deploying.
-- Optional: also emit a `/visualize` content-reference in chat; keep prose ≤3 sentences.
-- Link `mockup/` from `ANALYSIS.md` and from `MAPPING.md` § Links.
+- Do **not** delete `mockup/` when building Kibana JSON or deploying.
+- Link `mockup/` from `ANALYSIS.md` and `MAPPING.md` § Links.
 
 ## 3 — Elastic panel map
 
@@ -107,71 +128,67 @@ Hard constraints (Kibana **9.4+** Dashboards API, serverless included):
 | radial / gauge | `vis` `gauge` |
 | punchcard | `vis` `heatmap` |
 | markdown/html | `markdown` |
-| Form **inputs** (text/dropdown/radio/multiselect) | Dashboard **Controls** (`pinned_panels`: `esql_control` / `options_list_control` / …) bound to ES\|QL `?params` — see **Inputs → Controls** below |
-| Custom graph / flow viz | Prefer **Vega** (table below) — never silently collapse |
+| Form **inputs** | Dashboard **Controls** (`pinned_panels`) bound to ES\|QL `?params` |
+| Custom graph / flow viz | Prefer **Vega** — never silently collapse |
 
 ### Inputs → Controls (hard rule)
 
-After panel inventory, every Splunk `input` must appear in an **Inputs → Controls
-matrix** in `MAPPING.md`. Each row is one of:
+Every Splunk `input` must appear in an **Inputs → Controls matrix** in `MAPPING.md`:
 
 1. Dashboard **time picker** (`?_tstart` / `?_tend`)
-2. Options list / range / **ES|QL variable Control** (`pinned_panels` + `?name` in queries)
+2. Options list / range / **ES|QL variable Control** (`pinned_panels` + `?name`)
 3. Explicit **GAP** with user-visible markdown (not a silent hard-coded demo value)
 
-**Ban:** documenting the token in markdown and hard-coding the demo value in every
-`WHERE` as the default for text / dropdown / radio pivots.
-
-Wire panels like:
+**Ban:** documenting the token in markdown and hard-coding the demo value in every `WHERE`.
 
 ```esql
-FROM logs-* 
+FROM logs-*
 | WHERE source.ip == TO_IP(?target_ip)
 | WHERE TO_STRING(?aws_account) == "*" OR cloud.account.id == TO_STRING(?aws_account)
 | WHERE @timestamp <= ?_tend AND @timestamp > ?_tstart
 ```
 
-Cast Control values with `TO_STRING` / `TO_IP` when the field is `keyword` / `ip` —
-STATIC_VALUES that look numeric are often bound as non-keyword and break every panel.
+Cast Control values with `TO_STRING` / `TO_IP` when the field is `keyword` / `ip`.
 
 ### Custom viz → Vega (hard rule)
 
-| Splunk `custom_viz` / intent | Elastic target (P0) | Allowed fallback (must label **GAP**) |
+| Splunk `custom_viz` / intent | Elastic target (P0) | Allowed fallback (label **GAP**) |
 |---|---|---|
-| `sankey_diagram*` / flow quantities | **Vega Sankey** (saved viz + `config.ref_id` if inline `type:vega` unsupported) | heatmap or path `xy` + GAP note |
-| `force_directed*` / node-link | **`heatmap`** (src×dest count) + companion edge `data_table` — keep Splunk title | edge `data_table` only + GAP |
-| `*3d_graph*` / GraphLabelPropagation | Vega network colored by community **or** community table + scatter | table-only + GAP |
+| `sankey_diagram*` / flow quantities | **Vega Sankey** (saved viz + `config.ref_id`) | heatmap or path `xy` + GAP |
+| `force_directed*` / node-link | **`heatmap`** (src×dest count) + edge `data_table` | edge table only + GAP |
+| `*3d_graph*` / GraphLabelPropagation | Vega network by community **or** community table | table-only + GAP |
 | GraphCentrality / weighted ARNs | `xy` bar by weight (OK) | — |
 
-**Force-directed → heatmap (hard rule):** Do **not** attempt Kibana Vega `force`
-layouts for Splunk `force_directed*` / particle graphs. They fail on current
-Dashboards/Vega embeds (see tracking bug in skill `BUGS.md`). Ship heatmap +
-edge table and note the GAP in `MAPPING.md` (true force viz deferred).
+**Force-directed → heatmap:** Do **not** attempt Kibana Vega `force` layouts (see [`BUGS.md`](BUGS.md)).
 
-**Do not** silently collapse **Sankey** to table/heatmap — prefer Vega Sankey
-first and label any fallback as GAP. Embed Vega via Visualize saved object
-(`POST /api/saved_objects/visualization/{id}?overwrite=true`) + dashboard panel
-`{"type":"vis","config":{"ref_id":"…","title":"…"}}` when the Dashboards API
-`vis` discriminator does not accept `"type":"vega"` inline.
-**Always rewire** `ref_id` lens stubs → SO type `visualization` after dashboard PUT
-(see [reference.md](reference.md#vega-sankey--force-via-saved-visualization--ref_id)).
+**Do not** silently collapse **Sankey** to table/heatmap — Vega first; label fallbacks as GAP.
 
-**Vega hard constraints (Blast Radius lessons):**
+Embed Vega via Visualize saved object + dashboard `ref_id`, then **rewire** lens → `visualization` SO refs:
 
-1. **No dotted field paths in Vega transforms/encodes** — ES|QL columns like
-   `bx.aws.community` / `source.ip` must be aliased flat in the query
-   (`community = bx.aws.community`) or copied with `datum['source.ip']` → `src`.
-   Leaving `fields: ["bx.aws.community"]` throws
-   `Cannot read properties of undefined (reading 'aws')`.
-2. **Do not use Vega `force` for `force_directed*`** — mark-level and data-transform
-   attempts still failed on serverless (id / Invalid SVG path / empty panels).
-   Default to heatmap; track a proper force recipe in `BUGS.md`.
-3. After every Dashboards API PUT that includes Vega `ref_id` panels, run the
-   visualization-ref rewire or the UI shows **"visualization type not found"**.
+```bash
+python scripts/rewire_vega_refs.py \
+  --dashboard-id "$DASH_ID" \
+  --map path/to/vega_panel_map.json
+```
 
-**Forbidden:** Lens-only `lnsDatatable` NDJSON with `gridData.tabId` / attributes `tabs` — API rejects or UI ignores; yields tables-only.
+**Vega hard constraints:**
 
-Deploy with:
+1. **No dotted field paths in Vega transforms/encodes** — alias flat in ES\|QL (`community = cloud.account.name`) or `datum['source.ip']`.
+2. **Do not use Vega `force` for `force_directed*`** — default to heatmap.
+3. After every Dashboards API PUT with Vega `ref_id` panels, run the rewire script.
+
+**Forbidden:** Lens-only `lnsDatatable` NDJSON with `gridData.tabId` / attributes `tabs`.
+
+Deploy:
+
+```bash
+python scripts/put_dashboard.py \
+  --kibana-url "$KIBANA_URL" \
+  --api-key "$ELASTICSEARCH_API_KEY" \
+  --body path/to/dashboard.json
+```
+
+Or:
 
 ```http
 PUT {KIBANA}/api/dashboards/{id}
@@ -179,122 +196,124 @@ Elastic-Api-Version: 2023-10-31
 kbn-xsrf: true
 ```
 
-Body: `{ title, description?, time_range, panels[], pinned_panels? }` — inline
-`config` for Lens-style `vis`; Vega via `ref_id`. Details: [reference.md](reference.md).
+Body: `{ title, description?, time_range, panels[], pinned_panels? }`. Details: [`reference.md`](reference.md).
 
-After user UI edits: `GET` each id → write `kibana/*_dashboards.json` with `"source":"exported_from_kibana"`. Redeploy from that file; do not regenerate from templates unless asked.
+After user UI edits: `GET` each id → write `kibana/*_dashboards.json` with `"source":"exported_from_kibana"`.
 
 ## 4 — Data factories
 
 For **each** panel query, list required data:
 
 - data stream / index / lookup
-- minimal ECS (or `bx.*`) fields the ES\|QL references
-- volume hint (rows for tables; cardinality for charts)
+- minimal ECS (or tenant-prefixed) fields the ES\|QL references
+- volume hint
 
-**Graph / custom-viz support fields** (emit in the factory **before** panel build):
+**Graph / custom-viz support fields** (emit before panel build):
 
 | Splunk custom_viz | Required factory fields (examples) |
 |---|---|
-| `sankey_diagram*` | Edge endpoints + count (`source.ip`, `destination.ip`, …) |
-| `force_directed*` | Same edges + optional size/color dims (`bx.aws.vpc_id`, `cloud.account.name`, `bx.aws.community`) |
-| `*3d_graph*` / LabelPropagation | Community / color field (e.g. `bx.aws.community`) |
-| GraphCentrality | Weight field (e.g. `bx.aws.centrality.weight`) on entity/ARN docs |
+| `sankey_diagram*` | Edge endpoints + count |
+| `force_directed*` | Same edges + optional size/color dims |
+| `*3d_graph*` / LabelPropagation | Community / color field |
+| GraphCentrality | Weight field on entity docs |
 
-Implement generator logic in the shared **`data_factories`** package
-(`/Users/klg/Documents/GItHub/data_factories`, modules grouped by data domain, e.g. `data_factories.network.dns_hunt`, `data_factories.identity.hdsi_user`).
-Keep a thin wrapper under `elastic/<use_case>/data_factories/` that calls the package
-and writes NDJSON → local `out/` (so existing `setup_*.py` subprocess paths keep working).
+Implementation order:
 
-1. Generator (in `data_factories`) writes NDJSON → `out/` via wrapper
-2. Setup/bulk push to destination ES (Gate 0 URL+key)
-3. Lookups: `index.mode=lookup` when `LOOKUP JOIN` needed
-4. Presence/entity rollups: transform **or** factory-built metrics stream if transform is overkill for POC
-
-Wire a customer catalog YAML (e.g. `customers/<name>/elastic/data_factories/factories.yaml`) **or** a use-case manifest so each dashboard id lists P0 factories. **Every panel must have a P0 producer** or an explicit “empty until real data” note to the user.
-
-Install once: `pip install -e /Users/klg/Documents/GItHub/data_factories`.
+1. Prefer shared **`DATA_FACTORIES`** package if the project has one (domain modules + thin wrappers under `PACKAGE_ROOT/data_factories/`).
+2. Else copy/adapt [`templates/factories/minimal_ndjson.py`](templates/factories/minimal_ndjson.py).
+3. Setup/bulk push to destination ES (Gate 0).
+4. Lookups: `index.mode=lookup` when `LOOKUP JOIN` needed.
+5. Catalog optional: `factories.yaml` listing P0 factories per dashboard. **Every panel needs a P0 producer** or an explicit “empty until real data” note.
 
 Validate: run each panel ES\|QL via `POST {ES}/_query` before declaring done.
 
 ## 5 — MAPPING.md (required deliverable)
 
-After panels and factories exist (before or right after deploy), write
-`elastic/<use_case>/MAPPING.md`. Do **not** dump this into chat—link the path.
+Write `PACKAGE_ROOT/MAPPING.md` from [`templates/MAPPING.md`](templates/MAPPING.md). Do **not** dump it into chat—link the path.
 
 **Must include:**
 
-1. **Header** — Splunk app/id, Elastic dashboard id, demo tokens, package path, **mockup path** (`mockup/index.html`)  
-2. **DIMA / audit JSON used** — which files under the Splunk/DIMA export (e.g. `dashboard_to_migrate.json`, `macros.json`, `lookup_samples.json`) were used, consulted-only, or unused — and for what  
-3. **Data factories** — generator script(s), setup/deploy script, NDJSON outputs → ES indices/streams → panels; note shared factories **not** used  
-4. **Inputs → Controls matrix** — every Splunk token → Control / time picker / **GAP** (required; see §3)  
-5. **Knowledge objects** — lookups, macros (expand from `macros.json` when present), datamodels → streams/indexes + why  
-6. **Panel-by-panel** — for each panel: original **SPL** (from `splunk_queries.json`), **ES|QL**, viz type, **why** (incl. stand-ins and omissions)  
-7. **Data layout** — which stream/index/lookup feeds which panel (may cross-ref factories section)  
-8. **Gaps / non-goals** — placeholders skipped, macros missing, map→bar, etc.  
-9. **Links** — include `mockup/` (Splunk HTML site) alongside Kibana URLs and `splunk_queries.json`
+1. Header — Splunk app/id, Elastic dashboard id, demo tokens, package + mockup paths  
+2. Audit/DIMA JSON used (or “N/A — raw XML only”)  
+3. Data factories — scripts, NDJSON → streams → panels  
+4. **Inputs → Controls matrix** (required)  
+5. Knowledge objects — lookups, macros, datamodels → streams  
+6. Panel-by-panel — SPL, ES\|QL, viz, why  
+7. Data layout  
+8. Gaps / non-goals  
+9. Links — mockup, Kibana URL, `splunk_queries.json`
 
-Keep `ANALYSIS.md` short; point it at `MAPPING.md` for full SPL rationale.  
-Template & example: [reference.md](reference.md#mappingmd-template) · worked example `elastic/hdsi_user_investigation/MAPPING.md`.
+Keep `ANALYSIS.md` short; point at `MAPPING.md`.
 
 ## 6 — Package layout
 
 ```
-# Shared implementations:
-#   data_factories/src/data_factories/<data_domain>/<factory>.py
-#     (network, threat_intel, identity, cloud_audit, cloud_billing, llm, apm, ...)
-# Customer catalog: elastic/data_factories/factories.yaml
-
-elastic/<use_case>/
-  ANALYSIS.md              # short: Splunk source → Elastic map (+ link MAPPING.md + mockup/)
-  MAPPING.md               # required: SPL ↔ ES|QL + why per panel
+PACKAGE_ROOT/                      # e.g. ./elastic/<use_case>/
+  ANALYSIS.md
+  MAPPING.md
   manifest.json
-  splunk_queries.json      # full SPL offline
-  macros_resolved.json     # optional when macros used
-  mockup/                  # required: Splunk-faithful HTML site (before Elastic)
+  splunk_queries.json
+  inventory.json
+  source.xml                       # or Studio JSON
+  mockup/
     index.html
-    tabs/                  # optional per Studio tab
-    assets/                # optional
-    README.md              # how to open
-  kibana/<id>.json         # per dashboard (exported or built)
-  kibana/*_dashboards.json # bundle + source stamp
-  data_factories/          # thin wrappers → data_factories package + local out/
-  esql/                    # optional panel query catalog
-  setup_*.py               # deploy lookups/data/dashboards
+    tabs/                          # optional
+    README.md
+  kibana/<id>.json
+  kibana/*_dashboards.json
+  data_factories/                  # wrappers + local out/
+  setup_*.py                       # deploy lookups/data/dashboards
+```
+
+Scaffold:
+
+```bash
+python scripts/scaffold_use_case.py --use-case "$USE_CASE" --out ./elastic
 ```
 
 ## 7 — Deploy sequence
 
-1. Confirm Gate 0 URL+key
+1. Confirm Gate 0 URL+key (echo destination)
 2. Templates / data streams / lookups
 3. Bulk factory data
-4. Create/update Vega saved visualizations when needed, then `PUT /api/dashboards/{id}` (include `pinned_panels`)
-5. **Rewire** Vega `ref_id` panels from lens → `visualization` SO refs
-6. Ensure `MAPPING.md` is written/updated to match deployed ES|QL + Controls matrix
-7. Print open URLs + which factory feeds which panel + paths to `MAPPING.md` and `mockup/index.html`
-8. **Spot-check (required):**
-   - [ ] Every Splunk input has a working Control or documented GAP
-   - [ ] Changing Control values changes panel queries (no leftover hard-coded demo IP / token)
-   - [ ] Sankey panels are visual flow (Vega), not only tables — unless GAP is explicit
-   - [ ] Force-directed panels are `heatmap` (src×dest) + edge table (not broken Vega force)
-   - [ ] Vega Sankey panels render (no “visualization type not found” / dotted-field errors)
+4. Create/update Vega saved visualizations when needed, then PUT dashboard (include `pinned_panels`)
+5. Rewire Vega `ref_id` panels (`scripts/rewire_vega_refs.py`)
+6. Ensure `MAPPING.md` matches deployed ES\|QL + Controls
+7. Print open URLs + factory → panel map + paths to `MAPPING.md` and `mockup/index.html`
+8. **Spot-check:**
+   - [ ] Every Splunk input → working Control or documented GAP
+   - [ ] Changing Controls changes panel queries (no leftover hard-coded demos)
+   - [ ] Sankey is visual flow (Vega) unless GAP
+   - [ ] Force-directed is heatmap + edge table
+   - [ ] Vega panels render (no “visualization type not found” / dotted-field errors)
 
 ## Anti-patterns
 
 - Deploying without asking for destination credentials
-- Chat-only mockup with no files under `elastic/<use_case>/mockup/`
-- Deleting the Splunk mockup after Kibana deploy (“cleanup”)
-- Classic Simple XML paste-as-dashboard when content is hunts → prefer saved ES\|QL / Timeline
+- Chat-only mockup with no files under `PACKAGE_ROOT/mockup/`
+- Deleting the Splunk mockup after Kibana deploy
 - One mega-dashboard with overlapping `y` from fake tabs
 - Committing `.env`, API keys, or real customer PII samples
+- Baking customer-absolute paths into the shared skill
 - Silent Sankey → heatmap/table collapse without GAP + Vega-first attempt
-- Attempting Kibana Vega `force` for Splunk `force_directed*` (use heatmap + edge table; see `BUGS.md`)
+- Attempting Kibana Vega `force` for Splunk `force_directed*`
 - Hard-coding Splunk input defaults into every `WHERE` instead of Controls
 - Leaving Dashboards API `ref_id` as lens refs for classic Vega visualizations
-- Feeding dotted ECS paths (`bx.aws.*`, `source.ip`) into Vega aggregate/encode field lists
+- Feeding dotted ECS paths into Vega aggregate/encode field lists
+
+## Adapters
+
+Customer-specific env paths, naming, and DIMA layouts:
+
+| Adapter | When to load |
+|---------|----------------|
+| [`adapters/blackstone.md`](adapters/blackstone.md) | Blackstone POC / `customers/blackstone/` |
+
+If no adapter applies, use Parameters only.
 
 ## References
 
-- Chart/API schemas, factories, **MAPPING.md template**: [reference.md](reference.md)
-- Mapping example: repo `elastic/hdsi_user_investigation/MAPPING.md`
-- Blackstone Employee Safety: repo `elastic/employee_safety/` + `build_tabbed_dashboard.py`
+- Chart/API schemas, factories, MAPPING template: [`reference.md`](reference.md)
+- Known platform bugs: [`BUGS.md`](BUGS.md)
+- Scripts: [`scripts/`](scripts/)
+- Templates: [`templates/`](templates/)
