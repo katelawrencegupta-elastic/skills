@@ -18,12 +18,12 @@ account-status-update/
 customer-tech-research/
   customer-tech-research.skill       # zip: SKILL.md + references/industry-angles.md
 splunk-xml-to-kibana/
-  SKILL.md                           # parameterized workflow (Claude Code + Cursor)
-  reference.md / BUGS.md             # API snippets + platform gaps
+  SKILL.md                           # slim round budget (≤12 turns; Claude Code + Cursor)
+  reference/                         # panels, controls, vega, mapping shards
   adapters/                          # optional customer one-pagers (e.g. blackstone.md)
-  scripts/                           # parse_inventory, put_dashboard, rewire_vega_refs, scaffold
-  templates/                         # mockup, MAPPING.md, minimal factory
-  README.md                          # install for Claude Code / Cursor / claude.ai
+  scripts/                           # parse, mockup, catalog build, mapping, spotcheck, deploy
+  templates/                         # mockup, MAPPING, factories, esql/panels.example.json
+  README.md                          # install + script quick start
 .cursor/rules/commits.mdc            # commit conventions for agents working in this repo
 ```
 
@@ -52,11 +52,13 @@ ln -s "$(pwd)/splunk-xml-to-kibana" ~/.cursor/skills/splunk-xml-to-kibana
 The same few principles show up in all three skills:
 
 1. **Fewer round trips.** Every assistant turn re-reads the whole conversation, so the number of turns costs more than the size of any single result. The skills batch independent tool calls into one message and set an explicit round budget.
-2. **Load only what's needed.** Descriptions are written so the skill triggers on its own. Heavy reference material sits in separate files (`references/industry-angles.md`, `reference.md`) and is read only when a step needs it.
+2. **Load only what's needed.** Descriptions are written so the skill triggers on its own. Heavy reference material sits in separate files (`references/industry-angles.md`, `reference/*.md` shards) and is read only when a step needs it.
 3. **Filter before reading.** Queries exclude noise at the source (Gmail category/subject filters, year cutoffs, specific tool names), and results are screened from snippets or metadata before any full fetch.
 4. **Hard caps and early exits.** Fixed page sizes, fetch limits, per-page token budgets, and stop conditions keep a run from drifting.
 5. **Work offline, not in chat.** Large payloads (oversized tool results, Splunk XML, SPL) are parsed by scripts and saved to files. Only compact summaries come back into the conversation.
 6. **Fixed output templates.** Each skill has an exact report or file structure, so the agent spends nothing designing a format and the output is the same every run.
+7. **Catalog / script codegen.** Artifact-heavy skills (e.g. splunk-xml-to-kibana) have the agent edit a small JSON catalog; scripts emit HTML, Kibana JSON, and draft MAPPING — avoid pasting multi-hundred-line builders into chat.
+8. **One task per chat** for long workflows (one Splunk `USE_CASE` per conversion chat). Sticky multi-dashboard threads dominate token cost.
 
 ---
 

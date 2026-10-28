@@ -66,9 +66,17 @@ def main() -> int:
     if factory_src.is_file() and not factory_dest.exists():
         shutil.copy2(factory_src, factory_dest)
 
+    ex = TEMPLATES / "esql" / "panels.example.json"
+    dest_ex = root / "esql" / "panels.example.json"
+    if ex.is_file() and not dest_ex.exists():
+        shutil.copy2(ex, dest_ex)
+
     print(f"Scaffolded {root}")
     print(f"  dashboard_id={dash_id}")
-    print("Next: copy Splunk XML → source.xml, then run scripts/parse_inventory.py")
+    print("Next: copy Splunk XML → source.xml, then:")
+    print("  parse_inventory.py → mockup_from_inventory.py → edit esql/panels.json")
+    print("  → build_from_catalog.py → put_dashboard.py → render_mapping.py")
+    print("Target: ≤12 assistant turns; one USE_CASE per chat.")
     return 0
 
 

@@ -1,0 +1,61 @@
+{
+  "dashboard": {
+    "id": "example-dash",
+    "title": "Example Dashboard",
+    "description": "Built from esql/panels.json via build_from_catalog.py",
+    "time_range": { "from": "now-24h", "to": "now" }
+  },
+  "pinned_panels": [
+    {
+      "type": "esql_control",
+      "id": "ctl_user",
+      "width": "medium",
+      "grow": false,
+      "config": {
+        "title": "User",
+        "variable_name": "username",
+        "variable_type": "values",
+        "control_type": "STATIC_VALUES",
+        "available_options": ["demo.user@example.com"],
+        "selected_options": ["demo.user@example.com"],
+        "single_select": true
+      }
+    }
+  ],
+  "panels": [
+    {
+      "id": "hdr",
+      "title": "Header",
+      "viz": "markdown",
+      "content": "### Example\nControls + ES|QL panels from catalog.",
+      "grid": { "x": 0, "y": 0, "w": 48, "h": 3 }
+    },
+    {
+      "id": "kpi_denied",
+      "title": "Access Denied Events",
+      "viz": "metric",
+      "esql": "FROM logs-demo.events-* | WHERE user.email == ?username | WHERE error.code == \"AccessDenied\" | STATS count = COUNT(*)",
+      "metrics": ["count"],
+      "grid": { "x": 0, "y": 3, "w": 12, "h": 5 }
+    },
+    {
+      "id": "chart_apis",
+      "title": "Top API Calls",
+      "viz": "xy",
+      "layer": "bar_horizontal",
+      "esql": "FROM logs-demo.events-* | WHERE user.email == ?username | STATS count = COUNT(*) BY event.action | SORT count DESC | LIMIT 15",
+      "x": "event.action",
+      "y": "count",
+      "grid": { "x": 12, "y": 3, "w": 36, "h": 10 }
+    },
+    {
+      "id": "table_recent",
+      "title": "Recent Activity",
+      "viz": "data_table",
+      "esql": "FROM logs-demo.events-* | WHERE user.email == ?username | KEEP @timestamp, event.action, source.ip | SORT @timestamp DESC | LIMIT 50",
+      "rows": ["@timestamp", "event.action"],
+      "metrics": ["source.ip"],
+      "grid": { "x": 0, "y": 13, "w": 48, "h": 10 }
+    }
+  ]
+}

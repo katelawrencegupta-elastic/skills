@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/splunk-xml-to-kibana/panels.schema.json",
+  "title": "esql/panels.json catalog",
+  "type": "object",
+  "required": ["dashboard", "panels"],
+  "properties": {
+    "dashboard": {
+      "type": "object",
+      "required": ["id", "title"],
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "description": { "type": "string" },
+        "time_range": {
+          "type": "object",
+          "properties": {
+            "from": { "type": "string" },
+            "to": { "type": "string" }
+          }
+        }
+      }
+    },
+    "pinned_panels": { "type": "array" },
+    "panels": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "viz"],
+        "properties": {
+          "id": { "type": "string" },
+          "title": { "type": "string" },
+          "viz": {
+            "type": "string",
+            "enum": ["metric", "gauge", "xy", "heatmap", "data_table", "markdown", "links", "vega_ref"]
+          },
+          "esql": { "type": "string" },
+          "content": { "type": "string" },
+          "rows": { "type": "array", "items": { "type": "string" } },
+          "metrics": { "type": "array", "items": { "type": "string" } },
+          "x": { "type": "string" },
+          "y": { "type": "string" },
+          "layer": { "type": "string" },
+          "ref_id": { "type": "string" },
+          "grid": {
+            "type": "object",
+            "properties": {
+              "x": { "type": "integer" },
+              "y": { "type": "integer" },
+              "w": { "type": "integer" },
+              "h": { "type": "integer" }
+            }
+          }
+        }
+      }
+    }
+  }
+}
