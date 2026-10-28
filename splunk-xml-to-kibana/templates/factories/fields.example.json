@@ -1,0 +1,24 @@
+{
+  "stream": "logs-demo.events-default",
+  "n": 200,
+  "seed": 42,
+  "days": 7,
+  "fields": {
+    "event.action": {
+      "type": "enum",
+      "values": ["read", "write", "login", "denied"]
+    },
+    "event.outcome": {
+      "type": "enum",
+      "values": ["success", "failure"]
+    },
+    "user.email": {
+      "type": "enum",
+      "values": ["demo.user@example.com", "other@example.com"]
+    },
+    "source.ip": {
+      "type": "enum",
+      "values": ["10.0.0.10", "203.0.113.5"]
+    }
+  }
+}

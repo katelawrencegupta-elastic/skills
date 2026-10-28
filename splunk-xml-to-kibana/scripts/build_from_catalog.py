@@ -107,38 +107,44 @@ def panel_to_api(p: dict, auto_y: int) -> dict:
 
     if viz == "xy":
         layer = p.get("layer") or "bar"
+        layer_cfg: dict = {
+            "type": layer,
+            "data_source": {"type": "esql", "query": esql},
+            "x": {"column": p.get("x") or "x"},
+            "y": [{"column": p.get("y") or (p.get("metrics") or ["count"])[0]}],
+        }
+        if p.get("breakdown_by"):
+            layer_cfg["breakdown_by"] = {"column": p["breakdown_by"]}
+        cfg: dict = {
+            "title": title,
+            "type": "xy",
+            "layers": [layer_cfg],
+        }
+        if p.get("axis"):
+            cfg["axis"] = p["axis"]
         return {
             "type": "vis",
             "id": pid,
             "grid": grid,
-            "config": {
-                "title": title,
-                "type": "xy",
-                "layers": [
-                    {
-                        "type": layer,
-                        "data_source": {"type": "esql", "query": esql},
-                        "x": {"column": p.get("x") or "x"},
-                        "y": [{"column": p.get("y") or (p.get("metrics") or ["count"])[0]}],
-                    }
-                ],
-            },
+            "config": cfg,
         }
 
-    # data_table default
+    # data_table default — omit empty metrics (Kibana 400: reading 'type' of undefined)
     rows = p.get("rows") or []
     metrics = p.get("metrics") or []
+    cfg: dict = {
+        "title": title,
+        "type": "data_table",
+        "data_source": {"type": "esql", "query": esql},
+        "rows": [{"column": c} for c in rows],
+    }
+    if metrics:
+        cfg["metrics"] = [{"column": c} for c in metrics]
     return {
         "type": "vis",
         "id": pid,
         "grid": grid,
-        "config": {
-            "title": title,
-            "type": "data_table",
-            "data_source": {"type": "esql", "query": esql},
-            "rows": [{"column": c} for c in rows],
-            "metrics": [{"column": c} for c in metrics],
-        },
+        "config": cfg,
     }
 
 

@@ -6,7 +6,7 @@ Load at R5 **only** when inventory has sankey / force / custom graph viz. See al
 
 | Splunk `custom_viz` / intent | Elastic P0 | Fallback (label **GAP**) |
 |---|---|---|
-| `sankey_diagram*` | Vega Sankey (saved viz + `ref_id`) | heatmap / path xy |
+| `sankey_diagram*` | Vega Sankey via `scripts/deploy_vega_sankey.py` + `templates/vega/sankey.py` (`ref_id`) | heatmap / path xy |
 | `force_directed*` | **heatmap** src×dest + edge `data_table` | edge table only |
 | `*3d_graph*` / LabelPropagation | Vega network by community or table | table-only |
 | GraphCentrality | `xy` bar by weight | — |

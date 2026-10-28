@@ -27,13 +27,17 @@ def _text(el: ET.Element | None, default: str = "") -> str:
 
 
 def _query_from_panel(panel: ET.Element) -> str:
-    search = panel.find("search")
-    if search is None:
-        return ""
-    q = search.find("query")
-    if q is not None and (q.text or "").strip():
-        return (q.text or "").strip()
-    # Studio often embeds CDATA elsewhere; Classic uses <query>
+    """Classic nests <search><query> under table/chart/single, not only under panel."""
+    for tag in ("table", "chart", "single", "viz", "event", "map", "search"):
+        el = panel.find(tag)
+        if el is None:
+            continue
+        search = el if tag == "search" else el.find("search")
+        if search is None:
+            continue
+        q = search.find("query")
+        if q is not None and (q.text or "").strip():
+            return (q.text or "").strip()
     return ""
 
 
@@ -138,23 +142,55 @@ def parse_studio(xml_text: str, root: ET.Element) -> dict:
     else:
         raw = m.group(1)
     data = json.loads(raw)
-    title = (data.get("title") or data.get("definition", {}).get("title") or "Untitled")
+    # Studio JSON title; fall back to XML <label>
+    title = (
+        data.get("title")
+        or _text(root.find("label"))
+        or data.get("definition", {}).get("title")
+        or "Untitled"
+    )
     layout = data.get("layout") or {}
     tabs_items = ((layout.get("tabs") or {}).get("items")) or []
     tabs = [{"id": t.get("id"), "label": t.get("label")} for t in tabs_items]
     viz = data.get("visualizations") or {}
+    data_sources = data.get("dataSources") or {}
     inputs_raw = data.get("inputs") or {}
     inputs = []
     for iid, inp in inputs_raw.items():
+        opts = inp.get("options") or {}
+        token = opts.get("token") or iid
         inputs.append(
             {
-                "token": iid,
-                "type": (inp.get("inputType") or inp.get("type") or "text"),
-                "label": (inp.get("title") or iid),
-                "default": str((inp.get("defaults") or {}).get("value") or inp.get("default") or ""),
-                "n_choices": len(inp.get("options") or []),
+                "token": token,
+                "id": iid,
+                "type": (inp.get("type") or inp.get("inputType") or "text"),
+                "label": (inp.get("title") or opts.get("title") or token),
+                "default": str(
+                    (inp.get("defaults") or {}).get("value")
+                    or opts.get("defaultValue")
+                    or inp.get("default")
+                    or ""
+                ),
+                "n_choices": len(opts.get("items") or opts.get("choices") or []),
             }
         )
+
+    def _query_from_ds_ref(ref) -> str:
+        """Resolve Studio dataSources.primary (string id or inline dict)."""
+        if isinstance(ref, str):
+            ds_obj = data_sources.get(ref) or {}
+            opts = ds_obj.get("options") or {}
+            return (opts.get("query") or ds_obj.get("query") or "").strip()
+        if isinstance(ref, dict):
+            opts = ref.get("options") or {}
+            nested = ref.get("dataSource") if isinstance(ref.get("dataSource"), dict) else {}
+            return (
+                opts.get("query")
+                or ref.get("query")
+                or nested.get("query")
+                or ""
+            ).strip()
+        return ""
 
     panels: list[dict] = []
     queries: dict[str, str] = {}
@@ -177,16 +213,17 @@ def parse_studio(xml_text: str, root: ET.Element) -> dict:
             if not vid or vid not in viz:
                 continue
             v = viz[vid]
-            q = ""
             ds = v.get("dataSources") or {}
-            # primary search often under dataSources.primary
-            primary = ds.get("primary") or {}
-            q = (primary.get("query") or primary.get("dataSource", {}).get("query") or "")
+            primary = ds.get("primary")
+            q = _query_from_ds_ref(primary)
             if not q and isinstance(v.get("search"), dict):
-                q = v["search"].get("query") or ""
+                q = (v["search"].get("query") or "").strip()
             key = vid
             queries[key] = q
             vtype = v.get("type") or "table"
+            chart_type = ""
+            if isinstance(vtype, str) and vtype.startswith("splunk."):
+                chart_type = vtype.split(".", 1)[-1]
             panels.append(
                 {
                     "row": idx,
@@ -195,7 +232,7 @@ def parse_studio(xml_text: str, root: ET.Element) -> dict:
                     "tab": tab_id,
                     "title": v.get("title") or key,
                     "viz": vtype,
-                    "chart_type": "",
+                    "chart_type": chart_type,
                     "custom_viz": vtype if "viz." in str(vtype) else "",
                     "depends": "",
                     "rejects": "",
@@ -205,6 +242,35 @@ def parse_studio(xml_text: str, root: ET.Element) -> dict:
                 }
             )
             idx += 1
+
+    # Orphan visualizations not placed in layout (still inventory them)
+    placed = {p["id"] for p in panels}
+    for vid, v in viz.items():
+        if vid in placed:
+            continue
+        ds = v.get("dataSources") or {}
+        q = _query_from_ds_ref(ds.get("primary"))
+        queries[vid] = q
+        vtype = v.get("type") or "table"
+        chart_type = vtype.split(".", 1)[-1] if isinstance(vtype, str) and "." in vtype else ""
+        panels.append(
+            {
+                "row": idx,
+                "panel": 0,
+                "id": vid,
+                "tab": "unplaced",
+                "title": v.get("title") or vid,
+                "viz": vtype,
+                "chart_type": chart_type,
+                "custom_viz": vtype if "viz." in str(vtype) else "",
+                "depends": "",
+                "rejects": "",
+                "query_len": len(q),
+                "query_head": q[:140].replace("\n", " "),
+                "query_tail": (q[-140:] if len(q) > 140 else q).replace("\n", " "),
+            }
+        )
+        idx += 1
 
     return {
         "kind": "Studio",
@@ -237,15 +303,37 @@ def parse_file(path: Path) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--source", type=Path, required=True, help="Classic or Studio XML")
+    ap.add_argument("--source", type=Path, help="Classic or Studio XML")
     ap.add_argument("--out-dir", type=Path, required=True)
+    ap.add_argument(
+        "--from-audit",
+        type=Path,
+        help="Audit JSON (dashboard_to_migrate.json); requires --name",
+    )
+    ap.add_argument(
+        "--name",
+        default="",
+        help="Dashboard/view/label match when using --from-audit",
+    )
     ap.add_argument("--copy-source", action="store_true", default=True)
     ap.add_argument("--no-copy-source", action="store_true")
     args = ap.parse_args()
 
     out = args.out_dir
     out.mkdir(parents=True, exist_ok=True)
-    parsed = parse_file(args.source)
+
+    source = args.source
+    if args.from_audit:
+        if not args.name:
+            raise SystemExit("--from-audit requires --name")
+        # Import sibling without package install
+        import extract_from_audit as _extract  # type: ignore
+
+        source = _extract.extract(args.from_audit, args.name, out)
+    elif not source:
+        raise SystemExit("Need --source or --from-audit + --name")
+
+    parsed = parse_file(source)
     queries = parsed.pop("queries")
 
     inv_path = out / "inventory.json"
@@ -255,7 +343,10 @@ def main() -> int:
     q_path.write_text(json.dumps(queries, indent=2) + "\n", encoding="utf-8")
 
     if args.copy_source and not args.no_copy_source:
-        shutil.copy2(args.source, out / "source.xml")
+        dest = out / "source.xml"
+        src = source.resolve()
+        if src != dest.resolve():
+            shutil.copy2(source, dest)
 
     n = len(parsed.get("panels") or [])
     ni = len(parsed.get("inputs") or [])

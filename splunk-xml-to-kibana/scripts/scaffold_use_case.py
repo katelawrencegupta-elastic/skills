@@ -66,6 +66,11 @@ def main() -> int:
     if factory_src.is_file() and not factory_dest.exists():
         shutil.copy2(factory_src, factory_dest)
 
+    fields_ex = TEMPLATES / "factories" / "fields.example.json"
+    fields_dest = root / "data_factories" / "fields.example.json"
+    if fields_ex.is_file() and not fields_dest.exists():
+        shutil.copy2(fields_ex, fields_dest)
+
     ex = TEMPLATES / "esql" / "panels.example.json"
     dest_ex = root / "esql" / "panels.example.json"
     if ex.is_file() and not dest_ex.exists():
@@ -73,10 +78,10 @@ def main() -> int:
 
     print(f"Scaffolded {root}")
     print(f"  dashboard_id={dash_id}")
-    print("Next: copy Splunk XML → source.xml, then:")
-    print("  parse_inventory.py → mockup_from_inventory.py → edit esql/panels.json")
-    print("  → build_from_catalog.py → put_dashboard.py → render_mapping.py")
-    print("  → record_token_usage.py (or Cursor stop hook with SX2K_PACKAGE_ROOT)")
+    print("Next:")
+    print("  parse_inventory.py [--from-audit … --name …] → panels_from_inventory.py")
+    print("  → edit esql/panels.json + data_factories/fields.json")
+    print("  → run_pipeline.py --package … --assume-env")
     print("Target: ≤12 assistant turns; one USE_CASE per chat; metrics/token_usage.json required.")
     return 0
 

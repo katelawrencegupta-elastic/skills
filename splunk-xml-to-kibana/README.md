@@ -2,7 +2,7 @@
 
 Portable Agent Skill: migrate Splunk dashboards to Elastic — mockup → ES|QL panels → factories → `MAPPING.md` → deploy.
 
-Works in **Claude Code** and **Cursor**. Token target: **≤12 assistant turns** per clean conversion; **one `USE_CASE` per chat**.
+Works in **Claude Code** and **Cursor**. Token target: **≤12 assistant turns** per clean conversion (prefer **2–4** after kickoff via stub + `run_pipeline`); **one `USE_CASE` per chat**.
 
 ## Layout
 
@@ -13,15 +13,16 @@ reference/
   panels.md controls.md vega.md mapping.md
 adapters/blackstone.md   # optional customer adapter
 scripts/
-  parse_inventory.py scaffold_use_case.py mockup_from_inventory.py
-  build_from_catalog.py render_mapping.py spotcheck_esql.py
-  put_dashboard.py rewire_vega_refs.py estimate_package.py
-  record_token_usage.py          # metrics/token_usage.json(l)
+  extract_from_audit.py parse_inventory.py panels_from_inventory.py
+  scaffold_use_case.py mockup_from_inventory.py generate_from_fields.py
+  build_from_catalog.py spotcheck_esql.py deploy_vega_sankey.py
+  put_dashboard.py rewire_vega_refs.py render_mapping.py
+  run_pipeline.py estimate_package.py record_token_usage.py
 hooks/
-  cursor_stop_record_tokens.sh   # Cursor stop/afterAgentResponse
+  cursor_stop_record_tokens.sh
   hooks.json.example
 templates/
-  mockup/ MAPPING.md factories/ esql/ metrics/token_usage.example.json
+  mockup/ MAPPING.md factories/ esql/ vega/ metrics/
 ```
 
 ## Install
@@ -37,23 +38,36 @@ ln -s "$(pwd)" ~/.cursor/skills/splunk-xml-to-kibana
 ## Quick start (script path)
 
 ```bash
-python scripts/scaffold_use_case.py --use-case my_dash --out ./elastic
-cp dashboard.xml ./elastic/my_dash/source.xml
-python scripts/parse_inventory.py --source ./elastic/my_dash/source.xml --out-dir ./elastic/my_dash
-python scripts/mockup_from_inventory.py --inventory ./elastic/my_dash/inventory.json --out ./elastic/my_dash/mockup
-# edit ./elastic/my_dash/esql/panels.json (start from templates/esql/panels.example.json)
-python scripts/build_from_catalog.py --catalog ./elastic/my_dash/esql/panels.json --out ./elastic/my_dash/kibana
-python scripts/put_dashboard.py --body ./elastic/my_dash/kibana/<id>.json
-python scripts/render_mapping.py --inventory ./elastic/my_dash/inventory.json \
-  --catalog ./elastic/my_dash/esql/panels.json --out ./elastic/my_dash/MAPPING.md \
-  --queries ./elastic/my_dash/splunk_queries.json
-python scripts/estimate_package.py --package ./elastic/my_dash
+PKG=./elastic/my_dash
+python scripts/scaffold_use_case.py --use-case my_dash --out ./elastic --dash-id my-dash
 
-# Token usage (required)
-export SX2K_PACKAGE_ROOT="$PWD/elastic/my_dash"
-# Prefer Cursor hook (copy hooks/hooks.json.example into project or ~/.cursor/hooks.json)
-python scripts/record_token_usage.py --package "$SX2K_PACKAGE_ROOT" \
-  --input-tokens 0 --output-tokens 0 --source manual --note "R7 placeholder"
+# From Splunk audit export (Classic or Studio):
+python scripts/parse_inventory.py \
+  --from-audit path/to/dashboard_to_migrate.json \
+  --name my_dashboard_view_name \
+  --out-dir "$PKG"
+
+# Stub catalog + fields skeleton (agent then fills ES|QL):
+python scripts/panels_from_inventory.py \
+  --inventory "$PKG/inventory.json" \
+  --out "$PKG/esql/panels.json" \
+  --dash-id my-dash \
+  --stream 'logs-demo.events-*'
+
+# Edit esql/panels.json + data_factories/fields.json, then:
+python scripts/run_pipeline.py --package "$PKG" --assume-env --env-file path/to/.env
+
+# Offline (no cluster):
+python scripts/run_pipeline.py --package "$PKG" \
+  --skip-bulk --skip-spotcheck --skip-put --skip-vega --skip-tokens
+```
+
+Blackstone adapter:
+
+```bash
+python scripts/run_pipeline.py \
+  --package customers/blackstone/elastic/<use_case> \
+  --adapter blackstone --assume-env
 ```
 
 ### Cursor hook (real per-turn counts)
@@ -65,9 +79,10 @@ python scripts/record_token_usage.py --package "$SX2K_PACKAGE_ROOT" \
 ## Token rules (summary)
 
 - Progressive disclosure: open one `reference/*.md` shard per round
-- Agent writes small `esql/panels.json`; scripts build HTML/Kibana/MAPPING
+- Stub via `panels_from_inventory.py`; agent fills ES|QL only
+- Prefer `run_pipeline.py` over hand-rolled setup scripts
+- Sankey → `deploy_vega_sankey.py` / `templates/vega/sankey.py` (do not copy customer builders)
 - Never paste XML / full SPL / NDJSON / dashboard JSON into chat
-- Subagents only when ≥3 factory domains
 - Persist `metrics/token_usage.json` every run (hook and/or R7)
 
 ## Sharing

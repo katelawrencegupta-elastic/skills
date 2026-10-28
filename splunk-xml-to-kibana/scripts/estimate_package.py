@@ -45,12 +45,20 @@ def main() -> int:
         print(f"build_dashboard.py lines={lines}")
         if lines > args.max_build_lines and not catalog.exists():
             issues.append(
-                f"build_dashboard.py has {lines} lines (>{args.max_build_lines}) without esql/panels.json"
+                f"build_dashboard.py has {lines} lines (>{args.max_build_lines}) without esql/panels.json — "
+                "prefer panels_from_inventory.py + run_pipeline.py"
             )
         elif lines > args.max_build_lines:
             issues.append(
-                f"build_dashboard.py has {lines} lines (>{args.max_build_lines}); prefer catalog codegen"
+                f"build_dashboard.py has {lines} lines (>{args.max_build_lines}); "
+                "prefer esql/panels.json + build_from_catalog.py / run_pipeline.py"
             )
+        elif catalog.exists():
+            print("hint: catalog present — prefer run_pipeline.py over custom build_dashboard.py")
+
+    fields = root / "data_factories" / "fields.json"
+    if catalog.exists() and not fields.exists():
+        print("hint: add data_factories/fields.json for generate_from_fields.py / run_pipeline")
 
     if not mockup.exists():
         issues.append("missing mockup/index.html")

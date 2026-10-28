@@ -14,7 +14,7 @@ Token-first. Prefer scripts over narrating. Never paste large XML/SPL/NDJSON/das
 
 **Harness-agnostic** (Claude Code + Cursor). Customer paths: [`adapters/`](adapters/) — load only when relevant.
 
-**Target:** ≤ **12 assistant turns** for a clean conversion when scripts succeed. **One `USE_CASE` per chat.**
+**Target:** ≤ **12 assistant turns** for a clean conversion when scripts succeed (prefer **2–4** after kickoff: fill ES|QL + `run_pipeline`). **One `USE_CASE` per chat.**
 
 ## Parameters (ask once)
 
@@ -24,7 +24,7 @@ Token-first. Prefer scripts over narrating. Never paste large XML/SPL/NDJSON/das
 | `PACKAGE_ROOT` | `./elastic/<USE_CASE>/` | Artifact root |
 | `STREAM` | `logs-<tenant>.<dataset>-*` | Primary index pattern |
 | `DASH_ID` | `acme-aws-user-investigation` | Kibana dashboard id |
-| `DATA_FACTORIES` | path or empty | Shared factory pkg; else templates |
+| `DATA_FACTORIES` | path or empty | Shared factory pkg; else `fields.json` |
 | `ADAPTER` | `adapters/blackstone.md` or none | Customer adapter |
 
 Never hard-code machine-absolute paths in customer outputs.
@@ -33,32 +33,29 @@ Never hard-code machine-absolute paths in customer outputs.
 
 Ask once: Kibana URL + API key. Echo destination before writes. Prefer env `KIBANA_URL` / `ELASTICSEARCH_URL` / `ELASTICSEARCH_API_KEY`. Never invent keys or read `.env` without user OK. Skip Gate 0 for mockup-only.
 
+If the user already approved credentials (e.g. “use blackstone `.env`”), pass `--assume-env` to [`scripts/run_pipeline.py`](scripts/run_pipeline.py) — echo URLs, do not wait another turn.
+
 ## Round budget (hard)
 
 | Round | Work | Load next |
 |-------|------|-----------|
-| R0 | Params + Gate 0 (echo URL) | adapter if any |
-| R1 | `scripts/parse_inventory.py` — print panel/input **counts** only | — |
-| R2 | `scaffold_use_case.py` + `mockup_from_inventory.py` | — |
-| R3 | Write compact `esql/panels.json` + factory field list | [`reference/panels.md`](reference/panels.md), [`reference/controls.md`](reference/controls.md) |
-| R4 | Factories + bulk + `spotcheck_esql.py` | — |
-| R5 | `build_from_catalog.py` + `put_dashboard.py` (+ rewire if Vega) | [`reference/vega.md`](reference/vega.md) **only if** custom_viz |
-| R6 | `render_mapping.py` + short ANALYSIS + URLs | [`reference/mapping.md`](reference/mapping.md) |
-| R7 | Spot-check ≤10 lines + **record token usage** → `metrics/token_usage.json` | — |
+| R0 | Params + Gate 0 (or `--assume-env` if already approved) | adapter if any |
+| R1 | `parse_inventory.py --from-audit … --name …` — **counts only** | — |
+| R2 | `scaffold_use_case.py` + `panels_from_inventory.py` stub | — |
+| R3 | Agent fills `esql/panels.json` + `data_factories/fields.json` | [`reference/panels.md`](reference/panels.md), [`reference/controls.md`](reference/controls.md) |
+| R4–R7 | `run_pipeline.py --package … --assume-env` (mockup→factory→bulk→spotcheck→build→vega→put→rewire→mapping→tokens) | [`reference/vega.md`](reference/vega.md) **only if** sankey/custom |
 
-**Hard stop:** R5–R7 Vega/UI failure → **one** diagnose batch, then `BUGS.md` fallback or ask user. No open-ended force-graph loops.
+**Hard stop:** Vega/UI failure → **one** diagnose batch, then `BUGS.md` fallback or ask user. No open-ended force-graph loops.
 
 ## Checklist
 
 ```
-- [ ] R0 Params + Gate 0
-- [ ] R1 Parse inventory (counts only)
-- [ ] R2 Scaffold + mockup script
-- [ ] R3 esql/panels.json + Controls in catalog/manifest
-- [ ] R4 Factories + spotcheck_esql
-- [ ] R5 build_from_catalog + put (+ rewire)
-- [ ] R6 render_mapping + ANALYSIS
-- [ ] R7 Spot-check ≤10 lines; write `metrics/token_usage.*`; new chat for next USE_CASE
+- [ ] R0 Params + Gate 0 (or --assume-env)
+- [ ] R1 parse_inventory --from-audit (counts only)
+- [ ] R2 scaffold + panels_from_inventory stub
+- [ ] R3 Agent ES|QL + fields.json
+- [ ] R4–R7 run_pipeline.py
+- [ ] Confirm metrics/token_usage.json; new chat for next USE_CASE
 ```
 
 ## Hard rules
@@ -69,25 +66,30 @@ Ask once: Kibana URL + API key. Echo destination before writes. Prefer env `KIBA
 | Viz map | table→`data_table`; bar/column→`xy`; single→`metric`; punchcard→`heatmap`; gauge→`gauge` |
 | Inputs | Every Splunk input → Control / time / **GAP** (MATRIX in MAPPING). Ban hard-coded demo tokens in every `WHERE` |
 | Force-directed | → `heatmap` + edge table; see `BUGS.md` |
-| Sankey | Vega first (`ref_id` + rewire); never silent collapse |
-| Vega fields | Alias dotted paths in ES\|QL before encode |
+| Sankey | Vega first (`ref_id` + rewire); use `deploy_vega_sankey.py` / `templates/vega/sankey.py` — never silent collapse |
+| Vega fields | Alias dotted paths in ES\|QL before encode (`src`/`dst`/`count`) |
 | Output | Link file paths; do not dump MAPPING/dashboard JSON in chat |
 
 ## Scripts (prefer these)
 
 | Script | Role |
 |--------|------|
-| `parse_inventory.py` | XML → inventory + queries (offline) |
+| `extract_from_audit.py` | Audit JSON → `source.xml` |
+| `parse_inventory.py` | XML → inventory (+ `--from-audit --name`) |
 | `scaffold_use_case.py` | Package tree |
+| `panels_from_inventory.py` | Stub `esql/panels.json` + `fields.json` skeleton |
 | `mockup_from_inventory.py` | HTML mockup from inventory |
+| `generate_from_fields.py` | `fields.json` → NDJSON |
 | `build_from_catalog.py` | `esql/panels.json` → kibana JSON |
 | `spotcheck_esql.py` | Batch `POST /_query` |
-| `render_mapping.py` | Draft MAPPING.md |
+| `deploy_vega_sankey.py` | Shared Vega Sankey saved viz |
 | `put_dashboard.py` / `rewire_vega_refs.py` | Deploy / Vega rewire |
+| `render_mapping.py` | Draft MAPPING.md |
+| `run_pipeline.py` | R2–R7 orchestrator (`--assume-env`, `--adapter`) |
 | `estimate_package.py` | Warn oversized hand-written builders |
 | `record_token_usage.py` | Append turn/run tokens → `metrics/token_usage.jsonl` + summary JSON |
 
-Agent-authored (small): `PACKAGE_ROOT/esql/panels.json` — see `templates/esql/panels.example.json`.
+Agent-authored (small): fill stub `PACKAGE_ROOT/esql/panels.json` ES|QL — see `templates/esql/panels.example.json`.
 
 ## Token usage (required artifact)
 
@@ -132,15 +134,15 @@ Link `metrics/token_usage.json` from ANALYSIS.md (one line). Do **not** paste fu
 ```
 PACKAGE_ROOT/
   ANALYSIS.md  MAPPING.md  manifest.json  inventory.json  splunk_queries.json
-  esql/panels.json          # agent catalog
+  esql/panels.json          # agent catalog (start from panels_from_inventory stub)
   metrics/token_usage.jsonl # per-turn events
   metrics/token_usage.json  # run summary (required)
-  mockup/  kibana/  data_factories/
+  mockup/  kibana/  data_factories/fields.json  data_factories/out/
 ```
 
 ## Anti-patterns
 
-Deploy without Gate 0 · chat-only mockup · delete mockup after deploy · sticky multi-dashboard chats · pasting XML/SPL into replies · Vega force for `force_directed*` · lens `ref_id` left unrewired · absolute `/Users/…` paths in shared outputs · closing a run without `metrics/token_usage.json`
+Deploy without Gate 0 · chat-only mockup · delete mockup after deploy · sticky multi-dashboard chats · pasting XML/SPL into replies · Vega force for `force_directed*` · lens `ref_id` left unrewired · absolute `/Users/…` paths in shared outputs · closing a run without `metrics/token_usage.json` · re-copying customer `build_dashboard.py` Vega instead of `templates/vega/sankey.py`
 
 ## References
 
