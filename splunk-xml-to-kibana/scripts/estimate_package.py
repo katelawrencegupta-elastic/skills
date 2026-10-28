@@ -55,6 +55,20 @@ def main() -> int:
     if not mockup.exists():
         issues.append("missing mockup/index.html")
 
+    metrics = root / "metrics" / "token_usage.json"
+    if metrics.exists():
+        import json
+
+        m = json.loads(metrics.read_text(encoding="utf-8"))
+        tot = (m.get("totals") or {})
+        print(
+            f"token_usage cost_relevant={tot.get('cost_relevant_tokens')} "
+            f"billed_in={tot.get('billed_input_incl_cache')} "
+            f"turns={m.get('assistant_turns_est')}"
+        )
+    else:
+        issues.append("missing metrics/token_usage.json (run record_token_usage.py or enable Cursor stop hook)")
+
     if issues:
         print("WARN:")
         for i in issues:

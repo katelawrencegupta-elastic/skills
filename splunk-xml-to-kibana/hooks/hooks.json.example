@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "hooks": {
+    "stop": [
+      {
+        "command": "hooks/cursor_stop_record_tokens.sh",
+        "timeout": 15
+      }
+    ],
+    "afterAgentResponse": [
+      {
+        "command": "hooks/cursor_stop_record_tokens.sh",
+        "timeout": 15
+      }
+    ]
+  }
+}

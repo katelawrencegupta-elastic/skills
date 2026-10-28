@@ -44,7 +44,7 @@ Ask once: Kibana URL + API key. Echo destination before writes. Prefer env `KIBA
 | R4 | Factories + bulk + `spotcheck_esql.py` | — |
 | R5 | `build_from_catalog.py` + `put_dashboard.py` (+ rewire if Vega) | [`reference/vega.md`](reference/vega.md) **only if** custom_viz |
 | R6 | `render_mapping.py` + short ANALYSIS + URLs | [`reference/mapping.md`](reference/mapping.md) |
-| R7 | Spot-check summary (≤10 lines) | — |
+| R7 | Spot-check ≤10 lines + **record token usage** → `metrics/token_usage.json` | — |
 
 **Hard stop:** R5–R7 Vega/UI failure → **one** diagnose batch, then `BUGS.md` fallback or ask user. No open-ended force-graph loops.
 
@@ -58,7 +58,7 @@ Ask once: Kibana URL + API key. Echo destination before writes. Prefer env `KIBA
 - [ ] R4 Factories + spotcheck_esql
 - [ ] R5 build_from_catalog + put (+ rewire)
 - [ ] R6 render_mapping + ANALYSIS
-- [ ] R7 Spot-check ≤10 lines; new chat for next USE_CASE
+- [ ] R7 Spot-check ≤10 lines; write `metrics/token_usage.*`; new chat for next USE_CASE
 ```
 
 ## Hard rules
@@ -85,8 +85,37 @@ Ask once: Kibana URL + API key. Echo destination before writes. Prefer env `KIBA
 | `render_mapping.py` | Draft MAPPING.md |
 | `put_dashboard.py` / `rewire_vega_refs.py` | Deploy / Vega rewire |
 | `estimate_package.py` | Warn oversized hand-written builders |
+| `record_token_usage.py` | Append turn/run tokens → `metrics/token_usage.jsonl` + summary JSON |
 
 Agent-authored (small): `PACKAGE_ROOT/esql/panels.json` — see `templates/esql/panels.example.json`.
+
+## Token usage (required artifact)
+
+Every conversion **must** leave metrics under `PACKAGE_ROOT/metrics/`:
+
+| File | Role |
+|------|------|
+| `token_usage.jsonl` | Append-only per-turn / per-hook events |
+| `token_usage.json` | Rolled-up totals + vs ≤12-turn / ~70k cost-relevant goals |
+
+**How to populate**
+
+1. **Cursor (preferred):** set `SX2K_PACKAGE_ROOT` to the package, install [`hooks/hooks.json.example`](hooks/hooks.json.example) (`stop` / `afterAgentResponse` → `hooks/cursor_stop_record_tokens.sh`). Each agent stop appends real `input_tokens` / `output_tokens` / cache fields when the hook payload includes them.
+2. **R7 manual / Claude:** if hooks are unavailable, record once at end of run:
+
+```bash
+export SX2K_PACKAGE_ROOT="$PACKAGE_ROOT"
+python scripts/record_token_usage.py --package "$PACKAGE_ROOT" \
+  --input-tokens N --output-tokens N \
+  --cache-read-tokens N --cache-write-tokens N \
+  --model "$MODEL" --source manual --note "R7 end" --print-summary
+```
+
+3. **Estimate only (last resort):**  
+   `python scripts/record_token_usage.py --package "$PACKAGE_ROOT" --estimate-transcript path/to/chat.jsonl`  
+   Label is `transcript_estimate` — undercounts real Cursor context; still better than nothing.
+
+Link `metrics/token_usage.json` from ANALYSIS.md (one line). Do **not** paste full metrics into chat.
 
 ## Token rules
 
@@ -96,6 +125,7 @@ Agent-authored (small): `PACKAGE_ROOT/esql/panels.json` — see `templates/esql/
 - Subagents only when ≥3 independent factory domains.
 - Do not open `reference/vega.md` unless sankey/force/custom viz present.
 - Do not open monolithic `reference.md` (index only) — use `reference/*.md` shards.
+- Always persist token counts before closing the run (hook and/or R7).
 
 ## Package layout
 
@@ -103,12 +133,14 @@ Agent-authored (small): `PACKAGE_ROOT/esql/panels.json` — see `templates/esql/
 PACKAGE_ROOT/
   ANALYSIS.md  MAPPING.md  manifest.json  inventory.json  splunk_queries.json
   esql/panels.json          # agent catalog
+  metrics/token_usage.jsonl # per-turn events
+  metrics/token_usage.json  # run summary (required)
   mockup/  kibana/  data_factories/
 ```
 
 ## Anti-patterns
 
-Deploy without Gate 0 · chat-only mockup · delete mockup after deploy · sticky multi-dashboard chats · pasting XML/SPL into replies · Vega force for `force_directed*` · lens `ref_id` left unrewired · absolute `/Users/…` paths in shared outputs
+Deploy without Gate 0 · chat-only mockup · delete mockup after deploy · sticky multi-dashboard chats · pasting XML/SPL into replies · Vega force for `force_directed*` · lens `ref_id` left unrewired · absolute `/Users/…` paths in shared outputs · closing a run without `metrics/token_usage.json`
 
 ## References
 

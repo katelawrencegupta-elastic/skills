@@ -1,0 +1,21 @@
+{
+  "updated_at": "2026-10-28T20:00:00Z",
+  "package": "./elastic/example",
+  "event_count": 8,
+  "assistant_turns_est": 8,
+  "totals": {
+    "input_tokens": 480000,
+    "output_tokens": 12000,
+    "cache_read_tokens": 400000,
+    "cache_write_tokens": 20000,
+    "cost_relevant_tokens": 72000,
+    "billed_input_incl_cache": 480000
+  },
+  "target": {
+    "max_assistant_turns": 12,
+    "cost_relevant_tokens_goal": 70000,
+    "billed_incl_cache_goal": 250000
+  },
+  "within_turn_target": true,
+  "events_tail": []
+}

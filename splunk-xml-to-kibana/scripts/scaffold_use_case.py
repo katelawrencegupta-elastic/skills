@@ -24,7 +24,7 @@ def main() -> int:
     args = ap.parse_args()
 
     root = args.out / args.use_case
-    for sub in ("mockup", "kibana", "data_factories/out", "esql"):
+    for sub in ("mockup", "kibana", "data_factories/out", "esql", "metrics"):
         (root / sub).mkdir(parents=True, exist_ok=True)
 
     # mockup
@@ -76,7 +76,8 @@ def main() -> int:
     print("Next: copy Splunk XML → source.xml, then:")
     print("  parse_inventory.py → mockup_from_inventory.py → edit esql/panels.json")
     print("  → build_from_catalog.py → put_dashboard.py → render_mapping.py")
-    print("Target: ≤12 assistant turns; one USE_CASE per chat.")
+    print("  → record_token_usage.py (or Cursor stop hook with SX2K_PACKAGE_ROOT)")
+    print("Target: ≤12 assistant turns; one USE_CASE per chat; metrics/token_usage.json required.")
     return 0
 
 

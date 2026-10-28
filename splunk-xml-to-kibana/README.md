@@ -16,8 +16,12 @@ scripts/
   parse_inventory.py scaffold_use_case.py mockup_from_inventory.py
   build_from_catalog.py render_mapping.py spotcheck_esql.py
   put_dashboard.py rewire_vega_refs.py estimate_package.py
+  record_token_usage.py          # metrics/token_usage.json(l)
+hooks/
+  cursor_stop_record_tokens.sh   # Cursor stop/afterAgentResponse
+  hooks.json.example
 templates/
-  mockup/ MAPPING.md factories/ esql/panels.example.json panels.schema.json
+  mockup/ MAPPING.md factories/ esql/ metrics/token_usage.example.json
 ```
 
 ## Install
@@ -44,7 +48,19 @@ python scripts/render_mapping.py --inventory ./elastic/my_dash/inventory.json \
   --catalog ./elastic/my_dash/esql/panels.json --out ./elastic/my_dash/MAPPING.md \
   --queries ./elastic/my_dash/splunk_queries.json
 python scripts/estimate_package.py --package ./elastic/my_dash
+
+# Token usage (required)
+export SX2K_PACKAGE_ROOT="$PWD/elastic/my_dash"
+# Prefer Cursor hook (copy hooks/hooks.json.example into project or ~/.cursor/hooks.json)
+python scripts/record_token_usage.py --package "$SX2K_PACKAGE_ROOT" \
+  --input-tokens 0 --output-tokens 0 --source manual --note "R7 placeholder"
 ```
+
+### Cursor hook (real per-turn counts)
+
+1. `export SX2K_PACKAGE_ROOT=/absolute/path/to/elastic/<use_case>`
+2. Merge [`hooks/hooks.json.example`](hooks/hooks.json.example) into the project `.cursor/hooks.json` or `~/.cursor/hooks.json` (adjust `command` path to the skill install).
+3. Each `stop` / `afterAgentResponse` appends to `metrics/token_usage.jsonl` and refreshes `metrics/token_usage.json`.
 
 ## Token rules (summary)
 
@@ -52,6 +68,7 @@ python scripts/estimate_package.py --package ./elastic/my_dash
 - Agent writes small `esql/panels.json`; scripts build HTML/Kibana/MAPPING
 - Never paste XML / full SPL / NDJSON / dashboard JSON into chat
 - Subagents only when ≥3 factory domains
+- Persist `metrics/token_usage.json` every run (hook and/or R7)
 
 ## Sharing
 
