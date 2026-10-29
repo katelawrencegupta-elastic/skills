@@ -11,7 +11,7 @@ SKILL.md                 # slim round budget + hard rules (~1.5–2k tokens)
 reference.md             # index only — do not load whole
 reference/
   panels.md controls.md vega.md mapping.md
-adapters/blackstone.md   # optional customer adapter
+adapters/<name>.md   # optional customer adapter
 scripts/
   extract_from_audit.py parse_inventory.py panels_from_inventory.py
   scaffold_use_case.py mockup_from_inventory.py generate_from_fields.py
@@ -62,12 +62,12 @@ python scripts/run_pipeline.py --package "$PKG" \
   --skip-bulk --skip-spotcheck --skip-put --skip-vega --skip-tokens
 ```
 
-Blackstone adapter:
+<name> adapter:
 
 ```bash
 python scripts/run_pipeline.py \
-  --package customers/blackstone/elastic/<use_case> \
-  --adapter blackstone --assume-env
+  --package customers/<name>/elastic/<use_case> \
+  --adapter <name> --assume-env
 ```
 
 ### Cursor hook (real per-turn counts)
