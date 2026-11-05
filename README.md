@@ -1,12 +1,14 @@
 # Field Engineering Skills
 
-Three agent skills for Elastic account work. Each one packages a repeatable workflow so the agent follows the same steps, produces the same output format, and spends as few tokens as possible doing it.
+Five agent skills for Elastic account work. Each one packages a repeatable workflow so the agent follows the same steps, produces the same output format, and spends as few tokens as possible doing it.
 
 | Skill | Runs in | What it produces | Needs |
 |---|---|---|---|
 | [account-status-update](#account-status-update) | Claude (`.skill`) | Account status summary + activity timeline, optionally as a Google Doc | Slack, Gmail, Google Calendar (Drive for docs) |
 | [customer-tech-research](#customer-tech-research) | Claude (`.skill`) | Confidence-rated tech-stack report + Elastic opportunity assessment | Web search, web fetch |
 | [splunk-xml-to-kibana](#splunk-xml-to-kibana) | Claude Code + Cursor | Splunk dashboard migrated to Kibana: mockup, ES\|QL panels, data factories, `MAPPING.md`, deploy | Kibana/ES URL + API key (optional shared `data_factories`) |
+| [k360-account-analysis](#k360-account-analysis) | Cursor | K360 account summary: footprint, ECU, storage, burndown, projections | K360 `.env`, `k360-org-report` |
+| [diag-serverless-consolidation](#diag-serverless-consolidation) | Cursor | Serverless consolidation priced from diagnostic bundles only | Account-summary artifacts, admin diagnostics, Sheets venv, es3-estimator |
 
 ---
 
@@ -24,6 +26,14 @@ splunk-xml-to-kibana/
   scripts/                           # parse, mockup, catalog build, mapping, spotcheck, deploy
   templates/                         # mockup, MAPPING, factories, esql/panels.example.json
   README.md                          # install + script quick start
+k360-account-analysis/
+  SKILL.md                           # K360 account summary; --skip-diags --skip-sizing
+  scripts/                           # fetch, infra, analyze, size, consolidate, PDF, upload
+  references/                        # estimator cells, recommendation rules, schema, setup
+diag-serverless-consolidation/
+  SKILL.md                           # diag bulk + measured retention → estimator read-back
+  scripts/diag_inputs.py             # pack counts and per-row inputs; no dollar quote
+  references/calculations.md         # arithmetic, cells, gap split
 .cursor/rules/commits.mdc            # commit conventions for agents working in this repo
 ```
 
@@ -36,6 +46,8 @@ splunk-xml-to-kibana/
 ```bash
 mkdir -p ~/.claude/skills
 ln -s "$(pwd)/splunk-xml-to-kibana" ~/.claude/skills/splunk-xml-to-kibana
+ln -s "$(pwd)/k360-account-analysis" ~/.claude/skills/k360-account-analysis
+ln -s "$(pwd)/diag-serverless-consolidation" ~/.claude/skills/diag-serverless-consolidation
 ```
 
 **Cursor skill.** Copy or symlink the folder into your personal skills directory, then start a new Agent chat:
@@ -43,13 +55,15 @@ ln -s "$(pwd)/splunk-xml-to-kibana" ~/.claude/skills/splunk-xml-to-kibana
 ```bash
 mkdir -p ~/.cursor/skills
 ln -s "$(pwd)/splunk-xml-to-kibana" ~/.cursor/skills/splunk-xml-to-kibana
+ln -s "$(pwd)/k360-account-analysis" ~/.cursor/skills/k360-account-analysis
+ln -s "$(pwd)/diag-serverless-consolidation" ~/.cursor/skills/diag-serverless-consolidation
 ```
 
 ---
 
 ## How these skills save tokens
 
-The same few principles show up in all three skills:
+The same few principles show up in these skills:
 
 1. **Fewer round trips.** Every assistant turn re-reads the whole conversation, so the number of turns costs more than the size of any single result. The skills batch independent tool calls into one message and set an explicit round budget.
 2. **Load only what's needed.** Descriptions are written so the skill triggers on its own. Heavy reference material sits in separate files (`references/industry-angles.md`, `reference/*.md` shards) and is read only when a step needs it.
@@ -161,6 +175,41 @@ Examples: `status update GE Vernova 3m`, `status update Merck 2w googledoc=y`. T
 - **Export instead of regenerate:** after UI edits, dashboards are exported and redeployed instead of rebuilt from templates.
 
 **Maintain:** Edit `SKILL.md` for workflow rules and the chart-type mapping, and `reference.md` for Dashboards API panel snippets and the `MAPPING.md` template. Factory implementations live in the separate `data_factories` repo.
+
+---
+
+## k360-account-analysis
+
+**What it does:** Runs one Elastic Cloud account through K360 and stops at the account summary: ECH versus Serverless mix, cloud and instance footprint, versions, ECU, storage, solution mix, ML and inference, a burndown check, 3- and 6-month projections, and up to five performance and five cost recommendations. It does not pull diagnostic bundles or quote Serverless.
+
+**Usage:** In Cursor, ask for an account summary, for example "run this skill for Colgate-Palmolive". The script resolves the K360 name and exits if the match is not unique. The run passes `--skip-diags --skip-sizing`.
+
+**How it works**
+
+1. **One pipeline run.** `scripts/run_account_analysis.py` fetches the org, fills storage when telemetry is missing, then analyzes the footprint.
+2. **No sizing step.** Estimator copies and the consolidation PDF belong to `diag-serverless-consolidation`.
+3. **Write the summary.** Account PDF, then a canvas and at most six chat bullets from the brief.
+
+**Token optimizations**
+
+- **One compact brief.** The command prints `brief <path>`. The agent does not open `account.json`, the markdown report, the org report, or infra.
+- **Name resolution fails closed.** A fuzzy name does not fetch a different customer.
+
+**Maintain:** Workflow rules live in `SKILL.md`. The parent fetch stays in `k360-org-report` (`K360_ORG_SKILL_DIR` overrides the path). Setup is `references/setup.md`.
+
+## diag-serverless-consolidation
+
+**What it does:** Prices a Serverless consolidation from Elasticsearch diagnostic bundles for deployments that billed in the latest month. A decommissioned deployment and its last snapshot stay out. Ingest is bulk GB/day. Retention is the measured age, rounded up to a whole month. The run writes two PDFs from the same bulk: the rounded month, and 30 days written as 1 month. Each PDF links to its own estimator sheet. Page 1 charts cutting the deployment count by 0, 25, 50, 75, and 100%. A later page lists each deployment's metered ingest rate and marks $0.50 rows in red. A search-power chart shows on-demand, performant, and high availability beside the quote and is not added to it.
+
+**Usage:** Ask for a diagnostic consolidation, a per-cluster Serverless price, or a 2–5 project pack. Reuse the account-summary org report when that folder already exists.
+
+**How it works**
+
+1. **One pipeline run** of `k360-account-analysis/scripts/run_account_analysis.py` with diagnostics left on. `--diags-dir` reuses zips already on disk. The active month is the latest lookback month, including a partial month.
+2. **Two sheets, two PDFs.** The rounded PDF writes the measured months, rounded up. The 30-day PDF writes 1 month on a separate sheet and leaves that sheet at 1 month. The deployment-count bars are priced again at that scenario's month.
+3. **Quote the read-back.** Show the arithmetic beside D32 (Observability), E74 (Security), or the es3 on-demand total (Search). The metered-rate table and the search-power chart are shown beside that quote. Deployments with no bundle add no ingest.
+
+**Maintain:** Workflow rules live in `SKILL.md`. The arithmetic is `references/calculations.md`. Cell maps and setup stay in `k360-account-analysis/references/`.
 
 ---
 
