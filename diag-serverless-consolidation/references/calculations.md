@@ -18,22 +18,39 @@ weighted_days = Σ (bulk_gb_day × retention_days) / bulk_gb_day
 months = weighted_days / 30.416
 ```
 
-The sheet retention is always a whole month. Round `months` up, then clamp to 1–36. The estimator prices retention only on the integers 1–36, so a fractional month leaves that line at zero. Show both the measured months and the whole month written. Only rows with `retention_days` above 0 enter the weight. A row with no measured age is named and left out. If the rows that have bulk have no measured age, the month stays unset and the sheet is not filled.
+The sheet retention is always a whole month. Round `months` up, then clamp to 1–36. The estimator prices retention only on the integers 1–36, so a fractional month leaves that line at zero. Show both the measured months and the whole month written. Only rows with `retention_days` above 0 enter the weight. A row with no measured age is named and left out. If the rows that have bulk have no measured age, the month stays unset and the sheet is not filled. A solution with no stored GB and no bulk is skipped because it has no workload. That skip is not an unmeasured retention month.
 
 Every consolidation run writes two PDFs from the same bulk.
 
 | PDF | Sheet month | File |
 |-----|-------------|------|
-| Rounded | measured months, rounded up, clamped to 1–36 | `<key>_Serverless_consolidation_savings` |
-| 30-day | 1, because 30 / 30.416 is under 1 | `<key>_Serverless_consolidation_30d` |
+| Rounded | measured months, rounded up, clamped to 1–36 | `<key>_Serverless_consolidation_bulk_savings` |
+| 30-day | 1, because 30 / 30.416 is under 1 | `<key>_Serverless_consolidation_30d_savings` |
 
-Each PDF links to its own estimator copy, left at that month. The rounded sheet is not rewritten to 1 after the 30-day read. If the measured ceiling is already 1, the two read-backs match. Still write both PDFs. The deployment-count bars are priced again at the scenario's month: measured months rounded up on the rounded PDF, and 1 month on every project on the 30-day PDF.
+Each PDF links to its own estimator copy, left at that month. The four estimate sheets live in the customer folder's `generated_estimates` child. Their deployment-plan sheets live in `generated_estimates/plan_sheets`. Measured-retention PDFs are uploaded to `full_retention`. 30-day PDFs are uploaded to `30d`. The account PDF stays in the customer folder. The rounded sheet is not rewritten to 1 after the 30-day read. If the measured ceiling is already 1, the two read-backs match. Still write both PDFs. The deployment-count bars are priced again at the scenario's month: measured months rounded up on the rounded PDF, and 1 month on every project on the 30-day PDF.
 
 When the user sets a retention month, that whole month replaces the headline (`--retention-months`, G11 or G6). Bulk GB/day stays the measured rate. The measured months stay in the arithmetic next to the month written. The 30-day read stays at 1 month.
 
 `retention_days` is the size-weighted ILM delete age, else data-stream retention, else the oldest index age, kept to 3 decimals. The weight uses local primary bytes only. Searchable-snapshot mounts (`partial-*`) and the snapshot portion of `total_data_set_size_in_bytes` stay out of store and out of that weight. `bulk_gb_day` is the sum of `index.primaries.bulk.est_bytes_per_day` on write indices, divided by 1e9. A write index is the last index of a data stream, or an index an alias marks `is_write_index`. For each of those indices the bytes per day are `primaries.bulk.total_size_in_bytes × 86,400 / write_phase_seconds`. The write phase is the time from creation until rollover, or the index age while the current ILM action is `rollover`. A missing write phase contributes 0. Rolled indices are not added. This is the bulk request size over the write window, not stored dataset growth and not node `total_size_in_bytes` divided by JVM uptime.
 
 A row with `uptime_days_min` < 2 has a short node uptime. Keep it in the sum and name it. The bulk rate is still the write-phase estimate.
+
+## compressioncalc_accounted_for
+
+This is a second estimate. It does not replace `bulk_gb_day`.
+
+On each write index, the on-disk rate uses the same write phase as the bulk rate and `primaries.store.size_in_bytes` in place of `primaries.bulk.total_size_in_bytes`. A write index's ratio is its on-disk daily est ÷ its bulk daily est, capped at 1. The calculated total is Σ on-disk est ÷ Σ bulk est. Different write phases make that ratio differ from Σ store bytes ÷ Σ bulk bytes. When the ratio of sums is above 1, the total is the median of the capped per-index ratios.
+
+```
+compression_ratio = Σ indexing est ÷ Σ bulk est, never above 1
+compressioncalc_accounted_for = bulk_gb_day × compression_ratio
+```
+
+`compression_ratio` is kept to 3 decimals and is never above 1. Both sums use the same write indices as `bulk_gb_day`, including a system write index that store itself leaves out. When the bulk sum is 0, or no write index has an on-disk rate, the ratio is unset and `compressioncalc_accounted_for` is 0.
+
+Observability and Security sheets for this set write that GB/day. Logs stay 90% and metrics 10% of it. Security takes all of it. Retention is weighted on this GB/day. G26 is accepted when it is within 0.51 GB/day of the accounted GB written, not the raw bulk. Search keeps local store and its existing es3 read-back.
+
+The rounded and 30-day PDFs are `<key>_Serverless_consolidate_meta_overhead_removed` and `<key>_Serverless_consolidate_meta_overhead_removed_30d`. Both sheets are in `generated_estimates`. The 30-day sheet writes 1 month. This set does not price the deployment-count plan.
 
 ## Which estimator
 
@@ -69,7 +86,7 @@ For an active fleet of N deployments, price five Observability plans on each PDF
 
 Pack the middle three by local `store_gb`: sort descending, place each row in the lightest bin. 100% stays one project even though N × 0 is 0. `round` is half-to-even, so 75% of 2 deployments is 0 projects. On the rounded PDF, a project with bulk and no measured month omits the whole bar set. On the 30-day PDF, a project with bulk is written at month 1.
 
-## Metered ingest rate
+## Deployment consolidation analysis across metered ingest rates
 
 This is the Observability ingest rate for one deployment priced alone. It is not a D32 quote and it does not include retention or support.
 
@@ -97,7 +114,7 @@ A deployment whose logs stream and metrics stream are both inside the first 50 G
 
 ## Search-power projection
 
-On-demand, performant, and high availability are priced with the es3 estimator on the sized stored GB, the measured query rate, and Premium support. High availability is the high-demand setting. Show monthly and steady annual (monthly × 12) for each. These dollars are not added to D32 or E74. When the quoted solution is Search, the quote stays the on-demand read-back.
+On-demand, performant, and high availability are priced with the es3 estimator on the sized stored GB, the measured query rate, and Premium support. High availability is the highly-performant setting. Show monthly and steady annual (monthly × 12) for each. When Search has no local store, the chart still uses the sized stored GB on the cover and the measured query rate. These dollars are not added to D32 or E74. When the quoted solution is Search, the quote stays the on-demand read-back. The page is the Appendix at the end of the PDF, after the reconciliation section.
 
 Same formulas inside each project. Each project is its own estimator copy. The month written is the project's measured months rounded up. Each project also gets a 30-day read at 1 month on the same bulk. Sum of the read-backs is the split-fleet price, once at the measured month and once at 30 days. Compare each sum with the matching one-project read-back. The difference is the cost of staying split. A user-set retention month replaces the headline month on every project, including the pool, and does not change Σ bulk.
 

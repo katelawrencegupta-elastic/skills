@@ -195,7 +195,7 @@ def cost_sizing_md(acc: dict) -> list[str]:
         L.append(f"Triggered — ECH share {sz.get('ech_share_pct')}%. Folder `{s(sz.get('folder'))}`" + (f" · Drive {sz['drive_folder'].get('url')}" if sz.get("drive_folder") else ""))
         L.append("")
         L.append(table(["Solution", "Deps", "ECU/mo", "Stored GB", "Retention (mo)", "Daily raw GB", "GB estimated?"],
-                       [[k.title(), v["deployments"], n0(v["ecu_monthly_avg"]), n0(v["stored_gb"]), v["retention_months"], n1(v["daily_raw_gb"]), "yes (ECU share)" if v.get("gb_estimated_from_ecu_share") else "no"] for k, v in con.items()]))
+                       [[k.title(), v["deployments"], n0(v["ecu_monthly_avg"]), n0(v["stored_gb"]), v.get("retention_months"), n1(v["daily_raw_gb"]), "yes (ECU share)" if v.get("gb_estimated_from_ecu_share") else "no"] for k, v in con.items()]))
         L.append("")
         est = sz.get("estimators") or {}
         rows = []
@@ -296,7 +296,7 @@ def consolidation_section(acc: dict) -> list[str]:
         ["Data tiers", n0(comp.get("data_tiers_mo")), f"ingest {usd(((svl.get('by_solution') or {}).get(svl.get('dominant_solution')) or {}).get('ingest_mo'))}"],
         ["Fixed overhead (master / Kibana / coord / integrations)", f"{n0(comp.get('fixed_overhead_mo'))} ({s(comp.get('fixed_overhead_pct'))}%)", f"retention {usd(((svl.get('by_solution') or {}).get(svl.get('dominant_solution')) or {}).get('retention_mo'))}"],
         ["ML nodes", n0(comp.get("ml_nodes_mo")), f"support {usd(((svl.get('by_solution') or {}).get(svl.get('dominant_solution')) or {}).get('support_mo'))}"],
-        ["Snapshots + transfer", n0(comp.get("non_capacity_mo")), "included"],
+        ["Snapshots + transfer", n0(comp.get("non_capacity_mo")), "data out is not in this total"],
         ["Cost per stored GB-month", f"{s(svl.get('ech_ecu_per_stored_gb_mo'))} ECU", f"${s(svl.get('eff_usd_per_stored_gb_mo'))}"],
         ["Effective unit rates", "—", f"${s(svl.get('eff_ingest_usd_per_gb'))}/GB ingest · ${s(svl.get('eff_retain_usd_per_gb_mo'))}/GB-mo retain"],
     ]))
@@ -322,7 +322,7 @@ def consolidation_section(acc: dict) -> list[str]:
         ml_sentence = f"Machine learning on Search is in the EIS line: {usd(search_blk.get('eis_mo'))}/mo, the billed tokens plus {n0(search_blk.get('jina_ml_ecu'))} ECU of ML nodes on deployments that billed jina."
     else:
         ml_sentence = f"Machine learning adds {n0(comp.get('ml_nodes_mo'))} ECU/mo."
-    L.append(f"These are nodes that do not hold data: master, Kibana, coordinating, integrations, enterprise search, and APM. Together they are {n0(comp.get('fixed_overhead_mo'))} ECU/mo. Serverless does not charge for them. {ml_sentence} Snapshots and transfer add {n0(comp.get('non_capacity_mo'))} ECU/mo.")
+    L.append(f"These are nodes that do not hold data: master, Kibana, coordinating, integrations, enterprise search, and APM. Together they are {n0(comp.get('fixed_overhead_mo'))} ECU/mo. Serverless does not charge for them. {ml_sentence} Snapshot storage, snapshot API calls, and data transfer add {n0(comp.get('non_capacity_mo'))} ECU/mo. Data in stays free. Data out carries over outside the serverless total: Observability and Security list it at 50 GB free, then $0.05 per GB, including Private Link. Inter-node does not carry over, and on Azure it is already waived. The bill is ECU, not GB, so this does not convert the hosted charge into a serverless dollar.")
     L.append("")
     if c.get("overhead_buckets"):
         L.append(table(["Size", "Clusters", "ECU", "Overhead %"], [[x["bucket"], x["deployments"], n0(x["ecu_lookback"]), s(x.get("fixed_overhead_pct"))] for x in c["overhead_buckets"]]))

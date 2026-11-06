@@ -6,7 +6,15 @@ Run with the Sheets venv python (google-api-python-client installed):
   ~/.config/cloud-tracker-sheets/venv/bin/python size_serverless.py \
       --account-json artifacts/Acme_2026-11-02/Acme_2026-11-02_account.json
 
-Produces (local folder + Drive folder of the same name):
+Produces a Drive folder <customer>_<date>. The account PDF stays in that folder.
+Measured-retention consolidation PDFs go in full_retention/. 30-day PDFs go in 30d/.
+Estimate sheets go in its generated_estimates child. Deployment-plan sheets go in generated_estimates/plan_sheets:
+  bulk at the measured month, rounded up
+  the same bulk written as 1 month (--name-suffix _30d)
+  bulk × compression ratio (--name-suffix compressioncalc_accounted_for)
+  that accounted ingest written as 1 month
+Sheet titles keep the suffix, so the four estimates can share the folder.
+Local .xlsx and .csv exports use generated_estimates under the artifact folder.
   <customer>_<date>_Observability_Serverless_estimate   (Sheets copy + .xlsx export)
   <customer>_<date>_Security_Serverless_estimate        (Sheets copy + .xlsx export)
   <customer>_<date>_Search_Serverless_estimate.csv      (es3-estimator report; uploaded as a Google Sheet)
@@ -93,13 +101,17 @@ def _esc(s: str) -> str:
     return s.replace("\\", "\\\\").replace("'", "\\'")
 
 
-def ensure_drive_folder(drive, name: str) -> dict:
-    q = f"name = '{_esc(name)}' and mimeType = '{FOLDER_MIME}' and trashed = false"
+def ensure_drive_folder(drive, name: str, parent_id: str | None = None) -> dict:
+    parent = f" and '{parent_id}' in parents" if parent_id else ""
+    q = f"name = '{_esc(name)}' and mimeType = '{FOLDER_MIME}' and trashed = false{parent}"
     found = drive.files().list(q=q, spaces="drive", fields="files(id,name,webViewLink)", pageSize=5).execute().get("files") or []
     if found:
         f = found[0]
         return {"id": f["id"], "name": f["name"], "url": f.get("webViewLink") or f"https://drive.google.com/drive/folders/{f['id']}"}
-    meta = drive.files().create(body={"name": name, "mimeType": FOLDER_MIME}, fields="id,name,webViewLink").execute()
+    body = {"name": name, "mimeType": FOLDER_MIME}
+    if parent_id:
+        body["parents"] = [parent_id]
+    meta = drive.files().create(body=body, fields="id,name,webViewLink").execute()
     return {"id": meta["id"], "name": meta["name"], "url": meta.get("webViewLink") or f"https://drive.google.com/drive/folders/{meta['id']}"}
 
 
@@ -413,6 +425,16 @@ def _suffix(raw: str | None) -> str:
     return text if text.startswith("_") else f"_{text}"
 
 
+ESTIMATE_FOLDER_NAME = "generated_estimates"
+PLAN_FOLDER_NAME = "plan_sheets"
+
+
+def estimate_folder_name(name_suffix: str | None) -> str:
+    """Estimate sheets share one folder. Plan sheets go in its plan_sheets child. The suffix stays on the sheet title."""
+    _suffix(name_suffix)
+    return ESTIMATE_FOLDER_NAME
+
+
 def _sheet_retention(months) -> int | None:
     """Estimator retention rows are the integers 1–36. A missing month is not invented."""
     if months is None or months == "":
@@ -432,6 +454,19 @@ def _months_for_sheet(block: dict, force: int | None) -> int | None:
     if force is not None:
         return int(min(36, max(1, force)))
     return measured
+
+
+def estimator_skip(block: dict, force: int | None, *, always_copy: bool = False) -> str | None:
+    """Why an Observability or Security sheet is not filled. None means fill it.
+
+    No workload is the reason when the solution has no stored GB and no bulk.
+    A missing retention month is the reason only when that solution has a workload.
+    """
+    if not always_copy and not (block or {}).get("has_workload"):
+        return "no_workload"
+    if _months_for_sheet(block, force) is None:
+        return "retention"
+    return None
 
 
 def _fill_missing_doc_bytes(acc_path: Path, acc: dict) -> None:
@@ -681,16 +716,23 @@ def main() -> None:
     provider, region = sz.get("provider"), sz.get("region")
 
     sheets, drive = services()
-    folder = ensure_drive_folder(drive, key)
-    lines = [f"Local folder → {local_dir}", f"Drive folder → {folder['url']}"]
+    root = ensure_drive_folder(drive, key)
+    scenario = estimate_folder_name(suffix)
+    folder = ensure_drive_folder(drive, scenario, root["id"])
+    estimate_dir = local_dir / scenario
+    estimate_dir.mkdir(parents=True, exist_ok=True)
+    lines = [f"Local folder → {estimate_dir}", f"Drive folder → {folder['url']}"]
     if args.projects:
         projects = size_regional_projects(
             acc, sheets, drive, folder, o11y_id=args.o11y_id, security_id=args.security_id,
             support=support, provider=provider, skip_xlsx=args.skip_xlsx, fresh=args.fresh,
-            local_dir=local_dir, customer=meta["customer"], when=meta["date"], name_suffix=suffix,
+            local_dir=estimate_dir, customer=meta["customer"], when=meta["date"], name_suffix=suffix,
             force_months=args.force_months,
         )
         sz.setdefault("estimators", {})["projects"] = projects
+        sz["folder"] = str(local_dir)
+        sz["estimate_folder"] = str(estimate_dir)
+        sz["drive_root"] = root
         sz["drive_folder"] = folder
         sz["sized_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
         acc["sizing"] = sz
@@ -713,7 +755,7 @@ def main() -> None:
             "support_tier": support,
             "workload": se.get("workload") or acc.get("workload") or {},
         }) if (se.get("stored_gb") or 0) > 0 else {}
-        published = write_search_sheet(drive, local_dir, folder["id"], title_se, result) if result.get("report_csv") else {"error": result.get("error") or "no report"}
+        published = write_search_sheet(drive, estimate_dir, folder["id"], title_se, result) if result.get("report_csv") else {"error": result.get("error") or "no report"}
         entry = dict(estimators.get("search") or {"kind": "search", "title": title_se})
         entry.pop("doc_id", None)
         entry.update({
@@ -733,7 +775,7 @@ def main() -> None:
         fresh = size_regional_projects(
             acc, sheets, drive, folder, o11y_id=args.o11y_id, security_id=args.security_id,
             support=support, provider=provider, skip_xlsx=args.skip_xlsx, fresh=args.fresh,
-            local_dir=local_dir, customer=meta["customer"], when=meta["date"], only={"search"},
+            local_dir=estimate_dir, customer=meta["customer"], when=meta["date"], only={"search"},
             name_suffix=suffix,
         )
         kept = [p for p in (estimators.get("projects") or []) if p.get("solution") != "search"]
@@ -741,6 +783,9 @@ def main() -> None:
         for p in fresh:
             prb = p.get("readback") or {}
             lines.append(f"{p['solution']} {p['region']} → {p.get('url') or p.get('error')}  (monthly {prb.get('monthly_steady_state')})")
+        sz["folder"] = str(local_dir)
+        sz["estimate_folder"] = str(estimate_dir)
+        sz["drive_root"] = root
         sz["drive_folder"] = folder
         sz["sized_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
         acc["sizing"] = sz
@@ -749,11 +794,17 @@ def main() -> None:
         print("\n".join(lines))
         return
     if args.deployment_plan:
+        plan_folder = ensure_drive_folder(drive, PLAN_FOLDER_NAME, folder["id"])
+        lines.append(f"Plan folder → {plan_folder['url']}")
         plan = size_deployment_plan(
-            acc, sheets, drive, folder, o11y_id=args.o11y_id, support=support, provider=provider,
+            acc, sheets, drive, plan_folder, o11y_id=args.o11y_id, support=support, provider=provider,
             force_months=args.force_months, name_suffix=suffix, fresh=args.fresh,
         )
         sz["deployment_plan"] = plan
+        sz["drive_folder_deployment_plan"] = plan_folder
+        sz["folder"] = str(local_dir)
+        sz["estimate_folder"] = str(estimate_dir)
+        sz["drive_root"] = root
         sz["drive_folder"] = folder
         sz["sized_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
         acc["sizing"] = sz
@@ -767,11 +818,15 @@ def main() -> None:
     # ---------------- Observability
     o = con["observability"]
     title_o = f"{key}_Observability_Serverless_estimate{suffix}"
-    o_months = _months_for_sheet(o, args.force_months)
-    if o_months is None:
+    o_skip = estimator_skip(o, args.force_months, always_copy=args.always_copy)
+    if o_skip == "no_workload":
+        estimators["observability"] = {"kind": "observability", "status": "skipped — no observability workload detected (use --always-copy to force)"}
+        lines.append("Observability → skipped (no workload)")
+    elif o_skip == "retention":
         estimators["observability"] = {"kind": "observability", "status": "skipped — retention was not measured"}
         lines.append("Observability → skipped (retention was not measured)")
-    elif o.get("has_workload") or args.always_copy:
+    else:
+        o_months = _months_for_sheet(o, args.force_months)
         copied, reused = copy_template(drive, args.o11y_id, title_o, folder["id"], reuse=not args.fresh)
         opts = region_options(sheets, copied["id"])
         reg, how = match_region(provider, region, opts)
@@ -787,24 +842,25 @@ def main() -> None:
             entry["readback_rejected"] = "G26 differs from the written bulk by more than 0.51 GB/day"
         if not args.skip_xlsx:
             try:
-                x = export_xlsx(drive, copied["id"], local_dir / f"{title_o}.xlsx")
+                x = export_xlsx(drive, copied["id"], estimate_dir / f"{title_o}.xlsx")
                 entry["local_xlsx"] = str(x)
             except Exception as ex:  # noqa: BLE001
                 entry["local_xlsx_error"] = str(ex)
         estimators["observability"] = entry
         lines.append(f"Observability → {copied['url']}  ({n} cells; Y1 {rb.get('annual_year1')}, monthly {rb.get('monthly_steady_state')}; region {reg} [{how}])")
-    else:
-        estimators["observability"] = {"kind": "observability", "status": "skipped — no observability workload detected (use --always-copy to force)"}
-        lines.append("Observability → skipped (no workload)")
 
     # ---------------- Security
     s = con["security"]
     title_s = f"{key}_Security_Serverless_estimate{suffix}"
-    s_months = _months_for_sheet(s, args.force_months)
-    if s_months is None:
+    s_skip = estimator_skip(s, args.force_months, always_copy=args.always_copy)
+    if s_skip == "no_workload":
+        estimators["security"] = {"kind": "security", "status": "skipped — no security workload detected (use --always-copy to force)"}
+        lines.append("Security → skipped (no workload)")
+    elif s_skip == "retention":
         estimators["security"] = {"kind": "security", "status": "skipped — retention was not measured"}
         lines.append("Security → skipped (retention was not measured)")
-    elif s.get("has_workload") or args.always_copy:
+    else:
+        s_months = _months_for_sheet(s, args.force_months)
         copied, reused = copy_template(drive, args.security_id, title_s, folder["id"], reuse=not args.fresh)
         opts = region_options(sheets, copied["id"])
         reg, how = match_region(provider, region, opts)
@@ -815,15 +871,12 @@ def main() -> None:
         entry = {"kind": "security", "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.security_id, "reused_existing_copy": reused, "tab": SEC_TAB, "cells": cells, "cells_written": n, "region_match": f"{reg} ({how})", "readback": rb, "status": "filled"}
         if not args.skip_xlsx:
             try:
-                x = export_xlsx(drive, copied["id"], local_dir / f"{title_s}.xlsx")
+                x = export_xlsx(drive, copied["id"], estimate_dir / f"{title_s}.xlsx")
                 entry["local_xlsx"] = str(x)
             except Exception as ex:  # noqa: BLE001
                 entry["local_xlsx_error"] = str(ex)
         estimators["security"] = entry
         lines.append(f"Security → {copied['url']}  ({n} cells; Y1 {rb.get('annual_year1')}; region {reg} [{how}])")
-    else:
-        estimators["security"] = {"kind": "security", "status": "skipped — no security workload detected (use --always-copy to force)"}
-        lines.append("Security → skipped (no workload)")
 
     # ---------------- Search (es3-estimator notebook library)
     se = con["search"]
@@ -850,7 +903,7 @@ def main() -> None:
         published = {}
         if result.get("report_csv"):
             try:
-                published = write_search_sheet(drive, local_dir, folder["id"], title_se, result)
+                published = write_search_sheet(drive, estimate_dir, folder["id"], title_se, result)
             except Exception as ex:  # noqa: BLE001
                 published = {"error": str(ex)}
         entry = {
@@ -881,7 +934,7 @@ def main() -> None:
     fresh_projects = size_regional_projects(
         acc, sheets, drive, folder, o11y_id=args.o11y_id, security_id=args.security_id,
         support=support, provider=provider, skip_xlsx=args.skip_xlsx, fresh=args.fresh,
-        local_dir=local_dir, customer=meta["customer"], when=meta["date"], name_suffix=suffix,
+        local_dir=estimate_dir, customer=meta["customer"], when=meta["date"], name_suffix=suffix,
         only=project_only, force_months=args.force_months,
     )
     if args.skip_search:
@@ -891,6 +944,8 @@ def main() -> None:
         estimators["projects"] = fresh_projects
 
     sz["folder"] = str(local_dir)
+    sz["estimate_folder"] = str(estimate_dir)
+    sz["drive_root"] = root
     sz["drive_folder"] = folder
     sz["estimators"] = estimators
     sz["sized_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")

@@ -223,13 +223,70 @@ def _omit_unquoted(blk: dict, notes: list[str], solution: str) -> None:
     notes.append(f"{solution.title()} has stored GB but no estimator read-back, so it is left out of the serverless total.")
 
 
-def _search_power(sz: dict, by_solution: dict) -> dict | None:
-    """es3 profiles already priced. They are not added to D32 or E74."""
+def _query_workload(sz: dict, acc: dict) -> dict:
+    return ((sz.get("consolidated") or {}).get("search") or {}).get("workload") or acc.get("workload") or {}
+
+
+def _has_query_rate(workload: dict) -> bool:
+    try:
+        return float((((workload.get("search") or {}).get("peak") or {}).get("qps")) or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _sized_store_gb(sz: dict, acc: dict) -> float:
+    """Primary store on the cover. Searchable snapshots are already out of this figure."""
+    diag = (sz.get("diagnostics") or {}).get("store_gb")
+    if diag:
+        return float(diag)
+    stored = float((acc.get("storage") or {}).get("data_stored_gb") or 0)
+    if stored:
+        return stored
+    con = sz.get("consolidated") or {}
+    return sum(float((con.get(sol) or {}).get("stored_gb") or 0) for sol in ("observability", "security", "search"))
+
+
+def _search_power(sz: dict, by_solution: dict, acc: dict | None = None) -> dict | None:
+    """es3 profiles for the search-power page. They are not added to D32 or E74.
+
+    A quoted Search slice uses its estimator profiles. When Search has no local
+    store, the page still prices the sized stored GB and the measured query rate.
+    """
+    acc = acc or {}
     regional = (by_solution.get("search") or {}).get("regional_profiles") or []
-    profiles = regional or (((sz.get("estimators") or {}).get("search") or {}).get("profiles") or [])
+    est = (sz.get("estimators") or {}).get("search") or {}
+    profiles = regional or (est.get("profiles") or [])
+    if profiles:
+        out = {"profiles": profiles}
+        if est.get("region_match") and not regional:
+            out["region_match"] = est["region_match"]
+        return out
+    stored = _sized_store_gb(sz, acc)
+    workload = _query_workload(sz, acc)
+    if stored <= 0 or not _has_query_rate(workload):
+        return None
+    cached = sz.get("search_power") or {}
+    cached_gb = (cached.get("inputs") or {}).get("stored_gb")
+    if cached.get("profiles") and cached_gb is not None and abs(float(cached_gb) - stored) < 0.05:
+        return {"profiles": cached["profiles"], "region_match": cached.get("region_match")}
+    cloud = (acc.get("cloud") or {}).get("summary") or {}
+    result = _es3_region({
+        "stored_gb": stored,
+        "org_stored_gb": stored,
+        "provider": sz.get("provider") or cloud.get("provider"),
+        "region": sz.get("region") or cloud.get("region"),
+        "support_tier": sz.get("support_tier") or "Premium",
+        "workload": workload,
+    }) or {}
+    profiles = result.get("profiles") or []
     if not profiles:
         return None
-    return {"profiles": profiles}
+    sz["search_power"] = {
+        "profiles": profiles,
+        "region_match": result.get("region_match"),
+        "inputs": {"stored_gb": round(stored, 2)},
+    }
+    return {"profiles": profiles, "region_match": result.get("region_match")}
 
 
 def _deployment_bars(sz: dict, by_solution: dict, notes: list[str]) -> list:
@@ -1046,7 +1103,7 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         "ladder": [] if quoted else (_ladder_walk(metered) if metered else []),
         "metered_rates": observability_metered_rates(((acc.get("solutions") or {}).get("by_deployment") or [])) if (sz.get("ingest_source") == "diagnostics") else [],
         "deployment_plan": _deployment_bars(sz, by_solution, notes),
-        "search_power": _search_power(sz, by_solution),
+        "search_power": _search_power(sz, by_solution, acc),
         "fragmentation": fragmentation,
         "architecture": architecture,
         "by_deployment": per[:TOP_N],

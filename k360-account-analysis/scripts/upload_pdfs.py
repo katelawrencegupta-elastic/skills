@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Upload the canvas PDF exports to the customer's Drive folder (Sheets venv).
+"""Upload the canvas PDF exports into the customer's Drive folder (Sheets venv).
 
-Only runs when sizing created a Drive folder (`sizing.drive_folder`); same-named files
-in the folder are updated in place. Writes `exports.<kind>.drive_url` back to account.json.
+Consolidation PDFs at measured retention go in `full_retention`. 30-day PDFs go in `30d`.
+The account PDF stays in the customer root. Same-named files are updated in place.
+Writes `exports.<kind>.drive_url` back to account.json.
 
   ~/.config/cloud-tracker-sheets/venv/bin/python upload_pdfs.py --account-json <key>_account.json
 """
@@ -12,7 +13,8 @@ import argparse
 import json
 from pathlib import Path
 
-from size_serverless import find_in_folder, services
+from render_pdf import pdf_folder_name
+from size_serverless import ensure_drive_folder, find_in_folder, services
 
 PDF_MIME = "application/pdf"
 
@@ -35,15 +37,29 @@ def main() -> None:
     args = ap.parse_args()
     src = Path(args.account_json)
     acc = json.loads(src.read_text())
-    folder = (acc.get("sizing") or {}).get("drive_folder") or {}
+    sizing = acc.get("sizing") or {}
+    rounded = sizing.get("drive_folder") or {}
+    day30 = sizing.get("drive_folder_30d") or {}
+    compressed = sizing.get("drive_folder_compressioncalc") or {}
+    compressed_30 = sizing.get("drive_folder_compressioncalc_30d") or {}
+    root = sizing.get("drive_root") or rounded
     exports = acc.get("exports") or {}
-    if not folder.get("id"):
+    if not any(folder.get("id") for folder in (rounded, day30, root, compressed, compressed_30)):
         print("no Drive folder (sizing not triggered) — PDFs kept local only")
         return
     _, drive = services()
+
+    def parent_for(kind: str) -> dict:
+        base = root if root.get("id") else (rounded or day30 or compressed or compressed_30)
+        name = pdf_folder_name(kind)
+        if not name or not base.get("id"):
+            return base
+        return ensure_drive_folder(drive, name, base["id"])
+
     for kind, e in exports.items():
         pdf = Path(e.get("pdf") or "")
-        if not pdf.is_file():
+        folder = parent_for(kind)
+        if not pdf.is_file() or not folder.get("id"):
             continue
         up = upload_pdf(drive, pdf, folder["id"], pdf.name)
         e["drive_url"] = up["url"]

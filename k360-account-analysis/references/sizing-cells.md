@@ -4,7 +4,9 @@ Trigger: `platform.ech_share_pct > 50` (ECU-weighted, ECH vs serverless projects
 
 ## Folder + naming
 - Local: `artifacts/<customer_slug>_<YYYY-MM-DD>/` · Drive: folder with the **same name** in My Drive (found-or-created).
-- Copies: `<customer>_<date>_Observability_Serverless_estimate`, `<customer>_<date>_Security_Serverless_estimate`, and `<customer>_<date>_Search_Serverless_estimate` (the es3-estimator CSV report, uploaded as a Google Sheet).
+- Estimate sheets live in `generated_estimates`, under the customer folder on Drive and under the artifact folder locally. Deployment-plan sheets live in `generated_estimates/plan_sheets`. Measured-retention PDFs go in `full_retention` and 30-day PDFs go in `30d`, on Drive and under the artifact folder. The account PDF stays in the customer folder. Sheet titles keep the scenario suffix (`_30d`, `_compressioncalc_accounted_for`, `_compressioncalc_accounted_for_30d`).
+- Consolidation PDFs and the account PDF are uploaded to the customer folder.
+- Copies: `<customer>_<date>_Observability_Serverless_estimate`, `<customer>_<date>_Security_Serverless_estimate`, and `<customer>_<date>_Search_Serverless_estimate` (the es3-estimator CSV report, uploaded as a Google Sheet). The 30-day titles keep the `_30d` suffix.
 - Same-named copies in the folder are **reused** on re-runs (cells rewritten); `--fresh` forces new copies. Golden templates are never written to.
 
 ## Golden templates (fixed — always copy these, never edit in place)

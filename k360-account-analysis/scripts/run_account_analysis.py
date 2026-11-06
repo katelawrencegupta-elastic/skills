@@ -195,6 +195,9 @@ def agent_brief(acc: dict) -> dict:
         "links": {
             "folder": sz.get("folder"),
             "drive": (sz.get("drive_folder") or {}).get("url"),
+            "drive_30d": (sz.get("drive_folder_30d") or {}).get("url"),
+            "drive_compressioncalc": (sz.get("drive_folder_compressioncalc") or {}).get("url"),
+            "drive_compressioncalc_30d": (sz.get("drive_folder_compressioncalc_30d") or {}).get("url"),
             "estimators": {k: v.get("url") for k, v in estimators.items() if v.get("url")},
             "pdfs": {k: {"pdf": v.get("pdf"), "drive_url": v.get("drive_url")} for k, v in exports.items() if isinstance(v, dict)},
         },
@@ -205,6 +208,7 @@ def agent_brief(acc: dict) -> dict:
         "k360_ingest": _k360_brief(acc),
         "k360_canvas_file": f"{slug}-serverless-consolidation-from-k360.canvas.tsx" if acc.get("k360_ingest") else None,
         "diagnostics_coverage": sz.get("diagnostics") if (cons.get("source") == "diagnostics" or sz.get("ingest_source") == "diagnostics") else None,
+        "compressioncalc_accounted_for": acc.get("compressioncalc_accounted_for"),
     }
 
 
@@ -234,6 +238,175 @@ def _money_note(diag_mo, k360_mo) -> str:
         f"The K360 backup, stored GB ÷ assumed retention, prices it at ${float(k360_mo):,.0f}/mo. "
         "K360 does not provide a raw ingest total, so those two figures are not interchangeable."
     )
+
+
+def _compression_totals(acc: dict) -> tuple[float, float | None, float]:
+    """Observability plus Security: raw bulk, on-disk ÷ bulk ratio, accounted GB/day.
+
+    The ratio stays at or below 1. Combining two solutions weights each solution's
+    ratio by its bulk.
+    """
+    from admin_diags import compression_share_from_ratios
+
+    con = (acc.get("sizing") or {}).get("consolidated") or {}
+    bulk = 0.0
+    accounted = 0.0
+    bulks: list[float] = []
+    ratios: list[float | None] = []
+    for sol in ("observability", "security"):
+        blk = con.get(sol) or {}
+        solution_bulk = float(blk.get("bulk_gb_day") or 0)
+        bulk += solution_bulk
+        accounted += float(blk.get("compressioncalc_accounted_for") or 0)
+        bulks.append(solution_bulk)
+        ratios.append(blk.get("compression_ratio"))
+    share = compression_share_from_ratios(bulks, ratios)
+    return round(bulk, 3), None if share is None else round(share, 3), round(accounted, 3)
+
+
+def _stamp_compression(acc: dict, *, scenario: str) -> tuple[float, float | None, float]:
+    from diag_account import COMPRESSIONCALC
+
+    bulk, ratio, accounted = _compression_totals(acc)
+    cons = acc.setdefault("consolidation", {})
+    cons["ingest_basis"] = COMPRESSIONCALC
+    cons["bulk_gb_day"] = bulk
+    cons["compression_ratio"] = ratio
+    cons[COMPRESSIONCALC] = accounted
+    cons["retention_scenario"] = scenario
+    return bulk, ratio, accounted
+
+
+def _run_compressioncalc(diag: dict, diag_path: Path, infra: dict, py: Path, args, *, size_sheets: bool) -> None:
+    """Price Observability and Security on compressioncalc_accounted_for. The bulk quote stays put."""
+    from diag_account import COMPRESSIONCALC, compressioncalc_account
+
+    comp = compressioncalc_account(diag)
+    bulk, ratio, accounted = _compression_totals(comp)
+    path = diag_path.with_name(diag_path.stem + "_compressioncalc_accounted_for.json")
+    path.write_text(json.dumps(comp, indent=2))
+    block = {
+        "bulk_gb_day": bulk,
+        "compression_ratio": ratio,
+        "gb_day": accounted,
+        "account": str(path),
+        "formula": (
+            "compressioncalc_accounted_for = bulk GB/day × compression ratio. "
+            "The compression ratio is on-disk ÷ bulk and is never above 1. "
+            "When the ratio of sums is above 1, the median of the per-index ratios is used."
+        ),
+    }
+    diag[COMPRESSIONCALC] = block
+    if accounted == 0 or not size_sheets or not py.is_file():
+        if accounted == 0:
+            block["status"] = "not priced — compressioncalc_accounted_for is 0"
+        elif not py.is_file():
+            block["status"] = "measured only — Sheets venv missing"
+        else:
+            block["status"] = "measured only — the bulk quote did not finish"
+        return
+    flags: list[str] = []
+    if args.skip_xlsx:
+        flags.append("--skip-xlsx")
+    if args.always_copy:
+        flags.append("--always-copy")
+    try:
+        _run([
+            str(py), str(HERE / "size_serverless.py"),
+            "--account-json", str(path),
+            "--name-suffix", COMPRESSIONCALC,
+            "--sizing-json", "sizing_compressioncalc_accounted_for.json",
+            "--skip-search",
+            *flags,
+        ])
+        comp = json.loads(path.read_text())
+        comp["consolidation"] = build_consolidation(comp, infra)
+        _stamp_compression(comp, scenario="rounded")
+        path.write_text(json.dumps(comp, indent=2))
+        if (comp.get("consolidation") or {}).get("architecture", {}).get("per_region") and not (comp.get("consolidation") or {}).get("error"):
+            try:
+                _run([
+                    str(py), str(HERE / "size_serverless.py"),
+                    "--account-json", str(path),
+                    "--projects",
+                    "--name-suffix", COMPRESSIONCALC,
+                    "--sizing-json", "sizing_compressioncalc_accounted_for.json",
+                    "--skip-search",
+                    *flags,
+                ])
+                comp = json.loads(path.read_text())
+                comp["consolidation"] = build_consolidation(comp, infra)
+                _stamp_compression(comp, scenario="rounded")
+                path.write_text(json.dumps(comp, indent=2))
+            except subprocess.CalledProcessError as e:
+                print(f"WARN: compressioncalc_accounted_for regional sizing failed ({e})", file=sys.stderr)
+                block["regional_status"] = f"consolidated read-back kept ({e})"
+    except subprocess.CalledProcessError as e:
+        print(f"WARN: compressioncalc_accounted_for sizing failed ({e})", file=sys.stderr)
+        block["status"] = f"not priced ({e})"
+        diag.setdefault("consolidation", {}).setdefault("notes", []).append(
+            f"compressioncalc_accounted_for was not priced ({e})."
+        )
+        return
+    except Exception as ex:
+        print(f"WARN: compressioncalc_accounted_for quote failed ({ex!r})", file=sys.stderr)
+        block["status"] = f"not priced ({ex!r})"
+        diag.setdefault("consolidation", {}).setdefault("notes", []).append(
+            f"compressioncalc_accounted_for was not priced ({ex!r})."
+        )
+        return
+    if (comp.get("consolidation") or {}).get("error"):
+        block["status"] = "not priced — consolidation failed"
+        return
+    path_30 = diag_path.with_name(diag_path.stem + "_compressioncalc_accounted_for_30d.json")
+    try:
+        comp_30 = copy.deepcopy(comp)
+        for sol in ("observability", "security"):
+            blk = ((comp_30.get("sizing") or {}).get("consolidated") or {}).get(sol) or {}
+            if blk.get("retention_months") is not None:
+                blk["retention_months"] = 1
+        (comp_30.get("sizing") or {}).pop("deployment_plan", None)
+        path_30.write_text(json.dumps(comp_30, indent=2))
+        _run([
+            str(py), str(HERE / "size_serverless.py"),
+            "--account-json", str(path_30),
+            "--name-suffix", f"{COMPRESSIONCALC}_30d",
+            "--sizing-json", "sizing_compressioncalc_accounted_for_30d.json",
+            "--force-months", "1",
+            "--skip-search",
+            *flags,
+        ])
+        comp_30 = json.loads(path_30.read_text())
+        comp_30["consolidation"] = build_consolidation(comp_30, infra)
+        _stamp_compression(comp_30, scenario="30d")
+        comp_30["consolidation"]["retention_set_days"] = 30
+        path_30.write_text(json.dumps(comp_30, indent=2))
+        monthly_30 = ((comp_30.get("consolidation") or {}).get("savings") or {}).get("serverless_mo")
+        comp["consolidation"]["thirty_day"] = {
+            "monthly": monthly_30,
+            "annual_year1": None if monthly_30 is None else round(float(monthly_30) * 12, 2),
+        }
+        path.write_text(json.dumps(comp, indent=2))
+        block["thirty_day_monthly"] = monthly_30
+        block["thirty_day_account"] = str(path_30)
+        diag["compressioncalc_thirty_day_account"] = str(path_30)
+        folder_30 = (comp_30.get("sizing") or {}).get("drive_folder") or {}
+        if folder_30.get("id"):
+            diag.setdefault("sizing", {})["drive_folder_compressioncalc_30d"] = folder_30
+    except subprocess.CalledProcessError as e:
+        print(f"WARN: compressioncalc_accounted_for 30-day sizing failed ({e})", file=sys.stderr)
+        block["thirty_day_status"] = f"not priced ({e})"
+    except Exception as ex:
+        print(f"WARN: compressioncalc_accounted_for 30-day quote failed ({ex!r})", file=sys.stderr)
+        block["thirty_day_status"] = f"not priced ({ex!r})"
+    monthly = ((comp.get("consolidation") or {}).get("savings") or {}).get("serverless_mo")
+    block["monthly"] = monthly
+    block["quotes"] = ((comp.get("consolidation") or {}).get("reconciliation") or {}).get("quotes") or []
+    block["account"] = str(path)
+    diag["compressioncalc_account"] = str(path)
+    folder = (comp.get("sizing") or {}).get("drive_folder") or {}
+    if folder.get("id"):
+        diag.setdefault("sizing", {})["drive_folder_compressioncalc"] = folder
 
 
 def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args) -> dict | None:
@@ -394,6 +567,9 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
                     "annual_year1": None if monthly is None else round(float(monthly) * 12, 2),
                 }
                 diag["thirty_day_account"] = str(path_30)
+                folder_30 = ((diag_30.get("sizing") or {}).get("drive_folder") or {})
+                if folder_30.get("id"):
+                    diag.setdefault("sizing", {})["drive_folder_30d"] = folder_30
             except subprocess.CalledProcessError as e:
                 print(f"WARN: 30-day sizing failed ({e})", file=sys.stderr)
                 diag.setdefault("consolidation", {}).setdefault("notes", []).append(f"The 30-day PDF was not priced ({e}).")
@@ -401,6 +577,17 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
                 print(f"WARN: 30-day quote failed ({ex!r})", file=sys.stderr)
                 diag.setdefault("consolidation", {}).setdefault("notes", []).append(f"The 30-day PDF was not priced ({ex!r}).")
         diag_path.write_text(json.dumps(diag, indent=2))
+    try:
+        _run_compressioncalc(
+            diag, diag_path, infra, py, args,
+            size_sheets=sizing_ran and not (diag.get("consolidation") or {}).get("error"),
+        )
+    except Exception as ex:
+        print(f"WARN: compressioncalc_accounted_for failed ({ex!r})", file=sys.stderr)
+        diag.setdefault("consolidation", {}).setdefault("notes", []).append(
+            f"compressioncalc_accounted_for was not priced ({ex!r})."
+        )
+    diag_path.write_text(json.dumps(diag, indent=2))
     sz["diagnostics_status"] = "ok"
     sz["diagnostics_dir"] = str(out_dir)
     return diag
@@ -562,11 +749,20 @@ def main() -> None:
     if diag_acc is not None and not (diag_acc.get("consolidation") or {}).get("error"):
         dsz = diag_acc.get("sizing") or {}
         sz = acc.setdefault("sizing", {})
-        for key in ("estimators", "consolidated", "notes", "diagnostics", "drive_folder", "sized_at"):
+        for key in (
+            "estimators", "consolidated", "notes", "diagnostics", "drive_folder", "drive_root",
+            "drive_folder_30d", "drive_folder_compressioncalc", "drive_folder_compressioncalc_30d", "sized_at",
+        ):
             if dsz.get(key) not in (None, {}, []):
                 sz[key] = dsz[key]
         sz["ingest_source"] = "diagnostics"
         acc["consolidation"] = diag_acc.get("consolidation")
+        if diag_acc.get("compressioncalc_accounted_for"):
+            acc["compressioncalc_accounted_for"] = diag_acc["compressioncalc_accounted_for"]
+        if diag_acc.get("compressioncalc_account"):
+            acc["compressioncalc_account"] = diag_acc["compressioncalc_account"]
+        if diag_acc.get("compressioncalc_thirty_day_account"):
+            acc["compressioncalc_thirty_day_account"] = diag_acc["compressioncalc_thirty_day_account"]
         cost = (diag_acc.get("analysis") or {}).get("cost")
         if cost:
             acc.setdefault("analysis", {})["cost"] = cost
@@ -588,8 +784,26 @@ def main() -> None:
                     if not (diag_30.get("consolidation") or {}).get("error"):
                         acc["exports"].update(export_pdfs(
                             diag_30, folder, only="consolidation",
-                            consolidation_suffix="Serverless_consolidation_30d",
+                            consolidation_suffix="Serverless_consolidation_30d_savings",
                             consolidation_kind="consolidation_30d",
+                        ))
+                comp_path = diag_acc.get("compressioncalc_account")
+                if comp_path and Path(comp_path).is_file():
+                    comp = json.loads(Path(comp_path).read_text())
+                    if not (comp.get("consolidation") or {}).get("error"):
+                        acc["exports"].update(export_pdfs(
+                            comp, folder, only="consolidation",
+                            consolidation_suffix="Serverless_consolidate_meta_overhead_removed",
+                            consolidation_kind="consolidation_compressioncalc",
+                        ))
+                comp_30_path = diag_acc.get("compressioncalc_thirty_day_account")
+                if comp_30_path and Path(comp_30_path).is_file():
+                    comp_30 = json.loads(Path(comp_30_path).read_text())
+                    if not (comp_30.get("consolidation") or {}).get("error"):
+                        acc["exports"].update(export_pdfs(
+                            comp_30, folder, only="consolidation",
+                            consolidation_suffix="Serverless_consolidate_meta_overhead_removed_30d",
+                            consolidation_kind="consolidation_compressioncalc_30d",
                         ))
             else:
                 acc["exports"] = export_pdfs(acc, folder)

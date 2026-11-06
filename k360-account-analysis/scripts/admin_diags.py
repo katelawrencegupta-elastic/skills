@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import statistics
 import time
 import urllib.error
 import urllib.request
@@ -287,6 +288,51 @@ def _est_bytes_per_day(bulk_bytes: int, creation: int | None, lifecycle: int | N
     return int(int(bulk_bytes) * (86400.0 / seconds))
 
 
+def compression_share(bulks: list[float], indexes: list[float]) -> float | None:
+    """On-disk ÷ bulk. The ratio stays at or below 1.
+
+    Each write index with both rates contributes min(1, index ÷ bulk). The total is
+    Σ index ÷ Σ bulk, including bulk whose on-disk rate is 0. When that total is
+    above 1, the median of the capped per-index ratios is used instead.
+    """
+    ratios: list[float] = []
+    bulk_sum = 0.0
+    index_sum = 0.0
+    for bulk, index in zip(bulks, indexes):
+        bulk = float(bulk or 0)
+        index = float(index or 0)
+        if bulk <= 0:
+            continue
+        bulk_sum += bulk
+        index_sum += max(index, 0.0)
+        if index > 0:
+            ratios.append(min(1.0, index / bulk))
+    if bulk_sum <= 0 or not ratios:
+        return None
+    share = index_sum / bulk_sum
+    if share > 1:
+        share = float(statistics.median(ratios))
+    return min(1.0, share)
+
+
+def compression_share_from_ratios(bulks: list[float], ratios: list[float | None]) -> float | None:
+    """Bulk-weighted total of ratios that are already on-disk ÷ bulk. Never above 1."""
+    capped: list[float] = []
+    weights: list[float] = []
+    for bulk, ratio in zip(bulks, ratios):
+        bulk = float(bulk or 0)
+        if bulk <= 0 or ratio is None:
+            continue
+        capped.append(min(1.0, float(ratio)))
+        weights.append(bulk)
+    if not weights:
+        return None
+    share = sum(weight * ratio for weight, ratio in zip(weights, capped)) / sum(weights)
+    if share > 1:
+        share = float(statistics.median(capped))
+    return min(1.0, share)
+
+
 def _write_indices(streams: list, alias: dict) -> set[str]:
     """Data-stream write index (last generation) plus any alias marked is_write_index."""
     write: set[str] = set()
@@ -327,18 +373,29 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         if ts > collection:
             collection = ts
     est_bytes = 0
+    bulk_parts: list[float] = []
+    index_parts: list[float] = []
     for name in _write_indices(streams, alias):
         body = stats.get(name) or {}
-        bulk_bytes = (((body.get("primaries") or {}).get("bulk") or {}).get("total_size_in_bytes") or 0)
+        primaries = body.get("primaries") or {}
+        bulk_bytes = ((primaries.get("bulk") or {}).get("total_size_in_bytes") or 0)
+        # On-disk rate uses the same write phase as the bulk rate.
+        store_bytes = ((primaries.get("store") or {}).get("size_in_bytes") or 0)
         info = explain.get(name) or {}
-        est_bytes += _est_bytes_per_day(
-            int(bulk_bytes),
-            info.get("index_creation_date_millis"),
-            info.get("lifecycle_date_millis"),
-            info.get("action"),
-            collection,
-        )
+        created_ms = info.get("index_creation_date_millis")
+        lifecycle_ms = info.get("lifecycle_date_millis")
+        action = info.get("action")
+        bulk_daily = _est_bytes_per_day(int(bulk_bytes), created_ms, lifecycle_ms, action, collection)
+        index_daily = _est_bytes_per_day(int(store_bytes), created_ms, lifecycle_ms, action, collection)
+        est_bytes += bulk_daily
+        bulk_parts.append(bulk_daily)
+        index_parts.append(index_daily)
     gb_day = est_bytes / 1e9
+    # compression_ratio is on-disk ÷ bulk and is never above 1. When the ratio of
+    # sums exceeds 1, compression_share substitutes the median of the capped ratios.
+    # compressioncalc_accounted_for = bulk GB/day × compression_ratio.
+    compression_ratio = compression_share(bulk_parts, index_parts)
+    accounted_gb = 0.0 if compression_ratio is None else gb_day * compression_ratio
 
     delete_age: dict[str, float] = {}
     for name, pol in (policies.items() if isinstance(policies, dict) else []):
@@ -415,6 +472,8 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
     return {
         "cluster": health.get("cluster_name"),
         "bulk_gb_day": round(gb_day, 3),
+        "compression_ratio": None if compression_ratio is None else round(compression_ratio, 3),
+        "compressioncalc_accounted_for": round(accounted_gb, 3),
         "uptime_days_min": round(min(hot_up), 1) if hot_up else None,
         "retention_days": round(days, 3) if days else None,
         "retention_basis": basis,
