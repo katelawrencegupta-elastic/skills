@@ -28,7 +28,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ORG_SKILL = Path(os.environ.get("K360_ORG_SKILL_DIR") or Path.home() / ".cursor/skills/k360-org-report")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(ORG_SKILL / "scripts"))
+from quote_checks import addon_off_value, g26_gate, money as sheet_money  # noqa: E402
 try:
     from sheets_auth import get_creds  # noqa: E402
 except ImportError as e:  # pragma: no cover
@@ -182,9 +184,74 @@ def push_cells(sheets, sid: str, tab: str, cells: dict) -> int:
 
 def read_cells(sheets, sid: str, tab: str, cells: dict[str, str]) -> dict:
     ranges = [f"'{tab}'!{a1}" for a1 in cells.values()]
-    res = sheets.spreadsheets().values().batchGet(spreadsheetId=sid, ranges=ranges).execute()
+    res = sheets.spreadsheets().values().batchGet(
+        spreadsheetId=sid, ranges=ranges, valueRenderOption="UNFORMATTED_VALUE",
+    ).execute()
     vals = [((vr.get("values") or [[None]])[0] or [None])[0] for vr in res.get("valueRanges", [])]
     return dict(zip(cells.keys(), vals))
+
+
+SEC_ADDON_CELLS = [
+    "G11", "G12", "G14", "G15", "G16", "G17", "G18", "G20",
+    "G23", "G24", "G25", "G27", "G28", "G29", "G30", "G31", "G32", "G33", "G34",
+]
+
+
+def clear_security_addons(sheets, sid: str, tab: str) -> dict:
+    """Turn template add-ons off on a copy. The golden template is not written."""
+    try:
+        meta = sheets.spreadsheets().get(
+            spreadsheetId=sid,
+            ranges=[f"'{tab}'!G11:G34"],
+            fields="sheets(data(startRow,rowData(values(formattedValue,dataValidation))))",
+        ).execute()
+    except Exception as ex:  # noqa: BLE001
+        return {"error": str(ex)}
+    blocks = ((meta.get("sheets") or [{}])[0].get("data") or [])
+    if not blocks:
+        return {}
+    block = blocks[0]
+    start = int(block.get("startRow") or 10)
+    cells = {}
+    for offset, row in enumerate(block.get("rowData") or []):
+        cell_name = f"G{start + offset + 1}"
+        if cell_name not in SEC_ADDON_CELLS:
+            continue
+        values = (row or {}).get("values") or [{}]
+        cell = values[0] or {}
+        off = addon_off_value(cell.get("dataValidation"), cell.get("formattedValue"))
+        if off is not None:
+            cells[cell_name] = off
+    if cells:
+        push_cells(sheets, sid, tab, cells)
+    return cells
+
+
+def observability_input_cells(acc: dict, support: str, region, retention: int, daily: float, logs=None, metrics=None) -> dict:
+    return {
+        "G4": (acc.get("sizing") or {}).get("feature_tier") or "Complete",
+        "G5": support,
+        "G8": region,
+        "G11": retention,
+        "G14": "No",
+        "G18": 0,
+        "G21": round(float(daily) * 0.90, 2) if logs is None else logs,
+        "G22": "0%",
+        "G23": round(float(daily) * 0.10, 2) if metrics is None else metrics,
+        "G24": 0,
+        "G25": "100%",
+    }
+
+
+def security_input_cells(acc: dict, support: str, region, retention: int, daily: float) -> dict:
+    return {
+        "G4": round(float(daily), 2),
+        "G6": retention,
+        "G7": region,
+        "G8": (acc.get("sizing") or {}).get("feature_tier") or "Complete",
+        "G9": 0,
+        "G21": support,
+    }
 
 
 def region_options(sheets, sid: str) -> list[str]:
@@ -346,14 +413,25 @@ def _suffix(raw: str | None) -> str:
     return text if text.startswith("_") else f"_{text}"
 
 
-def _sheet_retention(months) -> int:
-    """Estimator retention rows are the integers 1–36. Round up so a fractional month still matches a row."""
+def _sheet_retention(months) -> int | None:
+    """Estimator retention rows are the integers 1–36. A missing month is not invented."""
+    if months is None or months == "":
+        return None
     try:
         value = float(months)
     except (TypeError, ValueError):
-        value = 3.0
+        return None
     value = min(36.0, max(1.0, value))
     return int(min(36, max(1, math.ceil(value - 1e-9))))
+
+
+def _months_for_sheet(block: dict, force: int | None) -> int | None:
+    measured = _sheet_retention((block or {}).get("retention_months"))
+    if measured is None:
+        return None
+    if force is not None:
+        return int(min(36, max(1, force)))
+    return measured
 
 
 def _fill_missing_doc_bytes(acc_path: Path, acc: dict) -> None:
@@ -384,7 +462,7 @@ def _scale_qps(workload: dict, share: float) -> dict:
     return wl
 
 
-def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: str, security_id: str, support: str, provider, skip_xlsx: bool, fresh: bool, local_dir: Path, customer: str, when: str, only: set[str] | None = None, name_suffix: str = "") -> list[dict]:
+def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: str, security_id: str, support: str, provider, skip_xlsx: bool, fresh: bool, local_dir: Path, customer: str, when: str, only: set[str] | None = None, name_suffix: str = "", force_months: int | None = None) -> list[dict]:
     """One estimator copy per serverless project when a solution spans regions."""
     groups = ((acc.get("consolidation") or {}).get("architecture") or {}).get("groups") or []
     by_sol: dict[str, list] = {}
@@ -410,11 +488,14 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
                 continue
             region = g["region"]
             title = f"{key}_{sol.title()}_Serverless_{region}{name_suffix}"
-            retention = g.get("retention_months") or (con.get(sol) or {}).get("retention_months") or 3
+            source_months = g.get("retention_months") if g.get("retention_months") is not None else (con.get(sol) or {}).get("retention_months")
+            retention = _months_for_sheet({"retention_months": source_months}, force_months)
+            if sol != "search" and retention is None:
+                continue
             if g.get("daily_raw_gb") is not None:
                 daily = float(g["daily_raw_gb"])
             else:
-                daily = gb / (float(retention) * DAYS_PER_MONTH) if retention else 0.0
+                daily = gb / (float(retention or 3) * DAYS_PER_MONTH) if (retention or 3) else 0.0
             if sol == "search":
                 share = gb / total_gb if total_gb else 0.0
                 result = run_es3({
@@ -453,29 +534,12 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
             copied, reused = copy_template(drive, template, title, folder["id"], reuse=not fresh)
             opts = region_options(sheets, copied["id"])
             reg, how = match_region(provider, region, opts)
+            if sol == "security":
+                clear_security_addons(sheets, copied["id"], tab)
             if sol == "observability":
-                cells = {
-                    "G4": (acc.get("sizing") or {}).get("feature_tier") or "Complete",
-                    "G5": support,
-                    "G8": reg,
-                    "G11": _sheet_retention(retention),
-                    "G14": "No",
-                    "G18": 0,
-                    "G21": round(daily * 0.90, 2),
-                    "G22": "0%",
-                    "G23": round(daily * 0.10, 2),
-                    "G24": 0,
-                    "G25": "100%",
-                }
+                cells = observability_input_cells(acc, support, reg, int(retention), daily)
             else:
-                cells = {
-                    "G4": round(daily, 2),
-                    "G6": _sheet_retention(retention),
-                    "G7": reg,
-                    "G8": (acc.get("sizing") or {}).get("feature_tier") or "Complete",
-                    "G9": 0,
-                    "G21": support,
-                }
+                cells = security_input_cells(acc, support, reg, int(retention), daily)
             n = push_cells(sheets, copied["id"], tab, cells)
             rb = read_cells(sheets, copied["id"], tab, readback)
             entry = {
@@ -484,6 +548,10 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
                 "cells": cells, "cells_written": n, "region_match": f"{reg} ({how})",
                 "readback": rb, "status": "filled", "daily_raw_gb": round(daily, 2),
             }
+            if sol == "observability":
+                entry["g26_gate"] = g26_gate(daily, rb.get("total_raw_gb_day"))
+                if not entry["g26_gate"]["accepted"]:
+                    entry["readback_rejected"] = "G26 differs from the written bulk by more than 0.51 GB/day"
             if not skip_xlsx:
                 try:
                     entry["local_xlsx"] = str(export_xlsx(drive, copied["id"], local_dir / f"{title}.xlsx"))
@@ -491,6 +559,90 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
                     entry["local_xlsx_error"] = str(ex)
             projects.append(entry)
     return projects
+
+
+def _diag_inputs():
+    root = Path(__file__).resolve().parents[2] / "diag-serverless-consolidation" / "scripts"
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    import diag_inputs
+    return diag_inputs
+
+
+def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str, support: str, provider, force_months: int | None, name_suffix: str, fresh: bool) -> dict:
+    """Price the five Observability deployment-count bars. 100% reuses the headline sheet."""
+    diag = _diag_inputs()
+    rows = []
+    for dep in (acc.get("solutions") or {}).get("by_deployment") or []:
+        if dep.get("platform") == "serverless" or dep.get("ingest_source") == "inactive":
+            continue
+        if (dep.get("solution") or "search") != "observability":
+            continue
+        rows.append({
+            "name": dep.get("name") or "",
+            "bulk_gb_day": dep.get("daily_raw_gb") or 0,
+            "store_gb": dep.get("gb") or 0,
+            "retention_days": dep.get("retention_days"),
+        })
+    if not rows:
+        return {"bars": [], "error": "Observability deployment-count plan was not priced: no active observability deployments."}
+    key = acc["meta"]["run_key"]
+    region_name = (acc.get("sizing") or {}).get("region")
+    bars = []
+    try:
+        for plan in diag.deployment_count_plans(rows):
+            pct = plan["cut_pct"]
+            if pct == 100:
+                bars.append({"cut_pct": 100, "label": "100%", "projects": 1, "monthly": None, "reused_headline": True})
+                continue
+            monthly = 0.0
+            priced = []
+            for index, group in enumerate(plan["groups"], start=1):
+                summary = diag.summarize(group, force_months)
+                bulk = float(summary.get("bulk_gb_day") or 0)
+                if bulk <= 0:
+                    priced.append({"names": summary.get("names") or [], "monthly": 0.0, "bulk_gb_day": 0})
+                    continue
+                written = force_months or summary.get("months_written")
+                if not written:
+                    return {"bars": [], "error": "Observability deployment-count plan was not priced: a project has bulk and no measured retention."}
+                title = f"{key}_Observability_plan_{pct}_{index}{name_suffix}"
+                copied, _reused = copy_template(drive, o11y_id, title, folder["id"], reuse=not fresh)
+                opts = region_options(sheets, copied["id"])
+                reg, _how = match_region(provider, region_name, opts)
+                cells = observability_input_cells(acc, support, reg, int(written), bulk)
+                push_cells(sheets, copied["id"], O11Y_TAB, cells)
+                rb = read_cells(sheets, copied["id"], O11Y_TAB, O11Y_READBACK)
+                gate = g26_gate(bulk, rb.get("total_raw_gb_day"))
+                if not gate["accepted"]:
+                    return {
+                        "bars": [],
+                        "error": (
+                            "Observability deployment-count plan was not priced: "
+                            f"{title} G26 is {gate['sheet_raw_gb_day']} GB/day against {gate['written_bulk']} written."
+                        ),
+                    }
+                price = sheet_money(rb.get("monthly_steady_state"))
+                if price is None:
+                    return {"bars": [], "error": f"Observability deployment-count plan was not priced: {title} has no D32 read-back."}
+                monthly += price
+                priced.append({
+                    "names": summary.get("names") or [],
+                    "monthly": round(price, 2),
+                    "bulk_gb_day": bulk,
+                    "months_written": int(written),
+                    "url": copied.get("url"),
+                })
+            bars.append({
+                "cut_pct": pct,
+                "label": plan["label"],
+                "projects": plan["projects"],
+                "monthly": round(monthly, 2),
+                "groups": priced,
+            })
+    except Exception as ex:  # noqa: BLE001
+        return {"bars": [], "error": f"Observability deployment-count plan was not priced: {ex}"}
+    return {"bars": bars}
 
 
 # ----------------------------------------------------------------------------- main
@@ -507,6 +659,9 @@ def main() -> None:
     ap.add_argument("--search-sheets", action="store_true", help="Republish Search estimator output as Google Sheets and leave the other copies in place")
     ap.add_argument("--name-suffix", default="", help="Appended to estimator titles so a second sizing does not overwrite the first")
     ap.add_argument("--sizing-json", default=None, help="Filename for the sizing sidecar (default sizing.json)")
+    ap.add_argument("--force-months", type=int, default=None, help="Write this whole month when a measured month already exists")
+    ap.add_argument("--skip-search", action="store_true", help="Keep the Search estimator already on the account JSON")
+    ap.add_argument("--deployment-plan", action="store_true", help="Price the Observability 0/25/50/75/100%% deployment-count bars")
     args = ap.parse_args()
 
     acc_path = Path(args.account_json)
@@ -533,6 +688,7 @@ def main() -> None:
             acc, sheets, drive, folder, o11y_id=args.o11y_id, security_id=args.security_id,
             support=support, provider=provider, skip_xlsx=args.skip_xlsx, fresh=args.fresh,
             local_dir=local_dir, customer=meta["customer"], when=meta["date"], name_suffix=suffix,
+            force_months=args.force_months,
         )
         sz.setdefault("estimators", {})["projects"] = projects
         sz["drive_folder"] = folder
@@ -592,31 +748,43 @@ def main() -> None:
         (local_dir / sizing_name).write_text(json.dumps(sz, indent=2))
         print("\n".join(lines))
         return
+    if args.deployment_plan:
+        plan = size_deployment_plan(
+            acc, sheets, drive, folder, o11y_id=args.o11y_id, support=support, provider=provider,
+            force_months=args.force_months, name_suffix=suffix, fresh=args.fresh,
+        )
+        sz["deployment_plan"] = plan
+        sz["drive_folder"] = folder
+        sz["sized_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+        acc["sizing"] = sz
+        acc_path.write_text(json.dumps(acc, indent=2))
+        (local_dir / sizing_name).write_text(json.dumps(sz, indent=2))
+        lines.append(plan.get("error") or f"Deployment plan → {len(plan.get('bars') or [])} bars")
+        print("\n".join(lines))
+        return
     estimators: dict = {}
 
     # ---------------- Observability
     o = con["observability"]
     title_o = f"{key}_Observability_Serverless_estimate{suffix}"
-    if o.get("has_workload") or args.always_copy:
+    o_months = _months_for_sheet(o, args.force_months)
+    if o_months is None:
+        estimators["observability"] = {"kind": "observability", "status": "skipped — retention was not measured"}
+        lines.append("Observability → skipped (retention was not measured)")
+    elif o.get("has_workload") or args.always_copy:
         copied, reused = copy_template(drive, args.o11y_id, title_o, folder["id"], reuse=not args.fresh)
         opts = region_options(sheets, copied["id"])
         reg, how = match_region(provider, region, opts)
-        cells = {
-            "G4": sz.get("feature_tier") or "Complete",
-            "G5": support,
-            "G8": reg,
-            "G11": _sheet_retention(o["retention_months"]),
-            "G14": "No",
-            "G18": 0,
-            "G21": o["logs_gb_day"],
-            "G22": "0%",
-            "G23": o["metrics_gb_day"],
-            "G24": 0,
-            "G25": "100%",
-        }
+        daily = float(o.get("daily_raw_gb") or 0)
+        cells = observability_input_cells(
+            acc, support, reg, o_months, daily, logs=o.get("logs_gb_day"), metrics=o.get("metrics_gb_day"),
+        )
         n = push_cells(sheets, copied["id"], O11Y_TAB, cells)
         rb = read_cells(sheets, copied["id"], O11Y_TAB, O11Y_READBACK)
         entry = {"kind": "observability", "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.o11y_id, "reused_existing_copy": reused, "tab": O11Y_TAB, "cells": cells, "cells_written": n, "region_match": f"{reg} ({how})", "readback": rb, "status": "filled"}
+        entry["g26_gate"] = g26_gate(daily, rb.get("total_raw_gb_day"))
+        if not entry["g26_gate"]["accepted"]:
+            entry["readback_rejected"] = "G26 differs from the written bulk by more than 0.51 GB/day"
         if not args.skip_xlsx:
             try:
                 x = export_xlsx(drive, copied["id"], local_dir / f"{title_o}.xlsx")
@@ -632,18 +800,16 @@ def main() -> None:
     # ---------------- Security
     s = con["security"]
     title_s = f"{key}_Security_Serverless_estimate{suffix}"
-    if s.get("has_workload") or args.always_copy:
+    s_months = _months_for_sheet(s, args.force_months)
+    if s_months is None:
+        estimators["security"] = {"kind": "security", "status": "skipped — retention was not measured"}
+        lines.append("Security → skipped (retention was not measured)")
+    elif s.get("has_workload") or args.always_copy:
         copied, reused = copy_template(drive, args.security_id, title_s, folder["id"], reuse=not args.fresh)
         opts = region_options(sheets, copied["id"])
         reg, how = match_region(provider, region, opts)
-        cells = {
-            "G4": s["siem_gb_day"],
-            "G6": _sheet_retention(s["retention_months"]),
-            "G7": reg,
-            "G8": sz.get("feature_tier") or "Complete",
-            "G9": 0,
-            "G21": support,
-        }
+        clear_security_addons(sheets, copied["id"], SEC_TAB)
+        cells = security_input_cells(acc, support, reg, s_months, float(s.get("siem_gb_day") if s.get("siem_gb_day") is not None else s.get("daily_raw_gb") or 0))
         n = push_cells(sheets, copied["id"], SEC_TAB, cells)
         rb = read_cells(sheets, copied["id"], SEC_TAB, SEC_READBACK)
         entry = {"kind": "security", "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.security_id, "reused_existing_copy": reused, "tab": SEC_TAB, "cells": cells, "cells_written": n, "region_match": f"{reg} ({how})", "readback": rb, "status": "filled"}
@@ -662,56 +828,67 @@ def main() -> None:
     # ---------------- Search (es3-estimator notebook library)
     se = con["search"]
     title_se = f"{key}_Search_Serverless_estimate{suffix}"
-    has_search = bool(se.get("has_workload") or (se.get("stored_gb") or 0) > 0 or args.always_copy)
-    result: dict = {}
-    if has_search and (se.get("stored_gb") or 0) > 0:
-        result = run_es3({
-            "stored_gb": se.get("stored_gb") or 0,
-            "org_stored_gb": (acc.get("storage") or {}).get("data_stored_gb") or 0,
-            "provider": provider,
-            "region": region,
-            "support_tier": support,
-            "workload": se.get("workload") or acc.get("workload") or {},
-        })
-    elif has_search:
-        result = {"status": "skipped — search slice has no stored GB", "assumptions": ["Nothing to price."]}
+    if args.skip_search:
+        estimators["search"] = (sz.get("estimators") or {}).get("search") or {"kind": "search", "status": "kept from the previous sizing"}
+        lines.append("Search → kept from the previous sizing")
     else:
-        result = {"status": "skipped — no search workload detected (use --always-copy to force)"}
-    published = {}
-    if result.get("report_csv"):
-        try:
-            published = write_search_sheet(drive, local_dir, folder["id"], title_se, result)
-        except Exception as ex:  # noqa: BLE001
-            published = {"error": str(ex)}
-    entry = {
-        "kind": "search",
-        "status": result.get("status") or "error",
-        "title": title_se,
-        "local": published.get("local"),
-        "region_match": result.get("region_match"),
-        "support_level": result.get("support_level"),
-        "readback": result.get("readback"),
-        "profiles": result.get("profiles"),
-        "inputs": result.get("inputs"),
-        "assumptions": result.get("assumptions"),
-        "source": result.get("source"),
-        "url": published.get("url"),
-        "spreadsheet_id": published.get("spreadsheet_id"),
-        "note": "on-demand is the quotable profile" if result.get("readback") else (result.get("error") or result.get("status")),
-    }
-    if result.get("error"):
-        entry["error"] = result["error"]
-    if published.get("error"):
-        entry["error"] = published["error"]
-        entry["note"] = f"{entry.get('note')}; Drive upload failed: {published['error']}"
-    rb = result.get("readback") or {}
-    lines.append(f"Search → {entry.get('url') or entry.get('local')}  (on-demand {rb.get('monthly_steady_state') or entry['status']}; region {result.get('region_match')})")
-    estimators["search"] = entry
-    estimators["projects"] = size_regional_projects(
+        has_search = bool(se.get("has_workload") or (se.get("stored_gb") or 0) > 0 or args.always_copy)
+        result: dict = {}
+        if has_search and (se.get("stored_gb") or 0) > 0:
+            result = run_es3({
+                "stored_gb": se.get("stored_gb") or 0,
+                "org_stored_gb": (acc.get("storage") or {}).get("data_stored_gb") or 0,
+                "provider": provider,
+                "region": region,
+                "support_tier": support,
+                "workload": se.get("workload") or acc.get("workload") or {},
+            })
+        elif has_search:
+            result = {"status": "skipped — search slice has no stored GB", "assumptions": ["Nothing to price."]}
+        else:
+            result = {"status": "skipped — no search workload detected (use --always-copy to force)"}
+        published = {}
+        if result.get("report_csv"):
+            try:
+                published = write_search_sheet(drive, local_dir, folder["id"], title_se, result)
+            except Exception as ex:  # noqa: BLE001
+                published = {"error": str(ex)}
+        entry = {
+            "kind": "search",
+            "status": result.get("status") or "error",
+            "title": title_se,
+            "local": published.get("local"),
+            "region_match": result.get("region_match"),
+            "support_level": result.get("support_level"),
+            "readback": result.get("readback"),
+            "profiles": result.get("profiles"),
+            "inputs": result.get("inputs"),
+            "assumptions": result.get("assumptions"),
+            "source": result.get("source"),
+            "url": published.get("url"),
+            "spreadsheet_id": published.get("spreadsheet_id"),
+            "note": "on-demand is the quotable profile" if result.get("readback") else (result.get("error") or result.get("status")),
+        }
+        if result.get("error"):
+            entry["error"] = result["error"]
+        if published.get("error"):
+            entry["error"] = published["error"]
+            entry["note"] = f"{entry.get('note')}; Drive upload failed: {published['error']}"
+        rb = result.get("readback") or {}
+        lines.append(f"Search → {entry.get('url') or entry.get('local')}  (on-demand {rb.get('monthly_steady_state') or entry['status']}; region {result.get('region_match')})")
+        estimators["search"] = entry
+    project_only = {"observability", "security"} if args.skip_search else None
+    fresh_projects = size_regional_projects(
         acc, sheets, drive, folder, o11y_id=args.o11y_id, security_id=args.security_id,
         support=support, provider=provider, skip_xlsx=args.skip_xlsx, fresh=args.fresh,
         local_dir=local_dir, customer=meta["customer"], when=meta["date"], name_suffix=suffix,
+        only=project_only, force_months=args.force_months,
     )
+    if args.skip_search:
+        kept = [p for p in ((sz.get("estimators") or {}).get("projects") or []) if p.get("solution") == "search"]
+        estimators["projects"] = fresh_projects + kept
+    else:
+        estimators["projects"] = fresh_projects
 
     sz["folder"] = str(local_dir)
     sz["drive_folder"] = folder

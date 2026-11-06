@@ -1083,7 +1083,7 @@ def consolidation_inputs_html(acc: dict) -> str:
     avg_doc = ingest.get("avg_doc_bytes")
     from_diags = _from_diagnostics(acc)
     if from_diags:
-        size_src = "Elasticsearch diagnostic bundle, primary store size. A deployment with no bundle keeps its K360 size."
+        size_src = "Elasticsearch diagnostic bundle, local primary store. Searchable snapshots are left out. A deployment with no bundle keeps its K360 size."
         size_math = "Observability and Security GB/day is measured bulk index bytes per day. K360 has no raw ingest total; stored GB ÷ assumed retention is the --k360-ingest backup and can sit far below this bulk rate. Search disk is the diagnostic store size."
         ret_src = "Size-weighted ILM delete age, else data-stream retention, else the oldest index. Ingest-weighted across the solution. The estimator accepts 1–36 months."
         ret_math = "The GB/day written to the estimator is the measured bulk rate. The sensitivity table still shows stored GB ÷ retention and does not reprice the estimate."
@@ -1095,7 +1095,7 @@ def consolidation_inputs_html(acc: dict) -> str:
     rows = [
         ["Lookback ECU", f"{n0(e.get('total_lookback'))} ECU, {rng.get('start') or '—'} → {rng.get('end') or '—'} ({e.get('lookback_days')} d)", "cloud-tracker-billing", f"Complete-month average is {n0(sv.get('ech_list_mo'))} ECU/mo. Partial months left out: {', '.join(partial) if partial else 'none'}." + ("" if sv.get("ech_contract_mo") is not None else " List price is $1 per ECU.")],
         ["Stored size", f"{n1(st.get('data_stored_gb'))} GB · {n0(st.get('docs_count'))} docs · as of {st.get('as_of')} · {st.get('deployments_with_telemetry')} deployments with a row", size_src, size_math],
-        ["Solution split", split, "use case, then features, billing family, and name; GB joined by deployment name", "One serverless project per solution. A solution with 0 GB is not priced."],
+        ["Solution split", split, "use case, then features, billing family, and name; GB joined by deployment name", "One serverless project per solution. A solution with no bulk and no stored GB is not priced."],
         ["Retention", ret_txt, ret_src, ret_math],
         ["Workload", f"{wl.get('window_days')} d · {wl.get('indices')} indices · peak {n1((search_wl.get('peak') or {}).get('qps'))} QPS for {(search_wl.get('peak') or {}).get('pct_hours_mo')}% of hours · ingest {n1(ingest.get('docs_per_sec'))} docs/s · active {n0(ingest.get('active_hours_mo'))} h/mo · avg doc {n0(avg_doc) if avg_doc is not None else 'missing'} B", "cloud-tracker-index_telemetry, day averages. Average document size is dataset_size_bytes / docs_count.", "Hour mix is the Search Serverless estimator's active search hours. Ingest docs/s is scaled by the search share of stored GB. A missing document size leaves Search ingest at $0."],
         ["Contract", f"ARR {usd(cr.get('arr'))} · commit {n0(cr.get('commit_ecu_per_day'))} ECU/day · shown rate ${cr.get('implied_usd_per_ecu')}/ECU", "organization pivot", cr.get("note") or "list view only"],
@@ -1438,7 +1438,7 @@ def render_consolidation_html(acc: dict) -> str:
     if power_page:
         B.append(power_page)
     B.append(consolidation_inputs_html(acc))
-    profiles = (((c.get("serverless") or {}).get("by_solution") or {}).get("search") or {}).get("regional_profiles") or (((acc.get("sizing") or {}).get("estimators") or {}).get("search") or {}).get("profiles") or []
+    profiles = [] if (c.get("search_power") or {}).get("profiles") else ((((c.get("serverless") or {}).get("by_solution") or {}).get("search") or {}).get("regional_profiles") or (((acc.get("sizing") or {}).get("estimators") or {}).get("search") or {}).get("profiles") or [])
     regional_profiles = bool((((c.get("serverless") or {}).get("by_solution") or {}).get("search") or {}).get("regional_profiles"))
     if profiles:
         eis_profile = float((((c.get("serverless") or {}).get("by_solution") or {}).get("search") or {}).get("eis_mo") or 0)
@@ -1469,9 +1469,17 @@ def render_consolidation_html(acc: dict) -> str:
         ]), new_page=True))
 
     # 1
-    if dom.get("daily_metered_gb"):
-        volume = f"{n0(dom.get('daily_metered_gb'))} GB/d metered · {n0(dom.get('retained_gb'))} GB retained"
-        rates = f"${svl.get('eff_ingest_usd_per_gb')}/GB ingest · ${svl.get('eff_retain_usd_per_gb_mo')}/GB-mo retain"
+    if dom.get("daily_metered_gb") or dom.get("sheet_metered_gb_day"):
+        metered_v = dom.get("sheet_metered_gb_day")
+        if metered_v is None:
+            metered_v = dom.get("daily_metered_gb")
+        volume = f"{n0(metered_v)} GB/d metered · {n0(dom.get('retained_gb'))} GB retained"
+        rate_bits = []
+        if svl.get("eff_ingest_usd_per_gb") is not None:
+            rate_bits.append(f"${svl.get('eff_ingest_usd_per_gb')}/GB ingest")
+        if svl.get("eff_retain_usd_per_gb_mo") is not None:
+            rate_bits.append(f"${svl.get('eff_retain_usd_per_gb_mo')}/GB-mo retain")
+        rates = " · ".join(rate_bits) if rate_bits else "One monthly total"
         billed = "Metered ingest GB + retained GB (+ support)"
     elif str(dom.get("pricing") or "").startswith("es3-estimator"):
         od = next((p for p in (dom.get("regional_profiles") or []) if str(p.get("Search Power Setting")) == "on-demand"), None)
@@ -1658,10 +1666,12 @@ def render_consolidation_html(acc: dict) -> str:
                [[f"{r['retention_months']:g} mo" + (" (estimate)" if r.get("used") else ""), n0(r.get("stored_gb")), n1(r.get("raw_gb_day"))] for r in ret],
                tones=["info" if r.get("used") else None for r in ret])
     used = next((r for r in ret if r.get("used")), None)
-    if used:
-        ret_note = f"Search holds {n0(used.get('stored_gb'))} GB. The estimate keeps it for {used['retention_months']:g} months, about {n1(used.get('raw_gb_day'))} GB per day. A shorter keep means the same data arrived faster. The Search estimate was not recalculated."
+    if diag:
+        ret_note = "This table divides stored GB by a month count. It is not the bulk rate written to the estimator, and it does not reprice the quote."
+    elif used:
+        ret_note = f"Search holds {n0(used.get('stored_gb'))} GB. The backup keeps it for {used['retention_months']:g} months, about {n1(used.get('raw_gb_day'))} GB per day. A shorter keep means the same stored data is treated as having arrived faster. The estimate was not recalculated."
     else:
-        ret_note = "Stored GB stays the same. A shorter keep means the same data arrived faster. The price was not recalculated."
+        ret_note = "Stored GB stays the same. A shorter keep means the same stored data is treated as having arrived faster. The price was not recalculated."
 
     def _fleet_axis(scenario: str) -> str:
         low = scenario.lower()

@@ -18,7 +18,7 @@ weighted_days = Σ (bulk_gb_day × retention_days) / bulk_gb_day
 months = weighted_days / 30.416
 ```
 
-The sheet retention is always a whole month. Round `months` up, then clamp to 1–36. The estimator prices retention only on the integers 1–36, so a fractional month leaves that line at zero. Show both the measured months and the whole month written.
+The sheet retention is always a whole month. Round `months` up, then clamp to 1–36. The estimator prices retention only on the integers 1–36, so a fractional month leaves that line at zero. Show both the measured months and the whole month written. Only rows with `retention_days` above 0 enter the weight. A row with no measured age is named and left out. If the rows that have bulk have no measured age, the month stays unset and the sheet is not filled.
 
 Every consolidation run writes two PDFs from the same bulk.
 
@@ -31,7 +31,7 @@ Each PDF links to its own estimator copy, left at that month. The rounded sheet 
 
 When the user sets a retention month, that whole month replaces the headline (`--retention-months`, G11 or G6). Bulk GB/day stays the measured rate. The measured months stay in the arithmetic next to the month written. The 30-day read stays at 1 month.
 
-`retention_days` is the size-weighted ILM delete age, else data-stream retention, else the oldest index age. `bulk_gb_day` is the sum of `index.primaries.bulk.est_bytes_per_day` on write indices, divided by 1e9. A write index is the last index of a data stream, or an index an alias marks `is_write_index`. For each of those indices the bytes per day are `primaries.bulk.total_size_in_bytes × 86,400 / write_phase_seconds`. The write phase is the time from creation until rollover, or the index age while the current ILM action is `rollover`. A missing write phase contributes 0. Rolled indices are not added. This is the bulk request size over the write window, not stored dataset growth and not node `total_size_in_bytes` divided by JVM uptime.
+`retention_days` is the size-weighted ILM delete age, else data-stream retention, else the oldest index age, kept to 3 decimals. The weight uses local primary bytes only. Searchable-snapshot mounts (`partial-*`) and the snapshot portion of `total_data_set_size_in_bytes` stay out of store and out of that weight. `bulk_gb_day` is the sum of `index.primaries.bulk.est_bytes_per_day` on write indices, divided by 1e9. A write index is the last index of a data stream, or an index an alias marks `is_write_index`. For each of those indices the bytes per day are `primaries.bulk.total_size_in_bytes × 86,400 / write_phase_seconds`. The write phase is the time from creation until rollover, or the index age while the current ILM action is `rollover`. A missing write phase contributes 0. Rolled indices are not added. This is the bulk request size over the write window, not stored dataset growth and not node `total_size_in_bytes` divided by JVM uptime.
 
 A row with `uptime_days_min` < 2 has a short node uptime. Keep it in the sum and name it. The bulk rate is still the write-phase estimate.
 
@@ -41,11 +41,15 @@ A row with `uptime_days_min` < 2 has a short node uptime. Keep it in the sum and
 |----------|--------|------------|
 | Observability | G21 logs = 0.90 × bulk_gb_day, G23 metrics = 0.10 × bulk_gb_day, G22 0%, G24 0, G25 100%, G11 months, G4 Complete, G5 Premium, G8 region, G14 No, G18 0 | D32 monthly, E32 year 1, F32 steady annual |
 | Security | G4 = bulk_gb_day (all of it), G6 months, G7 region, G8 Complete, G21 Premium | E74 monthly |
-| Search | disk = Σ store_gb; queries stay the K360 window; es3 on-demand | `monthly_steady_state` |
+| Search | disk = Σ local `store_gb`. Ingest docs/s is the K360 org rate × local search store ÷ org store. On one region, query rate stays the org window. A regional split scales query rate by that region's share of search store. es3 on-demand | `monthly_steady_state` |
 
 The 90/10 logs/metrics split is only the Observability sheet. Security takes the full bulk rate on G4.
 
-G26 on the Observability sheet displays as an integer. Read it unformatted. Accept it when it is within 0.51 GB/day of `bulk_gb_day`. A mismatch larger than that means the sheet is not on these inputs; do not quote D32.
+G26 on the Observability sheet displays as an integer. Read it unformatted. Accept it when it is within 0.51 GB/day of the bulk written to that sheet, including when local store is 0. A wider miss records both numbers and leaves that solution unquoted. The written bulk stays on the solution block.
+
+Security E74 is the monthly quote only when parsed E73 is 0. A parenthesized credit stays negative. A non-zero E73 leaves Security out. E73 is not subtracted from E74. Add-on inputs are cleared on the copy. The golden template is not edited.
+
+A region with bulk and no measured age has no month of its own. If another region supplied the solution month, that region is written at the solution month. A solution with no measured age anywhere is not written. One regional G26 miss, or a non-zero regional E73, leaves the whole solution out, including regions whose own read-back was accepted. Before the per-region sheets exist, a multi-region total splits the one sheet by local store. A region with bulk and no local bytes contributes $0 on that first pass.
 
 ## Per deployment
 
@@ -61,9 +65,9 @@ For an active fleet of N deployments, price five Observability plans on each PDF
 | 25% | round(N × 0.75) |
 | 50% | round(N × 0.50) |
 | 75% | round(N × 0.25) |
-| 100% | 1 |
+| 100% | 1. Reuses the headline Observability read-back. No new sheet. After a regional pass that headline is one sheet per region. |
 
-Pack the middle three by `store_gb`: sort descending, place each row in the lightest bin. 100% is one project even though N × 0 is 0. The same Σ bulk is priced in every plan. The monthly total stays near the 0% sum until the large clusters share one ladder, which is the 100% plan.
+Pack the middle three by local `store_gb`: sort descending, place each row in the lightest bin. 100% stays one project even though N × 0 is 0. `round` is half-to-even, so 75% of 2 deployments is 0 projects. On the rounded PDF, a project with bulk and no measured month omits the whole bar set. On the 30-day PDF, a project with bulk is written at month 1.
 
 ## Metered ingest rate
 

@@ -218,12 +218,29 @@ def _parse_age(value) -> float | None:
     return n * {"ms": 1 / 86_400_000, "s": 1 / 86_400, "m": 1 / 1_440, "h": 1 / 24, "d": 1}[match.group(2)]
 
 
+def quoted_index_bytes(name: str, store: dict | None) -> dict:
+    """Local bytes are the quote. Searchable-snapshot mounts are reported and left out."""
+    store = store or {}
+    dataset_bytes = int(store.get("total_data_set_size_in_bytes") or store.get("size_in_bytes") or 0)
+    local_bytes = int(store.get("size_in_bytes") or 0)
+    if str(name).startswith("partial-"):
+        return {"quote": 0, "dataset": 0, "snapshot": dataset_bytes or local_bytes}
+    if not _user_index(name) or (local_bytes <= 0 and dataset_bytes <= 0):
+        return {"quote": 0, "dataset": 0, "snapshot": 0}
+    return {
+        "quote": local_bytes if local_bytes > 0 else 0,
+        "dataset": dataset_bytes or local_bytes,
+        "snapshot": 0,
+    }
+
+
 def _user_index(name: str) -> bool:
+    """Local user data. Searchable-snapshot mounts and system indexes stay out."""
+    if name.startswith("partial-"):
+        return False
     if name.startswith(".ds-"):
         rest = name[4:]
         return not (rest.startswith(".") or rest.startswith("ilm"))
-    if name.startswith("partial-"):
-        return True
     return not name.startswith(".")
 
 
@@ -349,17 +366,22 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
 
     by_age: dict[float, float] = defaultdict(float)
     unknown = 0.0
-    total = 0.0
+    local = 0.0
+    dataset = 0.0
+    snapshot = 0.0
     observed: list[float] = []
     captured_ms = captured.timestamp() * 1000
     for ix, body in stats.items():
-        if not _user_index(ix):
-            continue
         store = ((body.get("primaries") or {}).get("store") or {})
-        nbytes = store.get("total_data_set_size_in_bytes") or store.get("size_in_bytes") or 0
+        measured = quoted_index_bytes(ix, store)
+        snapshot += measured["snapshot"]
+        if measured["dataset"] <= 0 and measured["quote"] <= 0:
+            continue
+        dataset += measured["dataset"]
+        nbytes = measured["quote"]
         if nbytes <= 0:
             continue
-        total += nbytes
+        local += nbytes
         info = explain.get(ix) or {}
         age = delete_age.get(info.get("policy")) if info.get("managed") else None
         if age is None:
@@ -367,7 +389,7 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         if age is None:
             unknown += nbytes
         else:
-            by_age[round(age, 2)] += nbytes
+            by_age[round(age, 3)] += nbytes
         ms = created.get(ix) or info.get("index_creation_date_millis")
         if ms:
             observed.append((captured_ms - int(ms)) / 86_400_000)
@@ -376,7 +398,7 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
             if since:
                 observed.append(since)
 
-    known = total - unknown
+    known = local - unknown
     weighted = sum(age * nbytes for age, nbytes in by_age.items()) / known if known > 0 else None
     parts: list[dict] = []
     if known > 0:
@@ -394,10 +416,12 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         "cluster": health.get("cluster_name"),
         "bulk_gb_day": round(gb_day, 3),
         "uptime_days_min": round(min(hot_up), 1) if hot_up else None,
-        "retention_days": round(days, 1) if days else None,
+        "retention_days": round(days, 3) if days else None,
         "retention_basis": basis,
         "retention_label": _retention_label(parts, basis),
-        "store_gb": round(total / 1e9, 2),
+        "store_gb": round(local / 1e9, 2),
+        "dataset_gb": round((dataset + snapshot) / 1e9, 2),
+        "snapshot_gb": round(((dataset - local) + snapshot) / 1e9, 2),
     }
 
 

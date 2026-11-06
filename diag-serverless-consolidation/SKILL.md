@@ -2,9 +2,11 @@
 name: diag-serverless-consolidation
 description: >-
   Diagnostic-to-Serverless consolidation report for one Elastic Cloud account.
-  Prices Observability, Security, and Search from Elasticsearch diagnostic
-  bundles only: bulk GB/day and measured retention, through the matching
-  estimator read-back. Sizes deployments with a bill in the latest month.
+  Prices Observability and Security from Elasticsearch diagnostic bundles:
+  bulk GB/day and measured retention, through the matching estimator
+  read-back. Search disk is local store. Search ingest docs/s stays the
+  K360 rate scaled by that store. Sizes deployments with a bill in the
+  latest month.
   Leaves out a decommissioned deployment and does not carry its last
   snapshot. Covers one project per solution, per-deployment projects that
   pool ingest under 50 GB/day, a whole-month retention rounded up, a 30-day
@@ -24,7 +26,7 @@ description: >-
 Quote Serverless from diagnostic measurements. The K360 account summary is a different skill (`k360-account-analysis`) and is not rerun here except to reuse its org report.
 
 ## Hard rules
-1. **Diagnostic rows are the only ingest.** Daily GB is `bulk_gb_day`: the sum of `index.primaries.bulk.est_bytes_per_day` on write indices, in decimal GB. Retention is that row's `retention_days`. A combined project uses the bulk-weighted average. Stored GB, data_pivot growth, stored GB ÷ 3 months, and node `total_size_in_bytes` ÷ JVM uptime are not this quote.
+1. **Observability and Security ingest are diagnostic bulk.** Daily GB is `bulk_gb_day`: the sum of `index.primaries.bulk.est_bytes_per_day` on write indices, in decimal GB. Retention is that row's `retention_days`, and only a value above 0 enters the weight. A row with no measured age is named and left out. A solution with bulk and no measured age does not get a sheet. Stored GB, data_pivot growth, stored GB ÷ 3 months, and node `total_size_in_bytes` ÷ JVM uptime are not this ingest. Search disk is local `size_in_bytes`. `partial-*` and the snapshot portion of `total_data_set_size_in_bytes` stay out of store and out of the retention weight. Search ingest docs/s is the K360 org rate times local search store ÷ org store. On one region, query rate stays the org window. When Search is split by region, query rate is scaled by that region's share of search store. Say so when quoting Search. Do not replace Search ingest with `bulk_gb_day`.
 2. **The estimator read-back is the dollar.** Observability monthly is `D32`. Security monthly is `E74` (month-12 total). Search is the es3-estimator on-demand profile. The ladder in `consolidation.py` is a check, not the quote. Never edit a golden template.
 3. **Match the estimator to the solution.** Observability clusters go on the Observability sheet. Security on the Security sheet. Search on es3. Do not price an Observability fleet with the Security or Search estimator.
 4. **Show the arithmetic** for every quoted project: cluster count, Σ bulk, Σ(bulk × days), weighted days, months written to the sheet, the cells written, and the read-back. The formula is in [calculations.md](references/calculations.md). The month written is always a whole number: round the measured months up, then clamp to 1–36. Never write a fraction. Every consolidation run writes two PDFs from the same bulk. The rounded PDF uses that whole month. The 30-day PDF writes 1 month, because 30 / 30.416 is under 1. Each PDF links to a sheet left at that scenario's month.
@@ -53,22 +55,22 @@ Pipeline after the reused fetch: `admin_diags.py` + `diag_account.py` → `size_
 Read `*_brief.json`. Quote only when `ingest_source` is `diagnostics`. Build `<slug>-serverless-consolidation-savings.canvas.tsx` from `savings`, `quotes`, `fleet`, `contract_rate`, `notes`, and `diagnostics_coverage`. Page order is the account skill's [canvas-layout.md](../k360-account-analysis/references/canvas-layout.md) §11. Chat is the consolidation bullets plus estimator links (≤6).
 
 Confirm the sheet inputs before quoting:
-- Observability: G4 `Complete`, G5 `Premium`, G8 the account region, G11 = measured months rounded up, G21 = 90% of Σ bulk, G23 = 10%, G14 `No`. Dollar = D32.
-- Security: G4 = Σ bulk, G6 = measured months rounded up, G8 `Complete`, G21 `Premium`. Dollar = E74.
-- 30-day PDF: same ingest cells, G11 or G6 = 1, on its own sheet copy. Leave that copy at 1 month. The rounded PDF's sheet stays at the rounded measured month. Do not point either PDF at the other scenario's sheet.
-- Search: disk = Σ diagnostic `store_gb`. Query rates stay the K360 window. Dollar = on-demand `monthly_steady_state`.
+- Observability: G4 `Complete`, G5 `Premium`, G8 the account region, G11 = measured months rounded up, G21 = 90% of Σ bulk, G23 = 10%, G14 `No`. Dollar = D32 only when unformatted G26 is within 0.51 GB/day of the bulk written. A wider miss leaves Observability out. The written bulk stays on the solution block.
+- Security: G4 = Σ bulk, G6 = measured months rounded up, G8 `Complete`, G21 `Premium`. Add-ons are cleared on the copy. Dollar = E74 only when parsed E73 is 0. A non-zero E73, including a parenthesized credit, leaves Security out. Do not subtract E73 from E74.
+- 30-day PDF: same ingest cells, G11 or G6 = 1, on its own `_30d` sheet copy. Leave that copy at 1 month. The rounded PDF's sheet stays at the rounded measured month. Do not point either PDF at the other scenario's sheet. Search is not repriced for the 30-day PDF.
+- Search: disk = Σ local `store_gb`. Ingest docs/s = K360 org docs/s × local search store ÷ org store. On one region, query rate is the org window. Dollar = on-demand `monthly_steady_state`. Performant and high availability stay on the search-power chart and are not added to the total.
 
-If `diagnostics_coverage.inactive_excluded` is above zero, say how many deployments had no bill in the active month and how many GB of leftover snapshot were left out. If `k360_fallback` is above zero, those are active deployments with no bundle. They add no ingest.
+If `diagnostics_coverage.inactive_excluded` is above zero, say how many deployments had no bill in the active month and how many GB of leftover snapshot were left out. If `snapshot_gb` is above zero, say how many searchable-snapshot GB were left out of store. If `k360_fallback` is above zero, those are active deployments with no bundle. They add no ingest. If `retention_unmeasured` is non-empty, name those deployments and leave them out of the weighted month. A regional G26 miss or a non-zero regional E73 leaves that whole solution out, including regions that read back. Until the per-region sheets succeed, a multi-region total is a split of the one sheet by local store, so a region with bulk and no local bytes contributes $0.
 
 ## Deployment-count plan
 
 When the quote is Observability from diagnostics, page 1 of the consolidation PDF has a bar for cutting the active deployment count by 0, 25, 50, 75, and 100%.
 
-- 0% is one project per active deployment, including a deployment with no bundle at $0.
-- 25, 50, and 75% keep `round(active × (1 − pct/100))` projects. Pack by `store_gb`, largest into the lightest bin. Price on each group's Σ bulk.
-- 100% is one project. Do not round that count to zero.
-- Each bar is the sum of Observability D32 read-backs. Price the five bars on both PDFs. On the rounded PDF, retention for each project is that group's measured months, rounded up. On the 30-day PDF, every project is written as 1 month.
-- The bars stay nearly flat until one project when retention is the measured month. Each project restarts the ingest bands, and pack-by-store leaves the large clusters alone until the count is 1. At 30 days the level changes because retention is 1 month on every project. The shape can still be flat until one project. Report the read-backs either way.
+- 0% is one project per active Observability deployment. A deployment with no bulk is $0 and does not open a sheet.
+- 25, 50, and 75% keep `round(active × (1 − pct/100))` projects. Python rounds halves to even, so 75% of 2 deployments is 0 projects. Pack by local `store_gb`, largest into the lightest bin. Price on each group's Σ bulk.
+- 100% is one project. Do not round that count to zero. It does not open a sheet. The bar reuses the headline Observability read-back. After a regional pass that headline is one sheet per region.
+- The 0/25/50/75 bars are sums of D32. On the rounded PDF, retention for each project is that group's measured months, rounded up. A project with bulk and no measured month omits the whole rounded bar set. On the 30-day PDF, every project with bulk is written as 1 month, including a project with no measured age.
+- `--skip-deployment-plan` skips the bars. The headline quote still runs. A failed sheet pass leaves the bars off and puts that on the PDF note.
 
 ## Metered ingest rate
 

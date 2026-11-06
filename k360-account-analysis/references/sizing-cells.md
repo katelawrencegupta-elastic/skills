@@ -19,7 +19,7 @@ Overrides accept a bare id or a full `docs.google.com/spreadsheets/d/<id>/…` U
 ## Consolidated inputs (`sizing.consolidated`)
 The K360 backup, used by `--k360-ingest` and when no bundles are available, sets `daily_raw_gb = stored_gb / (retention_months × 30.416)` per solution slice (GB from ECH telemetry, grouped by `solutions.by_deployment`). K360 does not provide a raw ingest total. If a slice has ECU but no telemetry, GB is prorated by ECU share (`gb_estimated_from_ecu_share: true`). A slice with no ECU and no GB is **skipped** unless `--always-copy`.
 
-The default quote does not back-calculate. `daily_raw_gb` is the sum of measured bulk GB/day, and `retention_months` is the ingest-weighted diagnostic retention, rounded up to a whole month and clamped to 1–36 for the sheet. A regional project uses that region's measured bulk rate when `architecture.groups[].daily_raw_gb` is set. Search disk is the diagnostic store size. K360 does not provide a raw ingest total. `--k360-ingest` writes a second set of sheets suffixed `_from_k360` whose GB/day is stored GB ÷ assumed retention. The sidecar for that backup is `sizing_from_k360.json`. A deployment with no bundle keeps that backup inside the default quote.
+The default quote does not back-calculate. `daily_raw_gb` is the sum of measured bulk GB/day, and `retention_months` is the ingest-weighted diagnostic retention, rounded up to a whole month and clamped to 1–36 for the sheet. Only rows with a measured age above 0 days enter that weight. A solution with bulk and no measured retention leaves the month unset and does not get a sheet. A regional project uses that region's measured bulk rate when `architecture.groups[].daily_raw_gb` is set. Search disk is the local diagnostic store (`size_in_bytes`). Searchable snapshots stay out of that store. K360 does not provide a raw ingest total. `--k360-ingest` writes a second set of sheets suffixed `_from_k360` whose GB/day is stored GB ÷ assumed retention. The sidecar for that backup is `sizing_from_k360.json`. A deployment with no bundle adds no ingest.
 
 ## Observability — tab `Observability Estimator`
 | Cell | Value | Source |
@@ -27,7 +27,7 @@ The default quote does not back-calculate. `daily_raw_gb` is the sum of measured
 | G4 | `Complete` | feature tier (dropdown: Complete / Logs Essentials) |
 | G5 | `Premium` | support (Limited / Base / Enhanced / Premium) — like-for-like with ECH Enterprise |
 | G8 | region option | matched dropdown string, e.g. `AWS: us-east-1 (Virginia)` |
-| G11 | retention months | `--retention-months` (1–36) |
+| G11 | retention months | measured retention, rounded up (1–36). `--retention-months` is the K360 backup only |
 | G14 | `No` | synthetics |
 | G18 | `0` | Option 1 (ECH-derived) left empty — we use Option 2 raw data |
 | G21 | logs GB/day | 90 % of `daily_raw_gb` |
@@ -36,20 +36,20 @@ The default quote does not back-calculate. `daily_raw_gb` is the sum of measured
 | G24 | `0` | traces/min |
 | G25 | `100%` | trace sampling |
 
-Read-back: `G26` total raw GB/day · `G27` metered GB/day · `D32` monthly steady state · `E32` annual year 1 · `F32` annual steady state.
+Read-back, unformatted: `G26` total raw GB/day · `G27` metered GB/day · `D32` monthly steady state · `E32` annual year 1 · `F32` annual steady state. G26 is accepted when it is within 0.51 GB/day of the bulk written to that sheet. A wider miss is recorded and Observability is left unquoted. The written bulk stays on the solution block.
 
 ## Security — tab `Security Estimator`
 | Cell | Value | Source |
 |------|-------|--------|
 | G4 | SIEM raw GB/day | `daily_raw_gb` of the security slice |
-| G6 | retention months | `--security-retention-months` (defaults to `--retention-months`; sheet notes 12–13 is common for SIEM) |
+| G6 | retention months | measured retention, rounded up (1–36). `--security-retention-months` is the K360 backup only |
 | G7 | region option | matched dropdown string, e.g. `AZURE: us-east-2 (Virginia)` |
 | G8 | `Complete` | tier (Complete / Essentials) |
 | G9 | `0` | Elastic Defend endpoints (unknown from K360) |
 | G21 | `Premium` | support (Limited / Base / Enhanced / Premium) |
 
-Untouched: G11/G12 cloud security, G14–G18 agentic SOC / EIS LLM, G20 Tines, G23–G25 ramp, G27–G34 CPS.
-Read-back: `G5` metered GB/day · `E74` month-12 total (the monthly quote) · `E73` CPS add-on inside that total · `D36` / `E36` / `F36` annual Y1 / Y2 / Y3. Y2 is the steady annual. There is no separate monthly cell above the year row.
+Cleared on the copy, before the read-back: G11, G12, G14–G18, G20, G23–G25, G27–G34. A numeric cell is set to 0. A dropdown that contains `No` is set to `No`. A dropdown that cannot accept either is left alone. The golden template is not edited. E74 is the monthly quote only when parsed E73 is 0. A non-zero E73, including a parenthesized credit, leaves Security out of the quote. E73 is not subtracted from E74 by hand.
+Read-back, unformatted: `G5` metered GB/day · `E74` month-12 total (the monthly quote) · `E73` CPS add-on inside that total · `D36` / `E36` / `F36` annual Y1 / Y2 / Y3. Y2 is the steady annual. There is no separate monthly cell above the year row.
 
 ## Region matching (`size_serverless.match_region`)
 Dropdown strings are scraped live from the copy's `Estimator_Reference` tab (any cell matching `^(AWS|AZURE|GCP)`), so template version drift is tolerated. K360 region (`us-east-1`, `eastus2`, `europe-west1`) is normalised (strip dashes) and compared; Azure compass aliases handled (`eastus2` ⇄ `us-east-2`). Result recorded as `region_match: "<option> (exact|alias|provider_default|none)"` — **call out `provider_default`** in chat.

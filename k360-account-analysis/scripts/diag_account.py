@@ -2,9 +2,11 @@
 """Build the diagnostics copy of an account analysis.
 
 ECH ECU, contract rate, regions, and the Search query window stay on the K360 bill.
-Ingest GB/day and retention come from the diagnostic rows. Primary store size replaces
-K360 stored GB where a bundle matched the deployment name. A deployment with no bundle
-keeps its K360 size and the run's assumed retention, and is counted as a gap.
+Ingest GB/day and retention come from the diagnostic rows. Local primary store replaces
+K360 stored GB where a bundle matched the deployment name. Searchable snapshots stay
+out of that store. A deployment with no bundle keeps its K360 size and adds no ingest.
+A missing retention is named and left out of the weighted month. It is not replaced
+with an assumed retention.
 
 The copy is what the default sizing run reads. It does not replace the K360
 account JSON. The K360 stored-GB back-calculation is the backup (--k360-ingest),
@@ -43,6 +45,17 @@ def _sheet_months(months: float) -> int:
     return int(min(RETENTION_MAX, max(RETENTION_MIN, whole)))
 
 
+def _measured_days(value) -> float | None:
+    """A retention age counts only when the bundle measured it. Zero and missing do not."""
+    try:
+        days = float(value)
+    except (TypeError, ValueError):
+        return None
+    if days <= 0:
+        return None
+    return days
+
+
 def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
     """Return a deep copy whose sizing inputs are the diagnostic measurements."""
     out = copy.deepcopy(acc)
@@ -58,24 +71,20 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
 
     sz = out.setdefault("sizing", {})
     con = sz.get("consolidated") or {}
-    assumed = {
-        "observability": float((con.get("observability") or {}).get("retention_months") or 3),
-        "security": float((con.get("security") or {}).get("retention_months") or 3),
-        "search": float((con.get("search") or {}).get("retention_months") or 3),
-    }
     short: list[dict] = []
     matched = 0
     fallback = 0
     inactive = 0
     inactive_bundles: list[str] = []
     dropped_gb = 0.0
+    snapshot_gb = 0.0
+    unmeasured: list[dict] = []
     active_info = (out.get("deployments") or {}).get("active") or {}
     active_names = set(active_info.get("names") or [])
     use_active = bool(active_info.get("month")) and bool(active_names)
     for dep in (out.get("solutions") or {}).get("by_deployment") or []:
         if dep.get("platform") == "serverless":
             continue
-        sol = dep.get("solution") or "search"
         name = dep.get("name") or ""
         if use_active and name not in active_names:
             inactive += 1
@@ -93,11 +102,19 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
             matched += 1
             dep["gb"] = round(float(hit.get("store_gb") or 0), 2)
             dep["daily_raw_gb"] = round(float(hit.get("bulk_gb_day") or 0), 3)
-            days = hit.get("retention_days")
-            if not days or float(days) <= 0:
-                days = assumed[sol] * DAYS_PER_MONTH
+            snapshot_gb += float(hit.get("snapshot_gb") or 0)
+            days = _measured_days(hit.get("retention_days"))
+            if days is None:
                 dep["retention_unmeasured"] = True
-            dep["retention_days"] = round(float(days), 1)
+                dep["retention_days"] = None
+                if float(hit.get("bulk_gb_day") or 0) > 0:
+                    unmeasured.append({
+                        "name": dep.get("name"),
+                        "bulk_gb_day": round(float(hit.get("bulk_gb_day") or 0), 3),
+                    })
+            else:
+                dep.pop("retention_unmeasured", None)
+                dep["retention_days"] = round(days, 3)
             dep["retention_basis"] = hit.get("retention_basis")
             dep["retention_label"] = hit.get("retention_label")
             dep["ingest_source"] = "diagnostics"
@@ -122,10 +139,16 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
         group = [d for d in ech if (d.get("solution") or "search") == sol]
         daily = sum(float(d.get("daily_raw_gb") or 0) for d in group)
         stored = sum(float(d.get("gb") or 0) for d in group)
-        weighted = sum(float(d.get("daily_raw_gb") or 0) * float(d.get("retention_days") or 0) for d in group)
-        measured = (weighted / daily / DAYS_PER_MONTH) if daily else assumed[sol]
-        written = _sheet_months(measured)
-        if abs(float(written) - measured) > 0.05:
+        weighed = [
+            (float(d.get("daily_raw_gb") or 0), days)
+            for d in group
+            if (days := _measured_days(d.get("retention_days"))) is not None and float(d.get("daily_raw_gb") or 0) > 0
+        ]
+        weight_bulk = sum(rate for rate, _days in weighed)
+        weighted = sum(rate * days for rate, days in weighed)
+        measured = (weighted / weight_bulk / DAYS_PER_MONTH) if weight_bulk else None
+        written = _sheet_months(measured) if measured is not None else None
+        if written is not None and abs(float(written) - measured) > 0.05:
             clamped_notes.append(f"{sol} retention measures {measured:.1f} months and is written to the estimator as {written}")
         blk["deployments"] = len(group)
         ecu_map = active_info.get("ecu_complete_month") or {}
@@ -133,8 +156,14 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
             blk["ecu_monthly_avg"] = round(sum(float(ecu_map.get(d["name"]) or 0) for d in group), 2)
         blk["stored_gb"] = round(stored, 2)
         blk["daily_raw_gb"] = round(daily, 2)
-        blk["retention_months"] = written
-        blk["retention_months_measured"] = round(measured, 2)
+        blk.pop("retention_months", None)
+        blk.pop("retention_months_measured", None)
+        if written is not None:
+            blk["retention_months"] = written
+            blk["retention_months_measured"] = round(measured, 2)
+        blk["retention_unmeasured"] = bool(daily > 0 and written is None)
+        if blk["retention_unmeasured"]:
+            clamped_notes.append(f"{sol} has bulk and no measured retention, so its sheet is not filled.")
         blk["gb_estimated_from_ecu_share"] = False
         blk["has_workload"] = bool(stored > 0 or daily > 0 or (blk.get("ecu_lookback") or 0))
         blk["ingest_source"] = "diagnostics"
@@ -179,6 +208,8 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
         "short_uptime": short,
         "bulk_gb_day": round(sum(float(r.get("bulk_gb_day") or 0) for r in rows if r.get("name") in used and r.get("name") not in inactive_bundles), 2),
         "store_gb": round(sum(float(r.get("store_gb") or 0) for r in rows if r.get("name") in used and r.get("name") not in inactive_bundles), 2),
+        "snapshot_gb": round(snapshot_gb, 2),
+        "retention_unmeasured": unmeasured,
         "retention_clamped": clamped_notes,
         "active_month": active_info.get("month"),
         "active_month_partial": bool(active_info.get("partial")),
@@ -191,8 +222,9 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
     }
     notes = [
         "Ingest GB/day is the write-index sum of index.primaries.bulk.est_bytes_per_day from the Elasticsearch diagnostic bundle. "
-        "Retention is the size-weighted ILM delete age, or the oldest index age when no delete policy covers the stored data, rounded up to a whole month for the estimator. "
-        "Those two are summed by solution and by region. Search disk is the diagnostic store size. "
+        "Retention is the size-weighted ILM delete age on local primary store, or the oldest index age when no delete policy covers that store, rounded up to a whole month for the estimator. "
+        "A bundle with no measured age is left out of that average. "
+        "Those two are summed by solution and by region. Search disk is the local diagnostic store. "
         "Search query rates stay the K360 workload window. ECH ECU stays the K360 bill.",
     ]
     if short:
@@ -216,6 +248,15 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
         notes.append(
             f"{fallback} active {noun} {verb} no diagnostic bundle. {adds} no ingest. "
             "Current stored GB stays; a decommissioned snapshot is not added."
+        )
+    if snapshot_gb > 0:
+        notes.append(
+            f"Searchable snapshots, {snapshot_gb:,.0f} GB, are left out of store and retention. The quote uses local primary store."
+        )
+    if unmeasured:
+        names = ", ".join(row["name"] for row in unmeasured[:8])
+        notes.append(
+            f"{len(unmeasured)} deployments have bulk and no measured retention ({names}). They stay out of the weighted month."
         )
     if unmatched_diags:
         notes.append(f"{len(unmatched_diags)} diagnostic bundles did not match a billed deployment name and are not in the estimate.")

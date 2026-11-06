@@ -23,6 +23,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from analyze import build_account, chat_bullets, component_summary  # noqa: E402
 from consolidation import build_consolidation  # noqa: E402
+from quote_checks import e73_blocks_quote, money as _sheet_money  # noqa: E402
 from render_pdf import K360_BACKUP_SUFFIX, export as export_pdfs  # noqa: E402
 from k360_infra import es_base_and_key, fetch_infra, fill_ingest_doc_bytes, fill_storage_from_data_pivot, fill_storage_monthly, load_env, resolve_org_name, size_gaps  # noqa: E402
 from report_md import render  # noqa: E402
@@ -106,14 +107,10 @@ def agent_brief(acc: dict) -> dict:
     est_in = sz.get("estimators") if isinstance(sz.get("estimators"), dict) else {}
     estimators = {k: view for k, v in est_in.items() if (view := _est(v))}
     sec_rb = (estimators.get("security") or {}).get("readback") or {}
-    cps_raw = sec_rb.get("cps_addon_monthly")
-    try:
-        cps_val = float(cps_raw) if isinstance(cps_raw, (int, float)) else float("".join(ch for ch in str(cps_raw or "") if ch.isdigit() or ch == ".") or 0)
-    except ValueError:
-        cps_val = 0.0
+    cps_val = _sheet_money(sec_rb.get("cps_addon_monthly"))
     notes = list((cons.get("notes") or [])[:3])
-    if cps_val > 0:
-        notes.append(f"Security month-12 total includes ${cps_val:,.0f} of template cross-project search (sheet E73), not this account's linked projects.")
+    if e73_blocks_quote(cps_val):
+        notes.append(f"Security was left out of the quote. Sheet E73, the template cross-project search add-on, is ${cps_val:,.0f}.")
     exports = acc.get("exports") or {}
     slug = (m.get("customer_slug") or "account").replace("_", "-").lower()
     return {
@@ -337,6 +334,73 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
             diag_path.write_text(json.dumps(diag, indent=2))
         except subprocess.CalledProcessError as e:
             print(f"WARN: diagnostics regional sizing failed ({e}); document uses the consolidated read-backs", file=sys.stderr)
+    if sizing_ran and py.is_file() and not (diag.get("consolidation") or {}).get("error"):
+        if not args.skip_deployment_plan:
+            plan_cmd = [str(py), str(HERE / "size_serverless.py"), "--account-json", str(diag_path), "--deployment-plan", *extra]
+            if args.skip_xlsx:
+                plan_cmd.append("--skip-xlsx")
+            try:
+                _run(plan_cmd)
+            except subprocess.CalledProcessError as e:
+                diag = json.loads(diag_path.read_text())
+                diag.setdefault("sizing", {})["deployment_plan"] = {
+                    "bars": [],
+                    "error": f"Observability deployment-count plan was not priced ({e}).",
+                }
+                diag_path.write_text(json.dumps(diag, indent=2))
+            diag = json.loads(diag_path.read_text())
+            try:
+                diag["consolidation"] = build_consolidation(diag, infra)
+            except Exception as ex:
+                print(f"WARN: deployment-plan consolidation failed ({ex!r})", file=sys.stderr)
+                diag["consolidation"] = {"triggered": True, "source": "diagnostics", "error": repr(ex)}
+        if not (diag.get("consolidation") or {}).get("error"):
+            diag.setdefault("consolidation", {})["retention_scenario"] = "rounded"
+            try:
+                diag_30 = copy.deepcopy(diag)
+                for sol in ("observability", "security"):
+                    blk = ((diag_30.get("sizing") or {}).get("consolidated") or {}).get(sol) or {}
+                    if blk.get("retention_months") is not None:
+                        blk["retention_months"] = 1
+                if args.skip_deployment_plan:
+                    (diag_30.get("sizing") or {}).pop("deployment_plan", None)
+                path_30 = diag_path.with_name(diag_path.stem + "_30d.json")
+                path_30.write_text(json.dumps(diag_30, indent=2))
+                month_cmd = [str(py), str(HERE / "size_serverless.py"), "--account-json", str(path_30), "--name-suffix", "_30d", "--force-months", "1", "--skip-search", *extra]
+                if args.skip_xlsx:
+                    month_cmd.append("--skip-xlsx")
+                _run(month_cmd)
+                if not args.skip_deployment_plan:
+                    plan_30 = [str(py), str(HERE / "size_serverless.py"), "--account-json", str(path_30), "--deployment-plan", "--name-suffix", "_30d", "--force-months", "1", *extra]
+                    if args.skip_xlsx:
+                        plan_30.append("--skip-xlsx")
+                    try:
+                        _run(plan_30)
+                    except subprocess.CalledProcessError as e:
+                        diag_30 = json.loads(path_30.read_text())
+                        diag_30.setdefault("sizing", {})["deployment_plan"] = {
+                            "bars": [],
+                            "error": f"Observability deployment-count plan was not priced ({e}).",
+                        }
+                        path_30.write_text(json.dumps(diag_30, indent=2))
+                diag_30 = json.loads(path_30.read_text())
+                diag_30["consolidation"] = build_consolidation(diag_30, infra)
+                diag_30["consolidation"]["retention_scenario"] = "30d"
+                diag_30["consolidation"]["retention_set_days"] = 30
+                path_30.write_text(json.dumps(diag_30, indent=2))
+                monthly = ((diag_30.get("consolidation") or {}).get("savings") or {}).get("serverless_mo")
+                diag["consolidation"]["thirty_day"] = {
+                    "monthly": monthly,
+                    "annual_year1": None if monthly is None else round(float(monthly) * 12, 2),
+                }
+                diag["thirty_day_account"] = str(path_30)
+            except subprocess.CalledProcessError as e:
+                print(f"WARN: 30-day sizing failed ({e})", file=sys.stderr)
+                diag.setdefault("consolidation", {}).setdefault("notes", []).append(f"The 30-day PDF was not priced ({e}).")
+            except Exception as ex:
+                print(f"WARN: 30-day quote failed ({ex!r})", file=sys.stderr)
+                diag.setdefault("consolidation", {}).setdefault("notes", []).append(f"The 30-day PDF was not priced ({ex!r}).")
+        diag_path.write_text(json.dumps(diag, indent=2))
     sz["diagnostics_status"] = "ok"
     sz["diagnostics_dir"] = str(out_dir)
     return diag
@@ -363,6 +427,7 @@ def main() -> None:
     ap.add_argument("--diags-dir", default=None, help="Existing directory of admin-console diagnostic zips. Skips the admin API and parses this folder")
     ap.add_argument("--k360-ingest", action="store_true", help="Also price serverless from K360 stored GB ÷ assumed retention. K360 has no raw ingest total, so this backup can sit far below diagnostic bulk. Used automatically when bundles are unavailable")
     ap.add_argument("--skip-vpn-check", action="store_true", help="Pull diagnostics without checking that the Aviatrix VPN tunnel is up")
+    ap.add_argument("--skip-deployment-plan", action="store_true", help="Skip the Observability 0/25/50/75/100%% deployment-count sheets. The headline quote still runs")
     args = ap.parse_args()
 
     fetch_py = ORG_SKILL / "scripts" / "fetch_org.py"
@@ -517,6 +582,15 @@ def main() -> None:
             if diag_acc is not None and not (diag_acc.get("consolidation") or {}).get("error"):
                 acc["exports"] = export_pdfs(acc, folder, only="account")
                 acc["exports"].update(export_pdfs(diag_acc, folder, only="consolidation"))
+                path_30 = diag_acc.get("thirty_day_account")
+                if path_30 and Path(path_30).is_file():
+                    diag_30 = json.loads(Path(path_30).read_text())
+                    if not (diag_30.get("consolidation") or {}).get("error"):
+                        acc["exports"].update(export_pdfs(
+                            diag_30, folder, only="consolidation",
+                            consolidation_suffix="Serverless_consolidation_30d",
+                            consolidation_kind="consolidation_30d",
+                        ))
             else:
                 acc["exports"] = export_pdfs(acc, folder)
             for kind, e in acc["exports"].items():

@@ -2,10 +2,12 @@
 """Print diagnostic-only Serverless inputs. Does not quote dollars.
 
 Reads sizing_from_diags.json (a list of bundle rows). Each printed project is
-Σ bulk_gb_day and the bulk-weighted retention. Stored GB is used only to pack
-rows into N groups. --each keeps deployments at or above 50 GB/day alone and
-pools the rest into one project. The estimator month is always a whole number,
-rounded up. Every project also carries a 30-day read, written as 1 month.
+Σ bulk_gb_day and the bulk-weighted measured retention. A row with no measured
+retention is left out of that average. Stored GB is used only to pack rows
+into N groups. --each keeps deployments at or above 50 GB/day alone and
+pools the rest into one project. The estimator month is a whole number,
+rounded up, and is omitted when nothing was measured. Every project also
+carries a 30-day read, written as 1 month.
 --retention-months replaces the headline month and leaves bulk measured.
 No K360 stored-GB backfill is added.
 """
@@ -52,27 +54,47 @@ def whole_months(months: float) -> int:
     return int(min(36, max(1, math.ceil(clamped - 1e-9))))
 
 
-def _cells(bulk: float, written: int) -> tuple[dict, dict]:
-    return (
-        {
-            "G21_logs_gb_day": round(bulk * 0.90, 3),
-            "G23_metrics_gb_day": round(bulk * 0.10, 3),
-            "G11_retention_months": written,
-        },
-        {
-            "G4_siem_gb_day": round(bulk, 3),
-            "G6_retention_months": written,
-        },
-    )
+def _measured_days(value) -> float | None:
+    """A retention age counts only when the bundle measured it. Zero and missing do not."""
+    try:
+        days = float(value)
+    except (TypeError, ValueError):
+        return None
+    if days <= 0:
+        return None
+    return days
+
+
+def _cells(bulk: float, written: int | None) -> tuple[dict, dict]:
+    o11y = {
+        "G21_logs_gb_day": round(bulk * 0.90, 3),
+        "G23_metrics_gb_day": round(bulk * 0.10, 3),
+    }
+    security = {"G4_siem_gb_day": round(bulk, 3)}
+    if written:
+        o11y["G11_retention_months"] = written
+        security["G6_retention_months"] = written
+    return o11y, security
 
 
 def summarize(rows: list[dict], retention_months: int | None = None) -> dict:
     bulk = sum(_num(r, "bulk_gb_day") for r in rows)
-    weight = sum(_num(r, "bulk_gb_day") * _num(r, "retention_days") for r in rows)
     store = sum(_num(r, "store_gb") for r in rows)
-    days = (weight / bulk) if bulk else 0.0
-    months = days / DAYS_PER_MONTH
-    written = whole_months(months) if bulk else 0
+    weight = 0.0
+    weight_bulk = 0.0
+    unmeasured = []
+    for row in rows:
+        rate = _num(row, "bulk_gb_day")
+        days = _measured_days(row.get("retention_days"))
+        if days is None:
+            if rate > 0:
+                unmeasured.append({"name": row.get("name"), "bulk_gb_day": round(rate, 3)})
+            continue
+        weight_bulk += rate
+        weight += rate * days
+    days = (weight / weight_bulk) if weight_bulk else None
+    months = (days / DAYS_PER_MONTH) if days is not None else None
+    written = whole_months(months) if months is not None else None
     if retention_months is not None and bulk:
         written = int(min(36, max(1, retention_months)))
     o11y, security = _cells(bulk, written)
@@ -88,9 +110,10 @@ def summarize(rows: list[dict], retention_months: int | None = None) -> dict:
         "names": [r["name"] for r in rows],
         "bulk_gb_day": round(bulk, 3),
         "bulk_times_days": round(weight, 1),
-        "weighted_days": round(days, 2),
-        "months_measured": round(months, 3),
+        "weighted_days": round(days, 2) if days is not None else None,
+        "months_measured": round(months, 3) if months is not None else None,
         "months_written": written,
+        "retention_unmeasured": unmeasured,
         "store_gb": round(store, 1),
         "observability_cells": o11y,
         "security_cells": security,
@@ -117,6 +140,45 @@ def pooled_deployments(rows: list[dict], threshold: float = POOL_UNDER_GB_DAY) -
     if small:
         groups.append(sorted(small, key=lambda r: -_num(r, "bulk_gb_day")))
     return groups
+
+
+def project_count(n: int, pct: int) -> int:
+    """Projects kept when the active deployment count is cut by `pct` percent.
+
+    0% keeps every deployment. 100% is one project, including when N × 0 is 0.
+    The middle cuts use round(N × (1 − pct/100)), which can be 0.
+    """
+    if n <= 0:
+        return 0
+    if pct >= 100:
+        return 1
+    if pct <= 0:
+        return n
+    return int(round(n * (1 - pct / 100)))
+
+
+def deployment_count_plans(rows: list[dict]) -> list[dict]:
+    """Five Observability packs: cut the deployment count by 0, 25, 50, 75, and 100%."""
+    n = len(rows)
+    plans = []
+    ordered = sorted(rows, key=lambda r: -_num(r, "bulk_gb_day"))
+    for pct in (0, 25, 50, 75, 100):
+        count = project_count(n, pct)
+        if count <= 0 or n == 0:
+            groups: list[list[dict]] = []
+        elif pct <= 0:
+            groups = [[row] for row in ordered]
+        elif pct >= 100:
+            groups = [list(rows)]
+        else:
+            groups = pack(rows, count)
+        plans.append({
+            "cut_pct": pct,
+            "label": f"{pct}%",
+            "projects": len(groups) if groups else count,
+            "groups": groups,
+        })
+    return plans
 
 
 def pack(rows: list[dict], n: int) -> list[list[dict]]:

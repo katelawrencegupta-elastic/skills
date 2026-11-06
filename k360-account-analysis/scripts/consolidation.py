@@ -15,10 +15,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
+
+from quote_checks import e73_blocks_quote, g26_gate, money as _money
 
 DAYS_PER_MONTH = 30.416
 TAIL_SHARE_PCT = 1.0          # "small" deployment = < 1 % of lookback ECU (same as cost rec)
@@ -187,15 +188,17 @@ def _apply_sheet_readback(by_solution: dict, sz: dict, solution: str) -> bool:
     rb = est.get("readback") or {}
     monthly = _money(rb.get("monthly_steady_state"))
     blk = by_solution.get(solution) or {}
-    if monthly is None or not (blk.get("stored_gb") or 0):
+    written = float(blk.get("daily_raw_gb") or 0)
+    if monthly is None or not ((blk.get("stored_gb") or 0) or written):
         return False
     _stash_model(blk)
     _clear_components(blk)
     raw = _money(rb.get("total_raw_gb_day"))
     metered = _money(rb.get("metered_gb_day"))
     if raw is not None:
-        blk["daily_raw_gb"] = raw
+        blk["sheet_raw_gb_day"] = raw
     if metered is not None:
+        blk["sheet_metered_gb_day"] = metered
         blk["daily_metered_gb"] = metered
     y1 = _money(rb.get("annual_year1"))
     blk["total_mo"] = round(monthly, 2)
@@ -205,16 +208,49 @@ def _apply_sheet_readback(by_solution: dict, sz: dict, solution: str) -> bool:
 
 
 def _omit_unquoted(blk: dict, notes: list[str], solution: str) -> None:
-    if not (blk.get("stored_gb") or 0):
+    if not ((blk.get("stored_gb") or 0) or (blk.get("daily_raw_gb") or 0)):
         return
-    if "quotable" in str(blk.get("pricing") or ""):
+    pricing = str(blk.get("pricing") or "")
+    if "quotable" in pricing:
         return
     _stash_model(blk)
     _clear_components(blk)
     blk["total_mo"] = 0.0
     blk["total_yr"] = 0.0
+    if pricing.startswith("rejected"):
+        return
     blk["pricing"] = "omitted — no estimator read-back"
     notes.append(f"{solution.title()} has stored GB but no estimator read-back, so it is left out of the serverless total.")
+
+
+def _search_power(sz: dict, by_solution: dict) -> dict | None:
+    """es3 profiles already priced. They are not added to D32 or E74."""
+    regional = (by_solution.get("search") or {}).get("regional_profiles") or []
+    profiles = regional or (((sz.get("estimators") or {}).get("search") or {}).get("profiles") or [])
+    if not profiles:
+        return None
+    return {"profiles": profiles}
+
+
+def _deployment_bars(sz: dict, by_solution: dict, notes: list[str]) -> list:
+    """Page-1 Observability bars. 100% reuses the headline read-back."""
+    raw = sz.get("deployment_plan") or {}
+    if not raw:
+        return []
+    if raw.get("error"):
+        notes.append(str(raw["error"]))
+        return []
+    bars = []
+    headline = by_solution.get("observability") or {}
+    for row in raw.get("bars") or []:
+        monthly = row.get("monthly")
+        if row.get("reused_headline"):
+            monthly = headline.get("total_mo") if "quotable" in str(headline.get("pricing") or "") else None
+        if monthly is None:
+            notes.append("Observability deployment-count plan was not priced.")
+            return []
+        bars.append({"label": row.get("label") or "", "monthly": monthly, "projects": row.get("projects")})
+    return bars
 
 
 def _deployment_groups(acc: dict, infra: dict | None, months: float) -> list[dict]:
@@ -230,7 +266,7 @@ def _deployment_groups(acc: dict, infra: dict | None, months: float) -> list[dic
             continue
         sol = d.get("solution") or "search"
         reg = region_by_name.get(d["name"]) or "unknown region"
-        g = grouped.setdefault((sol, reg), {"solution": sol, "region": reg, "deployments": [], "ech_ecu_mo": 0.0, "stored_gb": 0.0, "daily_raw_gb": 0.0, "retention_weighted": 0.0, "has_daily": False})
+        g = grouped.setdefault((sol, reg), {"solution": sol, "region": reg, "deployments": [], "ech_ecu_mo": 0.0, "stored_gb": 0.0, "daily_raw_gb": 0.0, "retention_weighted": 0.0, "retention_bulk": 0.0, "has_daily": False})
         g["deployments"].append(d["name"])
         g["ech_ecu_mo"] += float(d.get("ecu") or 0) / months
         g["stored_gb"] += float(d.get("gb") or 0)
@@ -238,7 +274,13 @@ def _deployment_groups(acc: dict, infra: dict | None, months: float) -> list[dic
             rate = float(d.get("daily_raw_gb") or 0)
             g["has_daily"] = True
             g["daily_raw_gb"] += rate
-            g["retention_weighted"] += rate * float(d.get("retention_days") or 0)
+            try:
+                days = float(d.get("retention_days"))
+            except (TypeError, ValueError):
+                days = 0.0
+            if days > 0:
+                g["retention_weighted"] += rate * days
+                g["retention_bulk"] = g.get("retention_bulk", 0.0) + rate
     groups = []
     for g in grouped.values():
         row = {
@@ -247,8 +289,8 @@ def _deployment_groups(acc: dict, infra: dict | None, months: float) -> list[dic
         }
         if g["has_daily"]:
             row["daily_raw_gb"] = round(g["daily_raw_gb"], 3)
-            if g["daily_raw_gb"] > 0 and g["retention_weighted"] > 0:
-                row["retention_months"] = round((g["retention_weighted"] / g["daily_raw_gb"]) / DAYS_PER_MONTH, 2)
+            if g["retention_bulk"] > 0:
+                row["retention_months"] = round((g["retention_weighted"] / g["retention_bulk"]) / DAYS_PER_MONTH, 2)
         groups.append(row)
     order = {"search": 0, "observability": 1, "security": 2}
     groups.sort(key=lambda g: (order.get(g["solution"], 9), -g["ech_ecu_mo"]))
@@ -358,10 +400,23 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                     "annual_steady_state": _money(rb.get("annual_steady_state")),
                 })
             else:
-                sheet_monthly = _money(saved_rb.get("monthly_steady_state"))
+                rejected = (saved_hit.get("g26_gate") or {}) if sol == "observability" else {}
+                e73_rejected = sol == "security" and e73_blocks_quote(saved_rb.get("cps_addon_monthly"))
+                if rejected and not rejected.get("accepted"):
+                    sheet_monthly = None
+                    how = "rejected — G26 differs from the written bulk"
+                    notes.append(f"Observability {g['region']} G26 differed from the written bulk, so that region was not quoted.")
+                elif e73_rejected:
+                    sheet_monthly = None
+                    how = "rejected — E73 add-on is not zero"
+                    notes.append(f"Security {g['region']} still has an E73 add-on, so that region was not quoted.")
+                else:
+                    sheet_monthly = _money(saved_rb.get("monthly_steady_state"))
+                    how = "sheet read-back" if sheet_monthly is not None else ""
                 if sheet_monthly is not None:
                     monthly = sheet_monthly
-                    how = "sheet read-back"
+                elif how.startswith("rejected"):
+                    monthly = None
                 else:
                     monthly = round(float(blk.get("total_mo") or 0) * share, 2) if g["stored_gb"] > 0 else None
                     how = "sheet read-back split by stored GB"
@@ -373,9 +428,16 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                     "annual_steady_state": _money(saved_rb.get("annual_steady_state")),
                 })
         blk["by_region"] = priced
-        total = round(sum(p["monthly"] or 0 for p in priced), 2)
-        blk["total_mo"] = total
-        blk["total_yr"] = round(total * 12, 2)
+        rejected = [p for p in priced if str(p.get("pricing") or "").startswith("rejected")]
+        if rejected and sol != "search":
+            blk["pricing"] = str(rejected[0].get("pricing"))
+            blk["total_mo"] = 0.0
+            blk["total_yr"] = 0.0
+            notes.append(f"{sol.title()} was left out of the quote because a regional read-back was not accepted.")
+        else:
+            total = round(sum(p["monthly"] or 0 for p in priced), 2)
+            blk["total_mo"] = total
+            blk["total_yr"] = round(total * 12, 2)
         if sol == "search":
             for key in ("search_mo", "ingest_mo", "retention_mo", "support_mo"):
                 vals = [p.get(key) for p in priced if p.get(key) is not None]
@@ -596,18 +658,6 @@ def _align_primary_cost_rec(acc: dict, savings: dict, by_solution: dict) -> None
     rec["action"] = "Quote the Search Serverless and Observability Serverless estimators. Migrate the dominant slice first. Keep latency-sensitive search on ECH if a project cannot meet it."
 
 
-def _money(s) -> float | None:
-    if s is None:
-        return None
-    if isinstance(s, (int, float)):
-        return float(s)
-    m = re.sub(r"[^\d.\-]", "", str(s))
-    try:
-        return float(m) if m else None
-    except ValueError:
-        return None
-
-
 # --------------------------------------------------------------------------- main build
 def build_consolidation(acc: dict, infra: dict | None) -> dict:
     sz = acc.get("sizing") or {}
@@ -650,12 +700,37 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
     for sol in ("observability", "security", "search"):
         blk = con.get(sol) or {}
         gb = float(blk.get("stored_gb") or 0)
+        written_bulk = float(blk.get("daily_raw_gb") or 0)
         ret = float(blk.get("retention_months") or 3.0)
         p = _price_slice(sol, gb, ret, workload)
         p.update({"stored_gb": round(gb, 1), "deployments": blk.get("deployments"), "ech_ecu_mo": blk.get("ecu_monthly_avg")})
+        if sz.get("ingest_source") == "diagnostics":
+            p["daily_raw_gb"] = round(written_bulk, 3)
         by_solution[sol] = p
     quoted = _apply_search_estimator(by_solution, sz)
     for sol in ("observability", "security"):
+        est = ((sz.get("estimators") or {}).get(sol) or {})
+        blk = by_solution[sol]
+        readback = est.get("readback") or {}
+        if sol == "observability" and readback and not est.get("readback_rejected"):
+            gate = est.get("g26_gate") or g26_gate(float(blk.get("daily_raw_gb") or 0), readback.get("total_raw_gb_day"))
+            if not gate.get("accepted"):
+                blk["pricing"] = "rejected — G26 differs from the written bulk"
+                notes.append(
+                    f"Observability sheet G26 is {gate.get('sheet_raw_gb_day')} GB/day against {gate.get('written_bulk')} GB/day written. D32 was not quoted."
+                )
+                continue
+        if sol == "security" and readback and e73_blocks_quote(readback.get("cps_addon_monthly")):
+            addon = _money(readback.get("cps_addon_monthly"))
+            blk["pricing"] = "rejected — E73 add-on is not zero"
+            notes.append(
+                f"Security month-12 total includes {addon} from template cross-project search (sheet E73). E74 was not quoted."
+            )
+            continue
+        if est.get("readback_rejected"):
+            blk["pricing"] = "rejected — " + str(est.get("readback_rejected"))
+            notes.append(f"{sol.title()} read-back was not quoted: {est.get('readback_rejected')}")
+            continue
         quoted = _apply_sheet_readback(by_solution, sz, sol) or quoted
     for sol, blk in by_solution.items():
         _omit_unquoted(blk, notes, sol)
@@ -687,17 +762,17 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         ))
     dominant = max(by_solution, key=lambda k: float(by_solution[k].get("stored_gb") or 0)) if by_solution else "observability"
     dom = by_solution.get(dominant) or {}
-    metered = float(dom.get("daily_metered_gb") or 0)
+    metered = float(dom.get("daily_metered_gb") or dom.get("sheet_metered_gb_day") or 0)
     retained = float(dom.get("retained_gb") or 0)
-    ingest_mo = float(dom.get("ingest_mo") or 0)
-    retain_mo = float(dom.get("retention_mo") or 0)
+    ingest_mo = dom.get("ingest_mo")
+    retain_mo = dom.get("retention_mo")
     serverless = {
         "by_solution": by_solution,
         "dominant_solution": dominant,
         "total_mo": round(svls_total_mo, 2),
         "total_yr": round(svls_total_mo * 12, 2),
-        "eff_ingest_usd_per_gb": round(ingest_mo / (metered * DAYS_PER_MONTH), 4) if metered else None,
-        "eff_retain_usd_per_gb_mo": round(retain_mo / retained, 4) if retained else None,
+        "eff_ingest_usd_per_gb": round(float(ingest_mo) / (metered * DAYS_PER_MONTH), 4) if ingest_mo is not None and metered else None,
+        "eff_retain_usd_per_gb_mo": round(float(retain_mo) / retained, 4) if retain_mo is not None and retained else None,
         "eff_usd_per_stored_gb_mo": round(svls_total_mo / stored_gb, 4) if stored_gb else None,
         "ech_ecu_per_stored_gb_mo": round(ech_mo / stored_gb, 4) if stored_gb else None,
         "pricing_source": PRICING_SOURCE,
@@ -970,6 +1045,8 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         "savings": savings,
         "ladder": [] if quoted else (_ladder_walk(metered) if metered else []),
         "metered_rates": observability_metered_rates(((acc.get("solutions") or {}).get("by_deployment") or [])) if (sz.get("ingest_source") == "diagnostics") else [],
+        "deployment_plan": _deployment_bars(sz, by_solution, notes),
+        "search_power": _search_power(sz, by_solution),
         "fragmentation": fragmentation,
         "architecture": architecture,
         "by_deployment": per[:TOP_N],
