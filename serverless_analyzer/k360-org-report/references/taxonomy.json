@@ -1,0 +1,21 @@
+{
+  "search": [
+    "elasticsearch", "kibana", "enterprise_search", "enterprisesearch",
+    "search ai lake", "snapshot-api-1k", "snapshot-storage",
+    "data-transfer-in", "data-transfer-out", "data-transfer-inter-node",
+    "data transfer", "ram hours", "vcu", "support", "cloud assets",
+    "vector database", "cross project search", "infrastructure"
+  ],
+  "observability": [
+    "synthetics-browser", "synthetics-lightweight", "synthetics",
+    "integrationsserver", "ingest", "metrics ingest",
+    "metrics search ai lake", "executions", "workflows", "managed integrations"
+  ],
+  "genai": [
+    "inference", "inference-chat-input", "inference-chat-output", "agent builder"
+  ],
+  "serverless_types": [
+    "search ai lake", "metrics search ai lake", "vcu", "vector database"
+  ],
+  "serverless_templates": ["search", "observability", "security", "default"]
+}
