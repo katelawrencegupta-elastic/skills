@@ -14,6 +14,10 @@ A script finds the other two skills beside its own folder, then in `~/.claude/sk
 
 Run each command from the project that holds `.env`. Artifacts land in `artifacts/<customer>_<date>/`.
 
+The K360 fetch, Sheets sign-in, and org report are `k360-org-report` in this folder. `.env` stays in the project you run from. The installer finds that file in the current directory, then in a parent directory.
+
+`python3 install.py` links these three folders into `~/.claude/skills` and `~/.cursor/skills`. It asks before it replaces a folder that is already a real directory.
+
 ## k360-org-report
 
 Fetches one Elastic Cloud organization from K360 and writes an exec report or a full report. The exec report condenses the footprint and keeps the projection and the Serverless split. The full report gives each section its own block. Both can copy Search and Observability estimator workbooks and upload a PDF.

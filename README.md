@@ -61,7 +61,9 @@ ln -s "$(pwd)/serverless_analyzer/k360-account-analysis" ~/.cursor/skills/k360-a
 ln -s "$(pwd)/serverless_analyzer/diag-serverless-consolidation" ~/.cursor/skills/diag-serverless-consolidation
 ```
 
-The serverless skills also have a guided installer. From `serverless_analyzer/`, run `python3 install.py`. The steps are `serverless_analyzer/INSTALL.md` and the script catalog is `serverless_analyzer/README.md`.
+The serverless skills also have a guided installer. From `serverless_analyzer/`, run `python3 install.py`. It links the three folders into both `~/.claude/skills` and `~/.cursor/skills`. When a name is already a real directory, it asks before replacing that directory with a symlink. `--check` only reports status. The steps are `serverless_analyzer/INSTALL.md` and the script catalog is `serverless_analyzer/README.md`.
+
+The installer looks for `.env` in the current directory, then in a parent directory. That file stays in the project you run from.
 
 Those three runners look for the other skills beside the one that is running, then in `~/.claude/skills` and `~/.cursor/skills`. `K360_ORG_SKILL_DIR`, `K360_ACCOUNT_SKILL_DIR`, and `DIAG_SKILL_DIR` override that search. In the commands below, `<skill>` is the directory that contains that skill's `SKILL.md`.
 
@@ -200,7 +202,7 @@ Examples: `status update GE Vernova 3m`, `status update Merck 2w googledoc=y`. T
 
 **How it works**
 
-1. **One pipeline run.** `scripts/run_account_analysis.py` fetches the org, fills storage when telemetry is missing, then analyzes the footprint.
+1. **One pipeline run.** `<skill>/scripts/run_account_analysis.py` fetches the org, fills storage when telemetry is missing, then analyzes the footprint.
 2. **No sizing step.** Estimator copies and the consolidation PDF belong to `diag-serverless-consolidation`.
 3. **Write the summary.** Account PDF, then a canvas and at most six chat bullets from the brief.
 

@@ -87,11 +87,7 @@ def default_artifacts_root() -> Path:
     env = os.environ.get("CLOUD_TRACKER_ARTIFACTS_ROOT")
     if env:
         return Path(env)
-    # Prefer workspace artifacts/ when cwd is the repo
-    cwd = Path.cwd()
-    if (cwd / "artifacts").is_dir() or (cwd / ".cursor").is_dir():
-        return cwd / "artifacts"
-    return cwd / "artifacts"
+    return Path.cwd() / "artifacts"
 
 
 def ensure_local_folder(root: Path, key: str) -> Path:

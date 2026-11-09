@@ -39,11 +39,11 @@ for skill in k360-org-report k360-account-analysis diag-serverless-consolidation
 done
 ```
 
-If a name is already a real directory, the installer leaves it alone unless you confirm a replacement. A symlink that already points at this repo is left as it is.
+If a name is already a real directory, the installer asks before it removes that directory and links this repo. A symlink that already points at this repo is left as it is. `--yes` leaves an existing directory in place.
 
 ## 2. Project `.env`
 
-Create the file in the project you will `cd` to, not in this skill folder. A read-only key on `cloud-tracker-*` is enough. `_cat` privileges are not required.
+Create the file in the project you will `cd` to, not in this skill folder. The installer uses the current directory when it contains `.env`, and otherwise the nearest parent that does. A read-only key on `cloud-tracker-*` is enough. `_cat` privileges are not required.
 
 ```bash
 # .env

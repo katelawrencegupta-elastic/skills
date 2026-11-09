@@ -101,9 +101,13 @@ def env_keys(path: Path) -> dict[str, bool]:
 
 
 def default_project() -> Path | None:
-    candidate = Path.home() / "Documents" / "GItHub" / "cloud_tracking"
-    if (candidate / ".env").is_file():
-        return candidate
+    """Directory that holds .env. The current directory wins, then its parents."""
+    cwd = Path.cwd()
+    if (cwd / ".env").is_file():
+        return cwd
+    for parent in cwd.parents:
+        if (parent / ".env").is_file():
+            return parent
     return None
 
 
