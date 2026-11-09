@@ -58,6 +58,8 @@ ln -s "$(pwd)/serverless_analyzer/k360-account-analysis" ~/.cursor/skills/k360-a
 ln -s "$(pwd)/serverless_analyzer/diag-serverless-consolidation" ~/.cursor/skills/diag-serverless-consolidation
 ```
 
+The serverless skills also have a guided installer. From `serverless_analyzer/`, run `python3 install.py`. The steps are `serverless_analyzer/INSTALL.md` and the script catalog is `serverless_analyzer/README.md`.
+
 ---
 
 ## How these skills save tokens
