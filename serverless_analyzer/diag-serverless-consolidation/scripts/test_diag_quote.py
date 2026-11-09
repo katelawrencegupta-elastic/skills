@@ -996,10 +996,44 @@ class PrivacyTests(unittest.TestCase):
             self.assertTrue(any(note.startswith(".env ") for note in tracked))
 
 
+class ChromeFallbackTests(unittest.TestCase):
+    def test_missing_chrome_keeps_the_html_report(self):
+        from unittest import mock
+
+        import render_pdf
+
+        account = {"meta": {"run_key": "Acme_2026-11-09", "customer": "Acme"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(render_pdf, "render_account_html", return_value="<html></html>"):
+                with mock.patch.object(render_pdf, "find_chrome", return_value=None):
+                    out = render_pdf.export_documents([(account, "account")], Path(tmp))
+            entry = out["account"]
+            self.assertTrue(entry["html"].endswith("Acme_2026-11-09_Account_analysis.html"))
+            self.assertTrue(Path(entry["html"]).is_file())
+            self.assertNotIn("pdf", entry)
+            self.assertIn("HTML file is the report", entry["error"])
+
+
 class SkillPathTests(unittest.TestCase):
     def test_sibling_org_skill_is_found_from_this_repo(self):
         found = find_skill("k360-org-report", HERE)
         self.assertTrue((found / "scripts" / "fetch_org.py").is_file())
+
+    def test_artifacts_land_beside_the_skills(self):
+        from skill_paths import artifacts_root
+
+        saved = {
+            name: os.environ.pop(name, None)
+            for name in ("SERVERLESS_ANALYZER_ARTIFACTS", "CLOUD_TRACKER_ARTIFACTS_ROOT")
+        }
+        try:
+            root = artifacts_root()
+        finally:
+            for name, value in saved.items():
+                if value is not None:
+                    os.environ[name] = value
+        self.assertEqual(root.name, "diag_artifacts")
+        self.assertTrue((root.parent / "k360-org-report" / "SKILL.md").is_file())
 
     def test_env_override_wins_over_the_sibling(self):
         with tempfile.TemporaryDirectory() as tmp:

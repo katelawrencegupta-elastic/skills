@@ -16,11 +16,13 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from skill_paths import artifacts_root
 from report_mode import (
     CANVAS_LAYOUT,
     add_report_arg,
     canvas_suggestion,
     normalize_report,
+    html_name,
     pdf_name,
 )
 
@@ -60,7 +62,7 @@ def main() -> None:
     ap.add_argument("--skip-push", action="store_true")
     ap.add_argument("--skip-pdf", action="store_true")
     ap.add_argument("--skip-workload", action="store_true")
-    ap.add_argument("--artifacts-root", default=None)
+    ap.add_argument("--artifacts-root", default=None, help="Parent of <customer>_<date>/ (default: serverless_analyzer/diag_artifacts)")
     add_report_arg(ap)
     args = ap.parse_args()
     report = normalize_report(args.report)
@@ -95,6 +97,7 @@ def main() -> None:
 
     data = json.loads(org_json.read_text())
     # Seed artifacts dir via emit
+    art_root = args.artifacts_root or str(artifacts_root())
     emit_cmd = [
         _py(),
         str(scripts / "emit_canvas_data.py"),
@@ -102,21 +105,11 @@ def main() -> None:
         str(org_json),
         "--report",
         report,
+        "--artifacts-root",
+        art_root,
     ]
     info = json.loads(subprocess.check_output(emit_cmd, text=True))
     folder = Path(info["folder"])
-    # Prefer artifacts under repo
-    if args.artifacts_root:
-        key = info["run_key"]
-        folder = Path(args.artifacts_root) / key
-        folder.mkdir(parents=True, exist_ok=True)
-        info = json.loads(
-            subprocess.check_output(
-                emit_cmd + ["--out-dir", str(folder)],
-                text=True,
-            )
-        )
-        folder = Path(info["folder"])
 
     # Copy full org json into artifacts (scripts already may have)
     dest_org = folder / f"{info['run_key']}_org_report.json"
@@ -183,6 +176,8 @@ def main() -> None:
     summary = json.loads(summary_path.read_text()) if summary_path.is_file() else {}
     slug = key.rsplit("_", 1)[0] if "_" in key else key
     canvas_file = canvas_suggestion(slug, report)
+    html_path = folder / html_name(key, report)
+    pdf_path = folder / pdf_name(key, report)
     result = {
         "ok": True,
         "report": report,
@@ -192,7 +187,8 @@ def main() -> None:
         "canvas": str(folder / f"{key}_canvas.json"),
         "offload": str(folder / f"{key}_offload.json"),
         "summary": str(summary_path),
-        "pdf": str(folder / pdf_name(key, report)),
+        "html": str(html_path) if html_path.is_file() else None,
+        "pdf": str(pdf_path) if pdf_path.is_file() else None,
         "canvas_file_hint": canvas_file,
         "canvas_layout": CANVAS_LAYOUT[report],
         "chat_bullets_hint": summary.get("chat_bullets_hint"),

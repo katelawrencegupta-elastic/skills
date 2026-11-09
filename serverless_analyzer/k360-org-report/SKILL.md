@@ -44,7 +44,7 @@ python <skill>/scripts/run_org_report.py --org "ORG_NAME" --report full --reuse 
 
 `.env`: `KIBANA_URL`, `ELASTIC_API_KEY`. Other flags: `--skip-pdf` · `--skip-push` · `--skip-workload` · `--days N`.
 
-**Pipeline:** fetch → `artifacts/<customer>_<date>/` → slim JSON → estimators (Drive+xlsx) → HTML+PDF (named by `--report`) → Drive PDF upload.
+**Pipeline:** fetch → `serverless_analyzer/diag_artifacts/<customer>_<date>/` → slim JSON → estimators (Drive+xlsx) → HTML+PDF (named by `--report`) → Drive PDF upload. When Chrome is missing, the HTML file is the report and the PDF upload is skipped.
 
 ## After the script (agent only)
 1. Open the matching child doc (`exec-report.md` or `full-report.md`).
@@ -52,7 +52,7 @@ python <skill>/scripts/run_org_report.py --org "ORG_NAME" --report full --reuse 
 3. **Chat** — ≤5 bullets from `*_summary.json` (+ folder / Drive URL).
 
 ## Artifacts (same folder for both)
-`artifacts/<customer>_<date>/` holds Search/Observability estimators, chosen `*_Exec_report` or `*_Full_report` PDF, HTML, org JSON, canvas/offload/summary, `artifacts.json`. Both PDFs may coexist in the folder.
+`serverless_analyzer/diag_artifacts/<customer>_<date>/` holds Search/Observability estimators, chosen `*_Exec_report` or `*_Full_report` PDF, HTML, org JSON, canvas/offload/summary, `artifacts.json`. Both PDFs may coexist in the folder. `--artifacts-root` overrides that directory.
 
 ## §10 (required)
 `offload.full_split` lines + totals; $/yr + 3yr; hybrid secondary; never recommend all-ES3. → [methodology.md](references/methodology.md)

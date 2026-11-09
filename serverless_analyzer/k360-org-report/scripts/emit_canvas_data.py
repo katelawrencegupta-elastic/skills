@@ -3,7 +3,7 @@
 
 Keeps the agent from loading ~250KB payloads into context.
 
-  python emit_canvas_data.py --org-json /tmp/org_report.json --out-dir artifacts/Acme_2026-11-02
+  python emit_canvas_data.py --org-json /tmp/org_report.json --out-dir serverless_analyzer/diag_artifacts/Acme_2026-11-02
 """
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from report_mode import (
     normalize_report,
     pdf_name,
 )
+from skill_paths import artifacts_root
 
 
 def _slug(name: str) -> str:
@@ -325,7 +326,8 @@ def build_summary(data: dict, canvas: dict, offload: dict, paths: dict, report: 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--org-json", required=True)
-    ap.add_argument("--out-dir", default=None, help="Artifacts folder (default: beside org-json or ./artifacts/<slug>_<date>)")
+    ap.add_argument("--out-dir", default=None, help="Artifacts folder (default: <artifacts-root>/<slug>_<date>)")
+    ap.add_argument("--artifacts-root", default=None, help="Parent of <customer>_<date>/ (default: serverless_analyzer/diag_artifacts)")
     ap.add_argument("--top-deps", type=int, default=12)
     add_report_arg(ap)
     args = ap.parse_args()
@@ -346,9 +348,14 @@ def main() -> None:
     slug = _slug(name)
     key = f"{slug}_{when.isoformat()}"
 
-    out_dir = Path(args.out_dir) if args.out_dir else org_path.parent
-    if out_dir == Path("/tmp") or out_dir.resolve() == Path("/tmp"):
-        out_dir = Path.cwd() / "artifacts" / key
+    if args.out_dir:
+        out_dir = Path(args.out_dir)
+    elif args.artifacts_root:
+        out_dir = Path(args.artifacts_root) / key
+    else:
+        out_dir = org_path.parent
+        if out_dir == Path("/tmp") or out_dir.resolve() == Path("/tmp"):
+            out_dir = artifacts_root() / key
     out_dir.mkdir(parents=True, exist_ok=True)
 
     canvas = build_canvas(data, top_deps=args.top_deps)

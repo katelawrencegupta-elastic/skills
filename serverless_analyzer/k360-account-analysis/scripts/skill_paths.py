@@ -55,3 +55,17 @@ def find_skill(name: str, caller: Path) -> Path:
 def scripts_dir(skill: Path) -> Path:
     scripts = skill / "scripts"
     return scripts if scripts.is_dir() else skill
+
+
+def artifacts_root() -> Path:
+    """Parent of <customer>_<date>/ run folders.
+
+    SERVERLESS_ANALYZER_ARTIFACTS overrides this. The default is
+    serverless_analyzer/diag_artifacts, beside the three skill folders.
+    CLOUD_TRACKER_ARTIFACTS_ROOT is honored only when the new variable is unset.
+    """
+    for name in ("SERVERLESS_ANALYZER_ARTIFACTS", "CLOUD_TRACKER_ARTIFACTS_ROOT"):
+        env = os.environ.get(name)
+        if env:
+            return Path(env).expanduser()
+    return Path(__file__).resolve().parents[2] / "diag_artifacts"

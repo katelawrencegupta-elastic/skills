@@ -265,7 +265,7 @@ def chrome_note() -> str:
     for path in candidates:
         if path and Path(path).is_file():
             return f"Chrome found at {path}"
-    return "Chrome not found. Install Google Chrome or set CHROME_PATH. HTML is still written when Chrome is missing"
+    return "Chrome not found. Install Google Chrome or set CHROME_PATH. The HTML file is the report when Chrome is missing"
 
 
 def main() -> int:
@@ -328,6 +328,7 @@ def main() -> int:
     say(f"  python {ROOT}/k360-org-report/scripts/run_org_report.py --org \"ORG NAME\" --report exec")
     say(f"  python {ROOT}/k360-account-analysis/scripts/run_account_analysis.py --org \"ORG NAME\" --skip-diags --skip-sizing")
     say(f"  python {ROOT}/diag-serverless-consolidation/scripts/run_consolidation.py --org \"ORG NAME\" --reuse <org_report.json> --diags-dir <bundles>")
+    say(f"Artifacts: {ROOT}/diag_artifacts")
     say("Written steps are INSTALL.md. The script catalog is README.md.")
     return 0
 

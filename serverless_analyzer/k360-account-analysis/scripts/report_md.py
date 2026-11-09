@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Render <run_key>_account_report.md from the account JSON (tables + Mermaid charts).
 
-  python report_md.py --account-json artifacts/Acme_2026-11-02/Acme_2026-11-02_account.json
+  python report_md.py --account-json serverless_analyzer/diag_artifacts/Acme_2026-11-02/Acme_2026-11-02_account.json
 """
 from __future__ import annotations
 

@@ -20,22 +20,17 @@
   `ES3_ESTIMATOR_DIR` defaults to `~/Documents/GItHub/es3-estimator-main` (the directory that contains `estimator/lib`). `ES3_ESTIMATOR_PY` overrides the interpreter.
 
 ## Env overrides
-`O11Y_SHEET_ID`, `SECURITY_SHEET_ID` (golden template ids) · `K360_ORG_SKILL_DIR` · `SERVERLESS_SHEETS_PY` · `ES3_ESTIMATOR_DIR` · `ES3_ESTIMATOR_PY`.
+`O11Y_SHEET_ID`, `SECURITY_SHEET_ID` (golden template ids) · `K360_ORG_SKILL_DIR` · `SERVERLESS_SHEETS_PY` · `ES3_ESTIMATOR_DIR` · `ES3_ESTIMATOR_PY` · `SERVERLESS_ANALYZER_ARTIFACTS` (overrides `serverless_analyzer/diag_artifacts`).
 
 ## Admin console (diagnostic consolidation skill)
 The account-summary skill passes `--skip-diags --skip-sizing` and does not use this. `diag-serverless-consolidation` needs `FOUND_ADMIN_API_KEY` in the same `.env`. `FOUND_ADMIN_URL` must be `https://admin.found.no`. Another host is used only when it is listed in `FOUND_ADMIN_HOST_ALLOWLIST` (comma-separated). A URL with a username, password, query, fragment, or path is refused. `KIBANA_URL` must be `https` and must not include a username or password. The key must be allowed to search deployments for the organization and to capture Elasticsearch diagnostics. Before a pull, the command opens a TLS connection to that admin host and does not send the API key. When the connection fails, connect the Aviatrix VPN tunnel. `--skip-vpn-check` skips that check. Without bundles the quote falls back to K360 stored GB ÷ assumed retention, and the notes say K360 does not provide a raw ingest total. `--diags-dir` reads a folder of zips and does not call the admin API. `--skip-diags` selects that backup on purpose. `--k360-ingest` writes the backup as well when the bundles succeed.
 
 ## Git
-Keep `.env` and `artifacts/` out of git. Add these lines to the project `.gitignore`:
+Reports and diagnostic bundles go to `serverless_analyzer/diag_artifacts/`. That directory ignores its contents. Keep `.env` out of git as well. `--artifacts-root` overrides the directory.
 
-```
-.env
-artifacts/
-```
-
-The runners warn when the working directory is a git repo and either path is tracked or unignored. They do not edit `.gitignore`. Diagnostic bundles, account JSON, and briefs are written mode `0600` inside a run directory mode `0700`.
+The runners warn when `.env` or `diag_artifacts/` is tracked or unignored. They do not edit `.gitignore`. Diagnostic bundles, account JSON, and briefs are written mode `0600` inside a run directory mode `0700`.
 
 ## Python
 Analysis scripts are stdlib-only (Python ≥ 3.10). `diag-serverless-consolidation/scripts/size_serverless.py` and this skill's `upload_pdfs.py` must run under the Sheets venv (`google-api-python-client`, `google-auth-oauthlib`).
 
-- **Chrome** (PDF export): Google Chrome or Chromium in `/Applications`, or set `CHROME_PATH`. If Chrome is missing the HTML is still written and `exports.<kind>.error` records why; use `--skip-pdf` to disable.
+- **Chrome** (PDF export): Google Chrome or Chromium in `/Applications`, or set `CHROME_PATH`. When Chrome is missing, the HTML file is the report. `--skip-pdf` writes that HTML and skips the print.

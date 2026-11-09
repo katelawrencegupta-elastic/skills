@@ -23,7 +23,7 @@ Python 3.10 or newer is required. The analysis scripts use the standard library.
 | Google Chrome | PDF print | `/Applications`, or `CHROME_PATH` |
 | Aviatrix VPN | A fresh admin-console pull | An `openvpn` process. `--diags-dir` does not need it |
 
-Keep `.env` and `artifacts/` out of git. A run directory is created mode `0700`, and the customer files inside it are mode `0600`.
+Reports and diagnostic bundles are written to `serverless_analyzer/diag_artifacts/`, beside the three skill folders. Keep `.env` and that directory's contents out of git. A run directory is created mode `0700`, and the customer files inside it are mode `0600`. `--artifacts-root` overrides the directory.
 
 ## 1. Link the skills
 
@@ -85,7 +85,7 @@ python3 -m venv ~/.config/es3-estimator/venv
 
 ## 5. Chrome
 
-PDF export uses headless Chrome. Install Google Chrome or Chromium, or set `CHROME_PATH`. When Chrome is missing, the HTML is still written and the export records why. `--skip-pdf` skips the print.
+PDF export uses headless Chrome. Install Google Chrome or Chromium, or set `CHROME_PATH`. When Chrome is missing, the run keeps going and the HTML file is the report. `--skip-pdf` writes that HTML and skips the print.
 
 ## Run from the project
 
@@ -102,8 +102,8 @@ python <skill>/scripts/run_account_analysis.py \
 
 python <skill>/scripts/run_consolidation.py \
   --org "ORG NAME" \
-  --reuse artifacts/<customer>_<date>/<customer>_<date>_org_report.json \
-  --diags-dir artifacts/<org_id>_diags_<date>
+  --reuse serverless_analyzer/diag_artifacts/<customer>_<date>/<customer>_<date>_org_report.json \
+  --diags-dir serverless_analyzer/diag_artifacts/<org_id>_diags_<date>
 ```
 
 `--report full` expands the same K360 fetch. A diagnostic run without `--diags-dir` calls the admin API and needs the Aviatrix tunnel. `--skip-vpn-check` skips that reachability check.

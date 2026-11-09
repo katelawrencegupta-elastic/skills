@@ -12,7 +12,7 @@ charts, stdlib only) and prints them with headless Chrome:
   <key>_30d_compression-applied_serverless_consolidation_plan.{html,pdf}            in 30d/
   <key>_full retention_k360_serverless_consolidation_plan.{html,pdf}                in full_retention/ (--k360-ingest)
 
-  python render_pdf.py --account-json artifacts/<key>/<key>_account.json [--skip-pdf] [--only account|consolidation]
+  python render_pdf.py --account-json serverless_analyzer/diag_artifacts/<key>/<key>_account.json [--skip-pdf] [--only account|consolidation]
 
 Chrome: $CHROME_PATH, else /Applications/Google Chrome.app or Chromium.app.
 """
@@ -2177,15 +2177,17 @@ def render_consolidation_html(acc: dict) -> str:
 
 
 # --------------------------------------------------------------------------- chrome
-def find_chrome() -> str:
+def find_chrome() -> str | None:
     for cand in (os.environ.get("CHROME_PATH"), "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Chromium.app/Contents/MacOS/Chromium", "/usr/bin/google-chrome", "/usr/bin/chromium"):
         if cand and Path(cand).is_file():
             return cand
-    raise FileNotFoundError("Chrome not found — set CHROME_PATH")
+    return None
 
 
 def chrome_pdf(html_path: Path, pdf_path: Path, chrome: str | None = None) -> None:
     chrome = chrome or find_chrome()
+    if not chrome:
+        raise FileNotFoundError("Chrome not found — set CHROME_PATH. The HTML file is the report.")
     tmp = pdf_path.with_suffix(".pdf.part")
     try:
         with tempfile.TemporaryDirectory(prefix="k360-chrome-") as prof:
@@ -2245,6 +2247,10 @@ def export_documents(docs: list[tuple[dict, str]], folder: Path, *, skip_pdf: bo
             pending.append((kind, html_path, pdf_path))
     if pending:
         chrome = find_chrome()
+        if not chrome:
+            for kind, _html_path, _pdf_path in pending:
+                out[kind]["error"] = "Chrome not found — set CHROME_PATH. The HTML file is the report."
+            return out
         with ThreadPoolExecutor(max_workers=len(pending)) as pool:
             futs = {pool.submit(chrome_pdf, html_path, pdf_path, chrome): (kind, pdf_path) for kind, html_path, pdf_path in pending}
             for fut in as_completed(futs):

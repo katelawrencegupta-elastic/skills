@@ -3,7 +3,7 @@
 
 Layout (local + matching Drive folder — PDF must live here too):
 
-  artifacts/<CustomerSlug>_<YYYY-MM-DD>/
+  serverless_analyzer/diag_artifacts/<CustomerSlug>_<YYYY-MM-DD>/
     <CustomerSlug>_<YYYY-MM-DD>_Search.xlsx          # exported copy of ES3 golden
     <CustomerSlug>_<YYYY-MM-DD>_Observability.xlsx   # exported copy of O11y golden
     <CustomerSlug>_<YYYY-MM-DD>_{Exec|Full}_report.pdf  # --report exec|full
@@ -27,6 +27,7 @@ from pathlib import Path
 
 from report_mode import add_report_arg, html_name, normalize_report, pdf_name
 from sheets_auth import get_creds
+from skill_paths import artifacts_root
 
 DEFAULT_ES3 = "1Jsi5cMIDGfaP-S1_xqDcGeMYJSgklcBbu4dSJAEjlA0"
 DEFAULT_O11Y = "1bu-qjVIab-rbWb7zvCEq6QEoLdKpi0vfw3yDj9_VJuE"
@@ -84,10 +85,7 @@ def resolve_customer(data: dict, payload: dict) -> str:
 
 
 def default_artifacts_root() -> Path:
-    env = os.environ.get("CLOUD_TRACKER_ARTIFACTS_ROOT")
-    if env:
-        return Path(env)
-    return Path.cwd() / "artifacts"
+    return artifacts_root()
 
 
 def ensure_local_folder(root: Path, key: str) -> Path:
@@ -256,7 +254,7 @@ def main() -> None:
     ap.add_argument(
         "--artifacts-root",
         default=None,
-        help="Parent of <customer>_<date>/ (default: ./artifacts)",
+        help="Parent of <customer>_<date>/ (default: serverless_analyzer/diag_artifacts)",
     )
     ap.add_argument(
         "--no-copy",

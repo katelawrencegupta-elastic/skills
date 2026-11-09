@@ -4,7 +4,7 @@
 Run with the Sheets venv python (google-api-python-client installed):
 
   ~/.config/serverless-analyzer/venv/bin/python size_serverless.py \
-      --account-json artifacts/Acme_2026-11-02/Acme_2026-11-02_account.json
+      --account-json serverless_analyzer/diag_artifacts/Acme_2026-11-02/Acme_2026-11-02_account.json
 
 Produces a Drive folder <customer>_<date>. The account PDF stays in that folder.
 Measured-retention consolidation PDFs go in full_retention/. 30-day PDFs go in 30d/.

@@ -12,7 +12,7 @@ A script finds the other two skills beside its own folder, then in `~/.claude/sk
 | 2 | [k360-account-analysis](k360-account-analysis/SKILL.md) | One customer's footprint, ECU, storage, burndown, and projections | Diagnostic bundles and a Serverless price |
 | 3 | [diag-serverless-consolidation](diag-serverless-consolidation/SKILL.md) | A Serverless quote from diagnostic bulk and measured retention | Using stored GB ÷ assumed retention as the quoted ingest |
 
-Run each command from the project that holds `.env`. Artifacts land in `artifacts/<customer>_<date>/`.
+Run each command from the project that holds `.env`. Reports and diagnostic bundles land in `serverless_analyzer/diag_artifacts/<customer>_<date>/`. `--artifacts-root` overrides that directory.
 
 The K360 fetch, Sheets sign-in, and org report are `k360-org-report` in this folder. `.env` stays in the project you run from. The installer finds that file in the current directory, then in a parent directory.
 
@@ -73,7 +73,7 @@ Prices Observability and Security from Elasticsearch diagnostic bundles. Daily G
 | `consolidation.py` | Builds the savings, deployment-count plan, metered rates, and quote integrity from the read-backs |
 | `quote_checks.py` | Checks the sheet echo, coverage, retention, and published totals. No network |
 | `diag_inputs.py` | Prints 2–5 project packs and per-deployment inputs. It does not quote dollars |
-| `privacy.py` | Sets private file modes and warns when `.env` or `artifacts/` would be committed |
+| `privacy.py` | Sets private file modes and warns when `.env` or `diag_artifacts/` would be committed |
 | `test_diag_quote.py` | Offline unit tests. No Google account and no sheets |
 | `skill_paths.py` | Finds `k360-org-report` and `k360-account-analysis` for this run. The same file is in the other two skills |
 

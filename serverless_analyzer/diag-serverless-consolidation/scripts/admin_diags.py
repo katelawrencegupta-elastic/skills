@@ -9,8 +9,8 @@ already in the output directory is kept. Each bundle is a full capture:
 Auth is FOUND_ADMIN_API_KEY. FOUND_ADMIN_URL must be https://admin.found.no.
 Another host is accepted only when it is listed in FOUND_ADMIN_HOST_ALLOWLIST.
 
-  python admin_diags.py --org-id 2513111014 --out artifacts/2513111014_diags_2026-11-04 --env .env
-  python admin_diags.py --parse-only --out artifacts/2513111014_diags_2026-11-04
+  python admin_diags.py --org-id 2513111014 --out serverless_analyzer/diag_artifacts/2513111014_diags_2026-11-04 --env .env
+  python admin_diags.py --parse-only --out serverless_analyzer/diag_artifacts/2513111014_diags_2026-11-04
 
 `sizing_from_diags.json` is one row per bundle: bulk GB/day from
 `index.primaries.bulk.est_bytes_per_day`, retention, and primary store size.

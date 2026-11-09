@@ -5,8 +5,8 @@ Reuses the account-summary fetch, then prices Observability and Security from
 diagnostic bundles. Search disk is the local store. The K360 stored-GB backup
 is a separate document.
 
-  python run_consolidation.py --org "Acme Corp" --reuse artifacts/<key>/<key>_org_report.json
-  python run_consolidation.py --org "Acme Corp" --diags-dir artifacts/<org_id>_diags_<date>
+  python run_consolidation.py --org "Acme Corp" --reuse serverless_analyzer/diag_artifacts/<key>/<key>_org_report.json
+  python run_consolidation.py --org "Acme Corp" --diags-dir serverless_analyzer/diag_artifacts/<org_id>_diags_<date>
 
 Run from the project root that holds `.env` (KIBANA_URL, ELASTIC_API_KEY, FOUND_ADMIN_API_KEY).
 The account summary stays on run_account_analysis.py --skip-diags --skip-sizing.
@@ -163,7 +163,10 @@ def consolidation_brief(acc: dict) -> dict:
             "drive_30d": (sz.get("drive_folder_30d") or {}).get("url"),
             "drive_compressioncalc": (sz.get("drive_folder_compressioncalc") or {}).get("url"),
             "drive_compressioncalc_30d": (sz.get("drive_folder_compressioncalc_30d") or {}).get("url"),
-            "pdfs": {k: {"pdf": v.get("pdf"), "drive_url": v.get("drive_url")} for k, v in exports.items() if isinstance(v, dict)},
+            "pdfs": {
+                k: {field: v.get(field) for field in ("pdf", "html", "drive_url") if v.get(field)}
+                for k, v in exports.items() if isinstance(v, dict)
+            },
         },
     }
     power = _search_power_brief(cons.get("search_power"))
@@ -687,7 +690,12 @@ def main() -> None:
                 jobs = quote_pdf_jobs(acc, None, [])
             acc["exports"] = export_documents(jobs, folder)
             for kind, e in acc["exports"].items():
-                print(f"{kind} PDF → {e.get('pdf') or e.get('error')}", flush=True)
+                if isinstance(e, dict) and e.get("pdf"):
+                    print(f"{kind} PDF → {e['pdf']}", flush=True)
+                elif isinstance(e, dict) and e.get("html"):
+                    print(f"{kind} HTML → {e['html']}", flush=True)
+                else:
+                    print(f"{kind} → {e.get('error') if isinstance(e, dict) else e}", flush=True)
         except Exception as ex:
             print(f"WARN: PDF export failed ({ex!r})", file=sys.stderr)
             acc["exports"] = {"error": repr(ex)}

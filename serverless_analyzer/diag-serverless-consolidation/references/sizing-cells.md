@@ -3,7 +3,7 @@
 Trigger: `platform.ech_share_pct > 50` (ECU-weighted, ECH vs serverless projects). Override with `--force-sizing` / `--skip-sizing`.
 
 ## Folder + naming
-- Local: `artifacts/<customer_slug>_<YYYY-MM-DD>/` · Drive: folder with the **same name** in My Drive (found-or-created).
+- Local: `serverless_analyzer/diag_artifacts/<customer_slug>_<YYYY-MM-DD>/` · Drive: folder with the **same name** in My Drive (found-or-created).
 - Estimate sheets live in `generated_estimates`, under the customer folder on Drive and under the artifact folder locally. Deployment-plan sheets live in `generated_estimates/plan_sheets`. Measured-retention PDFs go in `full_retention` and 30-day PDFs go in `30d`, on Drive and under the artifact folder. The account PDF stays in the customer folder. An estimate sheet is named `<customer>_<date>_<search|observability|security>_<full retention|30d>_<bulk|compression-applied>_serverless_estimate`.
 - A consolidation PDF is `<customer>_<date>_<full retention|30d>_<bulk|compression-applied>_serverless_consolidation_plan`. A K360 backup uses `k360` in the basis slot. The account PDF is `<customer>_<date>_Account_analysis`. Same-named PDFs are updated in place. Deployment-plan sheets keep the `_Observability_plan_` title.
 - Copies: `<customer>_<date>_observability_full retention_bulk_serverless_estimate`, and the same pattern for security and search. The 30-day copy uses `30d`. The compression copy uses `compression-applied`. Search is the es3-estimator CSV report, uploaded as a Google Sheet.

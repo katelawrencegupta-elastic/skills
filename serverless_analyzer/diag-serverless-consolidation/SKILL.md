@@ -33,7 +33,7 @@ A fast model launches the one command below and writes the chat bullets from the
 3. **Match the estimator to the solution.** Observability on the Observability sheet, Security on the Security sheet, Search on es3.
 4. **The month written is a whole number.** Snap a remainder under 0.001 month down, round up, then clamp to 1–36. 365 days writes 12. The run writes two PDFs from the same bulk: the rounded month, and 30 days written as 1 month. `compressioncalc_accounted_for` is bulk × 0.60, priced the same way, and does not replace the bulk quote.
 5. **Size the active month only.** A deployment is in the quote when it has billing ECU in the latest month. A deployment with no bill that month is out, including its last snapshot. An active deployment with no bundle adds no ingest.
-6. **Read the printed brief only.** The command prints `brief <path>`. That file is `<run_key>_consolidation_brief.json`. Do not open `*_account.json`, `*_diags_account.json`, the org report, infra, `sizing.json`, `calculations.md`, `canvas-layout.md`, or `render_pdf.py`. The PDF is the full report.
+6. **Read the printed brief only.** The command prints `brief <path>`. That file is `<run_key>_consolidation_brief.json`. Do not open `*_account.json`, `*_diags_account.json`, the org report, infra, `sizing.json`, `calculations.md`, `canvas-layout.md`, or `render_pdf.py`. The PDF is the full report. When Chrome is missing, the HTML file in `links` is the report.
 
 ## Run
 `<skill>` is the directory that contains this file. The same directory works for Claude and Cursor.
@@ -43,17 +43,17 @@ cd <project with .env>          # KIBANA_URL, ELASTIC_API_KEY, FOUND_ADMIN_API_K
 
 # Reuse the account-summary fetch when that folder already exists.
 python <skill>/scripts/run_consolidation.py --org "ORG NAME" \
-  --reuse artifacts/<customer>_<date>/<customer>_<date>_org_report.json
+  --reuse serverless_analyzer/diag_artifacts/<customer>_<date>/<customer>_<date>_org_report.json
 
 # Bundles already on disk. Does not call the admin API.
 python <skill>/scripts/run_consolidation.py --org "ORG NAME" \
-  --reuse artifacts/<customer>_<date>/<customer>_<date>_org_report.json \
-  --diags-dir artifacts/<org_id>_diags_<date>
+  --reuse serverless_analyzer/diag_artifacts/<customer>_<date>/<customer>_<date>_org_report.json \
+  --diags-dir serverless_analyzer/diag_artifacts/<org_id>_diags_<date>
 ```
 Do not pass `--skip-diags`, `--skip-sizing`, or `--k360-ingest` unless the user asked for the K360 backup as a separate document. Diagnostics are the quote. A fresh admin pull checks TLS to the pinned admin host before it sends the API key. Connect the Aviatrix VPN tunnel when that check fails. `--xlsx` is off unless the user asked for local workbooks. Pass `--skip-deployment-plan` only when the user asked to skip the bars.
 
 ## After the script
-Quote only when `ingest_source` is `diagnostics`. Build `<slug>-serverless-consolidation-savings.canvas.tsx` from the brief: `savings`, `quotes`, `fleet`, `contract_rate`, `notes`, `diagnostics_coverage`, `compressioncalc_accounted_for`, `thirty_day`, `deployment_plan`, `metered_rates`, `search_power`, `integrity`, `estimators`, and `links`. Chat is at most six bullets plus those links.
+Quote only when `ingest_source` is `diagnostics`. Build `<slug>-serverless-consolidation-savings.canvas.tsx` from the brief: `savings`, `quotes`, `fleet`, `contract_rate`, `notes`, `diagnostics_coverage`, `compressioncalc_accounted_for`, `thirty_day`, `deployment_plan`, `metered_rates`, `search_power`, `integrity`, `estimators`, and `links`. Chat is at most six bullets plus those links. Use the HTML path when a link has no PDF.
 
 Confirm the gates from the brief. Do not open the sheet.
 - Observability: D32 only when `estimators.observability.g26_gate.accepted` is true. A miss leaves Observability out. The cells on that estimator are what was written.
@@ -69,7 +69,7 @@ A 2–5 project pack, per-deployment prices, or a gap against K360 stored-GB pri
 
 ```bash
 python <skill>/scripts/diag_inputs.py \
-  --diags-json artifacts/<org_id>_diags_<date>/sizing_from_diags.json \
+  --diags-json serverless_analyzer/diag_artifacts/<org_id>_diags_<date>/sizing_from_diags.json \
   --projects 1,2,3,4,5 --each
 ```
 

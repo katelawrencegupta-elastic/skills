@@ -23,7 +23,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from skill_paths import find_skill, scripts_dir  # noqa: E402
+from skill_paths import artifacts_root, find_skill, scripts_dir  # noqa: E402
 
 
 def diag_script_dir() -> Path:
@@ -213,7 +213,10 @@ def agent_brief(acc: dict) -> dict:
             "drive_compressioncalc": (sz.get("drive_folder_compressioncalc") or {}).get("url"),
             "drive_compressioncalc_30d": (sz.get("drive_folder_compressioncalc_30d") or {}).get("url"),
             "estimators": {k: v.get("url") for k, v in estimators.items() if v.get("url")},
-            "pdfs": {k: {"pdf": v.get("pdf"), "drive_url": v.get("drive_url")} for k, v in exports.items() if isinstance(v, dict)},
+            "pdfs": {
+                k: {field: v.get(field) for field in ("pdf", "html", "drive_url") if v.get(field)}
+                for k, v in exports.items() if isinstance(v, dict)
+            },
         },
         "chat_bullets": chat_bullets(acc),
         "canvas_file": f"{slug}-account-analysis.canvas.tsx",
@@ -244,7 +247,7 @@ def parse_args(argv=None, description: str | None = None):
     ap.add_argument("--env", default=".env")
     ap.add_argument("--days", type=int, default=365, help="Trailing lookback in days. The skill runs the past year (365)")
     ap.add_argument("--reuse", default=None, help="Existing fetch_org.py JSON (skips the K360 fetch)")
-    ap.add_argument("--artifacts-root", default=None, help="Parent of <customer>_<date>/ (default ./artifacts)")
+    ap.add_argument("--artifacts-root", default=None, help="Parent of <customer>_<date>/ (default serverless_analyzer/diag_artifacts)")
     ap.add_argument("--date", default=None, help="YYYY-MM-DD for the run key (default today UTC)")
     ap.add_argument("--retention-months", type=float, default=3.0, help="Assumed retention for the K360 backup (stored GB ÷ retention). K360 has no raw ingest total")
     ap.add_argument("--security-retention-months", type=float, default=None, help="Override for the Security estimator (default = --retention-months)")
@@ -305,7 +308,7 @@ def prepare_account(args):
     acc = build_account(org, infra, when=when, retention_months=args.retention_months, security_retention_months=args.security_retention_months)
     acc["storage"]["size_gaps"] = size_gaps(base, key, acc)
     run_key = acc["meta"]["run_key"]
-    root = Path(args.artifacts_root) if args.artifacts_root else Path.cwd() / "artifacts"
+    root = Path(args.artifacts_root) if args.artifacts_root else artifacts_root()
     folder = root / run_key
     seal_dir(root)
     seal_dir(folder)
@@ -339,7 +342,12 @@ def finish_account(acc: dict, folder: Path, acc_path: Path, args) -> None:
 
             acc["exports"] = export(acc, folder, only="account")
             for kind, entry in acc["exports"].items():
-                print(f"{kind} PDF → {entry.get('pdf') or entry.get('error')}", flush=True)
+                if isinstance(entry, dict) and entry.get("pdf"):
+                    print(f"{kind} PDF → {entry['pdf']}", flush=True)
+                elif isinstance(entry, dict) and entry.get("html"):
+                    print(f"{kind} HTML → {entry['html']}", flush=True)
+                else:
+                    print(f"{kind} → {entry.get('error') if isinstance(entry, dict) else entry}", flush=True)
         except Exception as ex:
             print(f"WARN: PDF export failed ({ex!r})", file=sys.stderr)
             acc["exports"] = {"error": repr(ex)}

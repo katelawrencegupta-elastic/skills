@@ -35,16 +35,18 @@ def _num(n, d=0) -> str:
         return "—"
 
 
-def _find_chrome() -> str:
+def _find_chrome() -> str | None:
     candidates = [
         os.environ.get("CHROME_PATH"),
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
     ]
     for c in candidates:
         if c and Path(c).is_file():
             return c
-    raise SystemExit("Chrome not found — set CHROME_PATH")
+    return None
 
 
 def render_html(canvas: dict, offload: dict, report: str = "exec") -> str:
@@ -241,11 +243,17 @@ def main() -> None:
     html_path.write_text(render_html(canvas, offload, report=report))
     print(f"HTML → {html_path}", flush=True)
 
+    wrote_pdf = False
     if not args.skip_pdf:
-        chrome_pdf(_find_chrome(), html_path, pdf_path)
-        print(f"PDF  → {pdf_path}", flush=True)
+        chrome = _find_chrome()
+        if chrome:
+            chrome_pdf(chrome, html_path, pdf_path)
+            wrote_pdf = True
+            print(f"PDF  → {pdf_path}", flush=True)
+        else:
+            print(f"Chrome not found. HTML is the report → {html_path}", flush=True)
 
-    if not args.skip_upload and not args.skip_pdf and org_json and org_json.is_file():
+    if wrote_pdf and not args.skip_upload and org_json and org_json.is_file():
         py = os.environ.get(
             "SERVERLESS_SHEETS_PY",
             str(Path.home() / ".config/serverless-analyzer/venv/bin/python"),

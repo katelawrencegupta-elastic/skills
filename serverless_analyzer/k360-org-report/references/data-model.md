@@ -90,7 +90,7 @@ Also:
 - `scenarios` / `primary`: o11y-only retention variants (default `o11y_logs_3mo`) for sheet push
 - `hybrid`: o11y SVLS only; search+security stay on ECH
 - `apps_script_payload`: ES3 = **search-only** GB; O11y = o11y+logs @3mo — Sheets API (`push_estimator.py`) preferred; Apps Script fallback ([EstimatorImport.gs](apps-script/EstimatorImport.gs))
-- `estimator_artifacts` (after push): local + Drive folder `artifacts/<customer>_<date>/`;
+- `estimator_artifacts` (after push): local + Drive folder `serverless_analyzer/diag_artifacts/<customer>_<date>/`;
   copies named `<customer>_<date>_{Search|Observability}` (+ `.xlsx` export);
   PDF = `<customer>_<date>_Exec_report.pdf` in that **same** folder (local + Drive).
 - Agent-facing slim files (from `emit_canvas_data.py` / `run_org_report.py`):

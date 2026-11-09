@@ -1,0 +1,3 @@
+# Customer reports and diagnostic bundles stay on this machine.
+*
+!.gitignore
