@@ -47,7 +47,7 @@ def _run(cmd: list[str]) -> None:
 
 
 def _sheets_py() -> Path:
-    return Path(os.environ.get("CLOUD_TRACKER_SHEETS_PY") or Path.home() / ".config/cloud-tracker-sheets/venv/bin/python")
+    return Path(os.environ.get("SERVERLESS_SHEETS_PY") or Path.home() / ".config/serverless-analyzer/venv/bin/python")
 
 
 def _rnd(v, nd: int = 0):

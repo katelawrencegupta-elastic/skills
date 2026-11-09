@@ -33,7 +33,7 @@ Fetches one Elastic Cloud organization from K360 and writes an exec report or a 
 | `push_estimator.py` | Copies the golden estimator workbooks, fills them, and can upload the PDF |
 | `render_org_pdf.py` | Renders the exec or full HTML and PDF and uploads the PDF |
 | `emit_estimator_import.py` | Writes Apps Script JSON for a manual estimator fill |
-| `sheets_auth.py` | One-time Sheets and Drive sign-in. The token stays in `~/.config` |
+| `sheets_auth.py` | One-time Sheets and Drive sign-in. The token stays in `~/.config/serverless-analyzer` |
 | `skill_paths.py` | Finds this skill's siblings for the current run. The same file is in the other two skills |
 
 References: `exec-report.md` and `full-report.md` are the canvas outlines. `data-model.md` describes the fetch. `methodology.md` is the Serverless split. `taxonomy.json` classifies SKUs. `setup.md` is the Sheets sign-in. `EstimatorImport.gs` is the Apps Script fallback.

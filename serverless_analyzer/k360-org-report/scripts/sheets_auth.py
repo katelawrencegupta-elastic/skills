@@ -3,7 +3,7 @@
 
 Setup:
   1. Download OAuth client JSON (Desktop app) from GCP
-  2. Save as ~/.config/cloud-tracker-sheets/client_secret.json
+  2. Save as ~/.config/serverless-analyzer/client_secret.json
   3. Enable Google Sheets API + Google Drive API on the project
   4. Run:  python scripts/sheets_auth.py
   5. Browser opens → sign in → token saved to token.json
@@ -26,7 +26,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
-DEFAULT_DIR = Path.home() / ".config" / "cloud-tracker-sheets"
+DEFAULT_DIR = Path.home() / ".config" / "serverless-analyzer"
 
 
 def paths() -> tuple[Path, Path]:
@@ -102,7 +102,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--client-secret",
-        help="Path to OAuth client JSON (default ~/.config/cloud-tracker-sheets/client_secret.json)",
+        help="Path to OAuth client JSON (default ~/.config/serverless-analyzer/client_secret.json)",
     )
     args = ap.parse_args()
     if args.client_secret:

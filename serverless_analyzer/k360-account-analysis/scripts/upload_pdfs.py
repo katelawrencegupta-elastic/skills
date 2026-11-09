@@ -5,7 +5,7 @@ Consolidation PDFs at measured retention go in `full_retention`. 30-day PDFs go 
 The account PDF stays in the customer root. Same-named files are updated in place.
 Writes `exports.<kind>.drive_url` back to account.json.
 
-  ~/.config/cloud-tracker-sheets/venv/bin/python upload_pdfs.py --account-json <key>_account.json
+  ~/.config/serverless-analyzer/venv/bin/python upload_pdfs.py --account-json <key>_account.json
 """
 from __future__ import annotations
 

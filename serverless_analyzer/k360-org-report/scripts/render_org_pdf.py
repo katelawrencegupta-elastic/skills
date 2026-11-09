@@ -247,8 +247,8 @@ def main() -> None:
 
     if not args.skip_upload and not args.skip_pdf and org_json and org_json.is_file():
         py = os.environ.get(
-            "CLOUD_TRACKER_SHEETS_PY",
-            str(Path.home() / ".config/cloud-tracker-sheets/venv/bin/python"),
+            "SERVERLESS_SHEETS_PY",
+            str(Path.home() / ".config/serverless-analyzer/venv/bin/python"),
         )
         if Path(py).is_file():
             subprocess.check_call(

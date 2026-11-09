@@ -192,7 +192,7 @@ Examples: `status update GE Vernova 3m`, `status update Merck 2w googledoc=y`. T
 
 **Usage:** In Claude or Cursor, ask for an org report. The command is `python <skill>/scripts/run_org_report.py --org "ORG NAME" --report exec`. `--report full` expands the same fetch. `--reuse` skips a second K360 query.
 
-**Maintain:** Workflow rules live in `SKILL.md`. Setup is `references/setup.md`. OAuth files stay in `~/.config/cloud-tracker-sheets/` and are not in this folder.
+**Maintain:** Workflow rules live in `SKILL.md`. Setup is `references/setup.md`. OAuth files stay in `~/.config/serverless-analyzer/` and are not in this folder.
 
 ## k360-account-analysis
 

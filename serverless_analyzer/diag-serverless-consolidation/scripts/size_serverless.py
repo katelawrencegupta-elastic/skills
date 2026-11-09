@@ -3,7 +3,7 @@
 
 Run with the Sheets venv python (google-api-python-client installed):
 
-  ~/.config/cloud-tracker-sheets/venv/bin/python size_serverless.py \
+  ~/.config/serverless-analyzer/venv/bin/python size_serverless.py \
       --account-json artifacts/Acme_2026-11-02/Acme_2026-11-02_account.json
 
 Produces a Drive folder <customer>_<date>. The account PDF stays in that folder.

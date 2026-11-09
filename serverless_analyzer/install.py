@@ -24,7 +24,7 @@ AGENT_HOMES = (
     ("Claude", Path.home() / ".claude" / "skills"),
     ("Cursor", Path.home() / ".cursor" / "skills"),
 )
-SHEETS_DIR = Path.home() / ".config" / "cloud-tracker-sheets"
+SHEETS_DIR = Path.home() / ".config" / "serverless-analyzer"
 SHEETS_VENV = SHEETS_DIR / "venv"
 SHEETS_PY = SHEETS_VENV / "bin" / "python"
 SHEETS_REQ = ROOT / "k360-org-report" / "scripts" / "requirements-sheets.txt"

@@ -17,8 +17,8 @@ Python 3.10 or newer is required. The analysis scripts use the standard library.
 |---|---|---|
 | `KIBANA_URL`, `ELASTIC_API_KEY` | Every K360 fetch | `.env` in the project you run from |
 | `FOUND_ADMIN_API_KEY` | A fresh diagnostic pull | Same `.env`. Not used when `--diags-dir` points at zips already on disk |
-| Sheets virtualenv | Estimator copies and PDF upload | `~/.config/cloud-tracker-sheets/venv` |
-| OAuth client | Sheets and Drive sign-in | `~/.config/cloud-tracker-sheets/client_secret.json` |
+| Sheets virtualenv | Estimator copies and PDF upload | `~/.config/serverless-analyzer/venv` |
+| OAuth client | Sheets and Drive sign-in | `~/.config/serverless-analyzer/client_secret.json` |
 | es3-estimator | Search quotes only | Clone plus `~/.config/es3-estimator/venv` |
 | Google Chrome | PDF print | `/Applications`, or `CHROME_PATH` |
 | Aviatrix VPN | A fresh admin-console pull | An `openvpn` process. `--diags-dir` does not need it |
@@ -58,17 +58,17 @@ The installer can write this template with empty values. It will not overwrite a
 
 ## 3. Google Sheets and Drive
 
-Enable the Sheets API and the Drive API on the Google Cloud project. Download a Desktop OAuth client and save it as `~/.config/cloud-tracker-sheets/client_secret.json`.
+Enable the Sheets API and the Drive API on the Google Cloud project. Download a Desktop OAuth client and save it as `~/.config/serverless-analyzer/client_secret.json`.
 
 ```bash
-python3 -m venv ~/.config/cloud-tracker-sheets/venv
-~/.config/cloud-tracker-sheets/venv/bin/pip install -r \
+python3 -m venv ~/.config/serverless-analyzer/venv
+~/.config/serverless-analyzer/venv/bin/pip install -r \
   k360-org-report/scripts/requirements-sheets.txt
-~/.config/cloud-tracker-sheets/venv/bin/python \
+~/.config/serverless-analyzer/venv/bin/python \
   k360-org-report/scripts/sheets_auth.py
 ```
 
-The sign-in opens a browser and writes `token.json` next to the client file. Run it again if the token predates the Drive scopes. `CLOUD_TRACKER_SHEETS_PY` overrides the interpreter. `SHEETS_CLIENT_SECRET` and `SHEETS_TOKEN` override the two files.
+The sign-in opens a browser and writes `token.json` next to the client file. Run it again if the token predates the Drive scopes. `SERVERLESS_SHEETS_PY` overrides the interpreter. `SHEETS_CLIENT_SECRET` and `SHEETS_TOKEN` override the two files.
 
 Golden Observability and Security templates are copied. They are never edited. `O11Y_SHEET_ID` and `SECURITY_SHEET_ID` override the built-in template ids. The org report also accepts `ES3_SHEET_ID`.
 
