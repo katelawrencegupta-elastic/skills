@@ -13,8 +13,7 @@ description: >-
   read on the same bulk, two consolidation PDFs (rounded month and 30
   days), a deployment-count plan at 0/25/50/75/100%, the
   blended metered ingest rate for each active deployment, with $0.50 rows
-  marked in red, a search-power chart for on-demand, performant, and high
-  availability that is not added to the quote, 2–5 project packs,
+  marked in red, a search-power chart when Search was estimated, not added to the quote, 2–5 project packs,
   and a gap against the K360 stored-GB method.
   Does not use stored GB ÷ assumed retention as the quoted ingest. Triggers:
   diag consolidation, diagnostic bundles, serverless consolidation report,
@@ -52,15 +51,25 @@ python <skill>/scripts/run_consolidation.py --org "ORG NAME" \
 ```
 Do not pass `--skip-diags`, `--skip-sizing`, or `--k360-ingest` unless the user asked for the K360 backup as a separate document. Diagnostics are the quote. A fresh admin pull checks TLS to the pinned admin host before it sends the API key. Connect the Aviatrix VPN tunnel when that check fails. `--xlsx` is off unless the user asked for local workbooks. Pass `--skip-deployment-plan` only when the user asked to skip the bars.
 
+`--lookback-days` defaults to 30 and cannot exceed 365. That window sets ECH monthly ECU and the GB/day written into the estimators. The account summary still fetches the trailing year. Pass `--lookback-days 365` for a year. A value outside 1–365 stops the run.
+
 ## After the script
 Quote only when `ingest_source` is `diagnostics`. Build `<slug>-serverless-consolidation-savings.canvas.tsx` from the brief: `savings`, `quotes`, `fleet`, `contract_rate`, `notes`, `diagnostics_coverage`, `compressioncalc_accounted_for`, `thirty_day`, `deployment_plan`, `metered_rates`, `search_power`, `integrity`, `estimators`, and `links`. Chat is at most six bullets plus those links. Use the HTML path when a link has no PDF.
+
+**Cover.** Page 1 is the last 30 days of billed ECU unless `--lookback-days` says otherwise. The chart title, both bar labels, and the legend say that window: the estimates use the total of those billed days, expressed as a month (that total ÷ the number of days × 30.416). ECH is that month at the contract rate. The estimators are filled with diagnostic bulk × (that pace ÷ the complete-month pace), so D32 and E74 are the same window. `savings` is that read-back. The first row under “What if data is kept longer, or the fleet is busier” is the same window. The complete-month average and the quietest month scale that read-back and are not re-estimated.
+
+**What you pay for today.** The monthly build-up has three bars when a quote lookback is set. Full lookback is the fetched year, split by tier. The middle bar is the quote-window usage total and is not split by tier. Serverless is the estimator at that window. The year bar is labeled Full lookback.
+
+**Report.** Consolidation headings are not numbered. Each heading is the title of that section. The Appendix starts on its own page. Omit the Monthly search-power estimate when `search_power` is absent. Do not price the Observability store as Search. Fixed overhead in the report is the active deployments on the quote window, as a share of their ECU. The full-lookback overhead includes deployments with no bill in the latest month, so the two figures differ. The smallest clusters' ECU is their whole bill. Their fixed overhead is a separate figure, and the merge saving is a quarter of their bill. Bar charts have a top face and a side face. The usage chart under “What if data is kept longer, or the fleet is busier” is full width. Consolidation type is larger than the account report.
+
+**Deployment-count page.** Required on the canvas when `deployment_plan` has rows, and already printed on both bulk PDFs after the cover. Draw the five bars in order from `deployment_plan`: `label`, `projects`, `monthly`. 0% is one project per active deployment. 25%, 50%, and 75% remove that share of deployments. 100% is one project, and its monthly is the Observability headline. Put `savings.ech_contract_mo` on the chart as the ECH reference when that value exists. Do not reprice the bars. An empty `deployment_plan` means the page was not priced: say so, and do not draw stand-in bars. The compressioncalc PDFs do not get this page. The 30-day PDF prices the same five cuts at 1 month; those dollars stay on that PDF.
 
 Confirm the gates from the brief. Do not open the sheet.
 - Observability: D32 only when `estimators.observability.g26_gate.accepted` is true. A miss leaves Observability out. The cells on that estimator are what was written.
 - Security: E74 only when E73 is 0. A blank, unreadable, or non-zero E73 leaves Security out. A region that was never sized is a missing sheet. No workload skips Security.
-- 30-day dollars are `thirty_day`. Search is not repriced for that PDF. Search-power profiles stay off the quote total. A metered row with `at_half_dollar` true is the $0.50 row.
+- 30-day dollars are `thirty_day`. Search is not repriced for that PDF. Search-power profiles stay off the quote total, and the Appendix chart is omitted when `search_power` is absent. A metered row with `at_half_dollar` true is the $0.50 row.
 - Give `compressioncalc_accounted_for` beside the bulk quote when the brief has it. Do not replace D32 or E74 with it.
-- `integrity`: give the score, whether it passed, and every check in `failed`. It scores the written inputs, the sheet echo, and the published totals. It is not a serverless bill.
+- `integrity`: give the score, whether it passed, and every check in `failed`. A score of 0.90 or higher passes. A check in `failed` stays flagged. It scores the written inputs, the sheet echo, and the published totals. It is not a serverless bill.
 - If `diagnostics_coverage.inactive_excluded` is above zero, say how many deployments had no bill in the active month. If `snapshot_gb` is above zero, say how many searchable-snapshot GB were left out. If `k360_fallback` is above zero, those active deployments had no bundle and add no ingest. If `retention_unmeasured` is non-empty, name those deployments.
 - Regional dollars are one mode. Every region has its own accepted read-back and the headline is their sum, or the headline stays the one consolidated read-back and every region is a stored-GB share of it. A rejected region leaves that whole solution out.
 

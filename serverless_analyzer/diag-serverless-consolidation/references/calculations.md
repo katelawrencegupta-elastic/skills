@@ -27,6 +27,8 @@ Every consolidation run writes two PDFs from the same bulk.
 | Rounded | measured months, rounded up, clamped to 1–36 | `<key>_full retention_bulk_serverless_consolidation_plan` |
 | 30-day | 1, because 30 / 30.416 is under 1 | `<key>_30d_bulk_serverless_consolidation_plan` |
 
+The quote window is `--lookback-days`, default 30, maximum 365. ECH monthly ECU is the total of those billed days ÷ the number of days × 30.416. Ingest written to the estimators is diagnostic bulk × (window daily average ÷ complete-month daily average). The sheet read-back is the quote. The cover chart title, both bar labels, and the legend name that window. `savings` is that read-back. A missing daily series for a window of 30 days or less falls back to `last_30d_daily_avg`. The account fetch stays the trailing year. What you pay for today keeps the fetched year as Full lookback, split by tier, and adds the quote-window usage total as its own bar.
+
 Each PDF links to its own estimator copy, left at that month. The four estimate sheets live in the customer folder's `generated_estimates` child. Their deployment-plan sheets live in `generated_estimates/plan_sheets`. Measured-retention PDFs are uploaded to `full_retention`. 30-day PDFs are uploaded to `30d`. The account PDF stays in the customer folder. The rounded sheet is not rewritten to 1 after the 30-day read. If the measured ceiling is already 1, the two read-backs match. Still write both PDFs. The deployment-count bars are priced again at the scenario's month: measured months rounded up on the rounded PDF, and 1 month on every project on the 30-day PDF.
 
 When the user sets a retention month, that whole month replaces the headline (`--retention-months`, G11 or G6). Bulk GB/day stays the measured rate. The measured months stay in the arithmetic next to the month written. The 30-day read stays at 1 month.
@@ -114,7 +116,7 @@ A deployment whose logs stream and metrics stream are both inside the first 50 G
 
 ## Search-power projection
 
-On-demand, performant, and high availability are priced with the es3 estimator on the sized stored GB, the measured query rate, and Premium support. High availability is the highly-performant setting. Show monthly and steady annual (monthly × 12) for each. When Search has no local store, the chart still uses the sized stored GB on the cover and the measured query rate. These dollars are not added to D32 or E74. When the quoted solution is Search, the quote stays the on-demand read-back. The chart is the first part of the Appendix, after the reconciliation section. The quote integrity table follows it on that page.
+On-demand, performant, and high availability are priced with the es3 estimator when Search was estimated. High availability is the highly-performant setting. Show monthly and steady annual (monthly × 12) for each. When Search was not estimated, `search_power` is absent and the Appendix does not include the chart. These dollars are not added to D32 or E74. When the quoted solution is Search, the quote stays the on-demand read-back. The chart, when present, is in the Appendix, after the reconciliation section, the input arithmetic, and the metered-rate tables. The quote integrity table follows it.
 
 ## Quote integrity
 
@@ -129,7 +131,7 @@ The score is the mean of the checks that apply. A check with no inputs is n/a an
 | Line agreement | 1 − min(\|sum of quote lines − headline\| / headline, 1). Both $0 scores 1. | The lines and the headline agree to the cent. |
 | Year agreement | For each quote line, 1 − min(\|steady annual − 12 × unrounded monthly\| / \|steady annual\|, 1), then the mean. Both sides are rounded to cents first. A line with no steady annual uses its year-1 figure. | The steady annual equals 12 × the unrounded monthly, to the cent. When the sheet is written as 1 month, year 1 also equals that steady annual, to the cent. A longer keep may ramp, so year 1 can sit below the steady annual. |
 
-The detail prints both cents and the gap. A missing monthly or a missing steady annual on a quote line scores 0 for that line. The overall result passes only when every scored check passes. Bundle coverage still fails when any active deployment has no bundle, and the detail names that deployment.
+The detail prints both cents and the gap. A missing monthly or a missing steady annual on a quote line scores 0 for that line. The overall result passes when the score is 0.90 or higher, and also when every scored check passes. A check below its own bar stays flagged and its detail still names the gap. Bundle coverage below 1.0 names each deployment that has no bundle.
 
 Same formulas inside each project. Each project is its own estimator copy. The month written is the project's measured months rounded up. Each project also gets a 30-day read at 1 month on the same bulk. Sum of the read-backs is the split-fleet price, once at the measured month and once at 30 days. Compare each sum with the matching one-project read-back. The difference is the cost of staying split. A user-set retention month replaces the headline month on every project, including the pool, and does not change Σ bulk.
 

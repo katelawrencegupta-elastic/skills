@@ -315,14 +315,19 @@ def consolidation_section(acc: dict) -> list[str]:
                        [[w["model"], w["kind"], "—" if w.get("million_tokens") is None else f"{float(w.get('million_tokens') or 0):,.4f}", f"{float(w.get('ecu') or 0):,.2f}", f"${float(w.get('monthly') or 0):,.2f}"] for w in eis_rows]
                        + [["Total", "", "", f"{sum(float(w.get('ecu') or 0) for w in eis_rows):,.2f}", f"${float(search_blk_early.get('eis_mo') or 0):,.2f}"]]))
         L.append("")
-    oh = comp.get("fixed_overhead_pct")
-    L.append(f"### 11.2 {s(oh)}% of the ECH bill is cluster overhead" if oh is not None else "### 11.2 Cluster overhead")
+    oh = fr.get("fixed_overhead_pct")
+    if oh is None and fr.get("fixed_overhead_ecu_mo") and fr.get("ech_ecu_mo"):
+        oh = round(100 * float(fr["fixed_overhead_ecu_mo"]) / float(fr["ech_ecu_mo"]), 1)
+    if oh is None:
+        oh = comp.get("fixed_overhead_pct")
+    shown_fixed = fr.get("fixed_overhead_ecu_mo") or comp.get("fixed_overhead_mo")
+    L.append(f"### 11.2 {s(oh)}% of the active deployments' ECU is cluster overhead" if oh is not None else "### 11.2 Cluster overhead")
     search_blk = ((svl.get("by_solution") or {}).get("search") or {})
     if search_blk.get("eis_mo") is not None and search_blk.get("ml_node_ecu_mo"):
         ml_sentence = f"Machine learning on Search is in the EIS line: {usd(search_blk.get('eis_mo'))}/mo, the billed tokens plus {n0(search_blk.get('jina_ml_ecu'))} ECU of ML nodes on deployments that billed jina."
     else:
         ml_sentence = f"Machine learning adds {n0(comp.get('ml_nodes_mo'))} ECU/mo."
-    L.append(f"These are nodes that do not hold data: master, Kibana, coordinating, integrations, enterprise search, and APM. Together they are {n0(comp.get('fixed_overhead_mo'))} ECU/mo. Serverless does not charge for them. {ml_sentence} Snapshot storage, snapshot API calls, and data transfer add {n0(comp.get('non_capacity_mo'))} ECU/mo. Data in stays free. Data out carries over outside the serverless total: Observability and Security list it at 50 GB free, then $0.05 per GB, including Private Link. Inter-node does not carry over, and on Azure it is already waived. The bill is ECU, not GB, so this does not convert the hosted charge into a serverless dollar.")
+    L.append(f"These are nodes that do not hold data: master, Kibana, coordinating, integrations, enterprise search, and APM. Together they are {n0(shown_fixed)} ECU/mo. Serverless does not charge for them. {ml_sentence} Snapshot storage, snapshot API calls, and data transfer add {n0(comp.get('non_capacity_mo'))} ECU/mo. Data in stays free. Data out carries over outside the serverless total: Observability and Security list it at 50 GB free, then $0.05 per GB, including Private Link. Inter-node does not carry over, and on Azure it is already waived. The bill is ECU, not GB, so this does not convert the hosted charge into a serverless dollar.")
     L.append("")
     if c.get("overhead_buckets"):
         L.append(table(["Size", "Clusters", "ECU", "Overhead %"], [[x["bucket"], x["deployments"], n0(x["ecu_lookback"]), s(x.get("fixed_overhead_pct"))] for x in c["overhead_buckets"]]))
@@ -333,7 +338,7 @@ def consolidation_section(acc: dict) -> list[str]:
         L.append("")
     t = c.get("tail") or {}
     if t.get("n"):
-        L.append(f"Smallest clusters — {t['n']} under {1:g}% of spend each: {n0(t.get('ech_ecu_mo'))} ECU/mo ({s(t.get('ech_share_pct'))}% of spend), {n0(t.get('stored_gb'))} GB stored, {n0(t.get('fixed_overhead_ecu_mo'))} ECU/mo of overhead. Merging them onto fewer clusters saves about {n0(t.get('ech_consolidation_saving_mo'))} ECU/mo, if a quarter of that overhead goes away.")
+        L.append(f"Smallest clusters — {t['n']} under {1:g}% of spend each: their bill is {n0(t.get('ech_ecu_mo'))} ECU/mo ({s(t.get('ech_share_pct'))}% of ECU), {n0(t.get('stored_gb'))} GB stored. Fixed overhead on them is {n0(t.get('fixed_overhead_ecu_mo'))} ECU/mo. Merging them onto fewer clusters saves about {n0(t.get('ech_consolidation_saving_mo'))} ECU/mo, if a quarter of their bill goes away.")
         L.append("")
     L.append("### 11.3 One project per solution in each region" if (c.get("architecture") or {}).get("per_region") else "### 11.3 One project per solution")
     if c.get("ladder"):
@@ -403,7 +408,7 @@ def consolidation_section(acc: dict) -> list[str]:
         L.append("\n### Appendix\n")
         L.append(lead)
         L.append("")
-        L.append("The score is the mean of the checks that apply. A check that does not apply is n/a and stays out of the mean. Pass is separate from the score. A G26 gap of 0.51 scores 0 on that component and still passes. This is not a serverless bill.")
+        L.append("The score is the mean of the checks that apply. A check that does not apply is n/a and stays out of the mean. A score of 0.90 or higher passes. A check that misses its own bar stays flagged. A G26 gap of 0.51 scores 0 on that component and still passes that component. This is not a serverless bill.")
         L.append("")
         L.append(table(
             ["Check", "Score", "Pass", "Measured"],

@@ -23,12 +23,101 @@ from quote_checks import e73_blocks_quote, g26_gate, integrity_score, money as _
 from skill_paths import find_skill
 
 DAYS_PER_MONTH = 30.416
+MAX_LOOKBACK_DAYS = 365
+_INGEST_KEYS = (
+    "daily_raw_gb", "logs_gb_day", "metrics_gb_day", "siem_gb_day",
+    "bulk_gb_day", "compressioncalc_accounted_for",
+)
 TAIL_SHARE_PCT = 1.0          # "small" deployment = < 1 % of lookback ECU (same as cost rec)
 TOP_N = 15
 RETENTION_SCENARIOS = (1, 3, 6, 12)
 FIXED_TIERS = {"master", "kibana", "coordinating", "integrations server", "enterprise search", "apm"}
 
 ORG_SKILL = find_skill("k360-org-report", Path(__file__).resolve().parent)
+
+def quote_lookback_days(days) -> int:
+    """Billing window for the quote. The default is 30 days. A year is the maximum."""
+    try:
+        window = int(days)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("lookback days must be a whole number from 1 to 365") from exc
+    if not 1 <= window <= MAX_LOOKBACK_DAYS:
+        raise ValueError("lookback days must be from 1 to 365")
+    return window
+
+
+def _window_daily_avg(ecu: dict, days: int) -> float | None:
+    totals = ecu.get("daily_totals") or []
+    if totals:
+        window = [float(v or 0) for v in totals[-days:]]
+        if window:
+            return sum(window) / len(window)
+    if days <= 30 and ecu.get("last_30d_daily_avg") is not None:
+        return float(ecu["last_30d_daily_avg"])
+    fetched = int(ecu.get("lookback_days") or 0)
+    if ecu.get("daily_avg") is not None and fetched and days >= fetched:
+        return float(ecu["daily_avg"])
+    return None
+
+
+def _scale_ingest(row: dict, factor: float) -> None:
+    for key in _INGEST_KEYS:
+        if row.get(key) is None:
+            continue
+        try:
+            row[key] = round(float(row[key]) * factor, 3)
+        except (TypeError, ValueError):
+            continue
+
+
+def apply_quote_lookback(acc: dict, days: int = 30) -> float:
+    """Price ECH and the estimator ingest at the last `days` of billed ECU.
+
+    Diagnostic bulk stays the measured rate when the window matches the
+    complete-month pace. A shorter window writes bulk × (window pace ÷
+    complete-month pace) so the sheet read-back is that lookback.
+    """
+    window = quote_lookback_days(days)
+    ecu = acc.setdefault("ecu", {})
+    if ecu.get("quote_ingest_scaled") and int(ecu.get("quote_lookback_days") or 0) == window:
+        return float(ecu.get("quote_usage_factor") or 1)
+    daily = _window_daily_avg(ecu, window)
+    complete = ecu.get("monthly_avg_complete_months")
+    if complete:
+        base_daily = float(complete) / DAYS_PER_MONTH
+    elif ecu.get("daily_avg") is not None:
+        base_daily = float(ecu["daily_avg"])
+    else:
+        base_daily = None
+    if daily is None:
+        factor = 1.0
+        monthly = float(complete or 0)
+    else:
+        monthly = daily * DAYS_PER_MONTH
+        factor = (daily / base_daily) if base_daily else 1.0
+    if not ecu.get("quote_ingest_scaled"):
+        for dep in (acc.get("solutions") or {}).get("by_deployment") or []:
+            if isinstance(dep, dict):
+                _scale_ingest(dep, factor)
+        for block in ((acc.get("sizing") or {}).get("consolidated") or {}).values():
+            if isinstance(block, dict):
+                _scale_ingest(block, factor)
+        diagnostics = (acc.get("sizing") or {}).get("diagnostics") or {}
+        if isinstance(diagnostics, dict):
+            _scale_ingest(diagnostics, factor)
+        ingest = ((acc.get("workload") or {}).get("ingest") or {})
+        if ingest.get("docs_per_sec") is not None:
+            try:
+                ingest["docs_per_sec"] = round(float(ingest["docs_per_sec"]) * factor, 3)
+            except (TypeError, ValueError):
+                pass
+        ecu["quote_ingest_scaled"] = True
+    ecu["quote_lookback_days"] = window
+    ecu["quote_daily_avg"] = None if daily is None else round(daily, 2)
+    ecu["quote_monthly_ecu"] = round(monthly, 2)
+    ecu["quote_usage_factor"] = round(factor, 6)
+    return float(ecu["quote_usage_factor"])
+
 
 # --------------------------------------------------------------------------- pricing
 # Prefer the parent skill's ladders (single source of truth); mirror only as a fallback.
@@ -224,70 +313,25 @@ def _omit_unquoted(blk: dict, notes: list[str], solution: str) -> None:
     notes.append(f"{solution.title()} has stored GB but no estimator read-back, so it is left out of the serverless total.")
 
 
-def _query_workload(sz: dict, acc: dict) -> dict:
-    return ((sz.get("consolidated") or {}).get("search") or {}).get("workload") or acc.get("workload") or {}
+def _search_power(sz: dict, by_solution: dict, _acc: dict | None = None) -> dict | None:
+    """es3 profiles when Search was estimated. They are not added to D32 or E74.
 
-
-def _has_query_rate(workload: dict) -> bool:
-    try:
-        return float((((workload.get("search") or {}).get("peak") or {}).get("qps")) or 0) > 0
-    except (TypeError, ValueError):
-        return False
-
-
-def _sized_store_gb(sz: dict, acc: dict) -> float:
-    """Primary store on the cover. Searchable snapshots are already out of this figure."""
-    diag = (sz.get("diagnostics") or {}).get("store_gb")
-    if diag:
-        return float(diag)
-    stored = float((acc.get("storage") or {}).get("data_stored_gb") or 0)
-    if stored:
-        return stored
-    con = sz.get("consolidated") or {}
-    return sum(float((con.get(sol) or {}).get("stored_gb") or 0) for sol in ("observability", "security", "search"))
-
-
-def _search_power(sz: dict, by_solution: dict, acc: dict | None = None) -> dict | None:
-    """es3 profiles for the search-power page. They are not added to D32 or E74.
-
-    A quoted Search slice uses its estimator profiles. When Search has no local
-    store, the page still prices the sized stored GB and the measured query rate.
+    No profiles, and no page, when the Search estimator was skipped or never ran.
+    The sized stored GB is not priced as Search in that case.
     """
-    acc = acc or {}
-    regional = (by_solution.get("search") or {}).get("regional_profiles") or []
+    search = by_solution.get("search") or {}
     est = (sz.get("estimators") or {}).get("search") or {}
-    profiles = regional or (est.get("profiles") or [])
-    if profiles:
-        out = {"profiles": profiles}
-        if est.get("region_match") and not regional:
-            out["region_match"] = est["region_match"]
-        return out
-    stored = _sized_store_gb(sz, acc)
-    workload = _query_workload(sz, acc)
-    if stored <= 0 or not _has_query_rate(workload):
+    status = str(est.get("status") or "")
+    if status.startswith("skipped") or "no search workload" in status.lower():
         return None
-    cached = sz.get("search_power") or {}
-    cached_gb = (cached.get("inputs") or {}).get("stored_gb")
-    if cached.get("profiles") and cached_gb is not None and abs(float(cached_gb) - stored) < 0.05:
-        return {"profiles": cached["profiles"], "region_match": cached.get("region_match")}
-    cloud = (acc.get("cloud") or {}).get("summary") or {}
-    result = _es3_region({
-        "stored_gb": stored,
-        "org_stored_gb": stored,
-        "provider": sz.get("provider") or cloud.get("provider"),
-        "region": sz.get("region") or cloud.get("region"),
-        "support_tier": sz.get("support_tier") or "Premium",
-        "workload": workload,
-    }) or {}
-    profiles = result.get("profiles") or []
+    regional = search.get("regional_profiles") or []
+    profiles = regional or (est.get("profiles") or [])
     if not profiles:
         return None
-    sz["search_power"] = {
-        "profiles": profiles,
-        "region_match": result.get("region_match"),
-        "inputs": {"stored_gb": round(stored, 2)},
-    }
-    return {"profiles": profiles, "region_match": result.get("region_match")}
+    out = {"profiles": profiles}
+    if est.get("region_match") and not regional:
+        out["region_match"] = est["region_match"]
+    return out
 
 
 def _deployment_bars(sz: dict, by_solution: dict, notes: list[str]) -> list:
@@ -890,11 +934,22 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
     lookback_days = float(e.get("lookback_days") or 365)
     months = max(lookback_days / DAYS_PER_MONTH, 1.0)
     ecu_total = float(e.get("total_lookback") or 0)
-    ech_mo = float(e.get("monthly_avg_complete_months") or e.get("monthly_avg_all") or (ecu_total / months))
+    usage = float(e.get("quote_usage_factor") or 1.0)
+    if e.get("quote_monthly_ecu"):
+        ech_mo = float(e["quote_monthly_ecu"])
+    else:
+        ech_mo = float(e.get("monthly_avg_complete_months") or e.get("monthly_avg_all") or (ecu_total / months))
     stored_gb = float((acc.get("storage") or {}).get("data_stored_gb") or 0)
     con = sz.get("consolidated") or {}
     workload = acc.get("workload") or {}
     notes: list[str] = []
+    if e.get("quote_lookback_days"):
+        notes.append(
+            f"Quote lookback is {int(e['quote_lookback_days'])} days. "
+            f"ECH is that daily average × 30.416, {ech_mo:,.2f} ECU/mo. "
+            f"Ingest written to the estimators is diagnostic bulk × {usage:.3f}, "
+            "that pace divided by the complete-month pace."
+        )
 
     # ---- ECH composition (per-deployment tiers from infra)
     deps_infra = (infra or {}).get("by_deployment") or []
@@ -1055,16 +1110,16 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
             continue
         gb = float(d.get("gb") or 0)
         sol = d.get("solution") or "search"
-        ecu_mo = float(d.get("ecu") or 0) / months
+        ecu_mo = float(d.get("ecu") or 0) / months * usage
         ti = tiers_by_name.get(d["name"], {})
         t = ti.get("tiers") or {}
-        fixed_mo = round(sum(v for k, v in t.items() if k in FIXED_TIERS) / months, 2) if t else None
+        fixed_mo = round(sum(v for k, v in t.items() if k in FIXED_TIERS) / months * usage, 2) if t else None
         per.append({
             "name": d["name"], "solution": sol, "stored_gb": round(gb, 1),
             "ech_ecu_mo": round(ecu_mo, 2), "ech_ecu_lookback": round(float(d.get("ecu") or 0), 2),
             "fixed_overhead_ecu_mo": fixed_mo,
             "overhead_pct": round(100 * fixed_mo / ecu_mo, 1) if fixed_mo is not None and ecu_mo > 0 else None,
-            "ml_ecu_mo": round(float(t.get("ml") or 0) / months, 2) if t else None,
+            "ml_ecu_mo": round(float(t.get("ml") or 0) / months * usage, 2) if t else None,
             "zones": ti.get("zones"), "gb_known": gb > 0,
             "ech_cost_mo": round(ecu_mo * rate, 2) if rate else None,
         })
@@ -1092,6 +1147,8 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         "fixed_overhead_ecu_mo": round(sum((r["fixed_overhead_ecu_mo"] or 0) for r in per), 2),
         "note": "One estimator read-back per solution. Deployments are ECU, GB, and overhead share, not a second price.",
     }
+    if fragmentation["ech_ecu_mo"]:
+        fragmentation["fixed_overhead_pct"] = round(100 * fragmentation["fixed_overhead_ecu_mo"] / fragmentation["ech_ecu_mo"], 1)
     if n_with_gb < len(per):
         if gaps:
             notes.append(f"{len(per) - n_with_gb} deployments have no size on the snapshot day. {n_moved} of them now report size under a sibling name that is already in the stored-GB total. The rest have no current size. All stay in the ECU totals.")
@@ -1143,11 +1200,18 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         })
 
     fleet_rows = []
-    scen = [("Lookback-average fleet (estimator basis)", 1.0)]
+    quote_days = e.get("quote_lookback_days")
+    if quote_days:
+        scen = [(f"{int(quote_days)}-day lookback (estimator basis)", 1.0)]
+    else:
+        scen = [("Lookback-average fleet (estimator basis)", 1.0)]
     low = e.get("monthly_low") or {}
     if low.get("ecu") and ech_mo:
         scen.append((f"Quietest month {low.get('month')}", float(low["ecu"]) / ech_mo))
-    if e.get("last_30d_daily_avg") and ech_mo:
+    complete = e.get("monthly_avg_complete_months")
+    if quote_days and complete and ech_mo and abs(float(complete) - ech_mo) > 1:
+        scen.append(("Complete-month average", float(complete) / ech_mo))
+    elif not quote_days and e.get("last_30d_daily_avg") and ech_mo:
         scen.append(("Last 30 days run-rate", float(e["last_30d_daily_avg"]) * DAYS_PER_MONTH / ech_mo))
     eis_full = float((by_solution.get("search") or {}).get("eis_with_support_mo") or 0)
     eis_usage = float((by_solution.get("search") or {}).get("eis_mo") or 0)
@@ -1250,10 +1314,40 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         oh = f"{top['overhead_pct']}% fixed overhead" if top.get("overhead_pct") is not None else "fixed overhead not available"
         gb_bit = f"{top['stored_gb']:,.0f} GB" if top["gb_known"] else (f"its size now reports under {top['size_now_on']}" if top.get("size_now_on") else "no current size")
         callouts.append({"tone": "info", "title": f"Largest deployment: {top['name']}", "detail": f"{top['ech_ecu_mo']:,.0f} ECU/mo, {gb_bit}, {oh}. Deployments are not priced alone. The estimate is one project per solution in each region."})
-    if composition.get("fixed_overhead_mo"):
-        callouts.append({"tone": "success", "title": f"Fixed overhead is {composition['fixed_overhead_mo']:,.0f} ECU/mo", "detail": f"{composition.get('fixed_overhead_pct')}% of lookback ECU is master, Kibana, coordinating, and the other fixed roles. A serverless project does not bill those roles."})
+    active_fixed = fragmentation.get("fixed_overhead_ecu_mo") or 0
+    if active_fixed:
+        quote_days = int(e["quote_lookback_days"]) if e.get("quote_lookback_days") else None
+        pace = f" on the last {quote_days} billed days" if quote_days else ""
+        inactive_n = (sz.get("diagnostics") or {}).get("inactive_excluded") or 0
+        year_fixed = composition.get("fixed_overhead_mo")
+        year_bit = ""
+        if year_fixed and abs(float(year_fixed) - float(active_fixed)) > 1:
+            year_bit = f" The full lookback is {float(year_fixed):,.0f} ECU/mo, {composition.get('fixed_overhead_pct')}% of that year."
+            if inactive_n:
+                word = "deployment" if int(inactive_n) == 1 else "deployments"
+                year_bit = year_bit[:-1] + f", including {int(inactive_n)} {word} with no bill in the latest month."
+        callouts.append({
+            "tone": "success",
+            "title": f"Fixed overhead is {active_fixed:,.0f} ECU/mo",
+            "detail": (
+                f"{fragmentation.get('fixed_overhead_pct')}% of the active deployments' ECU{pace}. "
+                f"That is Fixed ECU/mo added across all {fragmentation.get('n_deployments')} active deployments. "
+                "These are master, Kibana, coordinating, integrations, enterprise search, and APM. "
+                "A serverless project does not bill those roles."
+                + year_bit
+            ),
+        })
     if tail_block["n"] >= 8:
-        callouts.append({"tone": "info", "title": f"Long tail: {tail_block['n']} deployments, {tail_block['ech_share_pct']}% of spend, {tail_block.get('data_share_pct')}% of data", "detail": f"{tail_block['ech_ecu_mo']:,.0f} ECU/mo holding {tail_block['stored_gb']:,.0f} GB. Merging them on ECH, at the 25% overhead-removal assumption, recovers about {tail_block['ech_consolidation_saving_mo']:,.0f} ECU/mo."})
+        callouts.append({
+            "tone": "info",
+            "title": f"{tail_block['n']} small deployments bill {tail_block['ech_ecu_mo']:,.0f} ECU/mo",
+            "detail": (
+                f"That is {tail_block['ech_share_pct']}% of ECU and {tail_block.get('data_share_pct')}% of stored data. "
+                "It is their whole bill, not the fixed-overhead figure. "
+                f"Fixed overhead on these {tail_block['n']} is {tail_block['fixed_overhead_ecu_mo']:,.0f} ECU/mo. "
+                f"Merging them, if a quarter of their bill goes away, recovers about {tail_block['ech_consolidation_saving_mo']:,.0f} ECU/mo."
+            ),
+        })
 
     caveats = [
         "Serverless $ are usage-based: a burst month costs more than the steady-state figure",
@@ -1269,7 +1363,14 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
     return {
         "triggered": bool(sz.get("triggered")),
         "source": sz.get("ingest_source") or "k360",
-        "basis": {"ech_monthly_ecu": round(ech_mo, 2), "lookback_days": lookback_days, "stored_gb": round(stored_gb, 1), "deployments": len(per), "retention_months": {k: (v or {}).get("retention_months") for k, v in con.items()}},
+        "basis": {
+            "ech_monthly_ecu": round(ech_mo, 2),
+            "lookback_days": lookback_days,
+            "quote_lookback_days": int(e["quote_lookback_days"]) if e.get("quote_lookback_days") else None,
+            "stored_gb": round(stored_gb, 1),
+            "deployments": len(per),
+            "retention_months": {k: (v or {}).get("retention_months") for k, v in con.items()},
+        },
         "ech_composition": composition,
         "serverless": serverless,
         "contract_rate": contract_rate,

@@ -304,7 +304,7 @@ def upload_text_as_doc(drive, local: Path, parent_id: str, title: str) -> dict:
 
 
 def _execute(build, attempts: int = 6):
-    """Run a Sheets request. A per-minute read quota waits and tries again."""
+    """Run a Sheets request. Quota (429) and a brief outage (500, 502, 503) wait and try again."""
     from googleapiclient.errors import HttpError
 
     delay = 20
@@ -313,7 +313,7 @@ def _execute(build, attempts: int = 6):
             return build().execute()
         except HttpError as exc:
             status = getattr(getattr(exc, "resp", None), "status", None)
-            if status != 429 or attempt + 1 == attempts:
+            if status not in (429, 500, 502, 503) or attempt + 1 == attempts:
                 raise
             time.sleep(delay)
             delay = min(delay * 2, 60)
@@ -911,7 +911,7 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
 
 
 def fill_plan_sheet(job: dict, creds) -> dict:
-    """Copy one plan workbook, write it, and read D32. A 429 is retried inside the request."""
+    """Copy one plan workbook, write it, and read D32. A 429 or 503 is retried inside the request."""
     sheets, drive = services_from(creds)
     try:
         copied, _reused = copy_template(drive, job["template_id"], job["title"], job["parent_id"], reuse=job["reuse"])

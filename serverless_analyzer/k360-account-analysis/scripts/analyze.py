@@ -509,6 +509,8 @@ def ecu_section(org: dict, infra: dict | None, platform: dict) -> dict:
         "daily_peak": daily_peak,
         "last_30d_total": last_30d,
         "last_30d_daily_avg": last_30d_avg,
+        "daily_days": days_t if grain == "day" else [],
+        "daily_totals": [round(v, 2) for v in tot_t] if grain == "day" else [],
         "trend": trend,
         "weekly_series": {"weeks": wk_days, "totals": wk_tot},
         "contract": {

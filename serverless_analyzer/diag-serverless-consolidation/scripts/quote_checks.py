@@ -224,11 +224,16 @@ def _year_row(lines: list[dict]) -> dict:
     )
 
 
+PASS_SCORE = 0.90
+
+
 def integrity_score(facts: dict) -> dict:
     """Quote integrity, 0 to 1. The mean skips a check that does not apply.
 
-    Pass is separate from the score. A G26 gap of 0.51 scores 0 on that component
-    and still passes. This is not a serverless bill.
+    A score of 0.90 or higher passes. A check that misses its own bar stays
+    flagged. A quote whose every scored check passes also passes. A G26 gap of
+    0.51 scores 0 on that component and still passes that component. This is
+    not a serverless bill.
     """
     coverage = facts.get("coverage")
     checks = [
@@ -239,10 +244,16 @@ def integrity_score(facts: dict) -> dict:
         _line_row(facts.get("headline_monthly"), list(facts.get("lines") or [])),
         _year_row(list(facts.get("lines") or [])),
     ]
-    scored = [row["score"] for row in checks if row["score"] is not None]
+    scored_rows = [row for row in checks if row["score"] is not None]
+    scored = [row["score"] for row in scored_rows]
+    score = None if not scored else round(sum(scored) / len(scored), 3)
+    if score is None:
+        passed = None
+    else:
+        passed = score >= PASS_SCORE or all(row["passed"] for row in scored_rows)
     return {
-        "score": None if not scored else round(sum(scored) / len(scored), 3),
-        "passed": None if not scored else all(row["passed"] for row in checks if row["score"] is not None),
+        "score": score,
+        "passed": passed,
         "checks": checks,
     }
 

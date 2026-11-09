@@ -8,6 +8,8 @@ is a separate document.
   python run_consolidation.py --org "Acme Corp" --reuse serverless_analyzer/diag_artifacts/<key>/<key>_org_report.json
   python run_consolidation.py --org "Acme Corp" --diags-dir serverless_analyzer/diag_artifacts/<org_id>_diags_<date>
 
+The quote window is the last 30 days (--lookback-days, maximum 365). The account fetch stays a year.
+
 Run from the project root that holds `.env` (KIBANA_URL, ELASTIC_API_KEY, FOUND_ADMIN_API_KEY).
 The account summary stays on run_account_analysis.py --skip-diags --skip-sizing.
 """
@@ -29,7 +31,7 @@ _account_root = find_skill("k360-account-analysis", HERE)
 K360_SCRIPTS = scripts_dir(_account_root)
 sys.path.insert(0, str(K360_SCRIPTS))
 
-from consolidation import build_consolidation  # noqa: E402
+from consolidation import apply_quote_lookback, build_consolidation  # noqa: E402
 from privacy import seal_text  # noqa: E402
 from render_pdf import export_documents  # noqa: E402
 from report_md import render  # noqa: E402
@@ -446,6 +448,7 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
         sz["diagnostics_status"] = "no diagnostic rows"
         return None
     diag = apply_diagnostics(acc, rows)
+    apply_quote_lookback(diag, args.lookback_days)
     diag_path = folder / f"{acc['meta']['run_key']}_diags_account.json"
     seal_text(diag_path, json.dumps(diag, indent=2))
     py = _sheets_py()
@@ -571,6 +574,8 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
 
 def main() -> None:
     args = parse_args(description=__doc__)
+    if not 1 <= int(args.lookback_days) <= 365:
+        raise SystemExit("--lookback-days must be from 1 to 365")
     acc, infra, folder, env, acc_path = prepare_account(args)
     if args.skip_diags and args.skip_sizing:
         finish_account(acc, folder, acc_path, args)

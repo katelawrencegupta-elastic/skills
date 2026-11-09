@@ -25,14 +25,14 @@ from admin_diags import (  # noqa: E402
     _parse_zip, _user_index, admin_base, analyze_bundle, capture_target, capture_url,
     parse_diagnostics, pull_diagnostics, quoted_index_bytes, safe_id,
 )
-from consolidation import build_consolidation, regional_quote  # noqa: E402
+from consolidation import apply_quote_lookback, build_consolidation, regional_quote  # noqa: E402
 from diag_account import _sheet_months, apply_diagnostics, compressioncalc_account  # noqa: E402
 from diag_inputs import deployment_count_plans, project_count, summarize, whole_months  # noqa: E402
 from k360_infra import es_base_and_key  # noqa: E402
 from privacy import seal_dir, seal_text, unignored_secret_warnings  # noqa: E402
 from quote_checks import addon_off_value, e73_blocks_quote, g26_gate, integrity_score, money  # noqa: E402
 from run_consolidation import _compression_totals, _estimator_flags, consolidation_brief, quote_pdf_jobs  # noqa: E402
-from render_pdf import consolidation_pdf_stem, pdf_folder_name, search_power_section, stat  # noqa: E402
+from render_pdf import consolidation_pdf_stem, pdf_folder_name, render_consolidation_html, search_power_section, stat  # noqa: E402
 from size_serverless import (  # noqa: E402
     DEFAULT_O11Y, DEFAULT_SECURITY, PLAN_FOLDER_NAME, _sheet_retention, assemble_plan_bars,
     assert_not_template, cell_input_mode, copy_template, estimate_folder_name, estimate_title,
@@ -235,6 +235,29 @@ class GateTests(unittest.TestCase):
         self.assertFalse(e73_blocks_quote("0"))
         self.assertFalse(e73_blocks_quote(0.0))
 
+    def test_overhead_callout_uses_the_active_deployments(self):
+        acc = _quote_account(g26=10, e73=0)
+        acc["ecu"]["quote_usage_factor"] = 0.5
+        acc["ecu"]["quote_lookback_days"] = 30
+        acc["ecu"]["total_lookback"] = 24000
+        acc["solutions"]["by_deployment"] = [{
+            "name": "active", "solution": "observability", "platform": "ech", "ecu": 12000, "gb": 1,
+        }]
+        acc["sizing"]["diagnostics"] = {"inactive_excluded": 1}
+        infra = {"by_deployment": [
+            {"name": "active", "tiers": {"master": 1200, "datahot": 1000}},
+            {"name": "gone", "tiers": {"master": 1200, "datahot": 1000}},
+        ]}
+        quoted = build_consolidation(acc, infra)
+        overhead = next(row for row in quoted["callouts"] if row["title"].startswith("Fixed overhead"))
+        active = quoted["fragmentation"]["fixed_overhead_ecu_mo"]
+        year = quoted["ech_composition"]["fixed_overhead_mo"]
+        self.assertEqual(overhead["title"], f"Fixed overhead is {active:,.0f} ECU/mo")
+        self.assertNotEqual(round(active), round(year))
+        self.assertIn(f"{year:,.0f}", overhead["detail"])
+        self.assertIn("active deployments", overhead["detail"])
+        self.assertIn("1 deployment with no bill", overhead["detail"])
+
     def test_readback_keeps_written_bulk_and_clears_unit_rates(self):
         quoted = build_consolidation(_quote_account(g26=10.51, e73=0), None)
         observability = quoted["serverless"]["by_solution"]["observability"]
@@ -265,6 +288,18 @@ class GateTests(unittest.TestCase):
         self.assertIsNone(unpriced["search_power"])
         self.assertEqual(unpriced["savings"]["serverless_mo"], 180)
         self.assertEqual([row["monthly"] for row in quoted["deployment_plan"]], [40, 100])
+        skipped = _quote_account(g26=10, e73=0)
+        skipped["sizing"]["estimators"]["search"] = {"status": "skipped — no search workload detected"}
+        skipped["storage"]["data_stored_gb"] = 100
+        skipped["workload"] = {"search": {"peak": {"qps": 50}}}
+        skipped["sizing"]["search_power"] = {
+            "profiles": [{"Search Power Setting": "on-demand", "Total $/month": 4734}],
+            "inputs": {"stored_gb": 100},
+        }
+        no_search = build_consolidation(skipped, None)
+        self.assertIsNone(no_search["search_power"])
+        page = search_power_section({"consolidation": {**no_search, "search_power": skipped["sizing"]["search_power"]}, "sizing": skipped["sizing"]})
+        self.assertNotIn("Monthly search-power estimate", page)
 
     def test_g26_miss_and_nonzero_e73_leave_the_solution_unquoted(self):
         missed = build_consolidation(_quote_account(g26=10.52, e73=0), None)
@@ -309,7 +344,9 @@ class GateTests(unittest.TestCase):
         self.assertTrue(by_name["Measured retention"]["passed"])
         self.assertFalse(by_name["Line agreement"]["passed"])
         self.assertTrue(by_name["Year agreement"]["passed"])
-        self.assertFalse(scored["passed"])
+        self.assertGreaterEqual(scored["score"], 0.90)
+        self.assertTrue(scored["passed"])
+        self.assertIn("Bundle coverage", [row["check"] for row in scored["checks"] if row["passed"] is False])
         named = integrity_score({
             "observability": {"has_workload": True, "sheet_read": True, "written_bulk": 10, "sheet_raw": 10},
             "security": {"has_workload": False},
@@ -994,6 +1031,75 @@ class PrivacyTests(unittest.TestCase):
             subprocess.run(["git", "add", "-f", ".env"], cwd=root, check=True, capture_output=True)
             tracked = unignored_secret_warnings(root)
             self.assertTrue(any(note.startswith(".env ") for note in tracked))
+
+
+class ConsolidationLayoutTests(unittest.TestCase):
+    def test_body_flows_and_the_appendix_is_last(self):
+        acc = _quote_account(g26=10, e73=0)
+        acc["consolidation"] = build_consolidation(acc, None)
+        html = render_consolidation_html(acc)
+        self.assertEqual(html.count("<h2>Appendix</h2>"), 1)
+        self.assertGreater(html.rfind("<h2>Appendix</h2>"), html.rfind("Reconciliation and what to confirm"))
+        self.assertNotIn("<h2>1. ", html)
+        self.assertNotIn("<h2>6. ", html)
+        self.assertNotIn("<h2>9. ", html)
+        self.assertNotIn("<div class='page-break'>", html)
+        self.assertEqual(html.count("sec newpage"), 1)
+        self.assertIn("<section class='sec newpage'><h2>Appendix</h2>", html)
+        self.assertIn("class='tbl'", html)
+        self.assertIn("class='consolidation'", html)
+        self.assertLess(html.find("Data used, and how the headline is calculated"), html.find("Quote integrity"))
+
+    def test_default_lookback_writes_the_30_day_pace_into_the_estimate(self):
+        acc = _quote_account(g26=10, e73=0)
+        acc["ecu"]["last_30d_daily_avg"] = 0.2
+        acc["ecu"]["daily_totals"] = [1.0] * 335 + [0.2] * 30
+        factor = apply_quote_lookback(acc, 30)
+        expected = 0.2 / (10 / 30.416)
+        self.assertAlmostEqual(factor, expected, places=4)
+        self.assertAlmostEqual(
+            acc["sizing"]["consolidated"]["observability"]["daily_raw_gb"],
+            round(10 * expected, 3),
+            places=3,
+        )
+        again = apply_quote_lookback(acc, 30)
+        self.assertAlmostEqual(again, factor, places=4)
+        self.assertAlmostEqual(
+            acc["sizing"]["consolidated"]["observability"]["daily_raw_gb"],
+            round(10 * expected, 3),
+            places=3,
+        )
+        with self.assertRaises(ValueError):
+            apply_quote_lookback(acc, 366)
+        acc["consolidation"] = build_consolidation(acc, None)
+        self.assertAlmostEqual(acc["consolidation"]["basis"]["ech_monthly_ecu"], round(0.2 * 30.416, 2))
+        html = render_consolidation_html(acc)
+        header = html.split("</header>", 1)[0]
+        self.assertIn("30-day lookback", header)
+        self.assertNotIn("complete-month", header)
+        self.assertIn("30-day lookback", html)
+        self.assertIn("Complete-month average", html)
+        self.assertIn("Last 30 days of billed usage", html)
+        self.assertIn("ECH, last 30 billed days", html)
+        self.assertIn("Serverless, last 30 billed days", html)
+        build = html.split("What you pay for today", 1)[1].split("<h2>", 1)[0]
+        self.assertIn("Full lookback", build)
+        self.assertIn("30-day lookback", build)
+        self.assertIn("30-day usage", build)
+        self.assertNotIn("ECH today", build)
+
+    def test_cover_stays_on_the_complete_month_average_without_a_30_day_rate(self):
+        acc = _quote_account(g26=10, e73=0)
+        acc["consolidation"] = build_consolidation(acc, None)
+        html = render_consolidation_html(acc)
+        header = html.split("</header>", 1)[0]
+        self.assertIn("complete-month avg", header)
+        self.assertIn("ECH cost today vs. the serverless estimate", html)
+        self.assertNotIn("last 30 billed days", html)
+        build = html.split("What you pay for today", 1)[1].split("<h2>", 1)[0]
+        self.assertIn("Full lookback", build)
+        self.assertNotIn("30-day lookback", build)
+        self.assertNotIn("ECH today", build)
 
 
 class ChromeFallbackTests(unittest.TestCase):
