@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 from quote_checks import e73_blocks_quote, g26_gate, integrity_score, money as _money
+from skill_paths import find_skill
 
 DAYS_PER_MONTH = 30.416
 TAIL_SHARE_PCT = 1.0          # "small" deployment = < 1 % of lookback ECU (same as cost rec)
@@ -27,7 +28,7 @@ TOP_N = 15
 RETENTION_SCENARIOS = (1, 3, 6, 12)
 FIXED_TIERS = {"master", "kibana", "coordinating", "integrations server", "enterprise search", "apm"}
 
-ORG_SKILL = Path(os.environ.get("K360_ORG_SKILL_DIR") or Path.home() / ".cursor/skills/k360-org-report")
+ORG_SKILL = find_skill("k360-org-report", Path(__file__).resolve().parent)
 
 # --------------------------------------------------------------------------- pricing
 # Prefer the parent skill's ladders (single source of truth); mirror only as a fallback.

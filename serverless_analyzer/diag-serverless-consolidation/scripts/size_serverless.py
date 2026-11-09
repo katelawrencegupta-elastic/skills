@@ -36,10 +36,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ORG_SKILL = Path(os.environ.get("K360_ORG_SKILL_DIR") or Path.home() / ".cursor/skills/k360-org-report")
-_account_root = Path(os.environ.get("K360_ACCOUNT_SKILL_DIR") or HERE.parents[1] / "k360-account-analysis")
-K360_SCRIPTS = _account_root / "scripts" if (_account_root / "scripts").is_dir() else _account_root
 sys.path.insert(0, str(HERE))
+from skill_paths import find_skill, scripts_dir  # noqa: E402
+
+ORG_SKILL = find_skill("k360-org-report", HERE)
+_account_root = find_skill("k360-account-analysis", HERE)
+K360_SCRIPTS = scripts_dir(_account_root)
 sys.path.insert(0, str(K360_SCRIPTS))
 sys.path.insert(0, str(ORG_SKILL / "scripts"))
 from privacy import seal_dir, seal_file, seal_text  # noqa: E402

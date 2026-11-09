@@ -36,16 +36,17 @@ A fast model launches the one command below and writes the chat bullets from the
 6. **Read the printed brief only.** The command prints `brief <path>`. That file is `<run_key>_consolidation_brief.json`. Do not open `*_account.json`, `*_diags_account.json`, the org report, infra, `sizing.json`, `calculations.md`, `canvas-layout.md`, or `render_pdf.py`. The PDF is the full report.
 
 ## Run
+`<skill>` is the directory that contains this file. The same directory works for Claude and Cursor.
+
 ```bash
-SCR=~/.cursor/skills/diag-serverless-consolidation/scripts
 cd <project with .env>          # KIBANA_URL, ELASTIC_API_KEY, FOUND_ADMIN_API_KEY
 
 # Reuse the account-summary fetch when that folder already exists.
-python $SCR/run_consolidation.py --org "ORG NAME" \
+python <skill>/scripts/run_consolidation.py --org "ORG NAME" \
   --reuse artifacts/<customer>_<date>/<customer>_<date>_org_report.json
 
 # Bundles already on disk. Does not call the admin API.
-python $SCR/run_consolidation.py --org "ORG NAME" \
+python <skill>/scripts/run_consolidation.py --org "ORG NAME" \
   --reuse artifacts/<customer>_<date>/<customer>_<date>_org_report.json \
   --diags-dir artifacts/<org_id>_diags_<date>
 ```
@@ -67,7 +68,7 @@ Confirm the gates from the brief. Do not open the sheet.
 A 2–5 project pack, per-deployment prices, or a gap against K360 stored-GB pricing. The K360 backup is a different quantity. Compare it only in a gap section. Do not blend the two into one quote.
 
 ```bash
-python ~/.cursor/skills/diag-serverless-consolidation/scripts/diag_inputs.py \
+python <skill>/scripts/diag_inputs.py \
   --diags-json artifacts/<org_id>_diags_<date>/sizing_from_diags.json \
   --projects 1,2,3,4,5 --each
 ```

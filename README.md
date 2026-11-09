@@ -7,9 +7,9 @@ Six agent skills for Elastic account work. Each one packages a repeatable workfl
 | [account-status-update](#account-status-update) | Claude (`.skill`) | Account status summary + activity timeline, optionally as a Google Doc | Slack, Gmail, Google Calendar (Drive for docs) |
 | [customer-tech-research](#customer-tech-research) | Claude (`.skill`) | Confidence-rated tech-stack report + Elastic opportunity assessment | Web search, web fetch |
 | [splunk-xml-to-kibana](#splunk-xml-to-kibana) | Claude Code + Cursor | Splunk dashboard migrated to Kibana: mockup, ES\|QL panels, data factories, `MAPPING.md`, deploy | Kibana/ES URL + API key (optional shared `data_factories`) |
-| [k360-org-report](#k360-org-report) | Cursor | K360 org fetch, exec or full report, Sheets auth | K360 `.env`, Sheets venv |
-| [k360-account-analysis](#k360-account-analysis) | Cursor | K360 account summary: footprint, ECU, storage, burndown, projections | K360 `.env`, `k360-org-report` |
-| [diag-serverless-consolidation](#diag-serverless-consolidation) | Cursor | Serverless consolidation priced from diagnostic bundles only | Account-summary artifacts, admin diagnostics, Sheets venv, es3-estimator |
+| [k360-org-report](#k360-org-report) | Claude Code + Cursor | K360 org fetch, exec or full report, Sheets auth | K360 `.env`, Sheets venv |
+| [k360-account-analysis](#k360-account-analysis) | Claude Code + Cursor | K360 account summary: footprint, ECU, storage, burndown, projections | K360 `.env`, `k360-org-report` |
+| [diag-serverless-consolidation](#diag-serverless-consolidation) | Claude Code + Cursor | Serverless consolidation priced from diagnostic bundles only | Account-summary artifacts, admin diagnostics, Sheets venv, es3-estimator |
 
 ---
 
@@ -28,6 +28,9 @@ splunk-xml-to-kibana/
   templates/                         # mockup, MAPPING, factories, esql/panels.example.json
   README.md                          # install + script quick start
 serverless_analyzer/
+  install.py                         # links Claude and Cursor, checks venvs
+  INSTALL.md                         # machine setup
+  README.md                          # what each skill and script does
   k360-org-report/                   # K360 org fetch; exec or full report
   k360-account-analysis/             # account summary; --skip-diags --skip-sizing
   diag-serverless-consolidation/     # diag bulk + measured retention → estimator read-back
@@ -59,6 +62,8 @@ ln -s "$(pwd)/serverless_analyzer/diag-serverless-consolidation" ~/.cursor/skill
 ```
 
 The serverless skills also have a guided installer. From `serverless_analyzer/`, run `python3 install.py`. The steps are `serverless_analyzer/INSTALL.md` and the script catalog is `serverless_analyzer/README.md`.
+
+Those three runners look for the other skills beside the one that is running, then in `~/.claude/skills` and `~/.cursor/skills`. `K360_ORG_SKILL_DIR`, `K360_ACCOUNT_SKILL_DIR`, and `DIAG_SKILL_DIR` override that search. In the commands below, `<skill>` is the directory that contains that skill's `SKILL.md`.
 
 ---
 
@@ -183,7 +188,7 @@ Examples: `status update GE Vernova 3m`, `status update Merck 2w googledoc=y`. T
 
 **What it does:** Fetches one Elastic Cloud organization from K360 and writes the exec or full org report. `fetch_org.py` and `sheets_auth.py` are the parent dependencies for the account summary and the diagnostic consolidation.
 
-**Usage:** `python scripts/run_org_report.py --org "ORG NAME" --report exec`. `--report full` expands the same fetch. `--reuse` skips a second K360 query.
+**Usage:** In Claude or Cursor, ask for an org report. The command is `python <skill>/scripts/run_org_report.py --org "ORG NAME" --report exec`. `--report full` expands the same fetch. `--reuse` skips a second K360 query.
 
 **Maintain:** Workflow rules live in `SKILL.md`. Setup is `references/setup.md`. OAuth files stay in `~/.config/cloud-tracker-sheets/` and are not in this folder.
 
@@ -191,7 +196,7 @@ Examples: `status update GE Vernova 3m`, `status update Merck 2w googledoc=y`. T
 
 **What it does:** Runs one Elastic Cloud account through K360 and stops at the account summary: ECH versus Serverless mix, cloud and instance footprint, versions, ECU, storage, solution mix, ML and inference, a burndown check, 3- and 6-month projections, and up to five performance and five cost recommendations. It does not pull diagnostic bundles or quote Serverless.
 
-**Usage:** In Cursor, ask for an account summary, for example "run this skill for Colgate-Palmolive". The script resolves the K360 name and exits if the match is not unique. The run passes `--skip-diags --skip-sizing`.
+**Usage:** In Claude or Cursor, ask for an account summary, for example "run this skill for Colgate-Palmolive". The script resolves the K360 name and exits if the match is not unique. The run passes `--skip-diags --skip-sizing`.
 
 **How it works**
 
@@ -210,7 +215,7 @@ Examples: `status update GE Vernova 3m`, `status update Merck 2w googledoc=y`. T
 
 **What it does:** Prices a Serverless consolidation from Elasticsearch diagnostic bundles for deployments that billed in the latest month. A decommissioned deployment and its last snapshot stay out. Ingest is bulk GB/day. Retention is the measured age, rounded up to a whole month. A solution with no stored GB and no bulk is skipped because it has no workload. The run writes two PDFs from the same bulk: the rounded month, and 30 days written as 1 month. It also writes `compressioncalc_accounted_for`, bulk multiplied by the compression ratio, as its own rounded and 30-day pair. That pair does not replace the bulk quote. Each PDF links to its own estimator sheet. Measured-retention PDFs go in `full_retention`. 30-day PDFs go in `30d`. The page after the cover puts horizontal bars for cutting the deployment count by 0, 25, 50, 75, and 100% down the left column, with the project count and monthly dollars on each row, and the component tables on the right. A later page, Deployment consolidation analysis across metered ingest rates, lists each deployment's metered ingest rate and marks $0.50 rows in red. The search-power chart is the Appendix, the last page, and is not added to the quote. A data-egress page lists hosted data in, data out, and inter-node. Data out carries over outside the estimator; inter-node does not.
 
-**Usage:** Ask for a diagnostic consolidation, a per-cluster Serverless price, or a 2–5 project pack. Reuse the account-summary org report when that folder already exists.
+**Usage:** In Claude or Cursor, ask for a diagnostic consolidation, a per-cluster Serverless price, or a 2–5 project pack. Reuse the account-summary org report when that folder already exists.
 
 **How it works**
 
@@ -224,4 +229,4 @@ Examples: `status update GE Vernova 3m`, `status update Merck 2w googledoc=y`. T
 
 ## Contributing
 
-Agents working in this repo follow `.cursor/rules/commits.mdc`: Conventional Commits, explicit `git add <paths>`, and never commit secrets, customer data, or generated artifacts. After editing a Claude skill, re-zip its folder as `<name>.skill` so the installable bundle stays in sync with the source.
+Agents working in this repo follow `.cursor/rules/commits.mdc`: Conventional Commits, explicit `git add <paths>`, and never commit secrets, customer data, or generated artifacts. After editing `account-status-update` or `customer-tech-research`, re-zip that folder as `<name>.skill` so the installable bundle stays in sync with the source. `splunk-xml-to-kibana` and the three skills under `serverless_analyzer/` are the folders themselves.

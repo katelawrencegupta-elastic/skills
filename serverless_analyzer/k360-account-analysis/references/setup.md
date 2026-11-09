@@ -1,14 +1,14 @@
 # Setup
 
 ## Dependencies
-- **Parent skill** `~/.cursor/skills/k360-org-report/` — provides `scripts/fetch_org.py` (K360 fetch) and `scripts/sheets_auth.py` (OAuth). Override location with `K360_ORG_SKILL_DIR`.
+- **Parent skill** `k360-org-report` — provides `scripts/fetch_org.py` (K360 fetch) and `scripts/sheets_auth.py` (OAuth). The runners find it beside this skill, then in `~/.claude/skills` and `~/.cursor/skills`. Override location with `K360_ORG_SKILL_DIR`.
 - **`.env`** in the working directory: `KIBANA_URL`, `ELASTIC_API_KEY` (read-only API key on `cloud-tracker-*` is enough; `_cat` privileges not required).
 - **Sheets venv** (only for the ECH > 50 % step):
   ```bash
   python3 -m venv ~/.config/cloud-tracker-sheets/venv
-  ~/.config/cloud-tracker-sheets/venv/bin/pip install -r ~/.cursor/skills/k360-org-report/scripts/requirements-sheets.txt
+  ~/.config/cloud-tracker-sheets/venv/bin/pip install -r <k360-org-report>/scripts/requirements-sheets.txt
   # client_secret.json → ~/.config/cloud-tracker-sheets/ ; enable Sheets + Drive APIs
-  ~/.config/cloud-tracker-sheets/venv/bin/python ~/.cursor/skills/k360-org-report/scripts/sheets_auth.py
+  ~/.config/cloud-tracker-sheets/venv/bin/python <k360-org-report>/scripts/sheets_auth.py
   ```
   Override interpreter with `CLOUD_TRACKER_SHEETS_PY`. If the venv is missing the pipeline still produces the report and records `sizing.estimators.error`.
 

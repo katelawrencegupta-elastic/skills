@@ -1359,8 +1359,9 @@ def metered_rate_section(acc: dict) -> str:
     c = acc.get("consolidation") or {}
     rates = list(c.get("metered_rates") or [])
     if not rates and _from_diagnostics(acc):
-        diag_scripts = Path(os.environ.get("DIAG_SKILL_DIR") or Path(__file__).resolve().parents[2] / "diag-serverless-consolidation")
-        diag_scripts = diag_scripts / "scripts" if (diag_scripts / "scripts").is_dir() else diag_scripts
+        from skill_paths import find_skill, scripts_dir
+
+        diag_scripts = scripts_dir(find_skill("diag-serverless-consolidation", Path(__file__).resolve().parent))
         if str(diag_scripts) not in sys.path:
             sys.path.insert(0, str(diag_scripts))
         from consolidation import observability_metered_rates

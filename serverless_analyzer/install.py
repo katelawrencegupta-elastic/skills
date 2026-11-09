@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Guided installer for the serverless_analyzer skills.
 
-Checks this machine, links the three skills into ~/.cursor/skills, and can
-create the Sheets and es3-estimator virtualenvs. It does not write API keys.
-An existing .env is only inspected for key names.
+Checks this machine, links the three skills into ~/.claude/skills and
+~/.cursor/skills, and can create the Sheets and es3-estimator virtualenvs.
+It does not write API keys. An existing .env is only inspected for key names.
 
   python3 install.py           # ask at each step
   python3 install.py --check   # report what is present and change nothing
@@ -20,6 +20,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 SKILLS = ("k360-org-report", "k360-account-analysis", "diag-serverless-consolidation")
+AGENT_HOMES = (
+    ("Claude", Path.home() / ".claude" / "skills"),
+    ("Cursor", Path.home() / ".cursor" / "skills"),
+)
 SHEETS_DIR = Path.home() / ".config" / "cloud-tracker-sheets"
 SHEETS_VENV = SHEETS_DIR / "venv"
 SHEETS_PY = SHEETS_VENV / "bin" / "python"
@@ -126,18 +130,30 @@ def link_one(name: str, dest_root: Path, assume_yes: bool) -> str:
     return f"linked {dest}"
 
 
+def link_status() -> list[str]:
+    lines = []
+    for label, root in AGENT_HOMES:
+        for name in SKILLS:
+            dest = root / name
+            src = (ROOT / name).resolve()
+            if dest.is_symlink() and dest.resolve() == src:
+                state = "linked"
+            elif dest.exists():
+                state = "other"
+            else:
+                state = "missing"
+            lines.append(f"{label} {state:7} {dest}")
+    return lines
+
+
 def link_skills(assume_yes: bool) -> list[str]:
     notes = []
-    cursor = Path.home() / ".cursor" / "skills"
-    if assume_yes or yes(f"Link the three skills into {cursor}?", default=True):
-        for name in SKILLS:
-            notes.append(link_one(name, cursor, assume_yes))
-    else:
-        notes.append("skipped Cursor skill links")
-    claude = Path.home() / ".claude" / "skills"
-    if not assume_yes and yes(f"Also link them into {claude}?", default=False):
-        for name in SKILLS:
-            notes.append(link_one(name, claude, assume_yes=False))
+    for label, root in AGENT_HOMES:
+        if assume_yes or yes(f"Link the three skills into {root}?", default=True):
+            for name in SKILLS:
+                notes.append(link_one(name, root, assume_yes))
+        else:
+            notes.append(f"skipped {label} skill links")
     return notes
 
 
@@ -267,17 +283,9 @@ def main() -> int:
         return 1
 
     if args.check:
-        section("Cursor skills")
-        cursor = Path.home() / ".cursor" / "skills"
-        for name in SKILLS:
-            dest = cursor / name
-            src = (ROOT / name).resolve()
-            if dest.is_symlink() and dest.resolve() == src:
-                say(f"linked  {dest}")
-            elif dest.exists():
-                say(f"other   {dest}")
-            else:
-                say(f"missing {dest}")
+        section("Claude and Cursor skills")
+        for line in link_status():
+            say(line)
         section("Project .env")
         for line in inspect_project(assume_yes=True):
             say(line)
@@ -294,7 +302,7 @@ def main() -> int:
 
     notes: list[str] = []
     section("Skill links")
-    say("The runners look in ~/.cursor/skills unless a path override is set.")
+    say("The runners find sibling skills, then ~/.claude/skills and ~/.cursor/skills.")
     notes.extend(link_skills(args.yes))
     section("K360 .env")
     say("The file stays in the project you run from. This installer does not print or invent key values.")
@@ -313,9 +321,9 @@ def main() -> int:
         say(f"- {line}")
     say("")
     say("Next: from the project that holds .env,")
-    say("  python ~/.cursor/skills/k360-org-report/scripts/run_org_report.py --org \"ORG NAME\" --report exec")
-    say("  python ~/.cursor/skills/k360-account-analysis/scripts/run_account_analysis.py --org \"ORG NAME\" --skip-diags --skip-sizing")
-    say("  python ~/.cursor/skills/diag-serverless-consolidation/scripts/run_consolidation.py --org \"ORG NAME\" --reuse <org_report.json> --diags-dir <bundles>")
+    say(f"  python {ROOT}/k360-org-report/scripts/run_org_report.py --org \"ORG NAME\" --report exec")
+    say(f"  python {ROOT}/k360-account-analysis/scripts/run_account_analysis.py --org \"ORG NAME\" --skip-diags --skip-sizing")
+    say(f"  python {ROOT}/diag-serverless-consolidation/scripts/run_consolidation.py --org \"ORG NAME\" --reuse <org_report.json> --diags-dir <bundles>")
     say("Written steps are INSTALL.md. The script catalog is README.md.")
     return 0
 

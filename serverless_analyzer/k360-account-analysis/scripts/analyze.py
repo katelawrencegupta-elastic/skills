@@ -60,8 +60,10 @@ def decode_inference_sku(sku: str) -> dict:
     """Same decoder as the org-report fetch. Model id is the SKU suffix, never invented."""
     global _DECODE_INFERENCE
     if _DECODE_INFERENCE is None:
-        root = Path(os.environ.get("K360_ORG_SKILL_DIR") or Path.home() / ".cursor/skills/k360-org-report")
-        scripts = root / "scripts" if (root / "scripts" / "fetch_org.py").is_file() else root
+        from skill_paths import find_skill, scripts_dir
+
+        root = find_skill("k360-org-report", Path(__file__).resolve().parent)
+        scripts = scripts_dir(root) if (scripts_dir(root) / "fetch_org.py").is_file() else root
         if str(scripts) not in sys.path:
             sys.path.insert(0, str(scripts))
         from fetch_org import decode_inference_sku as _dec

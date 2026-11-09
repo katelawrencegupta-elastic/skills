@@ -42,11 +42,12 @@ def _sheets_py() -> str:
 
 
 def _repo_root(scripts: Path) -> Path:
-    # …/cloud_tracking/.cursor/skills/…/scripts → repo root
-    for p in [scripts, *scripts.parents]:
-        if (p / "artifacts").is_dir() or (p / ".env").is_file():
-            if (p / ".cursor").is_dir() or (p / "artifacts").is_dir():
-                return p
+    """Project that holds .env. The current directory wins, then any parent of this skill."""
+    if (Path.cwd() / ".env").is_file():
+        return Path.cwd()
+    for parent in scripts.parents:
+        if (parent / ".env").is_file():
+            return parent
     return Path.cwd()
 
 

@@ -1,6 +1,10 @@
 # Serverless analyzer
 
-Three Cursor skills that share one K360 fetch. Install with [INSTALL.md](INSTALL.md), or run `python3 install.py` from this folder.
+Three skills that share one K360 fetch. The same folders run in Claude and in Cursor. Install with [INSTALL.md](INSTALL.md), or run `python3 install.py` from this folder.
+
+`<skill>` in the commands below is the directory that contains that skill's `SKILL.md`. After `install.py` links the folders, that is `~/.claude/skills/<name>` or `~/.cursor/skills/<name>`. From this repo it is `serverless_analyzer/<name>`.
+
+A script finds the other two skills beside its own folder, then in `~/.claude/skills` and `~/.cursor/skills`, then in a project `.claude/skills` or `.cursor/skills`. `K360_ORG_SKILL_DIR`, `K360_ACCOUNT_SKILL_DIR`, and `DIAG_SKILL_DIR` override that search. Each skill keeps its own copy of `scripts/skill_paths.py`, and those three copies stay the same.
 
 | Order | Skill | What it produces | Stops before |
 |---|---|---|---|
@@ -14,7 +18,7 @@ Run each command from the project that holds `.env`. Artifacts land in `artifact
 
 Fetches one Elastic Cloud organization from K360 and writes an exec report or a full report. The exec report condenses the footprint and keeps the projection and the Serverless split. The full report gives each section its own block. Both can copy Search and Observability estimator workbooks and upload a PDF.
 
-`python scripts/run_org_report.py --org "ORG NAME" --report exec`
+`python <skill>/scripts/run_org_report.py --org "ORG NAME" --report exec`
 
 | Script | What it does |
 |---|---|
@@ -26,6 +30,7 @@ Fetches one Elastic Cloud organization from K360 and writes an exec report or a 
 | `render_org_pdf.py` | Renders the exec or full HTML and PDF and uploads the PDF |
 | `emit_estimator_import.py` | Writes Apps Script JSON for a manual estimator fill |
 | `sheets_auth.py` | One-time Sheets and Drive sign-in. The token stays in `~/.config` |
+| `skill_paths.py` | Finds this skill's siblings for the current run. The same file is in the other two skills |
 
 References: `exec-report.md` and `full-report.md` are the canvas outlines. `data-model.md` describes the fetch. `methodology.md` is the Serverless split. `taxonomy.json` classifies SKUs. `setup.md` is the Sheets sign-in. `EstimatorImport.gs` is the Apps Script fallback.
 
@@ -33,7 +38,7 @@ References: `exec-report.md` and `full-report.md` are the canvas outlines. `data
 
 Writes the account summary for one customer: platform mix, cloud and instance footprint, versions, ECU, storage, solution mix, ML and inference, a burndown check, and 3- and 6-month projections. Pass `--skip-diags --skip-sizing`. Omitting either flag hands the command to the diagnostic consolidation.
 
-`python scripts/run_account_analysis.py --org "ORG NAME" --skip-diags --skip-sizing`
+`python <skill>/scripts/run_account_analysis.py --org "ORG NAME" --skip-diags --skip-sizing`
 
 | Script | What it does |
 |---|---|
@@ -43,6 +48,7 @@ Writes the account summary for one customer: platform mix, cloud and instance fo
 | `report_md.py` | Renders the markdown account report |
 | `render_pdf.py` | Renders account and consolidation HTML, then prints PDF with Chrome |
 | `upload_pdfs.py` | Uploads those PDFs into the customer's Drive folder |
+| `skill_paths.py` | Finds `k360-org-report` and `diag-serverless-consolidation` for this run. The same file is in the other two skills |
 
 References: `setup.md` is the machine setup. `output-schema.md` is the account JSON. `canvas-layout.md` is the page order. `recommendation-rules.md` is how the recommendations are chosen.
 
@@ -50,7 +56,7 @@ References: `setup.md` is the machine setup. `output-schema.md` is the account J
 
 Prices Observability and Security from Elasticsearch diagnostic bundles. Daily GB is bulk on the write indices. Retention is the measured age, written as a whole month. Search disk is local store, and Search ingest stays the K360 rate scaled by that store. The estimator read-back is the dollar. A second estimate, `compressioncalc_accounted_for`, is bulk × 0.60 and does not replace the bulk quote.
 
-`python scripts/run_consolidation.py --org "ORG NAME" --reuse <org_report.json> --diags-dir <bundles>`
+`python <skill>/scripts/run_consolidation.py --org "ORG NAME" --reuse <org_report.json> --diags-dir <bundles>`
 
 | Script | What it does |
 |---|---|
@@ -65,6 +71,7 @@ Prices Observability and Security from Elasticsearch diagnostic bundles. Daily G
 | `diag_inputs.py` | Prints 2–5 project packs and per-deployment inputs. It does not quote dollars |
 | `privacy.py` | Sets private file modes and warns when `.env` or `artifacts/` would be committed |
 | `test_diag_quote.py` | Offline unit tests. No Google account and no sheets |
+| `skill_paths.py` | Finds `k360-org-report` and `k360-account-analysis` for this run. The same file is in the other two skills |
 
 References: `calculations.md` is the arithmetic. `sizing-cells.md` is the estimator cell map.
 

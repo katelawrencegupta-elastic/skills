@@ -24,12 +24,13 @@ One command → folder of artifacts → account canvas + ≤6 chat bullets. This
 5. A request to price Serverless, to consolidate deployments, or to use diagnostic bundles is the `diag-serverless-consolidation` skill. Finish this summary first only when the user asked for both. Do not start that work inside this skill.
 
 ## Run
+`<skill>` is the directory that contains this file. The same directory works for Claude and Cursor.
+
 ```bash
-SCR=~/.cursor/skills/k360-account-analysis/scripts
 cd <project with .env>          # KIBANA_URL, ELASTIC_API_KEY
 
-python $SCR/run_account_analysis.py --org "ORG NAME" --skip-diags --skip-sizing
-python $SCR/run_account_analysis.py --org "ORG NAME" --skip-diags --skip-sizing \
+python <skill>/scripts/run_account_analysis.py --org "ORG NAME" --skip-diags --skip-sizing
+python <skill>/scripts/run_account_analysis.py --org "ORG NAME" --skip-diags --skip-sizing \
   --reuse /tmp/account_org_report.json
 ```
 Every run uses the trailing year (`--days` defaults to 365). Do not shorten the window. The 3- and 6-month projections use that year's complete-month ECU average (partial months excluded), not the last 30 days. Contract dollars on the projection are included only when ARR and a commit pace exist: ARR ÷ (commit ECU/day × 365).

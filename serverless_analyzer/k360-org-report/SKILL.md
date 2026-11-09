@@ -27,17 +27,19 @@ Details: [exec-report.md](references/exec-report.md) · [full-report.md](referen
 6. Chat **≤5 bullets** from `*_summary.json`. Methodology/setup refs only if blocked.
 
 ## Run
+`<skill>` is the directory that contains this file. The same directory works for Claude and Cursor.
+
 ```bash
-SCR=~/.cursor/skills/k360-org-report/scripts
+cd <project with .env>
 
 # Exec (short)
-python $SCR/run_org_report.py --org "ORG_NAME" --report exec
+python <skill>/scripts/run_org_report.py --org "ORG_NAME" --report exec
 
 # Full (expanded)
-python $SCR/run_org_report.py --org "ORG_NAME" --report full
+python <skill>/scripts/run_org_report.py --org "ORG_NAME" --report full
 
 # Same fetch, other flavor:
-python $SCR/run_org_report.py --org "ORG_NAME" --report full --reuse /tmp/org_report.json
+python <skill>/scripts/run_org_report.py --org "ORG_NAME" --report full --reuse /tmp/org_report.json
 ```
 
 `.env`: `KIBANA_URL`, `ELASTIC_API_KEY`. Other flags: `--skip-pdf` · `--skip-push` · `--skip-workload` · `--days N`.

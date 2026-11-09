@@ -15,9 +15,11 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 import sys
 
-K360 = HERE.parents[1] / "k360-account-analysis" / "scripts"
-sys.path.insert(0, str(K360))
 sys.path.insert(0, str(HERE))
+from skill_paths import find_skill, scripts_dir  # noqa: E402
+
+K360 = scripts_dir(find_skill("k360-account-analysis", HERE))
+sys.path.insert(0, str(K360))
 
 from admin_diags import (  # noqa: E402
     _parse_zip, _user_index, admin_base, analyze_bundle, capture_target, capture_url,
@@ -992,6 +994,20 @@ class PrivacyTests(unittest.TestCase):
             subprocess.run(["git", "add", "-f", ".env"], cwd=root, check=True, capture_output=True)
             tracked = unignored_secret_warnings(root)
             self.assertTrue(any(note.startswith(".env ") for note in tracked))
+
+
+class SkillPathTests(unittest.TestCase):
+    def test_sibling_org_skill_is_found_from_this_repo(self):
+        found = find_skill("k360-org-report", HERE)
+        self.assertTrue((found / "scripts" / "fetch_org.py").is_file())
+
+    def test_env_override_wins_over_the_sibling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["K360_ORG_SKILL_DIR"] = tmp
+            try:
+                self.assertEqual(find_skill("k360-org-report", HERE), Path(tmp))
+            finally:
+                os.environ.pop("K360_ORG_SKILL_DIR", None)
 
 
 if __name__ == "__main__":

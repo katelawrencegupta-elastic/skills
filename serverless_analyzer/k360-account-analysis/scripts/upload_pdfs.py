@@ -16,16 +16,14 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+from skill_paths import find_skill, scripts_dir  # noqa: E402
 
 
 def _diag_scripts() -> Path:
-    override = os.environ.get("DIAG_SKILL_DIR")
-    root = Path(override) if override else HERE.parents[1] / "diag-serverless-consolidation"
-    scripts = root / "scripts"
-    return scripts if scripts.is_dir() else root
+    return scripts_dir(find_skill("diag-serverless-consolidation", HERE))
 
 
-sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(_diag_scripts()))
 from render_pdf import pdf_folder_name  # noqa: E402
 from privacy import seal_text  # noqa: E402

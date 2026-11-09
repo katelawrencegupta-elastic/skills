@@ -27,18 +27,19 @@ Keep `.env` and `artifacts/` out of git. A run directory is created mode `0700`,
 
 ## 1. Link the skills
 
-The runners look in `~/.cursor/skills` unless `K360_ORG_SKILL_DIR`, `K360_ACCOUNT_SKILL_DIR`, or `DIAG_SKILL_DIR` points somewhere else.
+The same skill folders work for Claude and Cursor. The runners look beside the skill that is running, then in `~/.claude/skills` and `~/.cursor/skills`. `K360_ORG_SKILL_DIR`, `K360_ACCOUNT_SKILL_DIR`, and `DIAG_SKILL_DIR` override those locations.
 
 From this repository's `skills/` directory:
 
 ```bash
-mkdir -p ~/.cursor/skills
-ln -s "$(pwd)/serverless_analyzer/k360-org-report" ~/.cursor/skills/k360-org-report
-ln -s "$(pwd)/serverless_analyzer/k360-account-analysis" ~/.cursor/skills/k360-account-analysis
-ln -s "$(pwd)/serverless_analyzer/diag-serverless-consolidation" ~/.cursor/skills/diag-serverless-consolidation
+mkdir -p ~/.claude/skills ~/.cursor/skills
+for skill in k360-org-report k360-account-analysis diag-serverless-consolidation; do
+  ln -s "$(pwd)/serverless_analyzer/$skill" ~/.claude/skills/$skill
+  ln -s "$(pwd)/serverless_analyzer/$skill" ~/.cursor/skills/$skill
+done
 ```
 
-If a name in `~/.cursor/skills` is already a real directory, the installer leaves it alone unless you confirm a replacement. A symlink that already points at this repo is left as it is.
+If a name is already a real directory, the installer leaves it alone unless you confirm a replacement. A symlink that already points at this repo is left as it is.
 
 ## 2. Project `.env`
 
@@ -88,16 +89,18 @@ PDF export uses headless Chrome. Install Google Chrome or Chromium, or set `CHRO
 
 ## Run from the project
 
+`<skill>` is that skill's directory. After the links above, either `~/.claude/skills/<skill>` or `~/.cursor/skills/<skill>` works.
+
 ```bash
 cd <project with .env>
 
-python ~/.cursor/skills/k360-org-report/scripts/run_org_report.py \
+python <skill>/scripts/run_org_report.py \
   --org "ORG NAME" --report exec
 
-python ~/.cursor/skills/k360-account-analysis/scripts/run_account_analysis.py \
+python <skill>/scripts/run_account_analysis.py \
   --org "ORG NAME" --skip-diags --skip-sizing
 
-python ~/.cursor/skills/diag-serverless-consolidation/scripts/run_consolidation.py \
+python <skill>/scripts/run_consolidation.py \
   --org "ORG NAME" \
   --reuse artifacts/<customer>_<date>/<customer>_<date>_org_report.json \
   --diags-dir artifacts/<org_id>_diags_<date>

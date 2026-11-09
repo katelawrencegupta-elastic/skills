@@ -23,14 +23,12 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+from skill_paths import find_skill, scripts_dir  # noqa: E402
 
 
 def diag_script_dir() -> Path:
     """Sibling diag-serverless-consolidation scripts. DIAG_SKILL_DIR overrides the skill root."""
-    override = os.environ.get("DIAG_SKILL_DIR")
-    root = Path(override) if override else HERE.parents[1] / "diag-serverless-consolidation"
-    scripts = root / "scripts"
-    return scripts if scripts.is_dir() else root
+    return scripts_dir(find_skill("diag-serverless-consolidation", HERE))
 
 
 sys.path.insert(0, str(diag_script_dir()))
@@ -40,7 +38,7 @@ from quote_checks import e73_blocks_quote, money as _sheet_money  # noqa: E402
 from k360_infra import es_base_and_key, fetch_infra, fill_ingest_doc_bytes, fill_storage_from_data_pivot, fill_storage_monthly, load_env, resolve_org_name, size_gaps  # noqa: E402
 from report_md import render  # noqa: E402
 
-ORG_SKILL = Path(os.environ.get("K360_ORG_SKILL_DIR") or Path.home() / ".cursor/skills/k360-org-report")
+ORG_SKILL = find_skill("k360-org-report", HERE)
 
 
 def _run(cmd: list[str]) -> None:
