@@ -352,46 +352,63 @@ def bar_chart(categories: list[str], series: list[tuple[str, list[float]]], *, s
 
 
 def plan_hbar(rows: list[tuple[str, str, float]], *, ref: tuple[float, str] | None = None, width: int = 440) -> str:
-    """Horizontal bars for a tall column. Each row is (cut, project count, monthly dollars)."""
+    """Horizontal bars for a tall column. Each row is (cut, project count, monthly dollars).
+
+    The dollar amount sits on the bar. The project count is a column on the
+    right, with one arrow pointing down beside that column.
+    """
     n = max(len(rows), 1)
     dx, dy = 8.0, 5.0
-    plot_x, pad_r = 8, 10 + dx
-    plot_w = max(width - plot_x - pad_r, 40)
-    row_h, bar_h, top = 78, 42, 24
-    height = top + n * row_h + 24
+    label_w, count_w, arrow_w = 48, 96, 16
+    plot_x = label_w
+    plot_w = max(width - plot_x - count_w - arrow_w, 40)
+    row_h, bar_h, top = 52, 22, 22
+    height = top + n * row_h + 22
     vals = [float(v or 0) for _, _, v in rows]
     vmax = _nice_max(max(vals + ([ref[0]] if ref else []) + [1]))
     out = [f"<svg viewBox='0 0 {width} {height}' width='100%' xmlns='http://www.w3.org/2000/svg' font-family='inherit'>"]
-    ref_line = ""
     if ref:
         rx = plot_x + plot_w * min(float(ref[0]), vmax) / vmax
-        anchor = "end" if rx > plot_x + plot_w * 0.62 else "start"
-        lx = rx - 4 if anchor == "end" else rx + 4
-        ref_line = (
-            f"<line x1='{rx:.1f}' x2='{rx:.1f}' y1='16' y2='{top + n * row_h - 10:.1f}' stroke='#69707D' stroke-dasharray='4 3'/>"
-            f"<text x='{lx:.1f}' y='14' text-anchor='{anchor}' fill='#343741' font-size='13'>{esc(ref[1])}</text>"
+        anchor = "end" if rx > plot_x + plot_w * 0.55 else "start"
+        lx = min(rx - 4, plot_x + plot_w - 4) if anchor == "end" else rx + 4
+        out.append(
+            f"<line x1='{rx:.1f}' x2='{rx:.1f}' y1='16' y2='{top + n * row_h - 8:.1f}' stroke='#69707D' stroke-dasharray='4 3'/>"
+            f"<text x='{lx:.1f}' y='13' text-anchor='{anchor}' fill='#343741' font-size='12'>{esc(ref[1])}</text>"
         )
-    labels: list[str] = []
+    count_x = plot_x + plot_w + 10
     for i, (title, sub, v) in enumerate(rows):
         mid = top + i * row_h + row_h / 2
         bw = plot_w * float(v or 0) / vmax
         by = mid - bar_h / 2
-        out.append(f"<rect x='{plot_x}' y='{by:.1f}' width='{plot_w:.1f}' height='{bar_h}' rx='4' fill='#EEF2F7'/>")
-        face = max(bw - dx, 2) if bw > 0 else 0
+        out.append(f"<rect x='{plot_x}' y='{by:.1f}' width='{plot_w:.1f}' height='{bar_h}' rx='3' fill='#EEF2F7'/>")
+        face = max(bw - dx, 0)
         if bw > 0:
-            out.append(_hbar3d(plot_x, by, face, bar_h, PALETTE[0], dx=dx, dy=dy))
-        name_y = mid - 1 if sub else mid + 5
-        labels.append(f"<text x='{plot_x + 12:.1f}' y='{name_y:.1f}' fill='#fff' font-size='15' font-weight='700'>{esc(title)}</text>")
+            out.append(_hbar3d(plot_x, by, max(face, 2), bar_h, PALETTE[0], dx=dx, dy=dy))
+        label = usd(v)
+        text_y = by + bar_h * 0.72
+        if face >= 78:
+            out.append(
+                f"<text x='{plot_x + face - 8:.1f}' y='{text_y:.1f}' text-anchor='end' fill='#ffffff' font-size='12' font-weight='700'>{label}</text>"
+            )
+        else:
+            out.append(
+                f"<text x='{plot_x + max(face, 0) + dx + 6:.1f}' y='{text_y:.1f}' text-anchor='start' fill='#343741' font-size='12' font-weight='700'>{label}</text>"
+            )
+        out.append(f"<text x='4' y='{mid + 4:.1f}' fill='#343741' font-size='13' font-weight='700'>{esc(title)}</text>")
         if sub:
-            labels.append(f"<text x='{plot_x + 12:.1f}' y='{mid + 15:.1f}' fill='#fff' font-size='12'>{esc(sub)}</text>")
-        labels.append(f"<text x='{plot_x + face - 12:.1f}' y='{mid + 5:.1f}' text-anchor='end' fill='#fff' font-size='15' font-weight='700'>{usd(v)}</text>")
-    if ref_line:
-        out.append(ref_line)
-    out.extend(labels)
-    axis_y = top + n * row_h - 4
+            out.append(f"<text x='{count_x:.1f}' y='{mid + 4:.1f}' fill='#343741' font-size='12' font-weight='600'>{esc(sub)}</text>")
+    if n >= 2 and any(sub for _, sub, _ in rows):
+        ax = width - 8
+        y_top = top + row_h / 2
+        y_bot = top + (n - 1) * row_h + row_h / 2
+        out.append(
+            f"<line x1='{ax:.1f}' y1='{y_top:.1f}' x2='{ax:.1f}' y2='{y_bot - 8:.1f}' stroke='#69707D' stroke-width='1.6'/>"
+            f"<polygon points='{ax - 4.5:.1f},{y_bot - 8:.1f} {ax + 4.5:.1f},{y_bot - 8:.1f} {ax:.1f},{y_bot + 1:.1f}' fill='#69707D'/>"
+        )
+    axis_y = top + n * row_h - 2
     out.append(f"<line x1='{plot_x}' x2='{plot_x + plot_w:.1f}' y1='{axis_y:.1f}' y2='{axis_y:.1f}' stroke='#D3DAE6'/>")
-    out.append(f"<text x='{plot_x}' y='{axis_y + 16:.1f}' fill='#69707D' font-size='12'>$0</text>")
-    out.append(f"<text x='{plot_x + plot_w:.1f}' y='{axis_y + 16:.1f}' text-anchor='end' fill='#69707D' font-size='12'>{usd(vmax)}</text>")
+    out.append(f"<text x='{plot_x}' y='{axis_y + 14:.1f}' fill='#69707D' font-size='11'>$0</text>")
+    out.append(f"<text x='{plot_x + plot_w:.1f}' y='{axis_y + 14:.1f}' text-anchor='end' fill='#69707D' font-size='11'>{usd(vmax)}</text>")
     out.append("</svg>")
     return "".join(out)
 
@@ -882,13 +899,14 @@ def consolidation_report_exists(acc: dict) -> bool:
     return bool((acc.get("sizing") or {}).get("triggered") and c and not c.get("error"))
 
 
-def cost_sizing_sections(acc: dict, *, sizing: bool = True, new_page: bool = True, numbered: bool = True) -> list[str]:
+def cost_sizing_sections(acc: dict, *, sizing: bool = True, new_page: bool = True, numbered: bool = False) -> list[str]:
     m = acc.get("meta") or {}
     an = acc.get("analysis") or {}
     sz = acc.get("sizing") or {}
     est = sz.get("estimators") or {}
-    cost_title = "9. Cost-savings analysis" if numbered else "Cost-savings analysis"
-    sizing_title = "10. Serverless sizing (ECH > 50% rule)" if numbered else "Serverless sizing"
+    del numbered
+    cost_title = "Cost-savings analysis"
+    sizing_title = "Serverless sizing"
     out = [section(cost_title, recs(an.get("cost") or []), new_page=new_page)]
     if not sz.get("triggered"):
         body = f"<p>{'Skipped (' + esc(sz.get('skipped_reason')) + ')' if sz.get('skipped_reason') else 'Not triggered'} — ECH share {esc(sz.get('ech_share_pct'))}% (threshold {esc(sz.get('threshold_pct'))}%).</p>"
@@ -970,12 +988,12 @@ def recs(items: list[dict]) -> str:
     if not items:
         return "<div class='cap'>No recommendations triggered.</div>"
     out = []
-    for i, r in enumerate(items, 1):
+    for r in items:
         sev = (r.get("severity") or "low").lower()
         docs = doc_links(r)
         out.append(
             f"<div class='rec panel' style='border-left-color:{TONE.get(sev, '#69707D')}'>"
-            f"<div><span class='t'>{i}. {esc(r.get('title'))}</span><span class='sev' style='color:{TONE.get(sev, '#69707D')}'>{esc(sev.upper())}</span></div>"
+            f"<div><span class='t'>{esc(r.get('title'))}</span><span class='sev' style='color:{TONE.get(sev, '#69707D')}'>{esc(sev.upper())}</span></div>"
             f"<div class='e'>{esc(r.get('evidence'))}</div>"
             f"<div style='margin-top:4px'><b>Action.</b> {esc(r.get('action'))}</div>"
             + (f"<div class='cap'>Impact: {esc(r.get('impact'))}</div>" if r.get("impact") else "")
@@ -1070,7 +1088,7 @@ def render_account_html(acc: dict) -> str:
         topo = regional_architecture_svg(acc) + deployment_topology(acc)
         if topo.strip():
             B.append(section("Topology", topo, new_page=True))
-    B.append(section("1. Platform, cloud & instance footprint", "".join(b), new_page=True))
+    B.append(section("Platform, cloud and instance footprint", "".join(b), new_page=True))
 
     # 2 + 3 share one page
     vs = d.get("version_summary") or {}
@@ -1113,12 +1131,12 @@ def render_account_html(acc: dict) -> str:
         ["Deployment", "Version", "Template", "ECU", "%", "ECU/mo", "Months"],
         [[t["name"], t.get("version"), t.get("template"), n0(t["ecu"]), pct(t.get("ecu_pct")), n0(t.get("ecu_monthly_avg")), t.get("months_active")] for t in top[:6]],
         ["left", "left", "left", "right", "right", "right", "right"]))
-    B.append(section("2. Deployments, stack versions & ECU", "".join(b), new_page=True))
+    B.append(section("Deployments, stack versions and ECU", "".join(b), new_page=True))
 
     # 3 + 4 share one page
     ser = bd.get("series") or {}
     sm = ser.get("months") or []
-    burn = panel("<h3>3. Remaining ECU over time</h3>" + (
+    burn = panel("<h3>Remaining ECU over time</h3>" + (
         line_chart(
             [_mlab(x) for x in sm],
             series=[("Implied balance", ser.get("implied_balance") or []), ("Commit-pace forecast", ser.get("commit_pace_balance") or [])],
@@ -1127,7 +1145,7 @@ def render_account_html(acc: dict) -> str:
     ))
     flags = "".join(callout(f["flag"], esc(f.get("detail")), f.get("severity") or "info") for f in bd.get("flags") or []) or "<div class='cap'>No burndown flags.</div>"
     deps = panel(
-        "<h3>4. Active deployments</h3>"
+        "<h3>Active deployments</h3>"
         + line_chart([_mlab(x) for x in ot.get("periods") or []], ot.get("count") or [], height=230, show_values=False)
         + caption("Deployments with billing ECU > 0 per month · Source: K360 billing")
     )
@@ -1139,7 +1157,7 @@ def render_account_html(acc: dict) -> str:
         [f"Next {h.get('months')} months", _horizon_cell(h)] for h in ((an.get("projections") or {}).get("horizons") or [])
     ], boxed=True) + (f"<div class='cap'>{esc((an.get('projections') or {}).get('note'))}</div>" if (an.get("projections") or {}).get("note") else ""))
     B.append(section(
-        "3–4. Burndown and deployments over time",
+        "Burndown and deployments over time",
         grid(burn, deps, ratio="1.35fr 1fr", gap="28px")
         + grid(metrics, panel("<h3>What changed</h3>" + callout(str(tr.get("flag") or "trend").capitalize(), esc(trend_txt), tone) + flags), ratio="1.15fr 1fr", gap="28px"),
         new_page=True,
@@ -1260,10 +1278,10 @@ def render_account_html(acc: dict) -> str:
     rec_body = recs(an.get("performance") or [])
     if cons_pdf:
         rec_body += caption("Cost recommendations are on the consolidation report.") + f"<div class='docs'>{link(cons_pdf, 'Open the consolidation PDF')}</div>"
-    B.append(section("5. Data storage", "".join(body46), new_page=True))
-    B.append(section("6. ECU by solution", "".join(body6), new_page=True))
-    B.append(section("7. ML, vectors & AI", "".join(body7), new_page=True))
-    B.append(section("8. Current State Analysis & Recommendations", rec_body, new_page=True))
+    B.append(section("Data storage", "".join(body46), new_page=True))
+    B.append(section("ECU by solution", "".join(body6), new_page=True))
+    B.append(section("ML, vectors and AI", "".join(body7), new_page=True))
+    B.append(section("Current state analysis and recommendations", rec_body, new_page=True))
     if not consolidation_report_exists(acc):
         B.extend(cost_sizing_sections(acc))
     return page(f"{m.get('customer')} — K360 account analysis", "".join(B))
@@ -1424,6 +1442,11 @@ def serverless_component_slide(acc: dict, *, new_page: bool = True, bare: bool =
             names = [str(name) for name in (diag_cov.get("fallback_names") or []) if name]
             named = f" ({', '.join(names[:8])})" if names else ""
             roster_notes.append(f"{n0(n)} active {noun} {verb} no diagnostic bundle{named} and {add} no ingest.")
+        if c.get("retention_set_days") == 30 and (cons.get("search") or {}).get("retention_months") is not None:
+            roster_notes.append(
+                f"Search is kept {cons['search'].get('retention_months')} months, the full-retention estimate. "
+                "There is no 30-day Search estimate. Observability and Security on this page are written as 1 month."
+            )
         right += bullets(roster_notes)
     est = sz.get("estimators") or {}
     project_rows = []
@@ -1764,12 +1787,12 @@ def deployment_plan_section(c: dict, sv: dict, *, alongside: str = "") -> str:
     else:
         plan_ref = None
     if c.get("retention_set_days") == 30:
-        plan_ret = "Retention on every project is 30 days, written as 1 month."
+        plan_ret = "Observability on every bar is 30 days, written as 1 month. Search is not on this chart. Search has no 30-day estimate."
     else:
         plan_ret = "Retention on each project is its measured months, rounded up."
     chart = plan_hbar(rows, ref=plan_ref, width=460)
     chart += caption(
-        "The count on each bar is how many projects remain. "
+        "The project count is on the right. The arrow beside it points down the column. "
         "0% keeps one project per active deployment. 25, 50, and 75% pack the fleet into that many fewer projects. "
         "100% is a single project. Each bar is the sum of Observability estimator read-backs. "
         + plan_ret
@@ -1917,8 +1940,17 @@ def render_consolidation_html(acc: dict) -> str:
     if diag:
         headline += ", measured from cluster diagnostics"
     scenario = c.get("retention_scenario")
+    search_mo = float(((svl.get("by_solution") or {}).get("search") or {}).get("total_mo") or 0)
+    o11y_mo = float(((svl.get("by_solution") or {}).get("observability") or {}).get("total_mo") or 0)
+    sec_mo = float(((svl.get("by_solution") or {}).get("security") or {}).get("total_mo") or 0)
     if scenario == "30d":
-        headline += " — retention 30 days"
+        named = [label for label, amount in (("Observability", o11y_mo), ("Security", sec_mo)) if amount]
+        bits = []
+        if named:
+            bits.append(" and ".join(named) + " at 30 days")
+        if search_mo:
+            bits.append("Search at full retention")
+        headline += " — " + (", ".join(bits) if bits else "retention 30 days")
     elif scenario == "rounded":
         headline += " — retention rounded up"
     if c.get("ingest_basis") == "compressioncalc_accounted_for":
@@ -2023,10 +2055,8 @@ def render_consolidation_html(acc: dict) -> str:
         )
         thirty = c.get("thirty_day") or {}
         if c.get("retention_set_days") == 30:
-            measured = ((((acc.get("sizing") or {}).get("consolidated") or {}).get("observability") or {}).get("retention_months_measured"))
-            measured_bit = f" Measured retention is {measured} months." if measured else ""
             cover_notes.append(
-                f"Retention is set to 30 days and written as 1 month.{measured_bit} The saved sheet is at that month."
+                "Observability and Security are written as 1 month. Search is the full-retention estimate. There is no 30-day Search estimate, and the saved Search sheet stays at the measured month."
             )
         elif thirty.get("monthly") is not None:
             cover_notes.append(
@@ -2036,10 +2066,8 @@ def render_consolidation_html(acc: dict) -> str:
         cover_notes.append("Ingest is bulk GB/day from the diagnostic bundles. K360 does not provide a raw ingest total. Stored GB ÷ assumed retention is the --k360-ingest backup and can sit far below this bulk rate.")
         thirty = c.get("thirty_day") or {}
         if c.get("retention_set_days") == 30:
-            measured = ((((acc.get("sizing") or {}).get("consolidated") or {}).get("observability") or {}).get("retention_months_measured"))
-            measured_bit = f" Measured retention is {measured} months." if measured else ""
             cover_notes.append(
-                f"Retention is set to 30 days and written as 1 month.{measured_bit} The saved sheet is at that month."
+                "Observability and Security are written as 1 month. Search is the full-retention estimate. There is no 30-day Search estimate, and the saved Search sheet stays at the measured month."
             )
         elif thirty.get("monthly") is not None:
             cover_notes.append(
