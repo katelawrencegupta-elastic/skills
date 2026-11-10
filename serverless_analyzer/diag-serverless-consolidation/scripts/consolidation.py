@@ -297,6 +297,16 @@ def _apply_sheet_readback(by_solution: dict, sz: dict, solution: str) -> bool:
     return True
 
 
+def _solution_has_regional_readback(sz: dict, solution: str) -> bool:
+    """True when a per-region estimator for this solution already has a monthly read-back."""
+    for project in ((sz.get("estimators") or {}).get("projects") or []):
+        if project.get("solution") != solution:
+            continue
+        if _money((project.get("readback") or {}).get("monthly_steady_state")) is not None:
+            return True
+    return False
+
+
 def _omit_unquoted(blk: dict, notes: list[str], solution: str) -> None:
     if not ((blk.get("stored_gb") or 0) or (blk.get("daily_raw_gb") or 0)):
         return
@@ -547,12 +557,13 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
     support = ((acc.get("sizing") or {}).get("support_tier")) or "Premium"
     saved = _saved_projects(acc)
     store_split = False
+    regional_quoted = False
     profile_keys = ("Total $/month", "Provisioned Search VCU/h", "Idle Search VCU/h", "Search $/month", "Ingest $/month", "Storage $/month", "Support $/month")
     for sol, regions in spans.items():
         if len(regions) <= 1:
             continue
         blk = by_solution.get(sol) or {}
-        if "quotable" not in str(blk.get("pricing") or ""):
+        if "quotable" not in str(blk.get("pricing") or "") and not any(key[0] == sol for key in saved):
             continue
         rows = [g for g in groups if g["solution"] == sol]
         total_gb = sum(g["stored_gb"] for g in rows) or float(blk.get("stored_gb") or 0)
@@ -561,7 +572,8 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
             share = (g["stored_gb"] / total_gb) if total_gb else 0.0
             saved_hit = saved.get((sol, g["region"])) or {}
             saved_rb = saved_hit.get("readback") or {}
-            if sol == "search" and str(blk.get("pricing") or "").startswith("es3-estimator") and g["stored_gb"] > 0:
+            saved_search = sol == "search" and _money(saved_rb.get("monthly_steady_state")) is not None
+            if sol == "search" and g["stored_gb"] > 0 and (str(blk.get("pricing") or "").startswith("es3-estimator") or saved_search):
                 result = {"readback": saved_rb, "profiles": saved_hit.get("profiles"), "region_match": saved_hit.get("region_match")} if _money(saved_rb.get("monthly_steady_state")) is not None else _es3_region({
                     "stored_gb": g["stored_gb"],
                     "org_stored_gb": org_gb,
@@ -646,6 +658,12 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
         elif quote["mode"] == "per_region":
             blk["total_mo"] = quote["total_mo"]
             blk["total_yr"] = quote["total_yr"]
+            if "quotable" not in str(blk.get("pricing") or ""):
+                blk["pricing"] = (
+                    "es3-estimator on-demand (quotable)" if sol == "search"
+                    else f"{sol.title()} sheet read-back (quotable)"
+                )
+            regional_quoted = True
         else:
             store_split = True
         if sol == "search" and quote["mode"] == "per_region":
@@ -690,7 +708,7 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
     if store_split:
         note += " Where a region had no read-back of its own, that solution keeps the consolidated total and every region is a stored-GB share of it."
     notes.append(note)
-    return True
+    return regional_quoted
 
 
 def _search_eis(acc: dict, months: float) -> dict | None:
@@ -1017,10 +1035,12 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
             continue
         quoted = _apply_sheet_readback(by_solution, sz, sol) or quoted
     for sol, blk in by_solution.items():
+        if _solution_has_regional_readback(sz, sol):
+            continue
         _omit_unquoted(blk, notes, sol)
     svls_total_mo = sum(float(p.get("total_mo") or 0) for p in by_solution.values())
     region_groups = _deployment_groups(acc, infra, months)
-    _replicate_by_region(acc, by_solution, region_groups, notes)
+    quoted = _replicate_by_region(acc, by_solution, region_groups, notes) or quoted
     _apply_search_eis(acc, by_solution, months, notes)
     svls_total_mo = sum(float(p.get("total_mo") or 0) for p in by_solution.values())
     if quoted:

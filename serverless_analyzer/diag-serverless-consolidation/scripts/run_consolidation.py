@@ -227,14 +227,18 @@ def _money_note(diag_mo, k360_mo) -> str:
 
 
 def _compression_totals(acc: dict) -> tuple[float, float | None, float]:
-    """Observability plus Security: raw bulk, and that bulk kept at 60%."""
+    """Observability, Security, and Search: raw bulk, and that bulk kept at 60%."""
     from admin_diags import COMPRESSION_RATIO
 
     con = (acc.get("sizing") or {}).get("consolidated") or {}
     bulk = 0.0
-    for sol in ("observability", "security"):
-        bulk += float((con.get(sol) or {}).get("bulk_gb_day") or 0)
-    if bulk <= 0:
+    has_workload = False
+    for sol in ("observability", "security", "search"):
+        blk = con.get(sol) or {}
+        bulk += float(blk.get("bulk_gb_day") or 0)
+        if (blk.get("stored_gb") or 0) or (blk.get("bulk_gb_day") or 0) or (blk.get("daily_raw_gb") or 0):
+            has_workload = True
+    if not has_workload:
         return 0.0, None, 0.0
     return round(bulk, 3), COMPRESSION_RATIO, round(bulk * COMPRESSION_RATIO, 3)
 
@@ -271,9 +275,9 @@ def _run_compressioncalc(diag: dict, diag_path: Path, infra: dict, py: Path, arg
         ),
     }
     diag[COMPRESSIONCALC] = block
-    if accounted == 0 or not size_sheets or not py.is_file():
-        if accounted == 0:
-            block["status"] = "not priced — compressioncalc_accounted_for is 0"
+    if ratio is None or not size_sheets or not py.is_file():
+        if ratio is None:
+            block["status"] = "not priced — no workload to compress"
         elif not py.is_file():
             block["status"] = "measured only — Sheets venv missing"
         else:
@@ -290,7 +294,6 @@ def _run_compressioncalc(diag: dict, diag_path: Path, infra: dict, py: Path, arg
             "--account-json", str(path),
             "--name-suffix", COMPRESSIONCALC,
             "--sizing-json", "sizing_compressioncalc_accounted_for.json",
-            "--skip-search",
             *flags,
         ])
         comp = json.loads(path.read_text())
@@ -305,7 +308,6 @@ def _run_compressioncalc(diag: dict, diag_path: Path, infra: dict, py: Path, arg
                     "--projects",
                     "--name-suffix", COMPRESSIONCALC,
                     "--sizing-json", "sizing_compressioncalc_accounted_for.json",
-                    "--skip-search",
                     *flags,
                 ])
                 comp = json.loads(path.read_text())
@@ -347,7 +349,6 @@ def _run_compressioncalc(diag: dict, diag_path: Path, infra: dict, py: Path, arg
             "--name-suffix", f"{COMPRESSIONCALC}_30d",
             "--sizing-json", "sizing_compressioncalc_accounted_for_30d.json",
             "--force-months", "1",
-            "--skip-search",
             *flags,
         ])
         comp_30 = json.loads(path_30.read_text())
@@ -517,7 +518,7 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
                     (diag_30.get("sizing") or {}).pop("deployment_plan", None)
                 path_30 = diag_path.with_name(diag_path.stem + "_30d.json")
                 seal_text(path_30, json.dumps(diag_30, indent=2))
-                month_cmd = [str(py), str(HERE / "size_serverless.py"), "--account-json", str(path_30), "--name-suffix", "_30d", "--force-months", "1", "--skip-search", *extra]
+                month_cmd = [str(py), str(HERE / "size_serverless.py"), "--account-json", str(path_30), "--name-suffix", "_30d", "--force-months", "1", *extra]
                 if args.xlsx:
                     month_cmd.append("--xlsx")
                 _run(month_cmd)

@@ -31,8 +31,9 @@ RETENTION_MAX = 36.0
 COMPRESSIONCALC = "compressioncalc_accounted_for"
 COMPRESSION_FORMULA = (
     "compressioncalc_accounted_for is write-index bulk GB/day multiplied by 0.60. "
-    "On-disk bytes are not used. "
-    "Observability and Security use this ingest. Search stays on measured bulk."
+    "On-disk bytes are not used for that GB/day. "
+    "Observability and Security write this ingest. "
+    "Search re-estimates local store multiplied by 0.60."
 )
 
 
@@ -161,8 +162,9 @@ def _rollup_solutions(out: dict, clamped_notes: list[str]) -> None:
 def compressioncalc_account(acc: dict) -> dict:
     """Copy whose Observability and Security ingest is compressioncalc_accounted_for.
 
-    That figure is bulk GB/day × 0.60. On-disk bytes are not used.
-    Search keeps its local store and its existing estimator.
+    That figure is bulk GB/day × 0.60. On-disk bytes are not used for that GB/day.
+    Search keeps its measured store on this copy. The compression sizing multiplies
+    that store by 0.60 when it re-estimates Search.
     """
     out = copy.deepcopy(acc)
     for dep in (out.get("solutions") or {}).get("by_deployment") or []:

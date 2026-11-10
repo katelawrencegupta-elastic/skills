@@ -1444,8 +1444,8 @@ def serverless_component_slide(acc: dict, *, new_page: bool = True, bare: bool =
             roster_notes.append(f"{n0(n)} active {noun} {verb} no diagnostic bundle{named} and {add} no ingest.")
         if c.get("retention_set_days") == 30 and (cons.get("search") or {}).get("retention_months") is not None:
             roster_notes.append(
-                f"Search is kept {cons['search'].get('retention_months')} months, the full-retention estimate. "
-                "There is no 30-day Search estimate. Observability and Security on this page are written as 1 month."
+                f"Search disk is the measured store scaled from {cons['search'].get('retention_months')} months to 1 month. "
+                "Observability and Security on this page are written as 1 month."
             )
         right += bullets(roster_notes)
     est = sz.get("estimators") or {}
@@ -1667,7 +1667,7 @@ def _search_profile_fallback(acc: dict) -> str:
 
 
 def search_power_section(acc: dict) -> str:
-    """Appendix, last: inputs, metered rates, search power, then the quote integrity score."""
+    """Appendix A: inputs, metered rates, search power, then the quote integrity score."""
     profiles = ((acc.get("consolidation") or {}).get("search_power") or {}).get("profiles") or []
     if not _search_estimated(acc):
         profiles = []
@@ -1711,7 +1711,608 @@ def search_power_section(acc: dict) -> str:
         parts.append(integrity)
     if not parts:
         return ""
-    return section("Appendix", "".join(parts), new_page=True)
+    return section("Appendix A", "".join(parts), new_page=True)
+
+
+_INTEGRITY_FORMULA = {
+    "Sheet echo": "Mean of the G26 component and the E73 component, for each solution that has a workload and a sheet. G26 component = 1 − min(|G26 − written bulk| / 0.51, 1). A blank G26 scores 0. E73 scores 1 when the parsed amount is 0, and 0 when it is blank or the amount is above 0.005.",
+    "Bundle coverage": "Matched deployments ÷ active deployments. When the active count is absent, the denominator is matched bundles plus bundles that fell back.",
+    "Measured retention": "1 − (bulk with no measured age ÷ Σ bulk).",
+    "Direct read-back": "Solutions on their own read-back ÷ solutions with a workload. One region counts. A store split does not.",
+    "Line agreement": "1 − min(|sum of quote lines − headline| / headline, 1). Both $0 scores 1.",
+    "Year agreement": "For each quote line, 1 − min(|steady annual − 12 × unrounded monthly| / |steady annual|, 1), then the mean. Both sides are rounded to cents first.",
+}
+
+
+def _formula_num(x, places: int = 3) -> str | None:
+    if x is None or x == "":
+        return None
+    try:
+        value = float(x)
+    except (TypeError, ValueError):
+        return None
+    if abs(value - round(value)) < 1e-9:
+        return f"{value:,.0f}"
+    text = f"{value:,.{places}f}".rstrip("0").rstrip(".")
+    return text
+
+
+def _formula_money(x) -> str | None:
+    if x is None or x == "":
+        return None
+    try:
+        return f"${float(x):,.2f}"
+    except (TypeError, ValueError):
+        return None
+
+
+def _keep(row: list | None) -> list | None:
+    if not row or row[-1] is None:
+        return None
+    return row
+
+
+def _solution_measured(acc: dict) -> list[tuple[str, dict, dict]]:
+    """Solutions that have a store, a bulk rate, or a written month on this run."""
+    cons = (acc.get("sizing") or {}).get("consolidated") or {}
+    priced = ((acc.get("consolidation") or {}).get("serverless") or {}).get("by_solution") or {}
+    found = []
+    for name in ("search", "observability", "security"):
+        blk = cons.get(name) or {}
+        if not isinstance(blk, dict):
+            continue
+        stored = float(blk.get("stored_gb") or 0)
+        daily = float(blk.get("daily_raw_gb") or 0)
+        if stored <= 0 and daily == 0 and blk.get("retention_months") is None:
+            continue
+        found.append((name, blk, priced.get(name) or {}))
+    return found
+
+
+def _compression_on(acc: dict) -> bool:
+    c = acc.get("consolidation") or {}
+    sz = acc.get("sizing") or {}
+    return c.get("ingest_basis") == "compressioncalc_accounted_for" or sz.get("ingest_basis") == "compressioncalc_accounted_for"
+
+
+def _quote_window_rows(acc: dict) -> list[list]:
+    e = acc.get("ecu") or {}
+    c = acc.get("consolidation") or {}
+    b = c.get("basis") or {}
+    sv = c.get("savings") or {}
+    cr = c.get("contract_rate") or {}
+    rows: list[list] = []
+    days = e.get("quote_lookback_days")
+    ech = b.get("ech_monthly_ecu")
+    if ech is None:
+        ech = e.get("quote_monthly_ecu")
+    if days and _formula_num(ech, 2):
+        daily = _formula_num(e.get("quote_daily_avg"), 2)
+        inputs = f"{int(days)} billed days"
+        if daily:
+            inputs += f", daily average {daily} ECU"
+        rows.append([
+            "ECH ECU/month",
+            "Billed ECU over the quote window ÷ days × 30.416.",
+            inputs,
+            _formula_num(ech, 2),
+        ])
+    factor = e.get("quote_usage_factor")
+    if factor is not None:
+        complete = _formula_num(e.get("monthly_avg_complete_months"), 2)
+        inputs = f"pace factor {_formula_num(factor, 6)}"
+        if complete:
+            inputs += f". Complete-month average {complete} ECU/month"
+        rows.append([
+            "Pace factor",
+            "Quote-window daily average ÷ complete-month daily average.",
+            inputs,
+            _formula_num(factor, 6),
+        ])
+    by_sol = (c.get("serverless") or {}).get("by_solution") or {}
+    for name, quote in by_sol.items():
+        if "quotable" not in str((quote or {}).get("pricing") or ""):
+            continue
+        if name == "observability":
+            formula = "Observability monthly is the D32 read-back. Quoted only when G26 is within 0.51 GB/day of the written bulk."
+        elif name == "security":
+            formula = "Security monthly is the E74 read-back. Quoted only when parsed E73 is 0."
+        elif name == "search":
+            formula = "Search monthly is the es3 on-demand read-back."
+        else:
+            formula = "Estimator read-back."
+        rows.append([f"{name.title()} monthly", formula, "Sheet read-back. Not recomputed here.", _formula_money(quote.get("total_mo"))])
+    if cr.get("implied_usd_per_ecu") is not None:
+        rows.append([
+            "Contract rate",
+            "ARR ÷ (commit ECU/day × 365), applied unrounded.",
+            f"ARR {_formula_money(cr.get('arr'))} · commit {_formula_num(cr.get('commit_ecu_per_day'), 2)} ECU/day",
+            f"${cr.get('implied_usd_per_ecu')}/ECU",
+        ])
+    if sv.get("ech_contract_mo") is not None:
+        rows.append([
+            "ECH $/month",
+            "ECU/month × the contract rate.",
+            f"{_formula_num(sv.get('ech_list_mo'), 2)} ECU/month × ${cr.get('implied_usd_per_ecu')}/ECU",
+            _formula_money(sv.get("ech_contract_mo")),
+        ])
+        if sv.get("serverless_mo") is not None:
+            rows.append([
+                "Savings $/month",
+                "ECH at the contract rate − the serverless read-back.",
+                f"{_formula_money(sv.get('ech_contract_mo'))} − {_formula_money(sv.get('serverless_mo'))}",
+                _formula_money(sv.get("cost_mo")),
+            ])
+            rows.append([
+                "Savings %",
+                "Savings $/month ÷ ECH at the contract rate.",
+                f"{_formula_money(sv.get('cost_mo'))} ÷ {_formula_money(sv.get('ech_contract_mo'))}",
+                None if sv.get("cost_pct") is None else f"{sv.get('cost_pct')}%",
+            ])
+            rows.append([
+                "Savings $/year",
+                "Savings $/month × 12.",
+                _formula_money(sv.get("cost_mo")),
+                _formula_money(sv.get("cost_yr")),
+            ])
+    elif sv.get("serverless_mo") is not None and sv.get("list_mo") is not None:
+        rows.append([
+            "Savings $/month",
+            "ECH list ECU/month − the serverless read-back, at $1 per ECU.",
+            f"{_formula_num(sv.get('ech_list_mo'), 2)} ECU/month − {_formula_money(sv.get('serverless_mo'))}",
+            _formula_money(sv.get("list_mo")),
+        ])
+        rows.append([
+            "Savings %",
+            "Savings $/month ÷ ECH list ECU/month.",
+            f"{_formula_money(sv.get('list_mo'))} ÷ {_formula_num(sv.get('ech_list_mo'), 2)} ECU/month",
+            None if sv.get("list_pct") is None else f"{sv.get('list_pct')}%",
+        ])
+        rows.append([
+            "Savings $/year",
+            "Savings $/month × 12.",
+            _formula_money(sv.get("list_mo")),
+            _formula_money(sv.get("list_yr")),
+        ])
+    return [row for row in rows if _keep(row)]
+
+
+def _bulk_rows(acc: dict) -> list[list]:
+    c = acc.get("consolidation") or {}
+    factor = (acc.get("ecu") or {}).get("quote_usage_factor")
+    thirty = c.get("retention_set_days") == 30
+    rows: list[list] = []
+    for name, blk, _priced in _solution_measured(acc):
+        label = name.title()
+        daily = blk.get("daily_raw_gb")
+        stored = blk.get("stored_gb")
+        if name == "search" and float(stored or 0) > 0:
+            rows.append([
+                "Search disk",
+                "Σ local primary store. Searchable snapshots stay out. This is not bulk GB/day.",
+                "Diagnostic local store",
+                f"{_formula_num(stored, 3)} GB",
+            ])
+        elif name != "search" and _compression_on(acc):
+            pass
+        elif daily not in (None, "") and float(daily or 0) != 0:
+            if factor is not None:
+                formula = (
+                    "Σ write-index index.primaries.bulk.est_bytes_per_day ÷ 1e9, then × the pace factor. "
+                    "est_bytes_per_day = primaries.bulk.total_size_in_bytes × 86,400 ÷ write_phase_sec, truncated to a whole byte."
+                )
+                inputs = (
+                    f"pace factor {_formula_num(factor, 6)}. The result is the GB/day written after that factor. "
+                    "write_phase_sec is creation until rollover, in whole seconds, or the index age while the ILM action is rollover. "
+                    "A missing or zero write phase is 0. The indexing rate uses primaries.store.size_in_bytes and is not this figure."
+                )
+            else:
+                formula = (
+                    "Σ write-index index.primaries.bulk.est_bytes_per_day ÷ 1e9. "
+                    "est_bytes_per_day = primaries.bulk.total_size_in_bytes × 86,400 ÷ write_phase_sec, truncated to a whole byte."
+                )
+                inputs = (
+                    "Write indices only: the last index of a data stream, or an alias marked is_write_index. "
+                    "write_phase_sec is creation until rollover, in whole seconds, or the index age while the ILM action is rollover. "
+                    "A missing or zero write phase is 0. The indexing rate uses primaries.store.size_in_bytes and is not this figure."
+                )
+            rows.append([f"{label} bulk GB/day", formula, inputs, f"{_formula_num(daily, 3)} GB/day"])
+        measured = blk.get("retention_months_measured")
+        written = blk.get("retention_months")
+        if measured is not None:
+            rows.append([
+                f"{label} measured months",
+                "Σ (bulk × retention_days) ÷ Σ bulk ÷ 30.416. Only a retention age above 0 enters the weight.",
+                "Size-weighted ILM delete age, else data-stream retention, else the oldest index.",
+                f"{_formula_num(measured, 2)} months",
+            ])
+        if written is not None:
+            if thirty and name != "search":
+                formula = "The 30-day sheet writes 1 month. Bulk does not change."
+            else:
+                formula = "Snap a remainder under 0.001 month down, round up, then clamp to 1–36."
+            rows.append([f"{label} month written", formula, "The estimator prices retention only on the integers 1–36.", f"{_formula_num(written, 2)} months"])
+        if blk.get("retention_unmeasured"):
+            rows.append([
+                f"{label} retention",
+                "A solution with bulk and no measured age is not written.",
+                "No retention_days above 0 on the rows that have bulk.",
+                "not written",
+            ])
+    return [row for row in rows if _keep(row)]
+
+
+def _scale_rows(acc: dict) -> list[list]:
+    c = acc.get("consolidation") or {}
+    sz = acc.get("sizing") or {}
+    est = (sz.get("estimators") or {}).get("search") or {}
+    search = ((sz.get("consolidated") or {}).get("search") or {})
+    rows: list[list] = []
+    compressed = _compression_on(acc)
+    thirty = c.get("retention_set_days") == 30
+    if compressed:
+        ratio = c.get("compression_ratio")
+        if ratio is None:
+            ratio = 0.60
+        bulk = c.get("bulk_gb_day")
+        accounted = c.get("compressioncalc_accounted_for")
+        inputs = (
+            "The priced ratio is 0.60 whenever a solution has a workload. "
+            "It is not esdiag bulk.compression_ratio (bulk bytes ÷ store bytes) or bulk.storage_ratio (store bytes ÷ bulk bytes). "
+            "The indexing rate uses primaries.store.size_in_bytes and is not this figure."
+        )
+        if _formula_num(bulk, 3):
+            inputs = f"Bulk {_formula_num(bulk, 3)} GB/day. " + inputs
+        if accounted not in (None, ""):
+            label, result = "Compression-applied GB/day", f"{_formula_num(accounted, 3)} GB/day"
+        else:
+            label, result = "Compression ratio", _formula_num(ratio, 2)
+        rows.append([
+            label,
+            "compressioncalc_accounted_for = bulk GB/day × 0.60. That bulk is Σ write-index primaries.bulk.est_bytes_per_day ÷ 1e9, and est_bytes_per_day = primaries.bulk.total_size_in_bytes × 86,400 ÷ write_phase_sec. On-disk bytes do not change the 0.60.",
+            inputs,
+            result,
+        ])
+        for name, blk, _priced in _solution_measured(acc):
+            if name == "search":
+                continue
+            daily = blk.get("daily_raw_gb")
+            if daily in (None, "") or float(daily or 0) == 0:
+                continue
+            cells = ((sz.get("estimators") or {}).get(name) or {}).get("cells") or {}
+            if name == "observability":
+                bits = []
+                if cells.get("G21") is not None:
+                    bits.append(f"logs G21 {_formula_num(cells.get('G21'), 2)} GB/day = 90% of the written GB/day")
+                if cells.get("G23") is not None:
+                    bits.append(f"metrics G23 {_formula_num(cells.get('G23'), 2)} GB/day = 10%")
+                inputs = ". ".join(bits) or "Logs are 90% and metrics are 10% of the written GB/day."
+                formula = "Observability writes the accounted GB/day. Logs = 0.90 × that rate. Metrics = 0.10 × that rate."
+            else:
+                g4 = cells.get("G4")
+                inputs = f"G4 {_formula_num(g4, 2)} GB/day" if g4 is not None else "Security takes all of the accounted GB/day on G4."
+                formula = "Security writes the accounted GB/day. G4 is all of it."
+            rows.append([f"{name.title()} accounted GB/day", formula, inputs, f"{_formula_num(daily, 3)} GB/day"])
+    scale = est.get("store_scale")
+    written = search.get("retention_months")
+    if scale is not None and (float(search.get("stored_gb") or 0) > 0 or written is not None):
+        parts = ["Full-retention bulk leaves the measured store unchanged."]
+        if thirty:
+            parts.append("A 30-day sheet multiplies disk by 1 ÷ written months.")
+        if compressed:
+            parts.append("A compression-applied sheet multiplies disk by 0.60.")
+        parts.append("Org store uses the same scale, so the ingest share stays put. Query rate does not scale.")
+        inputs = f"Written month {_formula_num(written, 2)}." if written is not None else "Measured store."
+        if thirty:
+            inputs += " Forced month 1."
+        rows.append([
+            "Search disk scale",
+            " ".join(parts),
+            inputs,
+            _formula_num(scale, 4),
+        ])
+    return [row for row in rows if _keep(row)]
+
+
+def _workload_rows(acc: dict) -> list[list]:
+    if not _search_estimated(acc):
+        return []
+    wl = acc.get("workload") or {}
+    search = wl.get("search") or {}
+    peak = search.get("peak") or {}
+    nonpeak = search.get("nonpeak") or {}
+    ingest = wl.get("ingest") or {}
+    if peak.get("qps") is None and nonpeak.get("qps") is None and ingest.get("docs_per_sec") is None:
+        return []
+    rows: list[list] = []
+    window = wl.get("window_days")
+    indices = wl.get("indices")
+    window_bit = []
+    if window is not None:
+        window_bit.append(f"{window} days")
+    if indices is not None:
+        window_bit.append(f"{indices} indices")
+    where = ", ".join(window_bit) or "cloud-tracker-index_telemetry"
+    if peak.get("qps") is not None:
+        rows.append([
+            "Peak QPS",
+            "A day QPS is Σ Δsearch_total ÷ 86,400. Peak QPS is the highest cleaned day. A day above max(4 × the median, median + 50) is dropped unless that drops more than half the days.",
+            where + ". Day averages, not peak-second QPS.",
+            f"{_formula_num(peak.get('qps'), 2)} QPS",
+        ])
+    if peak.get("pct_hours_mo") is not None:
+        rows.append([
+            "Peak % of the month",
+            "100 × (days with QPS at or above the 75th percentile) ÷ days. The percentile index is round((p ÷ 100) × (len − 1)). Hours = that percent ÷ 100 × 730.",
+            where,
+            f"{_formula_num(peak.get('pct_hours_mo'), 1)}%",
+        ])
+    if nonpeak.get("qps") is not None:
+        rows.append([
+            "Non-peak QPS",
+            "The cleaned day closest to the median daily QPS.",
+            where,
+            f"{_formula_num(nonpeak.get('qps'), 2)} QPS",
+        ])
+    if nonpeak.get("pct_hours_mo") is not None:
+        rows.append([
+            "Non-peak % of the month",
+            "100 × (days − peak days − idle days) ÷ days. Idle days are counted only when some day is at or below 1 QPS, and then the days at or below the 10th percentile. Hours = that percent ÷ 100 × 730.",
+            where,
+            f"{_formula_num(nonpeak.get('pct_hours_mo'), 1)}%",
+        ])
+    if search.get("idle_pct_hours_mo") is not None:
+        rows.append([
+            "Idle % of the month",
+            "100 × idle days ÷ days. Hours = that percent ÷ 100 × 730.",
+            "Idle only when a day at or below 1 QPS exists.",
+            f"{_formula_num(search.get('idle_pct_hours_mo'), 1)}%",
+        ])
+    inputs = ((acc.get("sizing") or {}).get("estimators") or {}).get("search") or {}
+    written = (inputs.get("inputs") or {}).get("search_workloads") or []
+    labels = ["Peak", "Non-peak"]
+    for band, row in zip(labels, written):
+        hours = row.get("active_hours_per_month") if isinstance(row, dict) else None
+        if hours is None:
+            continue
+        rows.append([
+            f"{band} hours",
+            "Hours = percent ÷ 100 × 730. Shares that sum past 730 are scaled down to the month.",
+            "730-hour month.",
+            f"{_formula_num(hours, 2)} h",
+        ])
+    regions = (((acc.get("consolidation") or {}).get("serverless") or {}).get("by_solution") or {}).get("search") or {}
+    region_rows = [r for r in (regions.get("by_region") or []) if isinstance(r, dict)]
+    if len(region_rows) > 1 and peak.get("qps") is not None:
+        bits = [f"{r.get('region')} {_formula_num(r.get('stored_gb'), 1)} GB" for r in region_rows]
+        rows.append([
+            "Regional query rate",
+            "Peak QPS and non-peak QPS × that region's stored GB ÷ search stored GB. Hour percentages and query time are not scaled.",
+            f"Org peak {_formula_num(peak.get('qps'), 2)} QPS. " + "; ".join(bits),
+            "applied on each regional sheet",
+        ])
+    if ingest.get("docs_per_sec") is not None:
+        rows.append([
+            "Ingest docs/s",
+            "Median daily Σ Δdocs_count ÷ 86,400. On the Search sheet this rate is × search store ÷ org store. The quote-window pace factor scales it first when that factor is set.",
+            where,
+            f"{_formula_num(ingest.get('docs_per_sec'), 3)} docs/s",
+        ])
+    if ingest.get("active_hours_mo") is not None:
+        rows.append([
+            "Ingest active hours",
+            "(days with Δdocs above 1,000 ÷ days) × 730.",
+            where,
+            f"{_formula_num(ingest.get('active_hours_mo'), 1)} h/month",
+        ])
+    return [row for row in rows if _keep(row)]
+
+
+def _metered_rows(acc: dict) -> list[list]:
+    rates = list((acc.get("consolidation") or {}).get("metered_rates") or [])
+    if not rates:
+        return []
+    priced = [r for r in rates if r.get("usd_per_gb") is not None]
+    half = [r for r in priced if abs(float(r.get("usd_per_gb") or 0) - 0.5) < 1e-6]
+    return [[
+        "Metered ingest rate",
+        "Metered GB/day = bulk × 1.595. Logs = 0.90 × metered. Metrics = 0.10 × metered. Rate = (tier(logs) + tier(metrics)) ÷ metered GB/day. Bands per metered GB: 0–50 at $0.50, then $0.325, $0.225, $0.15, $0.105, $0.10, $0.095, and $0.0925.",
+        f"{len(priced)} deployments with a rate. {len(half)} sit at $0.50 because both streams are inside the first 50 GB/day.",
+        "not the monthly quote",
+    ]]
+
+
+def _plan_n(plan: list) -> int | None:
+    """Active Observability deployments. The 0% cut keeps one project per deployment."""
+    for row in plan:
+        if str(row.get("label") or "") != "0%":
+            continue
+        try:
+            return int(row.get("projects"))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _cut_pct(label: str) -> int | None:
+    text = str(label or "").strip().rstrip("%")
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _plain_number(value: float) -> str:
+    if abs(value - round(value)) < 1e-9:
+        return str(int(round(value)))
+    return f"{value:.2f}".rstrip("0").rstrip(".")
+
+
+def _plan_count_line(n: int, pct: int) -> str:
+    """The project-count arithmetic for one cut, with N filled in."""
+    if pct <= 0:
+        return f"N = {n}. 0% keeps every deployment, so the count stays {n}."
+    if pct >= 100:
+        return f"N = {n}. N × 0 = 0, so this cut does not use round. It is held at 1 project."
+    share = (100 - pct) / 100
+    product = n * share
+    kept = int(round(product))
+    line = f"N = {n}. {n} × {share:.2f} = {_plain_number(product)}, which rounds to {kept}."
+    if abs(product - int(product) - 0.5) < 1e-9:
+        line += f" Half-to-even sends .5 to the even integer, so the count is {kept}."
+    return line
+
+
+def _plan_dollar_line(acc: dict, label: str, monthly) -> str:
+    """Where that cut's dollar came from: the sheets in the cut, or the headline."""
+    bars = ((acc.get("sizing") or {}).get("deployment_plan") or {}).get("bars") or []
+    bar = next((b for b in bars if str(b.get("label") or "") == label), None) or {}
+    if bar.get("reused_headline"):
+        o11y = (((acc.get("consolidation") or {}).get("serverless") or {}).get("by_solution") or {}).get("observability") or {}
+        regions = [r for r in (o11y.get("by_region") or []) if isinstance(r, dict) and r.get("monthly") is not None]
+        if len(regions) > 1:
+            bits = [f"{r.get('region')} {_formula_money(r.get('monthly'))}" for r in regions]
+            return "Observability headline, one read-back per region: " + " + ".join(bits) + f" = {_formula_money(monthly)}. No combined sheet is filled."
+        return f"Observability headline {_formula_money(monthly)}. No combined sheet is filled."
+    groups = [g for g in (bar.get("groups") or []) if isinstance(g, dict)]
+    bits = []
+    monies = []
+    for group in groups:
+        names = ", ".join(group.get("names") or []) or "project"
+        money = _formula_money(group.get("monthly"))
+        bulk = group.get("bulk_gb_day")
+        if money:
+            monies.append(money)
+        if bulk is not None and money:
+            bits.append(f"{names}, {float(bulk):.3f} GB/day, D32 {money}")
+        elif money:
+            bits.append(f"{names}, D32 {money}")
+    if len(monies) > 1:
+        return "; ".join(bits) + ". " + " + ".join(monies) + f" = {_formula_money(monthly)}."
+    if bits:
+        return bits[0] + "."
+    if monthly is not None and float(monthly or 0) == 0:
+        return "No project is filled, so there is no D32 to add."
+    return "Sum of the Observability D32 read-backs at this cut."
+
+
+def _plan_rows(acc: dict) -> list[list]:
+    plan = (acc.get("consolidation") or {}).get("deployment_plan") or []
+    if not plan:
+        return []
+    thirty = (acc.get("consolidation") or {}).get("retention_set_days") == 30
+    month = "Every project is written as 1 month." if thirty else "Retention on a project is that group's measured months, rounded up."
+    n = _plan_n(plan)
+    n_bit = f" N = {n}, the active Observability deployments." if n is not None else ""
+    rows = [[
+        "Deployment-count cuts",
+        "0% keeps N projects, one per Observability deployment. 25%, 50%, and 75% keep round(N × the share that remains). round is half-to-even, so .5 goes to the even integer and a cut can be 0 projects. 100% is held at 1 project. Its dollar is the Observability headline, not the combined sheet from the 50% cut.",
+        month + " Bulk does not change." + n_bit,
+        f"{len(plan)} cuts",
+    ]]
+    for row in plan:
+        label = str(row.get("label") or "")
+        pct = _cut_pct(label)
+        if pct is None or n is None:
+            formula = "Sum of the Observability D32 read-backs at this cut."
+            count_line = _count_label(row.get("projects"), "project")
+        elif pct >= 100:
+            formula = "Held at 1 project. The dollar is the Observability headline."
+            count_line = _plan_count_line(n, pct)
+        elif pct <= 0:
+            formula = "One project per Observability deployment."
+            count_line = _plan_count_line(n, pct)
+        else:
+            formula = f"Projects kept = round(N × {(100 - pct) / 100:.2f})."
+            count_line = _plan_count_line(n, pct)
+        count = _count_label(row.get("projects"), "project")
+        money = _formula_money(row.get("monthly"))
+        rows.append([
+            f"{label} of deployments",
+            formula,
+            count_line + " " + _plan_dollar_line(acc, label, row.get("monthly")),
+            f"{count}, {money}" if count and money else money,
+        ])
+    return [row for row in rows if _keep(row)]
+
+
+def _fleet_rows(acc: dict) -> list[list]:
+    fleet = (((acc.get("consolidation") or {}).get("sensitivity") or {}).get("fleet")) or []
+    rows = []
+    for row in fleet:
+        label = str(row.get("scenario") or "")
+        if "estimator basis" in label.lower():
+            continue
+        if row.get("serverless_mo") is None:
+            continue
+        rows.append([
+            label,
+            "Quote-window read-back × (that scenario's ECU ÷ the quote-window ECU). Not re-estimated. EIS stays at its own figure.",
+            f"Scale {_formula_num(row.get('scale'), 3)}. ECH {_formula_num(row.get('ech_ecu_mo'), 2)} ECU/month.",
+            _formula_money(row.get("serverless_mo")),
+        ])
+    return rows
+
+
+def _integrity_rows(acc: dict) -> list[list]:
+    block = (acc.get("consolidation") or {}).get("integrity") or {}
+    rows = []
+    for row in block.get("checks") or []:
+        name = row.get("check") or ""
+        formula = _INTEGRITY_FORMULA.get(name)
+        if not formula:
+            continue
+        score = row.get("score")
+        if score is None:
+            result = "n/a"
+        else:
+            result = f"{float(score):.3f}"
+            if row.get("passed") is True:
+                result += " pass"
+            elif row.get("passed") is False:
+                result += " fail"
+        rows.append([name, formula, row.get("detail") or "This check does not apply.", result])
+    if block.get("score") is not None:
+        passed = "Pass is 0.90 or higher, and also when every scored check passes."
+        rows.append([
+            "Quote integrity",
+            "The score is the mean of the checks that apply. A check with no inputs is n/a and stays out of the mean. " + passed,
+            "This scores the written inputs, the sheet echo, and the published totals. It is not a serverless bill.",
+            f"{float(block['score']):.3f}" + (" pass" if block.get("passed") else " fail"),
+        ])
+    return rows
+
+
+def _formula_group(title: str, rows: list[list]) -> str:
+    if not rows:
+        return ""
+    return f"<h3>{esc(title)}</h3>" + table(
+        ["Value", "Formula", "Inputs used", "Result"],
+        rows,
+        ["left", "left", "left", "left"],
+    )
+
+
+def appendix_b_section(acc: dict) -> str:
+    """Appendix B: each calculated value, its formula, the inputs, and the result already on this PDF."""
+    groups = [
+        _formula_group("Quote window", _quote_window_rows(acc)),
+        _formula_group("Bulk and retention", _bulk_rows(acc)),
+        _formula_group("30-day and compression scales", _scale_rows(acc)),
+        _formula_group("Search workload", _workload_rows(acc)),
+        _formula_group("Metered ingest rate", _metered_rows(acc)),
+        _formula_group("Deployment count", _plan_rows(acc)),
+        _formula_group("Fleet scales", _fleet_rows(acc)),
+        _formula_group("Quote integrity", _integrity_rows(acc)),
+    ]
+    body = "".join(part for part in groups if part)
+    if not body:
+        return ""
+    lead = bullets([
+        "Each result is the figure already used in this report. Sheet dollars are read-backs. This page does not reprice them.",
+        "A value that was not calculated on this PDF is left out.",
+    ])
+    return section("Appendix B", lead + body, new_page=True)
 
 
 def _count_label(n, singular: str) -> str:
@@ -1787,14 +2388,17 @@ def deployment_plan_section(c: dict, sv: dict, *, alongside: str = "") -> str:
     else:
         plan_ref = None
     if c.get("retention_set_days") == 30:
-        plan_ret = "Observability on every bar is 30 days, written as 1 month. Search is not on this chart. Search has no 30-day estimate."
+        plan_ret = "Observability on every bar is 30 days, written as 1 month. Search is not on this chart."
     else:
         plan_ret = "Retention on each project is its measured months, rounded up."
+    n = _plan_n(plan)
+    n_bit = f" N = {n}." if n is not None else ""
     chart = plan_hbar(rows, ref=plan_ref, width=460)
     chart += caption(
-        "The project count is on the right. The arrow beside it points down the column. "
-        "0% keeps one project per active deployment. 25, 50, and 75% pack the fleet into that many fewer projects. "
-        "100% is a single project. Each bar is the sum of Observability estimator read-backs. "
+        "The project count is on the right. The arrow beside it points down the column."
+        + n_bit
+        + " 0% keeps one project per Observability deployment. 25%, 50%, and 75% keep round(N × the share that remains), half-to-even, so a .5 can become 0 projects. "
+        "100% stays 1 project and uses the Observability headline. That headline can differ from the 50% bar, which is one combined sheet. "
         + plan_ret
     )
     if alongside:
@@ -2051,12 +2655,12 @@ def render_consolidation_html(acc: dict) -> str:
             f"Ingest is compressioncalc_accounted_for: {c.get('compressioncalc_accounted_for')} GB/day. "
             f"That is bulk {c.get('bulk_gb_day')} GB/day multiplied by 0.60. "
             f"The ratio is {ratio_bit}. On-disk bytes are not used. "
-            "The diagnostic bulk quote is a separate estimate. Search stays on measured bulk."
+            "The diagnostic bulk quote is a separate estimate. Search disk on this set is measured store × 0.60."
         )
         thirty = c.get("thirty_day") or {}
         if c.get("retention_set_days") == 30:
             cover_notes.append(
-                "Observability and Security are written as 1 month. Search is the full-retention estimate. There is no 30-day Search estimate, and the saved Search sheet stays at the measured month."
+                "Observability and Security are written as 1 month. Search disk is the compressed store scaled to 1 month, on its own 30-day sheet."
             )
         elif thirty.get("monthly") is not None:
             cover_notes.append(
@@ -2067,7 +2671,7 @@ def render_consolidation_html(acc: dict) -> str:
         thirty = c.get("thirty_day") or {}
         if c.get("retention_set_days") == 30:
             cover_notes.append(
-                "Observability and Security are written as 1 month. Search is the full-retention estimate. There is no 30-day Search estimate, and the saved Search sheet stays at the measured month."
+                "Observability and Security are written as 1 month. Search disk is the measured store scaled to 1 month, on its own 30-day sheet."
             )
         elif thirty.get("monthly") is not None:
             cover_notes.append(
@@ -2472,6 +3076,9 @@ def render_consolidation_html(acc: dict) -> str:
     appendix = search_power_section(acc)
     if appendix:
         B.append(appendix)
+    formulas = appendix_b_section(acc)
+    if formulas:
+        B.append(formulas)
     return page(f"{m.get('customer')} — serverless consolidation savings", "".join(B), kind="consolidation")
 
 

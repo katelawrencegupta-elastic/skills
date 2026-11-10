@@ -36,8 +36,11 @@ from render_pdf import consolidation_pdf_stem, pdf_folder_name, render_consolida
 from size_serverless import (  # noqa: E402
     COMPRESSION_FOLDER_NAME, DEFAULT_O11Y, DEFAULT_SECURITY, PLAN_FOLDER_NAME, _sheet_retention,
     assemble_plan_bars, assert_not_template, cell_input_mode, copy_template, estimate_folder_name,
-    estimate_subfolder, estimate_title, estimator_skip, map_in_order, partition_cells, push_cells,
-    relocate_local_compression, require_customer_parent,
+    architecture_regions, estimate_subfolder, estimate_title, estimator_skip, fleet_sheet_region,
+    prefer_regional_estimators,
+    map_in_order, partition_cells, push_cells,
+    _search_volume_scale,
+    relocate_local_estimates, require_customer_parent,
 )
 from vpn_check import tunnel_reaches  # noqa: E402
 
@@ -477,33 +480,56 @@ class DeploymentCountTests(unittest.TestCase):
 
 
 class EstimateFolderTests(unittest.TestCase):
-    def test_estimates_and_plans_share_generated_estimates(self):
-        for suffix in ("", None, "_30d", "30d", "from_k360"):
+    def test_estimates_split_by_retention_under_generated_estimates(self):
+        self.assertEqual(estimate_subfolder(""), "full_retention")
+        self.assertEqual(estimate_subfolder(None), "full_retention")
+        self.assertEqual(estimate_subfolder("from_k360"), "full_retention")
+        self.assertEqual(estimate_subfolder("_30d"), "30d")
+        self.assertEqual(estimate_subfolder("30d"), "30d")
+        self.assertEqual(estimate_subfolder("compressioncalc_accounted_for"), "compression_applied/full_retention")
+        self.assertEqual(estimate_subfolder("_compressioncalc_accounted_for"), "compression_applied/full_retention")
+        self.assertEqual(estimate_subfolder("compressioncalc_accounted_for_30d"), "compression_applied/30d")
+        for suffix in ("", None, "_30d", "30d", "from_k360", "compressioncalc_accounted_for", "compressioncalc_accounted_for_30d"):
             self.assertEqual(estimate_folder_name(suffix), "generated_estimates")
-            self.assertIsNone(estimate_subfolder(suffix))
-        for suffix in (
-            "compressioncalc_accounted_for", "_compressioncalc_accounted_for",
-            "compressioncalc_accounted_for_30d",
-        ):
-            self.assertEqual(estimate_folder_name(suffix), "generated_estimates")
-            self.assertEqual(estimate_subfolder(suffix), "compression_applied")
         self.assertEqual(PLAN_FOLDER_NAME, "plan_sheets")
         self.assertEqual(COMPRESSION_FOLDER_NAME, "compression_applied")
 
-    def test_compression_applied_files_move_under_generated_estimates(self):
+    def test_search_disk_scales_for_30d_and_compression(self):
+        four = {"retention_months": 4}
+        one = {"retention_months": 1}
+        self.assertAlmostEqual(_search_volume_scale(four, None, ""), 1.0)
+        self.assertAlmostEqual(_search_volume_scale(one, 1, "_30d"), 1.0)
+        self.assertAlmostEqual(_search_volume_scale(four, 1, "_30d"), 0.25)
+        self.assertAlmostEqual(_search_volume_scale(four, None, "compressioncalc_accounted_for"), 0.6)
+        self.assertAlmostEqual(_search_volume_scale(four, 1, "compressioncalc_accounted_for_30d"), 0.15)
+        self.assertAlmostEqual(_search_volume_scale(one, 1, "compressioncalc_accounted_for_30d"), 0.6)
+
+    def test_estimates_move_into_retention_folders(self):
         with tempfile.TemporaryDirectory() as tmp:
             parent = Path(tmp) / "generated_estimates"
             parent.mkdir()
-            kept = parent / "Acme_search_full retention_bulk_serverless_estimate.csv"
-            moved = parent / "Acme_search_full retention_compression-applied_serverless_estimate.csv"
-            kept.write_text("bulk")
-            moved.write_text("compression")
-            dest, names = relocate_local_compression(parent)
-            self.assertEqual(dest, parent / "compression_applied")
-            self.assertEqual(names, [moved.name])
-            self.assertTrue(kept.is_file())
-            self.assertEqual((dest / moved.name).read_text(), "compression")
-            self.assertFalse(moved.exists())
+            (parent / "plan_sheets").mkdir()
+            bulk = parent / "Acme_search_full retention_bulk_serverless_estimate.csv"
+            day = parent / "Acme_search_30d_bulk_serverless_estimate.csv"
+            comp = parent / "Acme_search_full retention_compression-applied_serverless_estimate.csv"
+            comp_dir = parent / "compression_applied"
+            comp_dir.mkdir()
+            comp_30 = comp_dir / "Acme_search_30d_compression-applied_serverless_estimate.csv"
+            plan = parent / "plan_sheets" / "Acme_Observability_plan_0_serverless_estimate.csv"
+            other = parent / "notes.txt"
+            for path, text in (
+                (bulk, "bulk"), (day, "30"), (comp, "comp"), (comp_30, "comp30"), (plan, "plan"), (other, "note"),
+            ):
+                path.write_text(text)
+            names = relocate_local_estimates(parent)
+            self.assertEqual(sorted(names), sorted([bulk.name, day.name, comp.name, comp_30.name]))
+            self.assertEqual((parent / "full_retention" / bulk.name).read_text(), "bulk")
+            self.assertEqual((parent / "30d" / day.name).read_text(), "30")
+            self.assertEqual((parent / "compression_applied" / "full_retention" / comp.name).read_text(), "comp")
+            self.assertEqual((parent / "compression_applied" / "30d" / comp_30.name).read_text(), "comp30")
+            self.assertEqual(plan.read_text(), "plan")
+            self.assertEqual(other.read_text(), "note")
+            self.assertEqual(relocate_local_estimates(parent), [])
 
     def test_estimate_titles_name_solution_retention_and_basis(self):
         key = "GlaxoSmithKline_LLC_2026-11-09"
@@ -531,6 +557,42 @@ class EstimateFolderTests(unittest.TestCase):
             estimate_title(key, "observability", "", "eastus2"),
             f"{key}_observability_full retention_bulk_eastus2_serverless_estimate",
         )
+        self.assertEqual(
+            estimate_title(key, "search", "", "GCP us-central1"),
+            f"{key}_search_full retention_bulk_GCP-us-central1_serverless_estimate",
+        )
+
+    def test_a_split_solution_has_no_second_fleet_sheet(self):
+        acc = {"consolidation": {"architecture": {"groups": [
+            {"solution": "search", "region": "us-central1"},
+            {"solution": "search", "region": "europe-west1"},
+            {"solution": "observability", "region": "asia-east1"},
+        ]}}}
+        self.assertEqual(architecture_regions(acc, "search"), ["us-central1", "europe-west1"])
+        self.assertIsNone(fleet_sheet_region(acc, "search", "us-central1"))
+        self.assertEqual(fleet_sheet_region(acc, "observability", "us-central1"), "asia-east1")
+        self.assertEqual(fleet_sheet_region({"consolidation": {}}, "security", "eastus2"), "eastus2")
+        split = {
+            "cloud": {"by_deployment": [
+                {"name": "search-a", "region": "us-central1"},
+                {"name": "search-b", "region": "europe-west1"},
+            ]},
+            "solutions": {"by_deployment": [
+                {"name": "search-a", "solution": "search"},
+                {"name": "search-b", "solution": "search"},
+            ]},
+        }
+        self.assertIsNone(fleet_sheet_region(split, "search", "us-central1"))
+        estimators = {
+            "search": {"status": "estimated", "readback": {"monthly_steady_state": 887.48}},
+            "projects": [
+                {"solution": "search", "region": "us-central1", "readback": {"monthly_steady_state": 1501.05}},
+                {"solution": "search", "region": "europe-west1", "readback": {"monthly_steady_state": 1798.32}},
+            ],
+        }
+        prefer_regional_estimators(estimators)
+        self.assertEqual(estimators["search"]["status"], "sized per region")
+        self.assertNotIn("readback", estimators["search"])
 
     def test_pdfs_split_by_retention(self):
         self.assertEqual(pdf_folder_name("consolidation"), "full_retention")
@@ -718,8 +780,8 @@ class CompressionCalcTests(unittest.TestCase):
         self.assertNotIn("consolidation", priced)
         self.assertTrue(priced["sizing"]["notes"][0].startswith("compressioncalc_accounted_for"))
         bulk, ratio, accounted = _compression_totals(priced)
-        self.assertEqual(bulk, 120.0)
-        self.assertEqual(accounted, 72.0)
+        self.assertEqual(bulk, 128.0)
+        self.assertEqual(accounted, 76.8)
         self.assertEqual(ratio, 0.6)
 
 
@@ -1058,17 +1120,56 @@ class ConsolidationLayoutTests(unittest.TestCase):
         acc = _quote_account(g26=10, e73=0)
         acc["consolidation"] = build_consolidation(acc, None)
         html = render_consolidation_html(acc)
-        self.assertEqual(html.count("<h2>Appendix</h2>"), 1)
-        self.assertGreater(html.rfind("<h2>Appendix</h2>"), html.rfind("Reconciliation and what to confirm"))
+        self.assertEqual(html.count("<h2>Appendix A</h2>"), 1)
+        self.assertEqual(html.count("<h2>Appendix B</h2>"), 1)
+        self.assertGreater(html.rfind("<h2>Appendix A</h2>"), html.rfind("Reconciliation and what to confirm"))
+        self.assertGreater(html.rfind("<h2>Appendix B</h2>"), html.rfind("<h2>Appendix A</h2>"))
         self.assertNotIn("<h2>1. ", html)
         self.assertNotIn("<h2>6. ", html)
         self.assertNotIn("<h2>9. ", html)
         self.assertNotIn("<div class='page-break'>", html)
-        self.assertEqual(html.count("sec newpage"), 1)
-        self.assertIn("<section class='sec newpage'><h2>Appendix</h2>", html)
+        self.assertEqual(html.count("sec newpage"), 2)
+        self.assertIn("<section class='sec newpage'><h2>Appendix A</h2>", html)
+        self.assertIn("<section class='sec newpage'><h2>Appendix B</h2>", html)
         self.assertIn("class='tbl'", html)
         self.assertIn("class='consolidation'", html)
         self.assertLess(html.find("Data used, and how the headline is calculated"), html.find("Quote integrity"))
+
+    def test_appendix_b_prints_formulas_and_skips_an_unpriced_solution(self):
+        acc = _quote_account(g26=10, e73=0)
+        acc["workload"] = {
+            "window_days": 21,
+            "indices": 40,
+            "search": {
+                "peak": {"qps": 12.5, "pct_hours_mo": 25.0},
+                "nonpeak": {"qps": 4.0, "pct_hours_mo": 60.0},
+                "idle_pct_hours_mo": 15.0,
+            },
+            "ingest": {"docs_per_sec": 8.0, "active_hours_mo": 500},
+        }
+        acc["sizing"]["consolidated"]["security"] = {"stored_gb": 0, "daily_raw_gb": 0, "deployments": 0}
+        acc["sizing"]["estimators"]["security"] = {"status": "skipped — no security workload detected"}
+        acc["sizing"]["consolidated"]["search"] = {
+            "stored_gb": 400, "daily_raw_gb": 0, "retention_months": 4,
+            "retention_months_measured": 3.7, "deployments": 1, "has_workload": True,
+        }
+        acc["sizing"]["estimators"]["search"]["status"] = "estimated"
+        acc["sizing"]["estimators"]["search"]["store_scale"] = 0.6
+        acc["sizing"]["ingest_basis"] = "compressioncalc_accounted_for"
+        acc["consolidation"] = build_consolidation(acc, None)
+        acc["consolidation"]["ingest_basis"] = "compressioncalc_accounted_for"
+        acc["consolidation"]["compression_ratio"] = 0.6
+        html = render_consolidation_html(acc)
+        appendix_b = html.split("<h2>Appendix B</h2>", 1)[1]
+        self.assertIn("Σ Δsearch_total ÷ 86,400", appendix_b)
+        self.assertIn("percent ÷ 100 × 730", appendix_b)
+        self.assertIn("× 0.60", appendix_b)
+        self.assertIn("primaries.bulk.total_size_in_bytes", appendix_b)
+        self.assertIn("primaries.store.size_in_bytes and is not this figure", appendix_b)
+        self.assertIn("not esdiag bulk.compression_ratio", appendix_b)
+        self.assertIn("12.5 QPS", appendix_b)
+        self.assertNotIn("Security bulk", appendix_b)
+        self.assertNotIn("Security monthly", appendix_b)
 
     def test_default_lookback_writes_the_30_day_pace_into_the_estimate(self):
         acc = _quote_account(g26=10, e73=0)

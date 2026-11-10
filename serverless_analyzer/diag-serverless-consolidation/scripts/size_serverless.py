@@ -8,15 +8,21 @@ Run with the Sheets venv python (google-api-python-client installed):
 
 Produces a Drive folder <customer>_<date>. The account PDF stays in that folder.
 Measured-retention consolidation PDFs go in full_retention/. 30-day PDFs go in 30d/.
-Estimate sheets go in its generated_estimates child. Deployment-plan sheets go in generated_estimates/plan_sheets.
-Compression-applied sheets go in generated_estimates/compression_applied:
-  bulk at the measured month, rounded up
-  the same bulk written as 1 month (--name-suffix _30d)
-  bulk × compression ratio (--name-suffix compressioncalc_accounted_for)
-  that accounted ingest written as 1 month
+Estimate sheets go in generated_estimates/full_retention or generated_estimates/30d.
+Compression-applied sheets go in generated_estimates/compression_applied/full_retention or .../30d.
+Deployment-plan sheets stay in generated_estimates/plan_sheets.
+Each solution with a workload gets four sheets. A solution with no workload is skipped.
+  <solution>_full retention_bulk
+  <solution>_30d_bulk
+  <solution>_full retention_compression-applied
+  <solution>_30d_compression-applied
+Observability and Security write GB/day, and the 30-day sheet writes 1 month.
+Search disk on the 30-day sheet is measured store × (1 / written months).
+Search disk on a compression-applied sheet is measured store × 0.60, and the
+30-day compression sheet applies both. Ingest share stays put. Query rate does not scale.
 Sheet titles are
   <customer>_<date>_<search|observability|security>_<full retention|30d>_<bulk|compression-applied>_serverless_estimate
-Local .xlsx export is off unless `--xlsx` is passed. Search CSV reports still use that title. A compression-applied file already in generated_estimates is moved into compression_applied.
+Local .xlsx export is off unless `--xlsx` is passed. Search CSV reports still use that title. An estimate already in generated_estimates is moved into the retention folder its name calls for, on disk and on Drive.
   sizing.json ; account JSON `sizing.estimators` updated
 
 Never mutates the golden templates.
@@ -576,6 +582,9 @@ ESTIMATE_FOLDER_NAME = "generated_estimates"
 PLAN_FOLDER_NAME = "plan_sheets"
 COMPRESSION_FOLDER_NAME = "compression_applied"
 COMPRESSION_NAME_MARK = "compression-applied"
+FULL_RETENTION_FOLDER = "full_retention"
+THIRTY_DAY_FOLDER = "30d"
+ESTIMATE_NAME_MARK = "serverless_estimate"
 
 
 def _estimate_parts(name_suffix: str | None) -> tuple[str, str]:
@@ -597,45 +606,81 @@ def _estimate_parts(name_suffix: str | None) -> tuple[str, str]:
 
 
 def estimate_folder_name(name_suffix: str | None) -> str:
-    """Parent directory for estimate sheets. Plan sheets and compression-applied sheets are children of it."""
+    """Parent directory for estimate sheets. Retention, compression, and plan sheets are children of it."""
     _estimate_parts(name_suffix)
     return ESTIMATE_FOLDER_NAME
 
 
-def estimate_subfolder(name_suffix: str | None) -> str | None:
-    """Child of generated_estimates for this sizing. Compression-applied sheets have their own directory."""
-    _retention, basis = _estimate_parts(name_suffix)
+def estimate_dir_parts(name_suffix: str | None) -> tuple[str, ...]:
+    """Path under generated_estimates for this sizing.
+
+    Bulk and k360 sheets go in full_retention or 30d.
+    Compression-applied sheets go in compression_applied/full_retention or compression_applied/30d.
+    """
+    retention, basis = _estimate_parts(name_suffix)
+    retention_dir = THIRTY_DAY_FOLDER if retention == "30d" else FULL_RETENTION_FOLDER
     if basis == "compression-applied":
-        return COMPRESSION_FOLDER_NAME
-    return None
+        return (COMPRESSION_FOLDER_NAME, retention_dir)
+    return (retention_dir,)
+
+
+def estimate_subfolder(name_suffix: str | None) -> str:
+    """Relative directory under generated_estimates for this sizing."""
+    return "/".join(estimate_dir_parts(name_suffix))
 
 
 def is_compression_estimate_name(name: str) -> bool:
     return COMPRESSION_NAME_MARK in (name or "")
 
 
-def relocate_local_compression(parent: Path, child_name: str = COMPRESSION_FOLDER_NAME) -> tuple[Path, list[str]]:
-    """Move compression-applied files from generated_estimates into its compression_applied child."""
-    dest = parent / child_name
-    seal_dir(dest)
+def is_estimate_artifact_name(name: str) -> bool:
+    return ESTIMATE_NAME_MARK in (name or "")
+
+
+def retention_dir_for_filename(name: str) -> str:
+    """30d when the sheet title carries that token. Otherwise full retention."""
+    if "_30d_" in (name or "") or (name or "").endswith("_30d"):
+        return THIRTY_DAY_FOLDER
+    return FULL_RETENTION_FOLDER
+
+
+def estimate_dest_parts_for_filename(name: str) -> tuple[str, ...] | None:
+    """Where an existing estimate file belongs. Plan sheets and other files stay put."""
+    if not is_estimate_artifact_name(name):
+        return None
+    retention = retention_dir_for_filename(name)
+    if is_compression_estimate_name(name):
+        return (COMPRESSION_FOLDER_NAME, retention)
+    return (retention,)
+
+
+def relocate_local_estimates(parent: Path) -> list[str]:
+    """Move estimate files under generated_estimates into their retention folders."""
     moved: list[str] = []
-    for item in list(parent.iterdir()):
-        if not item.is_file() or not is_compression_estimate_name(item.name):
+    files = [
+        item for item in parent.rglob("*")
+        if item.is_file() and PLAN_FOLDER_NAME not in item.relative_to(parent).parts
+    ]
+    for item in files:
+        parts = estimate_dest_parts_for_filename(item.name)
+        if parts is None:
             continue
-        target = dest / item.name
+        dest_dir = parent.joinpath(*parts)
+        if item.parent == dest_dir:
+            continue
+        seal_dir(dest_dir)
+        target = dest_dir / item.name
         if target.exists():
             target.unlink()
         item.rename(target)
         seal_file(target)
         moved.append(item.name)
-    return dest, moved
+    return moved
 
 
-def relocate_drive_compression(drive, parent_id: str, child_id: str) -> list[str]:
-    """Move compression-applied Drive files from generated_estimates into compression_applied."""
+def _drive_child_files(drive, parent_id: str) -> list[dict]:
     parent_id = require_customer_parent(parent_id)
-    child_id = require_customer_parent(child_id)
-    moved: list[str] = []
+    files: list[dict] = []
     token = None
     while True:
         def _list(page=token):
@@ -652,52 +697,172 @@ def relocate_drive_compression(drive, parent_id: str, child_id: str) -> list[str
         for item in found.get("files") or []:
             if item.get("mimeType") == FOLDER_MIME:
                 continue
-            name = item.get("name") or ""
-            if not is_compression_estimate_name(name):
-                continue
-            assert_not_template(item["id"])
-            file_id = item["id"]
-            _execute(lambda fid=file_id: drive.files().update(
-                fileId=fid,
-                addParents=child_id,
-                removeParents=parent_id,
-                fields="id,parents",
-            ))
-            moved.append(name)
+            files.append(item)
         token = found.get("nextPageToken")
         if not token:
-            return moved
+            return files
+
+
+def _drive_folder_id(drive, estimates_id: str, parts: tuple[str, ...]) -> str | None:
+    current = estimates_id
+    for name in parts:
+        found = find_in_folder(drive, current, name)
+        if not found or found.get("mimeType") != FOLDER_MIME:
+            return None
+        current = found["id"]
+    return current
+
+
+def relocate_drive_estimates(drive, estimates_id: str) -> list[str]:
+    """Move estimate files under generated_estimates into their retention folders."""
+    estimates_id = require_customer_parent(estimates_id)
+    candidates = [
+        (),
+        (COMPRESSION_FOLDER_NAME,),
+        (FULL_RETENTION_FOLDER,),
+        (THIRTY_DAY_FOLDER,),
+        (COMPRESSION_FOLDER_NAME, FULL_RETENTION_FOLDER),
+        (COMPRESSION_FOLDER_NAME, THIRTY_DAY_FOLDER),
+    ]
+    planned: list[tuple[dict, str, tuple[str, ...]]] = []
+    for parts in candidates:
+        source_id = estimates_id if not parts else _drive_folder_id(drive, estimates_id, parts)
+        if not source_id:
+            continue
+        for item in _drive_child_files(drive, source_id):
+            dest = estimate_dest_parts_for_filename(item.get("name") or "")
+            if dest is None or dest == parts:
+                continue
+            planned.append((item, source_id, dest))
+    dest_ids: dict[tuple[str, ...], str] = {}
+    moved: list[str] = []
+    for item, source_id, dest in planned:
+        if dest not in dest_ids:
+            current = estimates_id
+            for name in dest:
+                current = ensure_drive_folder(drive, name, current)["id"]
+            dest_ids[dest] = current
+        assert_not_template(item["id"])
+        file_id = item["id"]
+        dest_id = dest_ids[dest]
+        _execute(lambda fid=file_id, src=source_id, dst=dest_id: drive.files().update(
+            fileId=fid,
+            addParents=dst,
+            removeParents=src,
+            fields="id,parents",
+        ))
+        moved.append(item.get("name") or file_id)
+    return moved
 
 
 def open_estimate_place(drive, root_id: str, local_dir: Path, name_suffix: str | None) -> tuple[dict, Path, dict, list[str]]:
     """Drive folder and local directory for this sizing, plus the generated_estimates Drive folder.
 
-    Compression-applied sheets are written under generated_estimates/compression_applied.
-    Files of that basis already in generated_estimates are moved there first.
+    Sheets land in full_retention or 30d. Compression-applied sheets use that split
+    under compression_applied. Files already in generated_estimates are moved to match.
     """
     parent = ensure_drive_folder(drive, ESTIMATE_FOLDER_NAME, root_id)
     local_parent = local_dir / ESTIMATE_FOLDER_NAME
     seal_dir(local_parent)
-    child_name = estimate_subfolder(name_suffix)
-    if not child_name:
-        return parent, local_parent, parent, []
-    _dest, local_moved = relocate_local_compression(local_parent, child_name)
-    child = ensure_drive_folder(drive, child_name, parent["id"])
-    drive_moved = relocate_drive_compression(drive, parent["id"], child["id"])
-    return child, local_parent / child_name, parent, local_moved + drive_moved
+    local_moved = relocate_local_estimates(local_parent)
+    drive_moved = relocate_drive_estimates(drive, parent["id"])
+    folder = parent
+    for name in estimate_dir_parts(name_suffix):
+        folder = ensure_drive_folder(drive, name, folder["id"])
+    working_local = local_parent.joinpath(*estimate_dir_parts(name_suffix))
+    seal_dir(working_local)
+    return folder, working_local, parent, local_moved + drive_moved
+
+
+def _deployment_region_rows(acc: dict) -> list[dict]:
+    """Solution and region pairs from the account when architecture groups are not written yet."""
+    region_by_name = {
+        dep.get("name"): dep.get("region")
+        for dep in ((acc.get("cloud") or {}).get("by_deployment") or [])
+        if dep.get("name") and dep.get("region")
+    }
+    rows: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for dep in (acc.get("solutions") or {}).get("by_deployment") or []:
+        if dep.get("platform") == "serverless" or dep.get("ingest_source") == "inactive":
+            continue
+        solution = dep.get("solution") or "search"
+        region = str(region_by_name.get(dep.get("name")) or "").strip()
+        key = (solution, region)
+        if not region or key in seen:
+            continue
+        seen.add(key)
+        rows.append({"solution": solution, "region": region})
+    return rows
+
+
+def architecture_regions(acc: dict, solution: str) -> list[str]:
+    """Deployment regions for one solution, in first-seen order.
+
+    Architecture groups are the quote's grouping. Before that consolidation
+    exists, the cloud and solution rows carry the same regions. A fleet-wide
+    sheet must not be written in that window and then reused as one region's file.
+    """
+    groups = ((acc.get("consolidation") or {}).get("architecture") or {}).get("groups") or []
+    if not groups:
+        groups = _deployment_region_rows(acc)
+    out: list[str] = []
+    for group in groups:
+        if group.get("solution") != solution:
+            continue
+        region = str(group.get("region") or "").strip()
+        if region and region not in out:
+            out.append(region)
+    return out
+
+
+def prefer_regional_estimators(estimators: dict) -> None:
+    """Drop a fleet-wide read-back once that solution has a sheet per region.
+
+    The fleet sheet is priced as the account region. Keeping it beside the
+    regional sheet for that same region records the solution twice.
+    """
+    projects = estimators.get("projects") or []
+    for solution in ("observability", "security", "search"):
+        regions: list[str] = []
+        for project in projects:
+            if project.get("solution") != solution:
+                continue
+            region = str(project.get("region") or "").strip()
+            if region and region not in regions:
+                regions.append(region)
+        if len(regions) >= 2:
+            estimators[solution] = {"kind": solution, "status": "sized per region", "regions": regions}
+
+
+def fleet_sheet_region(acc: dict, solution: str, fallback: str | None) -> str | None:
+    """Region for the one fleet-wide sheet.
+
+    None when that solution already has one sheet per region. A second fleet-wide
+    sheet would price the whole solution again, under the account region.
+    """
+    regions = architecture_regions(acc, solution)
+    if len(regions) >= 2:
+        return None
+    if len(regions) == 1:
+        return regions[0]
+    text = str(fallback or "").strip()
+    return text or None
 
 
 def estimate_title(run_key: str, solution: str, name_suffix: str | None = "", region: str | None = None) -> str:
     """Google Sheet title for one serverless estimate.
 
-    <customer>_<date>_<solution>_<full retention|30d>_<bulk|compression-applied>_serverless_estimate
-    A K360 backup uses k360 in the last slot so it does not replace the bulk sheet.
+    <customer>_<date>_<solution>_<full retention|30d>_<bulk|compression-applied>_<region>_serverless_estimate
+    The region is the cloud region the sheet was scoped to.
+    A K360 backup uses k360 in the basis slot so it does not replace the bulk sheet.
     """
     retention, basis = _estimate_parts(name_suffix)
     name = f"{run_key}_{(solution or '').strip().lower()}_{retention}_{basis}"
     if region:
-        safe = re.sub(r"[\\/]+", "-", str(region).strip())
-        name = f"{name}_{safe}"
+        safe = re.sub(r"[\\/:\s]+", "-", str(region).strip()).strip("-")
+        if safe:
+            name = f"{name}_{safe}"
     return f"{name}_serverless_estimate"
 
 
@@ -727,6 +892,26 @@ def _months_for_sheet(block: dict, force: int | None) -> int | None:
     if force is not None:
         return int(min(36, max(1, force)))
     return measured
+
+
+def _search_volume_scale(block: dict, force_months: int | None, name_suffix: str | None) -> float:
+    """Scale Search disk for a 30-day read and for a compression-applied read.
+
+    Full-retention bulk is 1. A forced month shrinks disk by that month divided
+    by the written month, so 30 days is 1 / written months. Compression-applied
+    multiplies by 0.60. Callers scale org store by the same factor so the
+    ingest share stays put. Query rate is not scaled here.
+    """
+    from admin_diags import COMPRESSION_RATIO
+
+    scale = 1.0
+    written = _sheet_retention((block or {}).get("retention_months"))
+    if force_months is not None and written:
+        scale *= float(int(min(36, max(1, force_months)))) / float(written)
+    _retention, basis = _estimate_parts(name_suffix)
+    if basis == "compression-applied":
+        scale *= COMPRESSION_RATIO
+    return scale
 
 
 def estimator_skip(block: dict, force: int | None, *, always_copy: bool = False) -> str | None:
@@ -790,6 +975,7 @@ def _fill_regional_job(job: dict, creds) -> dict:
             published = {"error": str(ex)}
         entry = {
             "solution": sol, "region": job["region"], "title": job["title"], "stored_gb": job["stored_gb"],
+            "store_scale": job.get("store_scale"),
             "status": result.get("status") or "error",
             "region_match": result.get("region_match"),
             "readback": result.get("readback"),
@@ -891,7 +1077,10 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
             }
             if sol == "search":
                 share = gb / total_gb if total_gb else 0.0
-                job["org_gb"] = org_gb
+                scale = _search_volume_scale({"retention_months": source_months}, force_months, name_suffix)
+                job["stored_gb"] = gb * scale
+                job["org_gb"] = org_gb * scale
+                job["store_scale"] = scale
                 job["workload"] = _scale_qps(workload, share)
             elif sol == "observability":
                 job.update({
@@ -981,7 +1170,11 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
             written = force_months or summary.get("months_written")
             if not written:
                 return [], [], "Observability deployment-count plan was not priced: a project has bulk and no measured retention."
-            title = f"{run_key}_Observability_plan_{pct}_{index}{name_suffix}"
+            slug = re.sub(r"[\\/:\s]+", "-", str(region_name or "").strip()).strip("-")
+            title = f"{run_key}_Observability_plan_{pct}_{index}"
+            if slug:
+                title = f"{title}_{slug}"
+            title = f"{title}{name_suffix}"
             groups.append({
                 "sheet": len(jobs),
                 "names": summary.get("names") or [],
@@ -1118,9 +1311,9 @@ def main() -> None:
     folder, estimate_dir, estimates_root, moved = open_estimate_place(drive, root["id"], local_dir, suffix)
     lines = [f"Local folder → {estimate_dir}", f"Drive folder → {folder['url']}"]
     if moved:
-        lines.append(f"Moved {len(moved)} compression-applied sizing(s) into {COMPRESSION_FOLDER_NAME}")
+        lines.append(f"Moved {len(moved)} estimate(s) into retention folders")
     if args.projects:
-        # Search has no 30-day sheet. --skip-search keeps the full-retention Search projects.
+        # --skip-search keeps Search projects already on the account JSON.
         only = {"observability", "security"} if args.skip_search else None
         projects = size_regional_projects(
             acc, sheets, drive, folder, o11y_id=args.o11y_id, security_id=args.security_id,
@@ -1132,6 +1325,7 @@ def main() -> None:
             kept = [p for p in ((sz.get("estimators") or {}).get("projects") or []) if p.get("solution") == "search"]
             projects = projects + kept
         sz.setdefault("estimators", {})["projects"] = projects
+        prefer_regional_estimators(sz["estimators"])
         sz["folder"] = str(local_dir)
         sz["estimate_folder"] = str(estimate_dir)
         sz["drive_root"] = root
@@ -1148,32 +1342,39 @@ def main() -> None:
     if args.search_sheets:
         estimators = sz.setdefault("estimators", {})
         se = con["search"]
-        title_se = estimate_title(key, "search", suffix)
-        result = run_es3({
-            "stored_gb": se.get("stored_gb") or 0,
-            "org_stored_gb": (acc.get("storage") or {}).get("data_stored_gb") or 0,
-            "provider": provider,
-            "region": region,
-            "support_tier": support,
-            "workload": se.get("workload") or acc.get("workload") or {},
-        }) if (se.get("stored_gb") or 0) > 0 else {}
-        published = write_search_sheet(drive, estimate_dir, folder["id"], title_se, result) if result.get("report_csv") else {"error": result.get("error") or "no report"}
-        entry = dict(estimators.get("search") or {"kind": "search", "title": title_se})
-        entry.pop("doc_id", None)
-        entry.update({
-            "status": result.get("status") or "error",
-            "local": published.get("local"),
-            "url": published.get("url"),
-            "spreadsheet_id": published.get("spreadsheet_id"),
-            "readback": result.get("readback") or entry.get("readback"),
-            "profiles": result.get("profiles") or entry.get("profiles"),
-            "region_match": result.get("region_match") or entry.get("region_match"),
-        })
-        if published.get("error"):
-            entry["error"] = published["error"]
-        estimators["search"] = entry
-        rb = result.get("readback") or {}
-        lines.append(f"Search → {entry.get('url') or entry.get('error')}  (on-demand {rb.get('monthly_steady_state')})")
+        search_regions = architecture_regions(acc, "search")
+        search_scope = fleet_sheet_region(acc, "search", region)
+        if search_scope is None:
+            estimators["search"] = {"kind": "search", "status": "sized per region", "regions": search_regions}
+            lines.append(f"Search → one sheet per region ({', '.join(search_regions)})")
+        else:
+            title_se = estimate_title(key, "search", suffix, search_scope)
+            store_scale = _search_volume_scale(se, args.force_months, suffix)
+            result = run_es3({
+                "stored_gb": float(se.get("stored_gb") or 0) * store_scale,
+                "org_stored_gb": float((acc.get("storage") or {}).get("data_stored_gb") or 0) * store_scale,
+                "provider": provider,
+                "region": search_scope or region,
+                "support_tier": support,
+                "workload": se.get("workload") or acc.get("workload") or {},
+            }) if (se.get("stored_gb") or 0) > 0 else {}
+            published = write_search_sheet(drive, estimate_dir, folder["id"], title_se, result) if result.get("report_csv") else {"error": result.get("error") or "no report"}
+            entry = dict(estimators.get("search") or {"kind": "search", "title": title_se})
+            entry.pop("doc_id", None)
+            entry.update({
+                "status": result.get("status") or "error",
+                "local": published.get("local"),
+                "url": published.get("url"),
+                "spreadsheet_id": published.get("spreadsheet_id"),
+                "readback": result.get("readback") or entry.get("readback"),
+                "profiles": result.get("profiles") or entry.get("profiles"),
+                "region_match": result.get("region_match") or entry.get("region_match"),
+            })
+            if published.get("error"):
+                entry["error"] = published["error"]
+            estimators["search"] = entry
+            rb = result.get("readback") or {}
+            lines.append(f"Search → {entry.get('url') or entry.get('error')}  (on-demand {rb.get('monthly_steady_state')})")
         fresh = size_regional_projects(
             acc, sheets, drive, folder, o11y_id=args.o11y_id, security_id=args.security_id,
             support=support, provider=provider, skip_xlsx=args.skip_xlsx, fresh=args.fresh,
@@ -1182,6 +1383,7 @@ def main() -> None:
         )
         kept = [p for p in (estimators.get("projects") or []) if p.get("solution") != "search"]
         estimators["projects"] = fresh + kept
+        prefer_regional_estimators(estimators)
         for p in fresh:
             prb = p.get("readback") or {}
             lines.append(f"{p['solution']} {p['region']} → {p.get('url') or p.get('error')}  (monthly {prb.get('monthly_steady_state')})")
@@ -1219,19 +1421,24 @@ def main() -> None:
 
     # ---------------- Observability
     o = con["observability"]
-    title_o = estimate_title(key, "observability", suffix)
+    o_regions = architecture_regions(acc, "observability")
+    o_scope = fleet_sheet_region(acc, "observability", region)
     o_skip = estimator_skip(o, args.force_months, always_copy=args.always_copy)
-    if o_skip == "no_workload":
+    if o_scope is None:
+        estimators["observability"] = {"kind": "observability", "status": "sized per region", "regions": o_regions}
+        lines.append(f"Observability → one sheet per region ({', '.join(o_regions)})")
+    elif o_skip == "no_workload":
         estimators["observability"] = {"kind": "observability", "status": "skipped — no observability workload detected (use --always-copy to force)"}
         lines.append("Observability → skipped (no workload)")
     elif o_skip == "retention":
         estimators["observability"] = {"kind": "observability", "status": "skipped — retention was not measured"}
         lines.append("Observability → skipped (retention was not measured)")
     else:
+        title_o = estimate_title(key, "observability", suffix, o_scope)
         o_months = _months_for_sheet(o, args.force_months)
         copied, reused = copy_template(drive, args.o11y_id, title_o, folder["id"], reuse=not args.fresh)
         opts = region_options(sheets, copied["id"])
-        reg, how = match_region(provider, region, opts)
+        reg, how = match_region(provider, o_scope or region, opts)
         daily = float(o.get("daily_raw_gb") or 0)
         cells = observability_input_cells(
             acc, support, reg, o_months, daily, logs=o.get("logs_gb_day"), metrics=o.get("metrics_gb_day"),
@@ -1253,19 +1460,24 @@ def main() -> None:
 
     # ---------------- Security
     s = con["security"]
-    title_s = estimate_title(key, "security", suffix)
+    s_regions = architecture_regions(acc, "security")
+    s_scope = fleet_sheet_region(acc, "security", region)
     s_skip = estimator_skip(s, args.force_months, always_copy=args.always_copy)
-    if s_skip == "no_workload":
+    if s_scope is None:
+        estimators["security"] = {"kind": "security", "status": "sized per region", "regions": s_regions}
+        lines.append(f"Security → one sheet per region ({', '.join(s_regions)})")
+    elif s_skip == "no_workload":
         estimators["security"] = {"kind": "security", "status": "skipped — no security workload detected (use --always-copy to force)"}
         lines.append("Security → skipped (no workload)")
     elif s_skip == "retention":
         estimators["security"] = {"kind": "security", "status": "skipped — retention was not measured"}
         lines.append("Security → skipped (retention was not measured)")
     else:
+        title_s = estimate_title(key, "security", suffix, s_scope)
         s_months = _months_for_sheet(s, args.force_months)
         copied, reused = copy_template(drive, args.security_id, title_s, folder["id"], reuse=not args.fresh)
         opts = region_options(sheets, copied["id"])
-        reg, how = match_region(provider, region, opts)
+        reg, how = match_region(provider, s_scope or region, opts)
         clear_security_addons(sheets, copied["id"], SEC_TAB)
         cells = security_input_cells(acc, support, reg, s_months, float(s.get("siem_gb_day") if s.get("siem_gb_day") is not None else s.get("daily_raw_gb") or 0))
         n = push_cells(sheets, copied["id"], SEC_TAB, cells, allowed_text=set(opts))
@@ -1282,19 +1494,25 @@ def main() -> None:
 
     # ---------------- Search (es3-estimator notebook library)
     se = con["search"]
-    title_se = estimate_title(key, "search", suffix)
+    search_regions = architecture_regions(acc, "search")
+    search_scope = fleet_sheet_region(acc, "search", region)
     if args.skip_search:
         estimators["search"] = (sz.get("estimators") or {}).get("search") or {"kind": "search", "status": "kept from the previous sizing"}
         lines.append("Search → kept from the previous sizing")
+    elif search_scope is None:
+        estimators["search"] = {"kind": "search", "status": "sized per region", "regions": search_regions}
+        lines.append(f"Search → one sheet per region ({', '.join(search_regions)})")
     else:
+        title_se = estimate_title(key, "search", suffix, search_scope)
         has_search = bool(se.get("has_workload") or (se.get("stored_gb") or 0) > 0 or args.always_copy)
         result: dict = {}
+        store_scale = _search_volume_scale(se, args.force_months, suffix)
         if has_search and (se.get("stored_gb") or 0) > 0:
             result = run_es3({
-                "stored_gb": se.get("stored_gb") or 0,
-                "org_stored_gb": (acc.get("storage") or {}).get("data_stored_gb") or 0,
+                "stored_gb": float(se.get("stored_gb") or 0) * store_scale,
+                "org_stored_gb": float((acc.get("storage") or {}).get("data_stored_gb") or 0) * store_scale,
                 "provider": provider,
-                "region": region,
+                "region": search_scope or region,
                 "support_tier": support,
                 "workload": se.get("workload") or acc.get("workload") or {},
             })
@@ -1318,6 +1536,7 @@ def main() -> None:
             "readback": result.get("readback"),
             "profiles": result.get("profiles"),
             "inputs": result.get("inputs"),
+            "store_scale": store_scale,
             "assumptions": result.get("assumptions"),
             "source": result.get("source"),
             "url": published.get("url"),
@@ -1344,6 +1563,7 @@ def main() -> None:
         estimators["projects"] = fresh_projects + kept
     else:
         estimators["projects"] = fresh_projects
+    prefer_regional_estimators(estimators)
 
     sz["folder"] = str(local_dir)
     sz["estimate_folder"] = str(estimate_dir)
