@@ -8,14 +8,15 @@ Run with the Sheets venv python (google-api-python-client installed):
 
 Produces a Drive folder <customer>_<date>. The account PDF stays in that folder.
 Measured-retention consolidation PDFs go in full_retention/. 30-day PDFs go in 30d/.
-Estimate sheets go in its generated_estimates child. Deployment-plan sheets go in generated_estimates/plan_sheets:
+Estimate sheets go in its generated_estimates child. Deployment-plan sheets go in generated_estimates/plan_sheets.
+Compression-applied sheets go in generated_estimates/compression_applied:
   bulk at the measured month, rounded up
   the same bulk written as 1 month (--name-suffix _30d)
   bulk × compression ratio (--name-suffix compressioncalc_accounted_for)
   that accounted ingest written as 1 month
 Sheet titles are
   <customer>_<date>_<search|observability|security>_<full retention|30d>_<bulk|compression-applied>_serverless_estimate
-Local .xlsx export is off unless `--xlsx` is passed. Search CSV reports still use that title under generated_estimates.
+Local .xlsx export is off unless `--xlsx` is passed. Search CSV reports still use that title. A compression-applied file already in generated_estimates is moved into compression_applied.
   sizing.json ; account JSON `sizing.estimators` updated
 
 Never mutates the golden templates.
@@ -573,20 +574,12 @@ def _suffix(raw: str | None) -> str:
 
 ESTIMATE_FOLDER_NAME = "generated_estimates"
 PLAN_FOLDER_NAME = "plan_sheets"
+COMPRESSION_FOLDER_NAME = "compression_applied"
+COMPRESSION_NAME_MARK = "compression-applied"
 
 
-def estimate_folder_name(name_suffix: str | None) -> str:
-    """Estimate sheets share one folder. Plan sheets go in its plan_sheets child."""
-    _suffix(name_suffix)
-    return ESTIMATE_FOLDER_NAME
-
-
-def estimate_title(run_key: str, solution: str, name_suffix: str | None = "", region: str | None = None) -> str:
-    """Google Sheet title for one serverless estimate.
-
-    <customer>_<date>_<solution>_<full retention|30d>_<bulk|compression-applied>_serverless_estimate
-    A K360 backup uses k360 in the last slot so it does not replace the bulk sheet.
-    """
+def _estimate_parts(name_suffix: str | None) -> tuple[str, str]:
+    """Retention label and basis for one sizing. Basis is bulk, compression-applied, or k360."""
     suffix = _suffix(name_suffix).lower()
     if suffix.endswith("_30d"):
         retention = "30d"
@@ -600,6 +593,107 @@ def estimate_title(run_key: str, solution: str, name_suffix: str | None = "", re
         basis = "k360"
     else:
         basis = "bulk"
+    return retention, basis
+
+
+def estimate_folder_name(name_suffix: str | None) -> str:
+    """Parent directory for estimate sheets. Plan sheets and compression-applied sheets are children of it."""
+    _estimate_parts(name_suffix)
+    return ESTIMATE_FOLDER_NAME
+
+
+def estimate_subfolder(name_suffix: str | None) -> str | None:
+    """Child of generated_estimates for this sizing. Compression-applied sheets have their own directory."""
+    _retention, basis = _estimate_parts(name_suffix)
+    if basis == "compression-applied":
+        return COMPRESSION_FOLDER_NAME
+    return None
+
+
+def is_compression_estimate_name(name: str) -> bool:
+    return COMPRESSION_NAME_MARK in (name or "")
+
+
+def relocate_local_compression(parent: Path, child_name: str = COMPRESSION_FOLDER_NAME) -> tuple[Path, list[str]]:
+    """Move compression-applied files from generated_estimates into its compression_applied child."""
+    dest = parent / child_name
+    seal_dir(dest)
+    moved: list[str] = []
+    for item in list(parent.iterdir()):
+        if not item.is_file() or not is_compression_estimate_name(item.name):
+            continue
+        target = dest / item.name
+        if target.exists():
+            target.unlink()
+        item.rename(target)
+        seal_file(target)
+        moved.append(item.name)
+    return dest, moved
+
+
+def relocate_drive_compression(drive, parent_id: str, child_id: str) -> list[str]:
+    """Move compression-applied Drive files from generated_estimates into compression_applied."""
+    parent_id = require_customer_parent(parent_id)
+    child_id = require_customer_parent(child_id)
+    moved: list[str] = []
+    token = None
+    while True:
+        def _list(page=token):
+            kwargs = {
+                "q": f"'{parent_id}' in parents and trashed = false",
+                "spaces": "drive",
+                "fields": "nextPageToken, files(id,name,mimeType)",
+                "pageSize": 100,
+            }
+            if page:
+                kwargs["pageToken"] = page
+            return drive.files().list(**kwargs)
+        found = _execute(_list)
+        for item in found.get("files") or []:
+            if item.get("mimeType") == FOLDER_MIME:
+                continue
+            name = item.get("name") or ""
+            if not is_compression_estimate_name(name):
+                continue
+            assert_not_template(item["id"])
+            file_id = item["id"]
+            _execute(lambda fid=file_id: drive.files().update(
+                fileId=fid,
+                addParents=child_id,
+                removeParents=parent_id,
+                fields="id,parents",
+            ))
+            moved.append(name)
+        token = found.get("nextPageToken")
+        if not token:
+            return moved
+
+
+def open_estimate_place(drive, root_id: str, local_dir: Path, name_suffix: str | None) -> tuple[dict, Path, dict, list[str]]:
+    """Drive folder and local directory for this sizing, plus the generated_estimates Drive folder.
+
+    Compression-applied sheets are written under generated_estimates/compression_applied.
+    Files of that basis already in generated_estimates are moved there first.
+    """
+    parent = ensure_drive_folder(drive, ESTIMATE_FOLDER_NAME, root_id)
+    local_parent = local_dir / ESTIMATE_FOLDER_NAME
+    seal_dir(local_parent)
+    child_name = estimate_subfolder(name_suffix)
+    if not child_name:
+        return parent, local_parent, parent, []
+    _dest, local_moved = relocate_local_compression(local_parent, child_name)
+    child = ensure_drive_folder(drive, child_name, parent["id"])
+    drive_moved = relocate_drive_compression(drive, parent["id"], child["id"])
+    return child, local_parent / child_name, parent, local_moved + drive_moved
+
+
+def estimate_title(run_key: str, solution: str, name_suffix: str | None = "", region: str | None = None) -> str:
+    """Google Sheet title for one serverless estimate.
+
+    <customer>_<date>_<solution>_<full retention|30d>_<bulk|compression-applied>_serverless_estimate
+    A K360 backup uses k360 in the last slot so it does not replace the bulk sheet.
+    """
+    retention, basis = _estimate_parts(name_suffix)
     name = f"{run_key}_{(solution or '').strip().lower()}_{retention}_{basis}"
     if region:
         safe = re.sub(r"[\\/]+", "-", str(region).strip())
@@ -1021,18 +1115,22 @@ def main() -> None:
 
     sheets, drive = services()
     root = ensure_drive_folder(drive, key)
-    scenario = estimate_folder_name(suffix)
-    folder = ensure_drive_folder(drive, scenario, root["id"])
-    estimate_dir = local_dir / scenario
-    seal_dir(estimate_dir)
+    folder, estimate_dir, estimates_root, moved = open_estimate_place(drive, root["id"], local_dir, suffix)
     lines = [f"Local folder → {estimate_dir}", f"Drive folder → {folder['url']}"]
+    if moved:
+        lines.append(f"Moved {len(moved)} compression-applied sizing(s) into {COMPRESSION_FOLDER_NAME}")
     if args.projects:
+        # Search has no 30-day sheet. --skip-search keeps the full-retention Search projects.
+        only = {"observability", "security"} if args.skip_search else None
         projects = size_regional_projects(
             acc, sheets, drive, folder, o11y_id=args.o11y_id, security_id=args.security_id,
             support=support, provider=provider, skip_xlsx=args.skip_xlsx, fresh=args.fresh,
             local_dir=estimate_dir, customer=meta["customer"], when=meta["date"], name_suffix=suffix,
-            force_months=args.force_months,
+            only=only, force_months=args.force_months,
         )
+        if args.skip_search:
+            kept = [p for p in ((sz.get("estimators") or {}).get("projects") or []) if p.get("solution") == "search"]
+            projects = projects + kept
         sz.setdefault("estimators", {})["projects"] = projects
         sz["folder"] = str(local_dir)
         sz["estimate_folder"] = str(estimate_dir)
@@ -1098,7 +1196,7 @@ def main() -> None:
         print("\n".join(lines))
         return
     if args.deployment_plan:
-        plan_folder = ensure_drive_folder(drive, PLAN_FOLDER_NAME, folder["id"])
+        plan_folder = ensure_drive_folder(drive, PLAN_FOLDER_NAME, estimates_root["id"])
         lines.append(f"Plan folder → {plan_folder['url']}")
         plan = size_deployment_plan(
             acc, sheets, drive, plan_folder, o11y_id=args.o11y_id, support=support, provider=provider,

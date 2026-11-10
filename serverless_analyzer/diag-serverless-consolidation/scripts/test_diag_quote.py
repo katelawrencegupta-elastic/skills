@@ -34,9 +34,10 @@ from quote_checks import addon_off_value, e73_blocks_quote, g26_gate, integrity_
 from run_consolidation import _compression_totals, _estimator_flags, consolidation_brief, quote_pdf_jobs  # noqa: E402
 from render_pdf import consolidation_pdf_stem, pdf_folder_name, render_consolidation_html, search_power_section, stat  # noqa: E402
 from size_serverless import (  # noqa: E402
-    DEFAULT_O11Y, DEFAULT_SECURITY, PLAN_FOLDER_NAME, _sheet_retention, assemble_plan_bars,
-    assert_not_template, cell_input_mode, copy_template, estimate_folder_name, estimate_title,
-    estimator_skip, map_in_order, partition_cells, push_cells, require_customer_parent,
+    COMPRESSION_FOLDER_NAME, DEFAULT_O11Y, DEFAULT_SECURITY, PLAN_FOLDER_NAME, _sheet_retention,
+    assemble_plan_bars, assert_not_template, cell_input_mode, copy_template, estimate_folder_name,
+    estimate_subfolder, estimate_title, estimator_skip, map_in_order, partition_cells, push_cells,
+    relocate_local_compression, require_customer_parent,
 )
 from vpn_check import tunnel_reaches  # noqa: E402
 
@@ -477,13 +478,32 @@ class DeploymentCountTests(unittest.TestCase):
 
 class EstimateFolderTests(unittest.TestCase):
     def test_estimates_and_plans_share_generated_estimates(self):
+        for suffix in ("", None, "_30d", "30d", "from_k360"):
+            self.assertEqual(estimate_folder_name(suffix), "generated_estimates")
+            self.assertIsNone(estimate_subfolder(suffix))
         for suffix in (
-            "", None, "_30d", "30d", "from_k360",
             "compressioncalc_accounted_for", "_compressioncalc_accounted_for",
             "compressioncalc_accounted_for_30d",
         ):
             self.assertEqual(estimate_folder_name(suffix), "generated_estimates")
+            self.assertEqual(estimate_subfolder(suffix), "compression_applied")
         self.assertEqual(PLAN_FOLDER_NAME, "plan_sheets")
+        self.assertEqual(COMPRESSION_FOLDER_NAME, "compression_applied")
+
+    def test_compression_applied_files_move_under_generated_estimates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            parent = Path(tmp) / "generated_estimates"
+            parent.mkdir()
+            kept = parent / "Acme_search_full retention_bulk_serverless_estimate.csv"
+            moved = parent / "Acme_search_full retention_compression-applied_serverless_estimate.csv"
+            kept.write_text("bulk")
+            moved.write_text("compression")
+            dest, names = relocate_local_compression(parent)
+            self.assertEqual(dest, parent / "compression_applied")
+            self.assertEqual(names, [moved.name])
+            self.assertTrue(kept.is_file())
+            self.assertEqual((dest / moved.name).read_text(), "compression")
+            self.assertFalse(moved.exists())
 
     def test_estimate_titles_name_solution_retention_and_basis(self):
         key = "GlaxoSmithKline_LLC_2026-11-09"

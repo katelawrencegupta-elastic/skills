@@ -25,11 +25,11 @@ Every consolidation run writes two PDFs from the same bulk.
 | PDF | Sheet month | File |
 |-----|-------------|------|
 | Rounded | measured months, rounded up, clamped to 1–36 | `<key>_full retention_bulk_serverless_consolidation_plan` |
-| 30-day | 1, because 30 / 30.416 is under 1 | `<key>_30d_bulk_serverless_consolidation_plan` |
+| 30-day | Observability and Security written as 1. Search stays the full-retention estimate. There is no 30-day Search sheet. | `<key>_30d_bulk_serverless_consolidation_plan` |
 
 The quote window is `--lookback-days`, default 30, maximum 365. ECH monthly ECU is the total of those billed days ÷ the number of days × 30.416. Ingest written to the estimators is diagnostic bulk × (window daily average ÷ complete-month daily average). The sheet read-back is the quote. The cover chart title, both bar labels, and the legend name that window. `savings` is that read-back. A missing daily series for a window of 30 days or less falls back to `last_30d_daily_avg`. The account fetch stays the trailing year. What you pay for today keeps the fetched year as Full lookback, split by tier, and adds the quote-window usage total as its own bar.
 
-Each PDF links to its own estimator copy, left at that month. The four estimate sheets live in the customer folder's `generated_estimates` child. Their deployment-plan sheets live in `generated_estimates/plan_sheets`. Measured-retention PDFs are uploaded to `full_retention`. 30-day PDFs are uploaded to `30d`. The account PDF stays in the customer folder. The rounded sheet is not rewritten to 1 after the 30-day read. If the measured ceiling is already 1, the two read-backs match. Still write both PDFs. The deployment-count bars are priced again at the scenario's month: measured months rounded up on the rounded PDF, and 1 month on every project on the 30-day PDF.
+Each PDF links to its own estimator copy, left at that month. Bulk estimate sheets live in the customer folder's `generated_estimates` child. Compression-applied estimate sheets live in `generated_estimates/compression_applied`. A file already in `generated_estimates` whose name contains `compression-applied` is moved there. Deployment-plan sheets live in `generated_estimates/plan_sheets`. Measured-retention PDFs are uploaded to `full_retention`. 30-day PDFs are uploaded to `30d`. The account PDF stays in the customer folder. The rounded sheet is not rewritten to 1 after the 30-day read. If the measured ceiling is already 1, the two read-backs match. Still write both PDFs. The deployment-count bars are priced again at the scenario's month: measured months rounded up on the rounded PDF, and 1 month on every project on the 30-day PDF.
 
 When the user sets a retention month, that whole month replaces the headline (`--retention-months`, G11 or G6). Bulk GB/day stays the measured rate. The measured months stay in the arithmetic next to the month written. The 30-day read stays at 1 month.
 
@@ -52,7 +52,7 @@ compressioncalc_accounted_for = bulk_gb_day × 0.60
 
 Observability and Security sheets for this set write that GB/day. Logs stay 90% and metrics 10% of it. Security takes all of it. Retention is weighted on this GB/day. G26 is accepted when it is within 0.51 GB/day of the accounted GB written, not the raw bulk. Search keeps local store and its existing es3 read-back.
 
-The rounded and 30-day PDFs are `<key>_full retention_compression-applied_serverless_consolidation_plan` and `<key>_30d_compression-applied_serverless_consolidation_plan`. Both sheets are in `generated_estimates`. The 30-day sheet writes 1 month. This set does not price the deployment-count plan.
+The rounded and 30-day PDFs are `<key>_full retention_compression-applied_serverless_consolidation_plan` and `<key>_30d_compression-applied_serverless_consolidation_plan`. Both sheets are in `generated_estimates/compression_applied`. The 30-day sheet writes 1 month. This set does not price the deployment-count plan.
 
 ## Which estimator
 
@@ -133,7 +133,7 @@ The score is the mean of the checks that apply. A check with no inputs is n/a an
 
 The detail prints both cents and the gap. A missing monthly or a missing steady annual on a quote line scores 0 for that line. The overall result passes when the score is 0.90 or higher, and also when every scored check passes. A check below its own bar stays flagged and its detail still names the gap. Bundle coverage below 1.0 names each deployment that has no bundle.
 
-Same formulas inside each project. Each project is its own estimator copy. The month written is the project's measured months rounded up. Each project also gets a 30-day read at 1 month on the same bulk. Sum of the read-backs is the split-fleet price, once at the measured month and once at 30 days. Compare each sum with the matching one-project read-back. The difference is the cost of staying split. A user-set retention month replaces the headline month on every project, including the pool, and does not change Σ bulk.
+Same formulas inside each project. Each project is its own estimator copy. The month written is the project's measured months rounded up. Observability and Security projects also get a 30-day read at 1 month on the same bulk. Search does not. Its only price is the full-retention read-back, and the 30-day total keeps that figure. Sum of the read-backs is the split-fleet price, once at the measured month and once at 30 days. Compare each sum with the matching one-project read-back. The difference is the cost of staying split. A user-set retention month replaces the headline month on every project, including the pool, and does not change Σ bulk.
 
 ## 2–5 projects
 
