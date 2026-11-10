@@ -272,12 +272,20 @@ def _complexity(ms: float | None) -> str | None:
     return "High"
 
 
-def fetch_workload(base: str, key: str, org_id: str, avg_doc_bytes: float | None) -> dict:
+def org_clause(org_ids: list[str]) -> dict:
+    """One id is a term filter. Several ids are one terms filter."""
+    ids = [str(i) for i in org_ids if str(i) and str(i) != "__none__"]
+    if len(ids) == 1:
+        return {"term": {"organization.id": ids[0]}}
+    return {"terms": {"organization.id": ids}}
+
+
+def fetch_workload(base: str, key: str, org_id: str | list[str], avg_doc_bytes: float | None) -> dict:
     """Day-average search/ingest sizing inputs from index_telemetry (2 ES calls).
 
     Cadence is ~daily → QPS/docs-sec are day averages; % hours use day-share proxies.
     """
-    org = {"term": {"organization.id": org_id}}
+    org = org_clause([org_id] if isinstance(org_id, str) else list(org_id))
     exclude = {"bool": {"must_not": [
         {"prefix": {"index.name": "."}},
         {"prefix": {"index.name": "partial-"}},
@@ -857,6 +865,12 @@ def rollup_weekly(days: list[str], series: list[list[float]], total: list[float]
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--org", required=True)
+    ap.add_argument(
+        "--org-id",
+        action="append",
+        default=None,
+        help="Cloud organization id. Repeat when one customer name covers several orgs. Billing, storage, and workload cover every id. The contract pivot is the id with the highest commit.",
+    )
     ap.add_argument("--env", default=".env")
     ap.add_argument("--days", type=int, default=365)
     ap.add_argument("--out", default="-")
@@ -880,46 +894,87 @@ def main() -> None:
     end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=args.days - 1)
     rng = {"gte": f"{start.isoformat()}T00:00:00Z", "lte": f"{end.isoformat()}T23:59:59Z"}
-    org_q = {"match_phrase": {"organization.name": args.org}}
-    filt = [org_q, {"range": {"@timestamp": rng}}]
-
-    pivots = [
-        h["_source"]
-        for h in es_post(base, key, "cloud-tracker-organization_pivot/_search", {"size": 5, "query": org_q})[
-            "hits"
-        ]["hits"]
-    ]
-    if not pivots:
+    org_ids_arg = [str(i).strip() for i in (args.org_id or []) if str(i).strip()]
+    if org_ids_arg:
         pivots = [
             h["_source"]
             for h in es_post(
                 base,
                 key,
                 "cloud-tracker-organization_pivot/_search",
-                {
-                    "size": 10,
-                    "query": {
-                        "query_string": {
-                            "query": f'organization.name:"{args.org}" OR organization.name:{args.org}*'
-                        }
-                    },
-                },
+                {"size": len(org_ids_arg), "query": {"terms": {"organization.id": org_ids_arg}}},
             )["hits"]["hits"]
         ]
-    if not pivots:
-        raise SystemExit(f"No organization_pivot for {args.org!r}")
-    pivot = next(
-        (p for p in pivots if (p.get("organization") or {}).get("name", "").lower() == args.org.lower()),
-        pivots[0],
-    )
+        found = {str((p.get("organization") or {}).get("id")): p for p in pivots}
+        missing = [i for i in org_ids_arg if i not in found]
+        if missing:
+            raise SystemExit(f"No organization_pivot for {missing}")
+
+        def _commit(p: dict) -> float:
+            try:
+                return float((p.get("pace") or {}).get("commit") or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        pivot = max((found[i] for i in org_ids_arg), key=_commit)
+        org_ids = org_ids_arg
+    else:
+        org_q = {"match_phrase": {"organization.name": args.org}}
+        pivots = [
+            h["_source"]
+            for h in es_post(base, key, "cloud-tracker-organization_pivot/_search", {"size": 20, "query": org_q})[
+                "hits"
+            ]["hits"]
+        ]
+        if not pivots:
+            pivots = [
+                h["_source"]
+                for h in es_post(
+                    base,
+                    key,
+                    "cloud-tracker-organization_pivot/_search",
+                    {
+                        "size": 10,
+                        "query": {
+                            "query_string": {
+                                "query": f'organization.name:"{args.org}" OR organization.name:{args.org}*'
+                            }
+                        },
+                    },
+                )["hits"]["hits"]
+            ]
+        if not pivots:
+            raise SystemExit(f"No organization_pivot for {args.org!r}")
+        named = [
+            p for p in pivots
+            if (p.get("organization") or {}).get("name", "").lower() == args.org.lower()
+        ]
+        chosen = named or pivots
+        if len({str((p.get("organization") or {}).get("id")) for p in chosen}) > 1:
+            shown = ", ".join(
+                f"{(p.get('organization') or {}).get('id')} {(p.get('organization') or {}).get('name')}"
+                for p in chosen
+            )
+            raise SystemExit(
+                f"Several cloud orgs share {args.org!r}. Pass each --org-id. Matches: {shown}"
+            )
+        pivot = chosen[0]
+        org_ids = []
     org_id = (pivot.get("organization") or {}).get("id", "__none__")
     # Prefer resolved pivot name/id — match_phrase on a short CLI token
     # (e.g. "GlaxoSmithKline") misses billing docs named "… LLC".
     org_name = (pivot.get("organization") or {}).get("name") or args.org
-    if org_id and org_id != "__none__":
-        org_q = {"term": {"organization.id": org_id}}
+    if not org_ids:
+        org_ids = [str(org_id)] if org_id and org_id != "__none__" else []
+    if org_ids:
+        org_q = org_clause(org_ids)
     else:
         org_q = {"match_phrase": {"organization.name": org_name}}
+    if len(org_ids) > 1:
+        print(
+            f"organizations: {', '.join(org_ids)}; contract pivot {org_id} (highest commit)",
+            file=sys.stderr,
+        )
     filt = [org_q, {"range": {"@timestamp": rng}}]
 
     bill = es_post(
@@ -1020,7 +1075,7 @@ def main() -> None:
         "cloud-tracker-telemetry/_search",
         {
             "size": 0,
-            "query": {"bool": {"filter": [{"term": {"organization.id": org_id}}]}},
+            "query": {"bool": {"filter": [org_clause(org_ids or [org_id])]}},
             "aggs": {
                 "by_dep": {
                     "terms": {"field": "deployment.name", "size": 200},
@@ -1051,7 +1106,7 @@ def main() -> None:
             "cloud-tracker-deployments/_search",
             {
                 "size": 200,
-                "query": {"term": {"organization.id": org_id}},
+                "query": org_clause(org_ids or [org_id]),
                 "_source": ["name", "stack_version", "template", "provider", "hot_instance_type"],
             },
         )["hits"]["hits"]
@@ -1482,7 +1537,11 @@ def main() -> None:
             "window_days": 0,
         }
     else:
-        workload = fetch_workload(base, key, org_id, avg_doc_bytes)
+        workload = fetch_workload(base, key, org_ids or [org_id], avg_doc_bytes)
+        if len(org_ids) > 1:
+            workload.setdefault("notes", []).append(
+                "Search and ingest rates cover organization ids " + ", ".join(org_ids)
+            )
 
     offload = build_serverless_offload(
         deployments, storage_by_dep, org_total_ecu, workload=workload
@@ -1600,7 +1659,7 @@ def main() -> None:
     out = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ"),
         "range": {"start": start.isoformat(), "end": end.isoformat(), "days": args.days},
-        "organization": slim_org(pivot.get("organization")),
+        "organization": slim_org(pivot.get("organization")) | ({"ids": list(org_ids)} if len(org_ids) > 1 else {}),
         "license": pivot.get("license"),
         "burndown": burndown(pivot),
         "infrastructure": infrastructure,

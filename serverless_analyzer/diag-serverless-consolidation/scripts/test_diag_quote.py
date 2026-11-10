@@ -32,7 +32,7 @@ from k360_infra import es_base_and_key  # noqa: E402
 from privacy import seal_dir, seal_text, unignored_secret_warnings  # noqa: E402
 from quote_checks import addon_off_value, e73_blocks_quote, g26_gate, integrity_score, money  # noqa: E402
 from run_consolidation import _compression_totals, _estimator_flags, consolidation_brief, quote_pdf_jobs  # noqa: E402
-from render_pdf import consolidation_pdf_stem, pdf_folder_name, render_consolidation_html, search_power_section, stat  # noqa: E402
+from render_pdf import consolidation_pdf_stem, pdf_folder_name, render_appendix_html, render_consolidation_html, search_power_section, stat  # noqa: E402
 from size_serverless import (  # noqa: E402
     COMPRESSION_FOLDER_NAME, DEFAULT_O11Y, DEFAULT_SECURITY, PLAN_FOLDER_NAME, _sheet_retention,
     assemble_plan_bars, assert_not_template, cell_input_mode, copy_template, estimate_folder_name,
@@ -462,21 +462,45 @@ class GateTests(unittest.TestCase):
 
 
 class DeploymentCountTests(unittest.TestCase):
-    def test_project_counts_keep_one_project_at_100_percent(self):
-        self.assertEqual([project_count(4, pct) for pct in (0, 25, 50, 75, 100)], [4, 3, 2, 1, 1])
+    def test_100_percent_is_one_project_per_deployment(self):
+        self.assertEqual([project_count(4, pct) for pct in (100, 75, 50, 25, 0)], [4, 3, 2, 1, 1])
         self.assertEqual(project_count(1, 100), 1)
         self.assertEqual(project_count(1, 50), 0)
         rows = [
             {"name": str(i), "bulk_gb_day": i + 1, "store_gb": i + 1, "retention_days": 30}
             for i in range(4)
         ]
-        plans = {plan["cut_pct"]: plan for plan in deployment_count_plans(rows)}
-        self.assertEqual([plans[pct]["projects"] for pct in (0, 25, 50, 75, 100)], [4, 3, 2, 1, 1])
-        self.assertEqual(len(plans[100]["groups"][0]), 4)
-        single = deployment_count_plans([{"name": "only", "bulk_gb_day": 1, "store_gb": 1}])
-        self.assertEqual(single[-1]["cut_pct"], 100)
-        self.assertEqual(single[-1]["projects"], 1)
-        self.assertEqual(len(single[-1]["groups"]), 1)
+        plans = deployment_count_plans(rows)
+        self.assertEqual([plan["cut_pct"] for plan in plans], [100, 75, 50, 25, 0])
+        by_pct = {plan["cut_pct"]: plan for plan in plans}
+        self.assertEqual([by_pct[pct]["projects"] for pct in (100, 75, 50, 25, 0)], [4, 3, 2, 1, 1])
+        self.assertEqual(len(by_pct[100]["groups"]), 4)
+        self.assertEqual(len(by_pct[0]["groups"][0]), 4)
+        single = {plan["cut_pct"]: plan for plan in deployment_count_plans([{"name": "only", "bulk_gb_day": 1, "store_gb": 1}])}
+        self.assertEqual(single[100]["projects"], 1)
+        self.assertEqual(len(single[100]["groups"]), 1)
+
+    def test_project_floor_stops_the_plan_at_the_region_count(self):
+        from diag_inputs import apply_project_floor
+        rows = [
+            {"name": str(i), "bulk_gb_day": 100 - i, "store_gb": i + 1, "retention_days": 30}
+            for i in range(11)
+        ]
+        plans = {plan["cut_pct"]: plan for plan in deployment_count_plans(rows, floor=8)}
+        self.assertEqual([plans[pct]["projects"] for pct in (100, 75, 50, 25, 0)], [11, 8, 8, 8, 8])
+        self.assertEqual(apply_project_floor(0, 1, 2), 0)
+        self.assertEqual(apply_project_floor(1, 8, 11), 8)
+
+    def test_logical_floor_counts_regions_above_ten_dollars(self):
+        from consolidation import logical_project_floor
+        groups = []
+        for region, gb in (("a", 1000), ("b", 1000), ("c", 1000), ("d", 1000), ("tiny", 0.1)):
+            groups.append({"solution": "search", "region": region, "stored_gb": gb, "daily_raw_gb": None, "retention_months": 1})
+        for region in ("e", "f", "g", "h"):
+            groups.append({"solution": "observability", "region": region, "stored_gb": 1000, "daily_raw_gb": 100, "retention_months": 1})
+        groups.append({"solution": "security", "region": "e", "stored_gb": 0, "daily_raw_gb": 0})
+        floor = logical_project_floor({"consolidation": {"architecture": {"groups": groups}}, "sizing": {"consolidated": {}}, "workload": {}})
+        self.assertEqual(floor, 8)
 
 
 class EstimateFolderTests(unittest.TestCase):
@@ -601,6 +625,7 @@ class EstimateFolderTests(unittest.TestCase):
         self.assertEqual(pdf_folder_name("consolidation_30d"), "30d")
         self.assertEqual(pdf_folder_name("consolidation_compressioncalc_30d"), "30d")
         self.assertIsNone(pdf_folder_name("account"))
+        self.assertIsNone(pdf_folder_name("appendix"))
         key = "GlaxoSmithKline_LLC_2026-11-09"
         self.assertEqual(
             consolidation_pdf_stem(key, "consolidation"),
@@ -786,6 +811,29 @@ class CompressionCalcTests(unittest.TestCase):
 
 
 class RegionalQuoteTests(unittest.TestCase):
+    def test_projection_skips_a_region_at_or_under_ten_dollars(self):
+        from consolidation import REGION_ESTIMATE_MIN_USD, projected_region_monthly
+
+        tiny = projected_region_monthly(
+            "observability", stored_gb=1, daily_raw_gb=0.01, retention_months=1,
+            solution_stored_gb=1, workload=None,
+        )
+        large = projected_region_monthly(
+            "observability", stored_gb=1000, daily_raw_gb=50, retention_months=1,
+            solution_stored_gb=1000, workload=None,
+        )
+        self.assertLessEqual(tiny, REGION_ESTIMATE_MIN_USD)
+        self.assertGreater(large, REGION_ESTIMATE_MIN_USD)
+        search = projected_region_monthly(
+            "search", stored_gb=1, daily_raw_gb=None, retention_months=1,
+            solution_stored_gb=1001, workload={},
+        )
+        kept = projected_region_monthly(
+            "search", stored_gb=1000, daily_raw_gb=None, retention_months=1,
+            solution_stored_gb=1001, workload={},
+        )
+        self.assertLessEqual(search, REGION_ESTIMATE_MIN_USD)
+        self.assertGreater(kept, REGION_ESTIMATE_MIN_USD)
     def test_one_own_readback_keeps_the_consolidated_total(self):
         quote = regional_quote(
             [
@@ -925,7 +973,7 @@ class EfficiencyTests(unittest.TestCase):
         ])
         self.assertEqual(
             [kind for _doc, kind in jobs],
-            ["account", "consolidation", "consolidation_30d", "consolidation_compressioncalc_30d", "consolidation_k360"],
+            ["account", "consolidation", "consolidation_30d", "consolidation_compressioncalc_30d", "consolidation_k360", "appendix"],
         )
 
     def test_xlsx_export_is_off_unless_asked(self):
@@ -1116,24 +1164,27 @@ class PrivacyTests(unittest.TestCase):
 
 
 class ConsolidationLayoutTests(unittest.TestCase):
-    def test_body_flows_and_the_appendix_is_last(self):
+    def test_body_flows_and_the_appendix_is_its_own_document(self):
         acc = _quote_account(g26=10, e73=0)
         acc["consolidation"] = build_consolidation(acc, None)
         html = render_consolidation_html(acc)
-        self.assertEqual(html.count("<h2>Appendix A</h2>"), 1)
-        self.assertEqual(html.count("<h2>Appendix B</h2>"), 1)
-        self.assertGreater(html.rfind("<h2>Appendix A</h2>"), html.rfind("Reconciliation and what to confirm"))
-        self.assertGreater(html.rfind("<h2>Appendix B</h2>"), html.rfind("<h2>Appendix A</h2>"))
+        appendix = render_appendix_html(acc)
+        self.assertEqual(html.count("<h2>Appendix A</h2>"), 0)
+        self.assertEqual(html.count("<h2>Appendix B</h2>"), 0)
+        self.assertIn("Reconciliation and what to confirm", html)
+        self.assertEqual(appendix.count("<h2>Appendix A</h2>"), 1)
+        self.assertEqual(appendix.count("<h2>Appendix B</h2>"), 1)
+        self.assertGreater(appendix.rfind("<h2>Appendix B</h2>"), appendix.rfind("<h2>Appendix A</h2>"))
         self.assertNotIn("<h2>1. ", html)
         self.assertNotIn("<h2>6. ", html)
         self.assertNotIn("<h2>9. ", html)
         self.assertNotIn("<div class='page-break'>", html)
-        self.assertEqual(html.count("sec newpage"), 2)
-        self.assertIn("<section class='sec newpage'><h2>Appendix A</h2>", html)
-        self.assertIn("<section class='sec newpage'><h2>Appendix B</h2>", html)
+        self.assertEqual(html.count("sec newpage"), 0)
+        self.assertIn("<section class='sec'><h2>Appendix A</h2>", appendix)
+        self.assertIn("<section class='sec newpage'><h2>Appendix B</h2>", appendix)
         self.assertIn("class='tbl'", html)
         self.assertIn("class='consolidation'", html)
-        self.assertLess(html.find("Data used, and how the headline is calculated"), html.find("Quote integrity"))
+        self.assertLess(appendix.find("Data used, and how the headline is calculated"), appendix.find("Quote integrity"))
 
     def test_appendix_b_prints_formulas_and_skips_an_unpriced_solution(self):
         acc = _quote_account(g26=10, e73=0)
@@ -1159,7 +1210,7 @@ class ConsolidationLayoutTests(unittest.TestCase):
         acc["consolidation"] = build_consolidation(acc, None)
         acc["consolidation"]["ingest_basis"] = "compressioncalc_accounted_for"
         acc["consolidation"]["compression_ratio"] = 0.6
-        html = render_consolidation_html(acc)
+        html = render_appendix_html(acc)
         appendix_b = html.split("<h2>Appendix B</h2>", 1)[1]
         self.assertIn("Σ Δsearch_total ÷ 86,400", appendix_b)
         self.assertIn("percent ÷ 100 × 730", appendix_b)
@@ -1208,6 +1259,21 @@ class ConsolidationLayoutTests(unittest.TestCase):
         self.assertIn("30-day lookback", build)
         self.assertIn("30-day usage", build)
         self.assertNotIn("ECH today", build)
+
+    def test_contract_rate_is_drawn_beside_the_list_price(self):
+        acc = _quote_account(g26=10, e73=0)
+        acc["meta"]["org"]["ARR"] = 1825
+        acc["ecu"]["contract"] = {"commit_pace_ecu_per_day": 10}
+        acc["consolidation"] = build_consolidation(acc, None)
+        html = render_consolidation_html(acc)
+        cover = html.split("What you pay for today", 1)[0]
+        self.assertIn("Serverless at list", cover)
+        self.assertIn("Serverless at contract rate", cover)
+        self.assertIn("ECH at contract rate", cover)
+        self.assertIn("Contract rate $0.5 per ECU", cover)
+        self.assertIn("minus serverless at the contract rate", cover)
+        self.assertNotIn("The contract rate is not applied to serverless.", cover)
+        self.assertNotIn("minus serverless at list", cover)
 
     def test_cover_stays_on_the_complete_month_average_without_a_30_day_rate(self):
         acc = _quote_account(g26=10, e73=0)

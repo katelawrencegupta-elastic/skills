@@ -1029,6 +1029,8 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
     signature for callers that already opened a client; each copy builds its own.
     """
     del sheets, drive, customer, when
+    from consolidation import REGION_ESTIMATE_MIN_USD, projected_region_monthly
+
     groups = ((acc.get("consolidation") or {}).get("architecture") or {}).get("groups") or []
     by_sol: dict[str, list] = {}
     for g in groups:
@@ -1052,9 +1054,19 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
                 continue
             if gb <= 0 and not (g.get("daily_raw_gb") or 0):
                 continue
+            source_months = g.get("retention_months") if g.get("retention_months") is not None else (con.get(sol) or {}).get("retention_months")
+            projected = projected_region_monthly(
+                sol,
+                stored_gb=gb,
+                daily_raw_gb=g.get("daily_raw_gb"),
+                retention_months=source_months,
+                solution_stored_gb=total_gb,
+                workload=workload if sol == "search" else None,
+            )
+            if projected <= REGION_ESTIMATE_MIN_USD:
+                continue
             region = g["region"]
             title = estimate_title(key, sol, name_suffix, region)
-            source_months = g.get("retention_months") if g.get("retention_months") is not None else (con.get(sol) or {}).get("retention_months")
             retention = _months_for_sheet({"retention_months": source_months}, force_months)
             if sol != "search" and retention is None:
                 continue
@@ -1150,15 +1162,20 @@ def assemble_plan_bars(specs: list[dict], fills: list[dict]) -> dict:
     return {"bars": bars}
 
 
-def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_months: int | None, o11y_id: str, parent_id: str, reuse: bool, provider, region_name, support: str, feature_tier) -> tuple[list[dict], list[dict], str | None]:
+def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_months: int | None, o11y_id: str, parent_id: str, reuse: bool, provider, region_name, support: str, feature_tier, floor: int = 1) -> tuple[list[dict], list[dict], str | None]:
     """Bar specs plus the sheet jobs they point at. A missing month fails before any copy."""
     diag = _diag_inputs()
     specs: list[dict] = []
     jobs: list[dict] = []
-    for plan in diag.deployment_count_plans(rows):
+    shared: dict[int, list] = {}
+    for plan in diag.deployment_count_plans(rows, floor):
         pct = plan["cut_pct"]
-        if pct == 100:
-            specs.append({"cut_pct": 100, "label": "100%", "projects": 1, "reused_headline": True, "groups": []})
+        if pct <= 0 and plan["projects"] <= 1:
+            specs.append({"cut_pct": 0, "label": "0%", "projects": 1, "reused_headline": True, "groups": []})
+            continue
+        packed = shared.get(plan["projects"])
+        if packed is not None:
+            specs.append({"cut_pct": pct, "label": plan["label"], "projects": plan["projects"], "groups": packed})
             continue
         groups = []
         for index, group in enumerate(plan["groups"], start=1):
@@ -1171,7 +1188,7 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
             if not written:
                 return [], [], "Observability deployment-count plan was not priced: a project has bulk and no measured retention."
             slug = re.sub(r"[\\/:\s]+", "-", str(region_name or "").strip()).strip("-")
-            title = f"{run_key}_Observability_plan_{pct}_{index}"
+            title = f"{run_key}_Observability_plan_{pct}pct_{plan['projects']}projects_{index}"
             if slug:
                 title = f"{title}_{slug}"
             title = f"{title}{name_suffix}"
@@ -1193,6 +1210,7 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
                 "months_written": int(written),
                 "bulk": bulk,
             })
+        shared[plan["projects"]] = groups
         specs.append({"cut_pct": pct, "label": plan["label"], "projects": plan["projects"], "groups": groups})
     return specs, jobs, None
 
@@ -1244,6 +1262,9 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
         })
     if not rows:
         return {"bars": [], "error": "Observability deployment-count plan was not priced: no active observability deployments."}
+    from consolidation import logical_project_floor
+    from diag_inputs import MINIMUM_PLAN_PROJECTS
+    floor = max(MINIMUM_PLAN_PROJECTS, logical_project_floor(acc))
     specs, jobs, error = plan_sheet_jobs(
         rows,
         run_key=acc["meta"]["run_key"],
@@ -1256,17 +1277,22 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
         region_name=(acc.get("sizing") or {}).get("region"),
         support=support,
         feature_tier=(acc.get("sizing") or {}).get("feature_tier"),
+        floor=floor,
     )
     if error:
         return {"bars": [], "error": error}
     if not jobs:
-        return assemble_plan_bars(specs, [])
-    try:
-        creds = load_sheet_creds()
-        fills = map_in_order(lambda job: fill_plan_sheet(job, creds), jobs)
-    except Exception as ex:  # noqa: BLE001
-        return {"bars": [], "error": f"Observability deployment-count plan was not priced: {ex}"}
-    return assemble_plan_bars(specs, fills)
+        built = assemble_plan_bars(specs, [])
+    else:
+        try:
+            creds = load_sheet_creds()
+            fills = map_in_order(lambda job: fill_plan_sheet(job, creds), jobs)
+        except Exception as ex:  # noqa: BLE001
+            return {"bars": [], "error": f"Observability deployment-count plan was not priced: {ex}"}
+        built = assemble_plan_bars(specs, fills)
+    if not built.get("error"):
+        built["floor"] = floor
+    return built
 
 
 # ----------------------------------------------------------------------------- main

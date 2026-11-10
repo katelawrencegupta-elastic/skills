@@ -27,7 +27,7 @@ Every consolidation run writes two PDFs from the same bulk.
 | Rounded | measured months, rounded up, clamped to 1–36 | `<key>_full retention_bulk_serverless_consolidation_plan` |
 | 30-day | Observability and Security written as 1. Search disk is measured store × (1 / written months), on its own 30-day sheet. | `<key>_30d_bulk_serverless_consolidation_plan` |
 
-The quote window is `--lookback-days`, default 30, maximum 365. ECH monthly ECU is the total of those billed days ÷ the number of days × 30.416. Ingest written to the estimators is diagnostic bulk × (window daily average ÷ complete-month daily average). The sheet read-back is the quote. The cover chart title, both bar labels, and the legend name that window. `savings` is that read-back. A missing daily series for a window of 30 days or less falls back to `last_30d_daily_avg`. The account fetch stays the trailing year. What you pay for today keeps the fetched year as Full lookback, split by tier, and adds the quote-window usage total as its own bar.
+The quote window is `--lookback-days`, default 30, maximum 365. ECH monthly ECU is the total of those billed days ÷ the number of days × 30.416. Ingest written to the estimators is diagnostic bulk × (window daily average ÷ complete-month daily average). The sheet read-back is the quote. The cover chart title names that window. When a contract rate exists, serverless is drawn twice: at list, and at list × ARR ÷ (commit ECU/day × 365). `savings` remains the list read-back against ECH at the contract rate. A missing daily series for a window of 30 days or less falls back to `last_30d_daily_avg`. The account fetch stays the trailing year. What you pay for today keeps the fetched year as Full lookback, split by tier, and adds the quote-window usage total as its own bar.
 
 Each PDF links to its own estimator copy, left at that month. Bulk estimate sheets live in `generated_estimates/full_retention` or `generated_estimates/30d`. Compression-applied estimate sheets live in `generated_estimates/compression_applied/full_retention` or `generated_estimates/compression_applied/30d`. An estimate already under `generated_estimates` is moved into the folder its name calls for. Deployment-plan sheets live in `generated_estimates/plan_sheets`. Measured-retention PDFs are uploaded to `full_retention`. 30-day PDFs are uploaded to `30d`. The account PDF stays in the customer folder. The rounded sheet is not rewritten to 1 after the 30-day read. If the measured ceiling is already 1, the two read-backs match. Still write both PDFs. The deployment-count bars are priced again at the scenario's month: measured months rounded up on the rounded PDF, and 1 month on every project on the 30-day PDF.
 
@@ -68,7 +68,7 @@ G26 on the Observability sheet displays as an integer. Read it unformatted. Acce
 
 Security E74 is the monthly quote only when parsed E73 is 0. A blank or unreadable E73 blocks, and so does a non-zero value. A parenthesized credit stays negative. Call that check only after a Security sheet was read. A region that was never sized is a missing sheet, not a blank E73. E73 is not subtracted from E74. Add-on inputs are cleared on the copy. The golden template is not edited.
 
-A region with bulk and no measured age has no month of its own. If another region supplied the solution month, that region is written at the solution month. A solution with no measured age anywhere is not written. One regional G26 miss, a blank regional E73, or a non-zero regional E73 leaves that whole Observability or Security solution out, including regions whose own read-back was accepted. Regional dollars use one mode. When every region has its own accepted read-back, the headline is the sum of those read-backs. Otherwise the headline stays the one consolidated read-back and every region, including Search, is a stored-GB share of that total. A region's own read-back is not added to another region's share. Year 1 follows the same mode. A region with bulk and no local bytes contributes $0 on a store split.
+A regional estimate is written only when that region's projected monthly sizing is more than $10. Observability and Security project from that region's bulk and retention. Search projects that region's share of the solution ballpark. A region at or under $10 is left out and does not count as a missing read-back. A region with bulk and no measured age has no month of its own. If another region supplied the solution month, that region is written at the solution month. A solution with no measured age anywhere is not written. One regional G26 miss, a blank regional E73, or a non-zero regional E73 leaves that whole Observability or Security solution out, including regions whose own read-back was accepted. Regional dollars use one mode. When every region has its own accepted read-back, the headline is the sum of those read-backs. Otherwise the headline stays the one consolidated read-back and every region, including Search, is a stored-GB share of that total. A region's own read-back is not added to another region's share. Year 1 follows the same mode. A region with bulk and no local bytes contributes $0 on a store split.
 
 ## Per deployment
 
@@ -78,15 +78,15 @@ A deployment at or above 50 GB/day is its own project. Every deployment under 50
 
 For an active fleet of N deployments, price five Observability plans on each PDF. Each plan's dollar is the sum of D32. On the rounded PDF, retention on a project is that group's measured months, rounded up. On the 30-day PDF, every project is written as 1 month. Bulk does not change.
 
-| Cut | Projects |
-|-----|----------|
-| 0% | N, one project per active deployment |
-| 25% | round(N × 0.75) |
-| 50% | round(N × 0.50) |
-| 75% | round(N × 0.25) |
-| 100% | 1. Reuses the headline Observability read-back. No new sheet. After a regional pass that headline is one sheet per region. |
+| Step | Projects |
+|------|----------|
+| 100% | N. One serverless project per ECH deployment. |
+| 75% | round(N × 0.75), and not below the floor |
+| 50% | round(N × 0.50), and not below the floor |
+| 25% | round(N × 0.25), and not below the floor |
+| 0% | The floor. At 1 it reuses the headline Observability read-back. Above 1 it is that many projects, packed and priced. |
 
-Pack the middle three by local `store_gb`: sort descending, place each row in the lightest bin. 100% stays one project even though N × 0 is 0. `round` is half-to-even, so 75% of 2 deployments is round(0.5) = 0 projects and that bar is $0. The 50% cut, when it is one project, is a new combined D32. The 100% dollar is still the Observability headline, so it is not that combined D32. On the rounded PDF, a project with bulk and no measured month omits the whole bar set. On the 30-day PDF, a project with bulk is written at month 1.
+Pack a step with more than one project by local `store_gb`: sort descending, place each row in the lightest bin. The floor is 8, or one project per solution per region above $10/mo when that count is larger, and never more than N. `round` is half-to-even, so 50% of 1 deployment is round(0.5) = 0 projects and that bar is $0 when the floor is 1. On the rounded PDF, a project with bulk and no measured month omits the whole bar set. On the 30-day PDF, a project with bulk is written at month 1.
 
 ## Deployment consolidation analysis across metered ingest rates
 
@@ -116,7 +116,7 @@ A deployment whose logs stream and metrics stream are both inside the first 50 G
 
 ## Search-power projection
 
-On-demand, performant, and high availability are priced with the es3 estimator when Search was estimated. High availability is the highly-performant setting. Show monthly and steady annual (monthly × 12) for each. When Search was not estimated, `search_power` is absent and the Appendix does not include the chart. These dollars are not added to D32 or E74. When the quoted solution is Search, the quote stays the on-demand read-back. The chart, when present, is in Appendix A, after the reconciliation section, the input arithmetic, and the metered-rate tables. The quote integrity table follows it. Appendix B follows Appendix A.
+On-demand, performant, and high availability are priced with the es3 estimator when Search was estimated. High availability is the highly-performant setting. Show monthly and steady annual (monthly × 12) for each. When Search was not estimated, `search_power` is absent and the Appendix does not include the chart. These dollars are not added to D32 or E74. When the quoted solution is Search, the quote stays the on-demand read-back. The chart, when present, is in Appendix A of serverless_consolidation_analysis_appendix, after the input arithmetic and the metered-rate tables. The quote integrity table follows it. Appendix B follows Appendix A in that same document.
 
 ## Quote integrity
 
@@ -165,4 +165,4 @@ Do not count `partial-*` (searchable snapshots) as ingest. Do count `.ds-*` data
 
 ## Appendix B
 
-The consolidation PDF prints these formulas as Appendix B, on its own page after Appendix A. Each row is the value, the formula, the inputs used on that run, and the result already in the report. A row is left out when that value was not calculated. D32, E74, and the es3 on-demand total stay read-backs. The page does not reprice them. A 30-day PDF shows the 1-month scale. A compression-applied PDF shows × 0.60.
+serverless_consolidation_analysis_appendix prints these formulas as Appendix B, on its own page after Appendix A. The numbers are the full-retention bulk quote. Each row is the value, the formula, the inputs used on that run, and the result already in the report. A row is left out when that value was not calculated. D32, E74, and the es3 on-demand total stay read-backs. The page does not reprice them.

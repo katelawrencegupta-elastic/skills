@@ -171,6 +171,10 @@ def consolidation_brief(acc: dict) -> dict:
             },
         },
     }
+    org_ids = [str(i) for i in ((m.get("org") or {}).get("ids") or []) if i]
+    if org_ids:
+        out["organization_id"] = (m.get("org") or {}).get("id")
+        out["organization_ids"] = org_ids
     power = _search_power_brief(cons.get("search_power"))
     if power:
         out["search_power"] = power
@@ -178,6 +182,14 @@ def consolidation_brief(acc: dict) -> dict:
     if integrity:
         out["integrity"] = integrity
     return out
+
+
+def _with_appendix(docs: list[tuple[dict, str]]) -> list[tuple[dict, str]]:
+    """One appendix document, from the full-retention bulk quote, in the run folder."""
+    source = next((doc for doc, kind in docs if kind == "consolidation"), None)
+    if source is None:
+        return docs
+    return docs + [(source, "appendix")]
 
 
 def quote_pdf_jobs(account: dict, diagnostic: dict | None, extras: list[tuple[dict | None, str]]) -> list[tuple[dict, str]]:
@@ -188,13 +200,13 @@ def quote_pdf_jobs(account: dict, diagnostic: dict | None, extras: list[tuple[di
         cons = account.get("consolidation") or {}
         if cons and not cons.get("error"):
             docs.append((account, "consolidation"))
-        return docs
+        return _with_appendix(docs)
     docs: list[tuple[dict, str]] = [(account, "account"), (diagnostic, "consolidation")]
     for doc, kind in extras:
         cons = (doc or {}).get("consolidation") or {}
         if doc is not None and cons and not cons.get("error"):
             docs.append((doc, kind))
-    return docs
+    return _with_appendix(docs)
 
 
 def _load_quote(path: str | None) -> dict | None:
@@ -394,7 +406,13 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
     from admin_diags import parse_diagnostics, pull_diagnostics
     from diag_account import apply_diagnostics
 
-    org_id = ((acc.get("meta") or {}).get("org") or {}).get("id")
+    org_meta = (acc.get("meta") or {}).get("org") or {}
+    org_id = org_meta.get("id")
+    org_ids = [str(i) for i in (org_meta.get("ids") or []) if i]
+    if org_id and str(org_id) not in org_ids:
+        org_ids.insert(0, str(org_id))
+    if not org_ids and org_id:
+        org_ids = [str(org_id)]
     when = (acc.get("meta") or {}).get("date")
     if args.diags_dir:
         out_dir = Path(args.diags_dir)
@@ -403,11 +421,12 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
             sz["diagnostics_status"] = f"--diags-dir not found: {out_dir}"
             return None
     else:
-        if not org_id:
+        if not org_ids:
             print("WARN: no organization id — diagnostic consolidation unavailable", file=sys.stderr)
             sz["diagnostics_status"] = "no organization id"
             return None
-        out_dir = folder.parent / f"{org_id}_diags_{when}"
+        label = "+".join(org_ids) if len(org_ids) > 1 else org_ids[0]
+        out_dir = folder.parent / f"{label}_diags_{when}"
         pull = True
         if not args.skip_vpn_check:
             from urllib.parse import urlsplit
@@ -426,13 +445,16 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
                 print("WARN: parsing diagnostic zips already on disk", file=sys.stderr)
                 pull = False
         if pull:
-            try:
-                pull_diagnostics(env, str(org_id), out_dir)
-            except Exception as ex:
-                print(f"WARN: diagnostic pull failed ({ex!r})", file=sys.stderr)
-                sz["diagnostics_status"] = f"diagnostic pull failed ({ex!r})"
-                if not any(out_dir.glob("*.zip")):
-                    return None
+            errors = []
+            for oid in org_ids:
+                try:
+                    pull_diagnostics(env, oid, out_dir)
+                except Exception as ex:
+                    errors.append(f"{oid}: {ex!r}")
+                    print(f"WARN: diagnostic pull failed for {oid} ({ex!r})", file=sys.stderr)
+            if errors and not any(out_dir.glob("*.zip")):
+                sz["diagnostics_status"] = "; ".join(errors)
+                return None
     zips = list(out_dir.glob("*.zip"))
     if not zips:
         print("WARN: no diagnostic bundles — the quote falls back to K360 stored GB", file=sys.stderr)

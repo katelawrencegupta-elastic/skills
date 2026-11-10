@@ -98,6 +98,22 @@ def resolve_org_name(base: str, key: str, name: str) -> str:
     raise SystemExit(f"No single organization match for {name!r}. Matches: {shown}{extra}")
 
 
+def org_clause(doc: dict) -> dict | None:
+    """Term filter for one cloud org, terms filter when the report lists several."""
+    org = doc.get("organization") if isinstance(doc.get("organization"), dict) else {}
+    meta = ((doc.get("meta") or {}).get("org") or {}) if isinstance(doc.get("meta"), dict) else {}
+    ids = org.get("ids") or meta.get("ids") or []
+    if not ids:
+        one = org.get("id") or meta.get("id")
+        ids = [one] if one else []
+    ids = [str(i) for i in ids if i]
+    if not ids:
+        return None
+    if len(ids) == 1:
+        return {"term": {"organization.id": ids[0]}}
+    return {"terms": {"organization.id": ids}}
+
+
 def es_post(base: str, key: str, path: str, body: dict) -> dict:
     req = urllib.request.Request(
         f"{base}/{path.lstrip('/')}",
@@ -139,12 +155,10 @@ def hex_id(n: str) -> bool:
 
 
 def fetch_infra(base: str, key: str, org: dict) -> dict:
-    org_id = (org.get("organization") or {}).get("id")
     org_name = (org.get("organization") or {}).get("name")
     rng = org.get("range") or {}
-    if org_id:
-        org_q = {"term": {"organization.id": org_id}}
-    else:
+    org_q = org_clause(org)
+    if org_q is None:
         org_q = {"match_phrase": {"organization.name": org_name}}
     filt = [org_q]
     if rng.get("start") and rng.get("end"):
@@ -425,12 +439,8 @@ def fill_ingest_doc_bytes(base: str, key: str, doc: dict) -> int | None:
     ingest = wl.get("ingest") if isinstance(wl.get("ingest"), dict) else {}
     if ingest.get("avg_doc_bytes"):
         return int(round(float(ingest["avg_doc_bytes"])))
-    org_id = str(
-        ((doc.get("meta") or {}).get("org") or {}).get("id")
-        or (doc.get("organization") or {}).get("id")
-        or ""
-    )
-    if not org_id:
+    clause = org_clause(doc)
+    if clause is None:
         return None
     exclude = {"bool": {"must_not": [
         {"prefix": {"index.name": "."}},
@@ -440,7 +450,7 @@ def fill_ingest_doc_bytes(base: str, key: str, doc: dict) -> int | None:
         res = es_post(base, key, "cloud-tracker-index_telemetry-*/_search", {
             "size": 0,
             "query": {"bool": {"filter": [
-                {"term": {"organization.id": org_id}},
+                clause,
                 exclude,
                 {"range": {"@timestamp": {"gte": "now-21d"}}},
             ]}},
@@ -494,14 +504,14 @@ def fill_storage_from_data_pivot(base: str, key: str, org: dict) -> None:
     st = org.setdefault("storage", {})
     if float(st.get("data_stored_gb") or 0) > 0:
         return
-    org_id = str((org.get("organization") or {}).get("id") or "")
-    if not org_id:
+    clause = org_clause(org)
+    if clause is None:
         return
     idx = "cloud-tracker-data_pivot/_search"
     try:
         mx = es_post(base, key, idx, {
             "size": 0,
-            "query": {"term": {"organization.id": org_id}},
+            "query": clause,
             "aggs": {"max_ts": {"max": {"field": "@timestamp"}}},
         })["aggregations"]["max_ts"]
         ts = mx.get("value_as_string")
@@ -510,7 +520,7 @@ def fill_storage_from_data_pivot(base: str, key: str, org: dict) -> None:
         buckets = es_post(base, key, idx, {
             "size": 0,
             "query": {"bool": {"filter": [
-                {"term": {"organization.id": org_id}},
+                clause,
                 {"range": {"@timestamp": {"gte": ts, "lte": ts}}},
             ]}},
             "aggs": {"by_dep": {"terms": {"field": "deployment.name", "size": 500}, "aggs": {
@@ -567,17 +577,17 @@ def fill_storage_monthly(base: str, key: str, org: dict) -> None:
     A single telemetry snapshot cannot draw this chart.
     """
     st = org.setdefault("storage", {})
-    org_id = str((org.get("organization") or {}).get("id") or "")
+    clause = org_clause(org)
     rng = org.get("range") or {}
     start = str(rng.get("start") or "now-365d")[:10]
     end = str(rng.get("end") or "now")[:10]
-    if not org_id:
+    if clause is None:
         return
     try:
         res = es_post(base, key, "cloud-tracker-data_pivot/_search", {
             "size": 0,
             "query": {"bool": {"filter": [
-                {"term": {"organization.id": org_id}},
+                clause,
                 {"range": {"@timestamp": {"gte": start, "lte": end}}},
             ]}},
             "aggs": {"by_month": {
@@ -629,17 +639,17 @@ def size_gaps(base: str, key: str, acc: dict) -> list[dict]:
     and ``apc-ecom-search``) and started reporting after it stopped.
     """
     st = acc.get("storage") or {}
-    org_id = str(((acc.get("meta") or {}).get("org") or {}).get("id") or "")
+    clause = org_clause(acc)
     on_snapshot = {r["name"] for r in st.get("by_deployment") or []}
     missing = [d["name"] for d in (acc.get("solutions") or {}).get("by_deployment") or []
                if d.get("platform") != "serverless" and d["name"] not in on_snapshot]
-    if not org_id or not missing or not on_snapshot:
+    if clause is None or not missing or not on_snapshot:
         return []
     idx = "cloud-tracker-data_pivot/_search"
     try:
         last = es_post(base, key, idx, {
             "size": 0,
-            "query": {"bool": {"filter": [{"term": {"organization.id": org_id}}, {"terms": {"deployment.name": missing}}]}},
+            "query": {"bool": {"filter": [clause, {"terms": {"deployment.name": missing}}]}},
             "aggs": {"by_dep": {"terms": {"field": "deployment.name", "size": 500}, "aggs": {"days": {
                 "date_histogram": {"field": "@timestamp", "calendar_interval": "1d", "min_doc_count": 1},
                 "aggs": {
@@ -650,7 +660,7 @@ def size_gaps(base: str, key: str, acc: dict) -> list[dict]:
         })["aggregations"]["by_dep"]["buckets"]
         first = es_post(base, key, idx, {
             "size": 0,
-            "query": {"bool": {"filter": [{"term": {"organization.id": org_id}}, {"terms": {"deployment.name": sorted(on_snapshot)}}]}},
+            "query": {"bool": {"filter": [clause, {"terms": {"deployment.name": sorted(on_snapshot)}}]}},
             "aggs": {"by_dep": {"terms": {"field": "deployment.name", "size": 500}, "aggs": {"first": {"min": {"field": "@timestamp"}}}}},
         })["aggregations"]["by_dep"]["buckets"]
     except SystemExit:

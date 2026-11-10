@@ -1563,7 +1563,7 @@ def build_account(org: dict, infra: dict | None, *, when: date | None = None, re
             "date": when.isoformat(),
             "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ"),
             "lookback": org.get("range"),
-            "org": {k: v for k, v in (org.get("organization") or {}).items() if k in ("id", "AE", "ARR", "segment", "geo", "region", "contract", "customer_type")},
+            "org": {k: v for k, v in (org.get("organization") or {}).items() if k in ("id", "ids", "AE", "ARR", "segment", "geo", "region", "contract", "customer_type")},
             "license": org.get("license"),
         }
     }

@@ -244,6 +244,7 @@ def wants_quote(args) -> bool:
 def parse_args(argv=None, description: str | None = None):
     ap = argparse.ArgumentParser(description=description or __doc__)
     ap.add_argument("--org", required=True, help="Organization name as in K360 (match_phrase)")
+    ap.add_argument("--org-id", action="append", default=None, help="Cloud organization id. Repeat when one customer name covers several orgs")
     ap.add_argument("--env", default=".env")
     ap.add_argument("--days", type=int, default=365, help="Trailing fetch window in days. The account summary uses the past year (365)")
     ap.add_argument("--lookback-days", type=int, default=30, help="Quote window in days. Default 30. Maximum 365. The account summary fetch still uses --days")
@@ -292,6 +293,8 @@ def prepare_account(args):
         args.org = canonical
         org_json = Path("/tmp/account_org_report.json")
         cmd = [sys.executable, str(fetch_py), "--org", args.org, "--env", str(env_path), "--days", str(args.days), "--chart", "day", "--out", str(org_json)]
+        for oid in args.org_id or []:
+            cmd.extend(["--org-id", str(oid)])
         if args.skip_workload:
             cmd.append("--skip-workload")
         _run(cmd)

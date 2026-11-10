@@ -23,6 +23,7 @@ from quote_checks import e73_blocks_quote, g26_gate, integrity_score, money as _
 from skill_paths import find_skill
 
 DAYS_PER_MONTH = 30.416
+REGION_ESTIMATE_MIN_USD = 10.0
 MAX_LOOKBACK_DAYS = 365
 _INGEST_KEYS = (
     "daily_raw_gb", "logs_gb_day", "metrics_gb_day", "siem_gb_day",
@@ -199,6 +200,76 @@ def observability_metered_rates(rows: list[dict]) -> list[dict]:
         })
     out.sort(key=lambda r: (-(r["metered_gb_day"] or 0), r["name"]))
     return out
+
+
+def projected_region_monthly(
+    solution: str,
+    *,
+    stored_gb: float,
+    daily_raw_gb: float | None,
+    retention_months: float | None,
+    solution_stored_gb: float,
+    workload: dict | None,
+) -> float:
+    """Monthly sizing before a regional sheet is written.
+
+    Observability and Security use the ladder on that region's bulk and retention.
+    Search is that region's share of the solution ballpark, so a per-region
+    minimum does not turn a few stored GB into a sheet.
+    """
+    gb = float(stored_gb or 0)
+    months = float(retention_months or 1)
+    if solution == "search":
+        total_gb = float(solution_stored_gb or 0)
+        if price_es3_search is None or total_gb <= 0 or gb <= 0:
+            return 0.0
+        total = float(price_es3_search(total_gb, workload).get("total_mo") or 0)
+        return total * gb / total_gb
+    daily = daily_raw_gb
+    if daily is None:
+        daily = gb / (months * DAYS_PER_MONTH) if months else 0.0
+    return float(price_o11y_serverless(float(daily or 0), months).get("total_mo") or 0)
+
+
+def logical_project_floor(acc: dict) -> int:
+    """Fewest serverless projects the regions and solutions still require.
+
+    One project per solution per region, and only a region whose projected
+    sizing is more than $10/mo. A solution that lives in one region still
+    counts. With no regional split on the account, the floor stays 1.
+    """
+    groups = ((acc.get("consolidation") or {}).get("architecture") or {}).get("groups") or []
+    if not groups:
+        return 1
+    by_sol: dict[str, list] = {}
+    for group in groups:
+        by_sol.setdefault(group.get("solution") or "search", []).append(group)
+    con = (acc.get("sizing") or {}).get("consolidated") or {}
+    workload = (con.get("search") or {}).get("workload") or acc.get("workload") or {}
+    kept = 0
+    for sol, rows in by_sol.items():
+        total_gb = sum(float(row.get("stored_gb") or 0) for row in rows)
+        for row in rows:
+            gb = float(row.get("stored_gb") or 0)
+            daily = row.get("daily_raw_gb")
+            if sol == "search" and gb <= 0:
+                continue
+            if gb <= 0 and not daily:
+                continue
+            months = row.get("retention_months")
+            if months is None:
+                months = (con.get(sol) or {}).get("retention_months")
+            projected = projected_region_monthly(
+                sol,
+                stored_gb=gb,
+                daily_raw_gb=daily,
+                retention_months=months,
+                solution_stored_gb=total_gb,
+                workload=workload if sol == "search" else None,
+            )
+            if projected > REGION_ESTIMATE_MIN_USD:
+                kept += 1
+    return kept or 1
 
 
 def _price_slice(solution: str, gb: float, retention_months: float, workload: dict | None) -> dict:
@@ -558,6 +629,7 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
     saved = _saved_projects(acc)
     store_split = False
     regional_quoted = False
+    omitted_small: list[str] = []
     profile_keys = ("Total $/month", "Provisioned Search VCU/h", "Idle Search VCU/h", "Search $/month", "Ingest $/month", "Storage $/month", "Support $/month")
     for sol, regions in spans.items():
         if len(regions) <= 1:
@@ -569,6 +641,17 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
         total_gb = sum(g["stored_gb"] for g in rows) or float(blk.get("stored_gb") or 0)
         classified = []
         for g in rows:
+            projected = projected_region_monthly(
+                sol,
+                stored_gb=g.get("stored_gb") or 0,
+                daily_raw_gb=g.get("daily_raw_gb"),
+                retention_months=g.get("retention_months") if g.get("retention_months") is not None else blk.get("retention_months"),
+                solution_stored_gb=total_gb,
+                workload=workload if sol == "search" else None,
+            )
+            if projected <= REGION_ESTIMATE_MIN_USD:
+                omitted_small.append(f"{sol} {g['region']} ${projected:,.2f}")
+                continue
             share = (g["stored_gb"] / total_gb) if total_gb else 0.0
             saved_hit = saved.get((sol, g["region"])) or {}
             saved_rb = saved_hit.get("readback") or {}
@@ -638,6 +721,12 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                 "own_steady": _money(saved_rb.get("annual_steady_state")),
                 "region_match": saved_hit.get("region_match"), "url": saved_hit.get("url"),
             })
+        if not classified:
+            blk["by_region"] = []
+            blk["regional_mode"] = "below_minimum"
+            blk["total_mo"] = 0.0
+            blk["total_yr"] = 0.0
+            continue
         est_rb = (((acc.get("sizing") or {}).get("estimators") or {}).get(sol) or {}).get("readback") or {}
         steady_total = _money(est_rb.get("annual_steady_state"))
         quote = regional_quote(
@@ -707,6 +796,11 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
         note += " " + bits + "."
     if store_split:
         note += " Where a region had no read-back of its own, that solution keeps the consolidated total and every region is a stored-GB share of it."
+    if omitted_small:
+        note += (
+            f" A regional estimate is produced only when the projected sizing is more than ${REGION_ESTIMATE_MIN_USD:.0f}/mo. "
+            "Left out: " + "; ".join(omitted_small) + "."
+        )
     notes.append(note)
     return regional_quoted
 
@@ -1398,6 +1492,7 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         "ladder": [] if quoted else (_ladder_walk(metered) if metered else []),
         "metered_rates": observability_metered_rates(((acc.get("solutions") or {}).get("by_deployment") or [])) if (sz.get("ingest_source") == "diagnostics") else [],
         "deployment_plan": _deployment_bars(sz, by_solution, notes),
+        "deployment_plan_floor": int((sz.get("deployment_plan") or {}).get("floor") or 1),
         "search_power": _search_power(sz, by_solution, acc),
         "fragmentation": fragmentation,
         "architecture": architecture,
