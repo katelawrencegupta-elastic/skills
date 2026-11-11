@@ -1133,6 +1133,7 @@ def assemble_plan_bars(specs: list[dict], fills: list[dict]) -> dict:
                 "cut_pct": spec["cut_pct"],
                 "label": spec["label"],
                 "projects": spec.get("projects", 1),
+                "from_projects": spec.get("from_projects"),
                 "monthly": None,
                 "reused_headline": True,
             })
@@ -1141,7 +1142,14 @@ def assemble_plan_bars(specs: list[dict], fills: list[dict]) -> dict:
         priced = []
         for group in spec.get("groups") or []:
             if group.get("sheet") is None:
-                priced.append({"names": group.get("names") or [], "monthly": 0.0, "bulk_gb_day": 0})
+                money = float(group.get("monthly") or 0)
+                monthly += money
+                priced.append({
+                    "names": group.get("names") or [],
+                    "monthly": round(money, 2),
+                    "bulk_gb_day": group.get("bulk_gb_day") or 0,
+                    "months_written": group.get("months_written"),
+                })
                 continue
             fill = fills[group["sheet"]]
             monthly += float(fill["monthly"])
@@ -1156,38 +1164,103 @@ def assemble_plan_bars(specs: list[dict], fills: list[dict]) -> dict:
             "cut_pct": spec["cut_pct"],
             "label": spec["label"],
             "projects": spec["projects"],
+            "from_projects": spec.get("from_projects"),
             "monthly": round(monthly, 2),
             "groups": priced,
         })
     return {"bars": bars}
 
 
-def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_months: int | None, o11y_id: str, parent_id: str, reuse: bool, provider, region_name, support: str, feature_tier, floor: int = 1) -> tuple[list[dict], list[dict], str | None]:
-    """Bar specs plus the sheet jobs they point at. A missing month fails before any copy."""
+def _search_group_price(group: list[dict], *, workload: dict, org_gb: float, support: str, force_months: int | None, cache: dict) -> float:
+    """On-demand Search price for one project. An empty project still pays the estimator minimum."""
+    store = sum(float(row.get("store_gb") or 0) for row in group)
+    diag = _diag_inputs()
+    written = (diag.summarize(group, force_months).get("months_written") or 1)
+    scale = float(force_months) / float(written) if force_months and written else 1.0
+    stored = store * scale
+    org = float(org_gb or 0) * scale
+    share = (store / float(org_gb)) if org_gb else 0.0
+    region = str(group[0].get("region") or "")
+    provider = str(group[0].get("provider") or "")
+    key = (provider, region, round(stored, 3), round(share, 6), support)
+    if key in cache:
+        return cache[key]
+    from fetch_org import price_es3_search
+    wl = _scale_qps(workload, share) if org_gb else (workload or {})
+    money = None
+    if stored > 0:
+        result = run_es3({
+            "stored_gb": stored,
+            "org_stored_gb": org or stored,
+            "provider": provider,
+            "region": region,
+            "support_tier": support,
+            "workload": wl,
+        })
+        money = ((result.get("readback") or {}).get("monthly_steady_state"))
+    if money is None:
+        money = price_es3_search(stored, wl).get("total_mo") or 0
+    cache[key] = round(float(money), 2)
+    return cache[key]
+
+
+def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_months: int | None, o11y_id: str, parent_id: str, reuse: bool, provider, region_name, support: str, feature_tier, workload: dict | None = None, org_gb: float = 0) -> tuple[list[dict], list[dict], str | None, int]:
+    """Bar specs plus the Observability sheet jobs they point at.
+
+    Search projects are priced here. A missing Observability month fails before any copy.
+    """
     diag = _diag_inputs()
     specs: list[dict] = []
     jobs: list[dict] = []
     shared: dict[int, list] = {}
-    for plan in diag.deployment_count_plans(rows, floor):
+    search_cache: dict = {}
+    floor = diag.plan_floor_for_rows(rows)
+    for plan in diag.region_feature_plans(rows):
         pct = plan["cut_pct"]
         if pct <= 0 and plan["projects"] <= 1:
             specs.append({"cut_pct": 0, "label": "0%", "projects": 1, "reused_headline": True, "groups": []})
             continue
         packed = shared.get(plan["projects"])
         if packed is not None:
-            specs.append({"cut_pct": pct, "label": plan["label"], "projects": plan["projects"], "groups": packed})
+            specs.append({
+                "cut_pct": pct,
+                "label": plan["label"],
+                "projects": plan["projects"],
+                "from_projects": plan.get("from_projects"),
+                "groups": packed,
+            })
             continue
         groups = []
         for index, group in enumerate(plan["groups"], start=1):
             summary = diag.summarize(group, force_months)
+            solution = str((group[0] if group else {}).get("solution") or "observability")
+            if solution == "search":
+                money = _search_group_price(
+                    group,
+                    workload=workload or {},
+                    org_gb=float(org_gb or 0),
+                    support=support,
+                    force_months=force_months,
+                    cache=search_cache,
+                )
+                groups.append({
+                    "sheet": None,
+                    "names": summary.get("names") or [],
+                    "bulk_gb_day": summary.get("bulk_gb_day") or 0,
+                    "months_written": summary.get("months_written"),
+                    "monthly": money,
+                })
+                continue
             bulk = float(summary.get("bulk_gb_day") or 0)
             if bulk <= 0:
                 groups.append({"sheet": None, "names": summary.get("names") or [], "bulk_gb_day": 0})
                 continue
             written = force_months or summary.get("months_written")
             if not written:
-                return [], [], "Observability deployment-count plan was not priced: a project has bulk and no measured retention."
-            slug = re.sub(r"[\\/:\s]+", "-", str(region_name or "").strip()).strip("-")
+                return [], [], "Observability deployment-count plan was not priced: a project has bulk and no measured retention.", floor
+            group_region = str((group[0] if group else {}).get("region") or region_name or "")
+            group_provider = str((group[0] if group else {}).get("provider") or provider or "")
+            slug = re.sub(r"[\\/:\s]+", "-", group_region.strip()).strip("-")
             title = f"{run_key}_Observability_plan_{pct}pct_{plan['projects']}projects_{index}"
             if slug:
                 title = f"{title}_{slug}"
@@ -1203,16 +1276,22 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
                 "title": title,
                 "parent_id": parent_id,
                 "reuse": reuse,
-                "provider": provider,
-                "region_name": region_name,
+                "provider": group_provider,
+                "region_name": group_region,
                 "support": support,
                 "feature_tier": feature_tier,
                 "months_written": int(written),
                 "bulk": bulk,
             })
         shared[plan["projects"]] = groups
-        specs.append({"cut_pct": pct, "label": plan["label"], "projects": plan["projects"], "groups": groups})
-    return specs, jobs, None
+        specs.append({
+            "cut_pct": pct,
+            "label": plan["label"],
+            "projects": plan["projects"],
+            "from_projects": plan.get("from_projects"),
+            "groups": groups,
+        })
+    return specs, jobs, None, floor
 
 
 def fill_plan_sheet(job: dict, creds) -> dict:
@@ -1242,30 +1321,52 @@ def fill_plan_sheet(job: dict, creds) -> dict:
         return {"error": f"Observability deployment-count plan was not priced: {ex}"}
 
 
-def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str, support: str, provider, force_months: int | None, name_suffix: str, fresh: bool) -> dict:
-    """Price the five Observability deployment-count bars. 100% reuses the headline sheet.
+def _plan_solution(cloud_row: dict, measured: dict) -> str:
+    known = {"observability", "security", "search"}
+    sol = measured.get("solution")
+    if sol in known:
+        return sol
+    use = str(cloud_row.get("use_case") or "").lower()
+    if use in known:
+        return use
+    template = str(cloud_row.get("template") or "").lower()
+    if any(token in template for token in ("vector", "storage", "search")):
+        return "search"
+    return "search"
 
-    The sheet copies share one pool of at most four workers. Passes stay sequential.
+
+def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str, support: str, provider, force_months: int | None, name_suffix: str, fresh: bool) -> dict:
+    """Price five cuts from one project per ECH deployment down to one per region and feature.
+
+    Observability projects are D32 read-backs. Search projects are the on-demand estimator.
     """
     del sheets, drive
+    measured = {
+        dep.get("name"): dep
+        for dep in (acc.get("solutions") or {}).get("by_deployment") or []
+        if dep.get("platform") != "serverless"
+    }
+    cloud_rows = [
+        dep for dep in ((acc.get("cloud") or {}).get("by_deployment") or [])
+        if dep.get("platform") != "serverless"
+    ]
+    source = cloud_rows or list(measured.values())
     rows = []
-    for dep in (acc.get("solutions") or {}).get("by_deployment") or []:
-        if dep.get("platform") == "serverless" or dep.get("ingest_source") == "inactive":
-            continue
-        if (dep.get("solution") or "search") != "observability":
-            continue
+    for dep in source:
+        rec = measured.get(dep.get("name")) or dep
         rows.append({
             "name": dep.get("name") or "",
-            "bulk_gb_day": dep.get("daily_raw_gb") or 0,
-            "store_gb": dep.get("gb") or 0,
-            "retention_days": dep.get("retention_days"),
+            "solution": _plan_solution(dep, rec),
+            "region": dep.get("region") or rec.get("region") or "",
+            "provider": dep.get("provider") or provider,
+            "bulk_gb_day": rec.get("daily_raw_gb") or 0,
+            "store_gb": rec.get("gb") if rec.get("gb") is not None else dep.get("gb") or 0,
+            "retention_days": rec.get("retention_days"),
         })
     if not rows:
-        return {"bars": [], "error": "Observability deployment-count plan was not priced: no active observability deployments."}
-    from consolidation import logical_project_floor
-    from diag_inputs import MINIMUM_PLAN_PROJECTS
-    floor = max(MINIMUM_PLAN_PROJECTS, logical_project_floor(acc))
-    specs, jobs, error = plan_sheet_jobs(
+        return {"bars": [], "error": "Deployment-count plan was not priced: no ECH deployments."}
+    org_gb = sum(float(row["store_gb"] or 0) for row in rows if row["solution"] == "search")
+    specs, jobs, error, floor = plan_sheet_jobs(
         rows,
         run_key=acc["meta"]["run_key"],
         name_suffix=name_suffix,
@@ -1277,7 +1378,8 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
         region_name=(acc.get("sizing") or {}).get("region"),
         support=support,
         feature_tier=(acc.get("sizing") or {}).get("feature_tier"),
-        floor=floor,
+        workload=acc.get("workload") or {},
+        org_gb=org_gb,
     )
     if error:
         return {"bars": [], "error": error}
@@ -1312,7 +1414,7 @@ def main() -> None:
     ap.add_argument("--sizing-json", default=None, help="Filename for the sizing sidecar (default sizing.json)")
     ap.add_argument("--force-months", type=int, default=None, help="Write this whole month when a measured month already exists")
     ap.add_argument("--skip-search", action="store_true", help="Keep the Search estimator already on the account JSON")
-    ap.add_argument("--deployment-plan", action="store_true", help="Price the Observability 0/25/50/75/100%% deployment-count bars")
+    ap.add_argument("--deployment-plan", action="store_true", help="Price the deployment-count bars from one project per ECH deployment down to one project per feature per region")
     args = ap.parse_args()
     args.skip_xlsx = not args.xlsx
 

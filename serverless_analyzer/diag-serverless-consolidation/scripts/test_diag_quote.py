@@ -499,8 +499,33 @@ class DeploymentCountTests(unittest.TestCase):
         for region in ("e", "f", "g", "h"):
             groups.append({"solution": "observability", "region": region, "stored_gb": 1000, "daily_raw_gb": 100, "retention_months": 1})
         groups.append({"solution": "security", "region": "e", "stored_gb": 0, "daily_raw_gb": 0})
-        floor = logical_project_floor({"consolidation": {"architecture": {"groups": groups}}, "sizing": {"consolidated": {}}, "workload": {}})
+        account = {"consolidation": {"architecture": {"groups": groups}}, "sizing": {"consolidated": {}}, "workload": {}}
+        floor = logical_project_floor(account)
         self.assertEqual(floor, 8)
+
+    def test_plan_counts_every_deployment_down_to_region_and_feature(self):
+        from diag_inputs import region_feature_plans
+        rows = []
+        for i in range(3):
+            rows.append({"name": f"o{i}", "solution": "observability", "region": "east", "bulk_gb_day": 10, "store_gb": 10})
+        for i in range(2):
+            rows.append({"name": f"s{i}", "solution": "search", "region": "east", "bulk_gb_day": 1, "store_gb": 5})
+        rows.append({"name": "west", "solution": "search", "region": "west", "bulk_gb_day": 1, "store_gb": 1})
+        plans = region_feature_plans(rows)
+        self.assertEqual([plan["projects"] for plan in plans], [6, 4, 3])
+        self.assertEqual([plan["label"] for plan in plans], ["Ceiling", "−25%", "Floor"])
+        mixed = [set(row.get("solution") for row in group) for group in plans[-1]["groups"]]
+        self.assertTrue(all(len(sols) == 1 for sols in mixed))
+        one = [
+            {"name": str(i), "solution": "observability", "region": "eastus2", "bulk_gb_day": 1, "store_gb": 1}
+            for i in range(43)
+        ]
+        self.assertEqual(
+            [plan["projects"] for plan in region_feature_plans(one)],
+            [43, 32, 24, 18, 14, 10, 8, 6, 4, 3, 2, 1],
+        )
+        from diag_inputs import reduction_counts
+        self.assertEqual(reduction_counts(35, 14), [35, 26, 20, 15, 14])
 
 
 class EstimateFolderTests(unittest.TestCase):
@@ -1266,14 +1291,23 @@ class ConsolidationLayoutTests(unittest.TestCase):
         acc["ecu"]["contract"] = {"commit_pace_ecu_per_day": 10}
         acc["consolidation"] = build_consolidation(acc, None)
         html = render_consolidation_html(acc)
-        cover = html.split("What you pay for today", 1)[0]
+        cover = html.split("Monthly estimate as deployments become projects", 1)[0]
         self.assertIn("Serverless at list", cover)
-        self.assertIn("Serverless at contract rate", cover)
+        self.assertNotIn("Serverless at contract rate", cover)
         self.assertIn("ECH at contract rate", cover)
         self.assertIn("Contract rate $0.5 per ECU", cover)
-        self.assertIn("minus serverless at the contract rate", cover)
-        self.assertNotIn("The contract rate is not applied to serverless.", cover)
-        self.assertNotIn("minus serverless at list", cover)
+        self.assertIn("minus serverless at list", cover)
+        self.assertNotIn("minus serverless at the contract rate", cover)
+        plan = html.split("Monthly estimate as deployments become projects", 1)[1].split("<h2>", 1)[0]
+        self.assertIn("Serverless at list", plan)
+        self.assertIn("ECH at contract rate", plan)
+        self.assertIn("ECH bill minus serverless at list", plan)
+        self.assertNotIn("Serverless at contract rate", plan)
+        self.assertNotIn("Serverless at contract rate", html)
+        self.assertNotIn("At contract rate", html)
+        usage = html.split("What if data is kept longer", 1)[1]
+        self.assertIn("Serverless at list", usage)
+        self.assertIn("ECH at contract rate", usage)
 
     def test_cover_stays_on_the_complete_month_average_without_a_30_day_rate(self):
         acc = _quote_account(g26=10, e73=0)

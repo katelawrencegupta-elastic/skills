@@ -370,27 +370,30 @@ def bar_chart(categories: list[str], series: list[tuple[str, list[float]]], *, s
     return "".join(out) + legend
 
 
-def plan_hbar(rows: list[tuple[str, str, float]], *, ref: tuple[float, str] | None = None, width: int = 440, contract: list[float] | None = None) -> str:
+def plan_hbar(rows: list[tuple[str, str, float]], *, ref: tuple[float, str] | None = None, width: int = 440, contract: list[float] | None = None, ech: tuple[float, str] | None = None) -> str:
     """Horizontal bars for a tall column. Each row is (cut, project count, monthly dollars).
 
     The dollar amount sits on the bar. The project count is a column on the
-    right, with one arrow pointing down beside that column. When `contract`
-    is set, each cut draws the list amount and that amount at the contract rate.
+    right, with one arrow pointing down beside that column. When `ech` is set,
+    each cut draws serverless at list and that ECH bill, and the savings under
+    the project count is the ECH bill minus serverless at list.
     """
     n = max(len(rows), 1)
     dx, dy = 8.0, 5.0
-    label_w, count_w, arrow_w = 48, 96, 16
+    label_w, count_w, arrow_w = 64, 96, 16
     plot_x = label_w
     plot_w = max(width - plot_x - count_w - arrow_w, 40)
-    dual = contract is not None
+    dual = ech is not None or contract is not None
     row_h, bar_h, top = (72 if dual else 52), (14 if dual else 22), 22
     height = top + n * row_h + 22
     vals = [float(v or 0) for _, _, v in rows]
+    if ech is not None:
+        vals.append(float(ech[0]))
     if contract:
         vals.extend(float(v or 0) for v in contract)
-    vmax = _nice_max(max(vals + ([ref[0]] if ref else []) + [1]))
+    vmax = _nice_max(max(vals + ([ref[0]] if ref and ech is None else []) + [1]))
     out = [f"<svg viewBox='0 0 {width} {height}' width='100%' xmlns='http://www.w3.org/2000/svg' font-family='inherit'>"]
-    if ref:
+    if ref and ech is None:
         rx = plot_x + plot_w * min(float(ref[0]), vmax) / vmax
         anchor = "end" if rx > plot_x + plot_w * 0.55 else "start"
         lx = min(rx - 4, plot_x + plot_w - 4) if anchor == "end" else rx + 4
@@ -420,15 +423,24 @@ def plan_hbar(rows: list[tuple[str, str, float]], *, ref: tuple[float, str] | No
 
     for i, (title, sub, v) in enumerate(rows):
         mid = top + i * row_h + row_h / 2
-        if dual:
+        if ech is not None:
+            gap = 4
+            _money_bar(mid - bar_h - gap / 2, float(v or 0), PALETTE[2])
+            _money_bar(mid + gap / 2, float(ech[0]), PALETTE[0])
+        elif contract is not None:
             gap = 4
             _money_bar(mid - bar_h - gap / 2, float(v or 0), PALETTE[2])
             _money_bar(mid + gap / 2, float(contract[i] or 0), PALETTE[8])
         else:
-            _money_bar(mid - bar_h / 2, float(v or 0), PALETTE[0])
+            _money_bar(mid - bar_h / 2, float(v or 0), PALETTE[2])
         out.append(f"<text x='4' y='{mid + 4:.1f}' fill='#343741' font-size='13' font-weight='700'>{esc(title)}</text>")
         if sub:
-            out.append(f"<text x='{count_x:.1f}' y='{mid + 4:.1f}' fill='#343741' font-size='12' font-weight='600'>{esc(sub)}</text>")
+            sub_y = mid - 2 if ech is not None else mid + 4
+            out.append(f"<text x='{count_x:.1f}' y='{sub_y:.1f}' fill='#343741' font-size='12' font-weight='600'>{esc(sub)}</text>")
+            if ech is not None:
+                gap_usd = float(ech[0]) - float(v or 0)
+                gap_label = f"−${abs(gap_usd):,.0f}" if gap_usd < 0 else f"${gap_usd:,.0f}"
+                out.append(f"<text x='{count_x:.1f}' y='{mid + 14:.1f}' fill='#343741' font-size='11' font-weight='600'>{gap_label}</text>")
     if n >= 2 and any(sub for _, sub, _ in rows):
         ax = width - 8
         y_top = top + row_h / 2
@@ -442,8 +454,12 @@ def plan_hbar(rows: list[tuple[str, str, float]], *, ref: tuple[float, str] | No
     out.append(f"<text x='{plot_x}' y='{axis_y + 14:.1f}' fill='#69707D' font-size='11'>$0</text>")
     out.append(f"<text x='{plot_x + plot_w:.1f}' y='{axis_y + 14:.1f}' text-anchor='end' fill='#69707D' font-size='11'>{usd(vmax)}</text>")
     out.append("</svg>")
-    if dual:
+    if ech is not None:
+        out.append(_legend(["Serverless at list", ech[1]], [PALETTE[2], PALETTE[0]]))
+    elif contract is not None:
         out.append(_legend(["Serverless at list", "Serverless at contract rate"], [PALETTE[2], PALETTE[8]]))
+    else:
+        out.append(_legend(["Serverless at list"], [PALETTE[2]]))
     return "".join(out)
 
 
@@ -1457,23 +1473,35 @@ def serverless_component_slide(acc: dict, *, new_page: bool = True, bare: bool =
     for k, v in by_sol.items():
         if not ((v.get("stored_gb") or 0) > 0 or (v.get("total_mo") or 0) > 0):
             continue
-        parts = []
-        if v.get("search_mo") is not None:
-            parts.append(f"search VCU {usd(v.get('search_mo'))}")
-        if v.get("ingest_mo") is not None:
-            parts.append(f"ingest {usd(v.get('ingest_mo'))}")
-        if v.get("retention_mo") is not None:
-            parts.append(f"retain {usd(v.get('retention_mo'))}")
-        if v.get("eis_mo"):
-            parts.append(f"EIS {usd(v.get('eis_mo'))}")
-        if v.get("support_mo") is not None:
-            parts.append(f"support 15% {usd(v.get('support_mo'))}")
+        region_rows = [
+            r for r in (v.get("by_region") or [])
+            if isinstance(r, dict) and r.get("monthly") is not None
+        ]
+        region_sum = sum(float(r.get("monthly") or 0) for r in region_rows)
+        total = float(v.get("total_mo") or 0)
+        piece_vals = [
+            ("search VCU", v.get("search_mo")),
+            ("ingest", v.get("ingest_mo")),
+            ("retain", v.get("retention_mo")),
+            ("EIS", v.get("eis_mo") or None),
+            ("support 15%", v.get("support_mo")),
+        ]
+        piece_vals = [(label, float(val)) for label, val in piece_vals if val is not None]
+        pieces_sum = sum(val for _label, val in piece_vals)
+        regions_are_the_total = bool(region_rows) and total and abs(region_sum - total) <= 1.0
+        pieces_are_the_total = bool(piece_vals) and total and abs(pieces_sum - total) <= 1.0
+        if k in ("observability", "security") and regions_are_the_total and not pieces_are_the_total:
+            parts = [f"{r.get('region')} {usd(r.get('monthly'))}" for r in region_rows]
+        elif pieces_are_the_total:
+            parts = [f"{label} {usd(val)}" for label, val in piece_vals]
+        else:
+            parts = []
         comp_rows.append([k.title(), " + ".join(parts) or "—", usd(v.get("total_mo")), estimator_label(v.get("pricing"))])
     left = "<h3>By component</h3>" + table(
         ["Project", "Components / mo", "Estimate / mo", "Estimator"], comp_rows, ["left", "left", "right", "left"],
     ) + bullets([
         "On a Search row, add the component dollars to get the monthly total. Support is 15% of the other Search components.",
-        "The Observability row is one total. It is not split into ingest, retention, and support.",
+        "Observability and Security list one read-back per region. Those regions add up to the estimate.",
     ])
     cons = sz.get("consolidated") or {}
     right = "<h3>Sizing inputs</h3>" + table(
@@ -1703,17 +1731,9 @@ def _search_profile_fallback(acc: dict) -> str:
         if eis_profile:
             row.insert(6, usd(eis_profile))
         rows.append(row)
-    profile_rate = _contract_usd_per_ecu((acc.get("consolidation") or {}).get("contract_rate") or {})
     profile_monthly = [float(p.get("Total $/month") or 0) for p in profiles]
     profile_series = [("At list, $ / month", profile_monthly)]
     profile_colors = [PALETTE[2]]
-    if profile_rate is not None:
-        profile_series.append(("At contract rate, $ / month", [round(v * profile_rate, 2) for v in profile_monthly]))
-        profile_colors.append(PALETTE[8])
-        headers[1] = "At list, $ / mo"
-        headers.insert(2, "At contract rate, $ / mo")
-        for row, amount in zip(rows, profile_monthly):
-            row.insert(2, usd(round(amount * profile_rate, 2)))
     prof_table = table(
         headers,
         rows,
@@ -1731,7 +1751,6 @@ def _search_profile_fallback(acc: dict) -> str:
         + bullets([
             "On-demand is the sum of the regional Search projects used in this report. Performant and high availability keep more search capacity ready, so they cost more for the same GB." if regional_profiles else "On-demand is the Search Serverless price used in this report. Performant and high availability keep more search capacity ready, so they cost more for the same GB.",
             "Y: dollars per month. X: Search Serverless power setting.",
-            "At list is the estimator total. At contract rate multiplies that total by ARR ÷ (commit ECU/day × 365)." if profile_rate is not None else "",
             "Ingest is $0 on every profile when average document size is missing.",
             (f"EIS is {usd(eis_profile)} on every profile, and it is inside $ / mo. Search $ + storage $ + EIS $ + support $ = $ / mo." if eis_profile else ""),
         ])
@@ -1749,28 +1768,21 @@ def search_power_section(acc: dict, *, new_page: bool = True) -> str:
         profiles = sorted(profiles, key=lambda p: order.get(str(p.get("Search Power Setting") or "").lower(), 9))
         labels = [str(p.get("Search Power Setting") or "") for p in profiles]
         monthly = [float(p.get("Total $/month") or 0) for p in profiles]
-        power_rate = _contract_usd_per_ecu((acc.get("consolidation") or {}).get("contract_rate") or {})
         stored = ((acc.get("consolidation") or {}).get("basis") or {}).get("stored_gb")
         stored_bit = f"{float(stored):,.0f} GB" if stored else "the sized stored GB"
         power_series = [("At list, $ / month", monthly)]
         power_colors = [PALETTE[2]]
-        if power_rate is not None:
-            power_series.append(("At contract rate, $ / month", [round(v * power_rate, 2) for v in monthly]))
-            power_colors.append(PALETTE[8])
         body = "<h3>Monthly search-power estimate</h3>" + bar_chart(
             labels,
             power_series,
             width=700, height=230, show_values=True, prefix="$", exact_values=True, colors=power_colors,
         )
         power_headers = ["Search power", "At list, $ / month", "Steady annual", "Provisioned VCU", "Idle VCU", "Search $", "Ingest $", "Storage $", "Support $"]
-        if power_rate is not None:
-            power_headers.insert(2, "At contract rate, $ / month")
         body += table(
             power_headers,
             [[
                 p.get("Search Power Setting"),
                 usd(p.get("Total $/month")),
-                *([usd(round(float(p.get("Total $/month") or 0) * power_rate, 2))] if power_rate is not None else []),
                 usd(float(p.get("Total $/month") or 0) * 12),
                 p.get("Provisioned Search VCU/h"),
                 p.get("Idle Search VCU/h"),
@@ -1785,7 +1797,6 @@ def search_power_section(acc: dict, *, new_page: bool = True) -> str:
         body += bullets([
             "On-demand, performant, and high availability are the three search-power settings. High availability is the highly-performant option: it keeps the most search capacity ready.",
             f"The bars use {stored_bit}, the measured query rate, and Premium support. They are not added to the Observability ingest quote.",
-            "At list is the estimator total. At contract rate multiplies that total by ARR ÷ (commit ECU/day × 365)." if power_rate is not None else "",
             "Y: dollars per month. X: search power.",
         ])
         parts.append(body)
@@ -2316,33 +2327,29 @@ def _plan_rows(acc: dict) -> list[list]:
     month = "Every project is written as 1 month." if thirty else "Retention on a project is that group's measured months, rounded up."
     n = _plan_n(plan)
     floor = _plan_floor(acc)
-    n_bit = f" N = {n}, the active Observability deployments." if n is not None else ""
-    floor_bit = f" A step below {floor} stays at {floor}."
+    n_bit = f" The ceiling is {n}, one project per ECH deployment." if n is not None else ""
+    floor_bit = f" The floor is {floor}, one project per feature per region."
     rows = [[
         "Deployment-count steps",
-        "100% is one serverless project per ECH deployment. 75%, 50%, and 25% keep round(N × that share). round is half-to-even, so .5 goes to the even integer and a step can be 0 projects when the floor is 1. 0% is the minimum."
+        "Start at the ceiling. Each later bar is round(previous × 0.75). round is half-to-even, so .5 goes to the even integer. A result at or under the floor is the floor, and the series stops."
         + floor_bit,
-        month + " Bulk does not change." + n_bit,
+        month + " Projects stay inside one region and one feature." + n_bit,
         f"{len(plan)} steps",
     ]]
     for row in plan:
         label = str(row.get("label") or "")
-        pct = _cut_pct(label)
-        if pct is None or n is None:
-            formula = "Sum of the Observability D32 read-backs at this step."
-            count_line = _count_label(row.get("projects"), "project")
-        elif pct >= 100:
-            formula = "One serverless project per ECH deployment."
-            count_line = _plan_count_line(n, pct, floor)
-        elif pct <= 0 and floor <= 1:
-            formula = "Held at 1 project. The dollar is the Observability headline."
-            count_line = _plan_count_line(n, pct, floor)
-        elif pct <= 0:
-            formula = f"Held at the floor of {floor} projects. The dollar is that pack."
-            count_line = _plan_count_line(n, pct, floor)
+        projects = row.get("projects")
+        prior = row.get("from_projects")
+        if prior is None:
+            formula = "Ceiling. One serverless project per ECH deployment, aligned to that deployment's feature."
+            count_line = f"The count is {projects}."
+        elif int(projects or 0) <= floor:
+            formula = f"Floor. One project per feature per region. round({prior} × 0.75) is at or under {floor}, so the count stays {floor}."
+            count_line = f"{prior} × 0.75 is at or under the floor of {floor}."
         else:
-            formula = f"Projects kept = round(N × {pct / 100:.2f}), and not below {floor}."
-            count_line = _plan_count_line(n, pct, floor)
+            product = float(prior) * 0.75
+            formula = f"25% fewer than the previous bar. round({prior} × 0.75) = {projects}."
+            count_line = f"{prior} × 0.75 = {_plain_number(product)}, which rounds to {projects}."
         count = _count_label(row.get("projects"), "project")
         money = _formula_money(row.get("monthly"))
         rows.append([
@@ -2502,29 +2509,26 @@ def deployment_plan_section(c: dict, sv: dict, *, alongside: str = "") -> str:
         for p in plan
     ]
     if sv.get("ech_contract_mo") is not None:
-        plan_ref = (float(sv["ech_contract_mo"]), f"ECH bill {usd(sv['ech_contract_mo'])}")
+        ech = (float(sv["ech_contract_mo"]), "ECH at contract rate")
+    elif sv.get("ech_list_mo") is not None:
+        ech = (float(sv["ech_list_mo"]), "ECH at list")
     else:
-        plan_ref = None
-    plan_rate = _contract_usd_per_ecu(c.get("contract_rate") or {})
-    plan_contract = [round(amount * plan_rate, 2) for _label, _count, amount in rows] if plan_rate else None
+        ech = None
     if c.get("retention_set_days") == 30:
-        plan_ret = "Observability on every bar is 30 days, written as 1 month. Search is not on this chart."
+        plan_ret = "Observability on every serverless bar is 30 days, written as 1 month. Search disk is the measured store scaled to 1 month."
     else:
-        plan_ret = "Retention on each project is its measured months, rounded up."
-    if plan_contract is not None:
-        plan_ret += " The upper bar is that estimate at list. The lower bar multiplies it by ARR ÷ (commit ECU/day × 365)."
+        plan_ret = "Retention on each serverless project is its measured months, rounded up."
     n = _plan_n(plan)
     n_bit = f" N = {n}." if n is not None else ""
-    chart = plan_hbar(rows, ref=plan_ref, width=460, contract=plan_contract)
+    chart = plan_hbar(rows, width=460, ech=ech)
     chart += caption(
         "The project count is on the right. The arrow beside it points down the column."
         + n_bit
-        + " 100% is one serverless project per ECH deployment. 75%, 50%, and 25% keep round(N × that share), half-to-even. "
-        + (
-            f"0% is the minimum, {int(c.get('deployment_plan_floor') or 1)} projects, and no bar goes below it. "
-            if int(c.get("deployment_plan_floor") or 1) > 1 else
-            "0% is held at 1 project and uses the Observability headline. "
-        )
+        + " Ceiling is one serverless project per ECH deployment, aligned to that deployment's feature. "
+        + "Each later bar is round(previous × 0.75), half-to-even. "
+        + f"The floor is one project per feature per region, {int(c.get('deployment_plan_floor') or 1)} projects, and the series stops there. "
+        + "The upper bar is serverless at list. The lower bar is the ECH bill, the same on every step. "
+        + "The amount under the project count is that ECH bill minus serverless at list. "
         + plan_ret
     )
     if alongside:
@@ -2719,16 +2723,9 @@ def render_consolidation_html(acc: dict) -> str:
         ech_cat = "ECH at contract rate" if sv.get("cost_mo") is not None else "ECH at list"
         svl_cat = "Serverless estimate"
     cover_rate = _contract_usd_per_ecu(cr) if sv.get("cost_mo") is not None else None
-    contract_mo = None
-    reduce_mo = sv.get("cost_mo")
-    reduce_pct = sv.get("cost_pct")
     if sv.get("cost_mo") is not None:
         list_mo = float(sv.get("serverless_mo") or 0)
         ech_c = float(sv.get("ech_contract_mo") or 0)
-        if cover_rate is not None:
-            contract_mo = round(list_mo * cover_rate, 2)
-            reduce_mo = round(ech_c - contract_mo, 2)
-            reduce_pct = round(100 * reduce_mo / ech_c, 1) if ech_c else None
         ech_stat = "Monthly ECH cost at the contract rate" + (f", {window}" if window else "")
         svl_stat = "Estimated monthly serverless cost at list" + (f", {window}" if window else "")
         save_stat = "Estimated monthly reduction at the contract rate" + (f", {window}" if window else "")
@@ -2736,24 +2733,15 @@ def render_consolidation_html(acc: dict) -> str:
         stats = [
             stat(usd(sv.get("ech_contract_mo")), ech_stat, tag="calculated"),
             stat(usd(sv.get("serverless_mo")), svl_stat, "success", tag="estimate", estimate=True),
-            stat(usd(reduce_mo), save_stat, "success", tag="estimate", estimate=True),
-            stat(pct(reduce_pct), pct_stat, "success", tag="estimate", estimate=True, down=_reduction(reduce_pct)),
+            stat(usd(sv.get("cost_mo")), save_stat, "success", tag="estimate", estimate=True),
+            stat(pct(sv.get("cost_pct")), pct_stat, "success", tag="estimate", estimate=True, down=_reduction(sv.get("cost_pct"))),
         ]
         if cover_rate is not None:
-            ech_cat, svl_cat, ctr_cat = "ECH at contract rate", "Serverless at list", "Serverless at contract rate"
-            chart_cats = [ech_cat, svl_cat, ctr_cat]
-            chart_series = [
-                (ech_cat, [ech_c, 0.0, 0.0]),
-                (svl_cat, [0.0, list_mo, 0.0]),
-                (ctr_cat, [0.0, 0.0, contract_mo]),
-            ]
-            chart_colors = [PALETTE[0], PALETTE[2], PALETTE[8]]
-            chart_subs = [compare_subs[0], compare_subs[1], compare_subs[1]] if compare_subs and len(compare_subs) > 1 else compare_subs
-        else:
-            chart_cats = [ech_cat, svl_cat]
-            chart_series = [(ech_cat, [ech_c, 0.0]), (svl_cat, [0.0, list_mo])]
-            chart_colors = [PALETTE[0], PALETTE[2]]
-            chart_subs = compare_subs
+            ech_cat, svl_cat = "ECH at contract rate", "Serverless at list"
+        chart_cats = [ech_cat, svl_cat]
+        chart_series = [(ech_cat, [ech_c, 0.0]), (svl_cat, [0.0, list_mo])]
+        chart_colors = [PALETTE[0], PALETTE[2]]
+        chart_subs = compare_subs
     else:
         ech_stat = "Monthly ECH cost at list price" + (f", {window}" if window else "")
         svl_stat = "Estimated monthly serverless cost" + (f", {window}" if window else "")
@@ -2782,15 +2770,15 @@ def render_consolidation_html(acc: dict) -> str:
         quote_bits.append(f"{estimator_label(q.get('source'))} {usd(q.get('monthly'))}/mo")
     if sv.get("cost_mo") is not None and quote_days:
         cover_notes = [
-            f"Calculated: the last {int(quote_days)} days of billed ECU, as a month (that total ÷ {int(quote_days)} × 30.416), at the contract rate, ARR ÷ (commit ECU per day × 365). Serverless at list is the estimator total at that same pace. Serverless at contract rate multiplies that total by the same rate. The reduction is ECH at the contract rate minus serverless at the contract rate.",
+            f"Calculated: the last {int(quote_days)} days of billed ECU, as a month (that total ÷ {int(quote_days)} × 30.416), at the contract rate, ARR ÷ (commit ECU per day × 365). Serverless at list is the estimator total at that same pace. The reduction is ECH at the contract rate minus serverless at list.",
             ("The serverless estimate is " + " plus ".join(quote_bits) + ".") if quote_bits else "The serverless estimate is one project per solution.",
-            f"The rate is ${cr.get('implied_usd_per_ecu')} per ECU, shown rounded and applied unrounded. Those {int(quote_days)} days put ECH at {usd(sv.get('ech_contract_mo'))}/mo and serverless at the contract rate at {usd(contract_mo)}/mo. That is {usd(reduce_mo)}/mo lower, a {pct(reduce_pct)} reduction.",
+            f"The rate is ${cr.get('implied_usd_per_ecu')} per ECU, shown rounded and applied unrounded. Those {int(quote_days)} days put ECH at {usd(sv.get('ech_contract_mo'))}/mo. Serverless at list is {usd(sv.get('serverless_mo'))}/mo. The reduction is {usd(sv.get('cost_mo'))}/mo, {pct(sv.get('cost_pct'))}.",
         ]
     elif sv.get("cost_mo") is not None:
         cover_notes = [
-            "Calculated: ECU at the contract rate, ARR ÷ (commit ECU per day × 365). Serverless at list is the estimator total. Serverless at contract rate multiplies that total by the same rate. The reduction is ECH at the contract rate minus serverless at the contract rate.",
+            "Calculated: ECU at the contract rate, ARR ÷ (commit ECU per day × 365). Serverless at list is the estimator total. The reduction is ECH at the contract rate minus serverless at list.",
             ("The serverless estimate is " + " plus ".join(quote_bits) + ".") if quote_bits else "The serverless estimate is one project per solution.",
-            f"The rate is ${cr.get('implied_usd_per_ecu')} per ECU, shown rounded and applied unrounded. That puts ECH at {usd(sv.get('ech_contract_mo'))}/mo and serverless at the contract rate at {usd(contract_mo)}/mo. That is {usd(reduce_mo)}/mo lower, a {pct(reduce_pct)} reduction.",
+            f"The rate is ${cr.get('implied_usd_per_ecu')} per ECU, shown rounded and applied unrounded. That puts ECH at {usd(sv.get('ech_contract_mo'))}/mo. Serverless at list is {usd(sv.get('serverless_mo'))}/mo. The reduction is {usd(sv.get('cost_mo'))}/mo, {pct(sv.get('cost_pct'))}.",
         ]
     elif quote_days:
         cover_notes = [
@@ -2884,16 +2872,13 @@ def render_consolidation_html(acc: dict) -> str:
         raw_total = sv.get("ech_contract_mo") if contract_rate else sv.get("ech_list_mo")
         if raw_total is not None:
             lookback_total = float(raw_total)
-    show_svl_contract = cover_rate is not None
     list_i = 2 if lookback_total is not None else 1
-    slots = list_i + 1 + (1 if show_svl_contract else 0)
+    slots = list_i + 1
 
     def _bars(ech: float, serverless: float) -> list[float]:
         vals = [0.0] * slots
         vals[0] = ech
         vals[list_i] = serverless
-        if show_svl_contract:
-            vals[list_i + 1] = round(float(serverless) * cover_rate, 2)
         return vals
 
     pieces = [
@@ -2922,9 +2907,7 @@ def render_consolidation_html(acc: dict) -> str:
     categories = ["Full lookback"]
     if lookback_total is not None:
         categories.append(f"{int(quote_days)}-day lookback")
-    categories.append("Serverless at list" if show_svl_contract else "Serverless")
-    if show_svl_contract:
-        categories.append("Serverless at contract rate")
+    categories.append("Serverless at list" if cover_rate is not None else "Serverless")
     chart = bar_chart(categories, ser, stacked=True, width=520, height=260, show_values=True)
     projects = table(["Project", "Deps", "Stored GB", "Raw GB/d", "Metered GB/d", "Total $/mo", "ECH ECU/mo", "Pricing"],
                      [[k.title(), v.get("deployments"), n0(v.get("stored_gb")), n1(v.get("daily_raw_gb")), n0(v.get("daily_metered_gb")), usd(v.get("total_mo")), n0(v.get("ech_ecu_mo")), estimator_label(v.get("pricing"))] for k, v in (svl.get("by_solution") or {}).items() if (v.get("stored_gb") or 0) > 0 or (v.get("ech_ecu_mo") or 0) > 0],
@@ -2951,9 +2934,8 @@ def render_consolidation_html(acc: dict) -> str:
         build_notes = [
             f"Full lookback: ECU over {n0(b0.get('lookback_days'))} days, divided into a month and split by tier, at the contract rate.",
             f"{int(quote_days)}-day lookback: the usage total on the cover, {usd(lookback_total)}. It is not split by tier.",
-            "Serverless at list: dollars per month from the estimator at that lookback." if show_svl_contract else "Serverless: dollars per month from the estimator at that lookback.",
-            "Serverless at contract rate: that list total × ARR ÷ (commit ECU/day × 365)." if show_svl_contract else "",
-            "All four bars are dollars." if show_svl_contract else "All three bars are dollars.",
+            "Serverless at list: dollars per month from the estimator at that lookback." if cover_rate is not None else "Serverless: dollars per month from the estimator at that lookback.",
+            "All three bars are dollars.",
         ]
         build_notes = [note for note in build_notes if note]
     elif lookback_total is not None:
@@ -2966,9 +2948,8 @@ def render_consolidation_html(acc: dict) -> str:
     elif contract_rate:
         build_notes = [
             f"Full lookback: those ECU at the contract rate. It includes partial months, so it will not equal the {usd(sv.get('ech_contract_mo'))} complete-month contract cost in the headline.",
-            "Serverless at list: dollars per month from the serverless build-up." if show_svl_contract else "Serverless: dollars per month from the serverless build-up.",
-            "Serverless at contract rate: that list total × ARR ÷ (commit ECU/day × 365)." if show_svl_contract else "",
-            "All three bars are dollars." if show_svl_contract else "Both bars are dollars.",
+            "Serverless at list: dollars per month from the serverless build-up." if cover_rate is not None else "Serverless: dollars per month from the serverless build-up.",
+            "Both bars are dollars.",
         ]
         build_notes = [note for note in build_notes if note]
     else:
@@ -3154,20 +3135,16 @@ def render_consolidation_html(acc: dict) -> str:
     if has_svl:
         fleet_series.append(("Serverless at list" if cover_rate is not None else "Serverless, estimate", [f.get("serverless_mo") or 0 for f in fleet]))
         colors5.append(PALETTE[2])
-        if cover_rate is not None:
-            fleet_series.append(("Serverless at contract rate", [round(float(f.get("serverless_mo") or 0) * cover_rate, 2) for f in fleet]))
-            colors5.append(PALETTE[8])
     fc = bar_chart([_fleet_axis(f["scenario"]) for f in fleet], fleet_series, width=920, height=300, show_values=True, prefix="$", colors=colors5, exact_values=True)
     if has_contract and cover_rate is not None:
-        ft_headers = ["Usage", "ECH at contract rate", "Serverless at list", "Serverless at contract rate", "Savings vs. contract rate"]
+        ft_headers = ["Usage", "ECH at contract rate", "Serverless at list", "Savings vs. contract rate"]
         ft_rows = [[
             _fleet_row_label(f["scenario"]),
             usd(f.get("ech_cost_mo")),
             usd(f.get("serverless_mo")),
-            usd(round(float(f.get("serverless_mo") or 0) * cover_rate, 2)),
             usd(f.get("save_vs_contract_mo")),
         ] for f in fleet]
-        ft_align = ["left", "right", "right", "right", "right"]
+        ft_align = ["left", "right", "right", "right"]
     elif has_contract:
         ft_headers = ["Usage", "ECH at contract rate", "Serverless, estimate", "Savings vs. contract rate"]
         ft_rows = [[_fleet_row_label(f["scenario"]), usd(f.get("ech_cost_mo")), usd(f.get("serverless_mo")), usd(f.get("save_vs_contract_mo"))] for f in fleet]
@@ -3189,7 +3166,7 @@ def render_consolidation_html(acc: dict) -> str:
         basis_label = f"The {int(quote_days)}-day lookback" if quote_days else "Average month"
         fleet_notes.append(f"{basis_label} is the serverless estimate in this report. The other rows scale it by the same usage change ({scales}). The estimators were not re-run for them." if others else "The serverless figure is the estimate in this report.")
         if cover_rate is not None:
-            fleet_notes.append("Serverless at list is the estimator total. Serverless at contract rate multiplies that total by ARR ÷ (commit ECU/day × 365). Savings vs. contract rate is ECH at the contract rate minus serverless at list.")
+            fleet_notes.append("Savings vs. contract rate is ECH at the contract rate minus serverless at list.")
         busy = next((f for f in fleet if "last 30" in f["scenario"].lower() and abs(float(f.get("scale") or 0) - 1) > 1e-9), None)
         if busy and busy.get("save_vs_contract_mo") is not None:
             fleet_notes.append(f"At the last-30-day pace, the estimated savings against the contract rate are {usd(busy['save_vs_contract_mo'])}/mo.")

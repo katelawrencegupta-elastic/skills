@@ -205,6 +205,98 @@ def deployment_count_plans(rows: list[dict], floor: int = 1) -> list[dict]:
     return plans
 
 
+def _pair_key(row: dict) -> tuple[str, str]:
+    return (str(row.get("region") or "unknown"), str(row.get("solution") or "observability"))
+
+
+def plan_floor_for_rows(rows: list[dict]) -> int:
+    """One serverless project per feature per region. Never more than the deployment count."""
+    n = len(rows)
+    logical = len({_pair_key(row) for row in rows}) or 1
+    if n <= 0:
+        return logical
+    return min(logical, n)
+
+
+def reduction_counts(ceiling: int, floor: int) -> list[int]:
+    """Ceiling, then round(previous × 0.75) until the floor. Half-to-even. The series stops at the floor."""
+    if ceiling <= 0:
+        return []
+    floor_n = min(max(int(floor), 1), ceiling)
+    counts = [ceiling]
+    current = ceiling
+    while current > floor_n:
+        nxt = int(round(current * 0.75))
+        if nxt >= current:
+            nxt = current - 1
+        if nxt <= floor_n:
+            if counts[-1] != floor_n:
+                counts.append(floor_n)
+            break
+        counts.append(nxt)
+        current = nxt
+    return counts
+
+
+def _split_within_pairs(pairs: list[list[dict]], count: int) -> list[list[dict]]:
+    """`count` projects, at least one per region and feature. Extras stay inside that pair."""
+    slots = [1] * len(pairs)
+    extras = max(0, count - len(pairs))
+    order = sorted(range(len(pairs)), key=lambda i: (-len(pairs[i]), -sum(_num(r, "store_gb") for r in pairs[i])))
+    for index in order:
+        if extras <= 0:
+            break
+        room = len(pairs[index]) - slots[index]
+        give = min(room, extras)
+        slots[index] += give
+        extras -= give
+    groups: list[list[dict]] = []
+    for pair, nslot in zip(pairs, slots):
+        if nslot >= len(pair):
+            groups.extend([[row] for row in pair])
+        elif nslot <= 1:
+            groups.append(list(pair))
+        else:
+            groups.extend(pack(pair, nslot))
+    return groups
+
+
+def region_feature_plans(rows: list[dict]) -> list[dict]:
+    """Ceiling is one project per ECH deployment. Each later bar is 25% fewer, until one per region and feature."""
+    n = len(rows)
+    buckets: dict[tuple[str, str], list[dict]] = {}
+    for row in rows:
+        buckets.setdefault(_pair_key(row), []).append(row)
+    pairs = sorted(buckets.values(), key=lambda g: -sum(_num(r, "store_gb") for r in g))
+    floor = plan_floor_for_rows(rows)
+    counts = reduction_counts(n, floor)
+    plans = []
+    previous = None
+    for step, count in enumerate(counts):
+        if n == 0 or count <= 0:
+            groups = []
+            label = "Ceiling"
+        elif count >= n:
+            groups = [[row] for row in sorted(rows, key=lambda r: -_num(r, "bulk_gb_day"))]
+            label = "Ceiling"
+        elif count <= len(pairs):
+            groups = [list(pair) for pair in pairs]
+            label = "Floor"
+        else:
+            groups = _split_within_pairs(pairs, count)
+            label = "−25%"
+        plans.append({
+            "cut_pct": step,
+            "label": label,
+            "projects": len(groups) if groups else count,
+            "from_projects": previous,
+            "groups": groups,
+            "floor": floor,
+        })
+        previous = len(groups) if groups else count
+    return plans
+
+
 def pack(rows: list[dict], n: int) -> list[list[dict]]:
     """Largest store_gb into the lightest bin. Price still uses bulk, not store."""
     bins: list[dict] = [{"store": 0.0, "rows": []} for _ in range(n)]

@@ -231,19 +231,23 @@ def projected_region_monthly(
     return float(price_o11y_serverless(float(daily or 0), months).get("total_mo") or 0)
 
 
-def logical_project_floor(acc: dict) -> int:
+def logical_project_floor(acc: dict, solutions: tuple[str, ...] | None = None) -> int:
     """Fewest serverless projects the regions and solutions still require.
 
     One project per solution per region, and only a region whose projected
     sizing is more than $10/mo. A solution that lives in one region still
     counts. With no regional split on the account, the floor stays 1.
+    `solutions` limits the count to those solutions.
     """
     groups = ((acc.get("consolidation") or {}).get("architecture") or {}).get("groups") or []
     if not groups:
         return 1
     by_sol: dict[str, list] = {}
     for group in groups:
-        by_sol.setdefault(group.get("solution") or "search", []).append(group)
+        sol = group.get("solution") or "search"
+        if solutions is not None and sol not in solutions:
+            continue
+        by_sol.setdefault(sol, []).append(group)
     con = (acc.get("sizing") or {}).get("consolidated") or {}
     workload = (con.get("search") or {}).get("workload") or acc.get("workload") or {}
     kept = 0
@@ -270,6 +274,22 @@ def logical_project_floor(acc: dict) -> int:
             if projected > REGION_ESTIMATE_MIN_USD:
                 kept += 1
     return kept or 1
+
+
+def plan_project_floor(acc: dict, n: int) -> int:
+    """Fewest projects on the Observability deployment-count chart.
+
+    The chart prices Observability and Security. Search regions stay off it.
+    A fleet whose priced regions collapse to one stays at 8 projects when it
+    has that many deployments. A step can then merge deployments that have
+    ingest instead of stopping on empty ones.
+    """
+    from diag_inputs import MINIMUM_PLAN_PROJECTS
+    logical = logical_project_floor(acc, solutions=("observability", "security"))
+    floor = MINIMUM_PLAN_PROJECTS if logical <= 1 else logical
+    if n <= 0:
+        return max(int(floor), 1)
+    return min(max(int(floor), 1), n)
 
 
 def _price_slice(solution: str, gb: float, retention_months: float, workload: dict | None) -> dict:
@@ -432,7 +452,12 @@ def _deployment_bars(sz: dict, by_solution: dict, notes: list[str]) -> list:
         if monthly is None:
             notes.append("Observability deployment-count plan was not priced.")
             return []
-        bars.append({"label": row.get("label") or "", "monthly": monthly, "projects": row.get("projects")})
+        bars.append({
+            "label": row.get("label") or "",
+            "monthly": monthly,
+            "projects": row.get("projects"),
+            "from_projects": row.get("from_projects"),
+        })
     return bars
 
 
