@@ -48,8 +48,15 @@ THIRTY_DAY_FOLDER = "30d"
 
 
 def pdf_folder_name(kind: str) -> str | None:
-    """Retention folder for a consolidation PDF. The account PDF stays in the run folder."""
+    """Subfolder for a consolidation PDF, or None for the run folder.
+
+    The account PDF, the appendix, and the bulk consolidation PDFs (full retention
+    and 30-day) stay in the run folder root. Compression-applied and K360 backup
+    PDFs go in their retention folder.
+    """
     if not kind or kind in ("account", "appendix"):
+        return None
+    if "compression" not in kind and "k360" not in kind:
         return None
     if kind.endswith("_30d"):
         return THIRTY_DAY_FOLDER
@@ -186,7 +193,15 @@ def bullets(items: list[str], *, columns: int = 1) -> str:
     lis = "".join(f"<li>{esc(x)}</li>" for x in items if x)
     if not lis:
         return ""
-    cls = "notes cols2" if columns == 2 else "notes"
+    cls = "notes"
+    if columns == 2:
+        cls += " cols2"
+    elif columns == 3:
+        cls += " cols3"
+    elif columns == 4:
+        cls += " cols4"
+    elif columns >= 5:
+        cls += " cols5"
     return f"<ul class='{cls}'>{lis}</ul>"
 
 
@@ -370,7 +385,7 @@ def bar_chart(categories: list[str], series: list[tuple[str, list[float]]], *, s
     return "".join(out) + legend
 
 
-def plan_hbar(rows: list[tuple[str, str, float]], *, ref: tuple[float, str] | None = None, width: int = 440, contract: list[float] | None = None, ech: tuple[float, str] | None = None) -> str:
+def plan_hbar(rows: list[tuple[str, str, float]], *, ref: tuple[float, str] | None = None, width: int = 440, contract: list[float] | None = None, ech: tuple[float, str] | None = None, compact: bool = False) -> str:
     """Horizontal bars for a tall column. Each row is (cut, project count, monthly dollars).
 
     The dollar amount sits on the bar. The project count is a column on the
@@ -384,8 +399,13 @@ def plan_hbar(rows: list[tuple[str, str, float]], *, ref: tuple[float, str] | No
     plot_x = label_w
     plot_w = max(width - plot_x - count_w - arrow_w, 40)
     dual = ech is not None or contract is not None
-    row_h, bar_h, top = (72 if dual else 52), (14 if dual else 22), 22
-    height = top + n * row_h + 22
+    if compact and dual:
+        row_h, bar_h, top, tail = (32, 9, 12, 12) if n >= 6 else (40, 10, 14, 14)
+    elif dual:
+        row_h, bar_h, top, tail = 72, 14, 22, 22
+    else:
+        row_h, bar_h, top, tail = 52, 22, 22, 22
+    height = top + n * row_h + tail
     vals = [float(v or 0) for _, _, v in rows]
     if ech is not None:
         vals.append(float(ech[0]))
@@ -546,38 +566,57 @@ def donut(items: list[tuple[str, float]], *, size: int = 170) -> str:
 
 
 def architecture_svg(groups: list[dict], projects: list[dict], *, width: int = 940) -> str:
-    """ECH deployments grouped by solution and region, each wired to its own serverless project."""
+    """ECH deployments grouped by solution and region, each wired to its own serverless project.
+
+    More than four pairs use two columns so the map stays on one landscape page.
+    """
     if not groups or not projects:
         return ""
     sol_color = {"search": PALETTE[0], "observability": PALETTE[1], "security": PALETTE[3]}
     by_key = {(p.get("solution"), p.get("region")): p for p in projects}
     paired = all((g["solution"], g["region"]) in by_key for g in groups)
-    lx, lw, rw = 4, 360, 330
-    rx = width - rw - 4
-    head, bh, gap = 26, 48, 10
     n_regions = len({g["region"] for g in groups})
-    height = head + len(groups) * (bh + gap) + 4
-    out = [f"<svg viewBox='0 0 {width} {height}' width='100%' xmlns='http://www.w3.org/2000/svg' font-size='12' font-family='inherit'>"]
+    cols = 2 if len(groups) > 4 else 1
+    per = math.ceil(len(groups) / cols)
+    gap_x = 14
+    col_w = (width - 8 - gap_x * (cols - 1)) / cols
+    if cols == 2:
+        bh, gap, font = 26, 3, 10
+        lw = col_w * 0.54
+        rw = col_w * 0.38
+        title_dy, sub_dy = 11, 21
+    else:
+        bh, gap, font = 36, 6, 11
+        lw, rw = 380, 320
+        title_dy, sub_dy = 14, 28
+    head = 18
+    height = head + per * (bh + gap) + 2
+    out = [f"<svg class='arch-map' viewBox='0 0 {width} {height}' width='100%' xmlns='http://www.w3.org/2000/svg' font-size='{font}' font-family='inherit'>"]
     n_deps = sum(g.get("n") or 0 for g in groups)
     right_title = "Serverless: one project per region" if n_regions > 1 and paired else "Serverless: one project per solution"
-    out.append(f"<text x='{lx}' y='14' font-weight='600' fill='#343741'>ECH today: {n_deps} deployments</text>")
-    out.append(f"<text x='{rx}' y='14' font-weight='600' fill='#343741'>{right_title}</text>")
+    out.append(f"<text x='4' y='12' font-weight='600' fill='#343741'>ECH today: {n_deps} deployments</text>")
+    out.append(f"<text x='{width - 4}' y='12' text-anchor='end' font-weight='600' fill='#343741'>{right_title}</text>")
     for i, g in enumerate(groups):
-        y = head + i * (bh + gap)
+        col_i = i % cols
+        row = i // cols
+        x0 = 4 + col_i * (col_w + gap_x)
+        y = head + row * (bh + gap)
+        lx = x0
+        rx = x0 + col_w - rw
         col = sol_color.get(g["solution"], PALETTE[6])
-        out.append(f"<rect x='{lx}' y='{y}' width='{lw}' height='{bh}' rx='6' fill='#F5F7FA' stroke='#D3DAE6'/>")
-        out.append(f"<rect x='{lx}' y='{y}' width='5' height='{bh}' rx='2' fill='{col}'/>")
-        out.append(f"<text x='{lx + 14}' y='{y + 19}' font-weight='600' fill='#343741'>{esc(g['solution'].title())} · {esc(g['region'])}</text>")
+        out.append(f"<rect x='{lx:.1f}' y='{y}' width='{lw:.1f}' height='{bh}' rx='6' fill='#F5F7FA' stroke='#D3DAE6'/>")
+        out.append(f"<rect x='{lx:.1f}' y='{y}' width='5' height='{bh}' rx='2' fill='{col}'/>")
+        out.append(f"<text x='{lx + 12:.1f}' y='{y + title_dy}' font-weight='600' fill='#343741'>{esc(g['solution'].title())} · {esc(g['region'])}</text>")
         dep_word = "deployment" if g["n"] == 1 else "deployments"
-        out.append(f"<text x='{lx + 14}' y='{y + 37}' fill='#69707D'>{g['n']} {dep_word} · {n0(g.get('ech_ecu_mo'))} ECU/mo · {n0(g.get('stored_gb'))} GB</text>")
+        out.append(f"<text x='{lx + 12:.1f}' y='{y + sub_dy}' fill='#69707D'>{g['n']} {dep_word} · {n0(g.get('ech_ecu_mo'))} ECU/mo · {n0(g.get('stored_gb'))} GB</text>")
         p = by_key.get((g["solution"], g["region"])) if paired else None
         if p:
             mid_y = y + bh / 2
-            out.append(f"<line x1='{lx + lw}' y1='{mid_y:.1f}' x2='{rx}' y2='{mid_y:.1f}' stroke='#98A2B3' stroke-width='1.4'/>")
-            out.append(f"<rect x='{rx}' y='{y}' width='{rw}' height='{bh}' rx='6' fill='#ffffff' stroke='{col}' stroke-width='1.6'/>")
-            out.append(f"<text x='{rx + 14}' y='{y + 19}' font-weight='700' fill='#343741'>{esc(p['solution'].title())} · {esc(p['region'])}</text>")
+            out.append(f"<line x1='{lx + lw:.1f}' y1='{mid_y:.1f}' x2='{rx:.1f}' y2='{mid_y:.1f}' stroke='#98A2B3' stroke-width='1.4'/>")
+            out.append(f"<rect x='{rx:.1f}' y='{y}' width='{rw:.1f}' height='{bh}' rx='6' fill='#ffffff' stroke='{col}' stroke-width='1.6'/>")
+            out.append(f"<text x='{rx + 10:.1f}' y='{y + title_dy}' font-weight='700' fill='#343741'>{esc(p['solution'].title())} · {esc(p['region'])}</text>")
             price = f"{usd(p['serverless_mo'])}/mo estimate" if p.get("serverless_mo") is not None else "not priced"
-            out.append(f"<text x='{rx + 14}' y='{y + 37}' fill='#343741'>{n0(p.get('stored_gb'))} GB · {esc(price)}</text>")
+            out.append(f"<text x='{rx + 10:.1f}' y='{y + sub_dy}' fill='#343741'>{n0(p.get('stored_gb'))} GB · {esc(price)}</text>")
     out.append("</svg>")
     return "".join(out)
 
@@ -856,7 +895,12 @@ h3 { font-size: 13px; font-weight: 700; color: #153385; margin: 0 0 6px; }
 ul.notes { margin: 4px 0 8px 18px; padding: 0; color: #343741; font-size: 12px; }
 ul.notes li { margin: 2px 0; }
 ul.notes.cols2 { columns: 2; column-gap: 22px; font-size: 11px; line-height: 1.28; margin-bottom: 4px; }
-ul.notes.cols2 li { break-inside: avoid; margin: 1px 0; }
+ul.notes.cols3 { columns: 3; column-gap: 14px; font-size: 10.5px; line-height: 1.25; margin-bottom: 4px; }
+ul.notes.cols4 { columns: 4; column-gap: 12px; font-size: 10px; line-height: 1.2; margin-bottom: 4px; }
+ul.notes.cols2 li, ul.notes.cols3 li { break-inside: avoid; margin: 1px 0; }
+ul.notes.cols4 li { break-inside: auto; margin: 0; }
+ul.notes.cols5 { columns: 5; column-gap: 10px; font-size: 9px; line-height: 1.2; margin-bottom: 4px; }
+ul.notes.cols5 li { break-inside: auto; margin: 0; }
 .sec { margin: 0 0 2px; } .newpage { break-before: page; }
 .page-break { break-before: page; }
 .stats { display: grid; gap: 12px; margin: 0 0 12px; align-items: stretch; }
@@ -961,6 +1005,51 @@ body.consolidation .callout { padding: 10px 14px; margin-bottom: 14px; }
 body.consolidation .foot { font-size: 12.5px; margin-top: 18px; }
 body.consolidation .sec { margin: 0 0 18px; }
 body.consolidation .keep { break-inside: avoid; }
+body.consolidation .cover { break-after: avoid; }
+body.consolidation .cover .masthead { padding: 8px 12px 8px; margin-bottom: 8px; }
+body.consolidation .cover .masthead h1 { font-size: 18px; line-height: 1.2; }
+body.consolidation .cover .masthead .sub { font-size: 12px; line-height: 1.3; }
+body.consolidation .cover .stats { gap: 8px; margin-bottom: 8px; }
+body.consolidation .cover .stat { padding: 6px 8px 8px; }
+body.consolidation .cover .stat .v { font-size: 16px; }
+body.consolidation .cover h3 { margin: 4px 0 2px; font-size: 14px; }
+body.consolidation .cover ul.notes.cols2 { font-size: 11.5px; line-height: 1.3; column-gap: 16px; margin: 4px 0 0 14px; }
+body.consolidation .sec.newpage {
+  break-before: page;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: calc(8.5in - 22mm - 16px);
+  margin: 0;
+  padding: 12px 14px 14px;
+  border: 1px solid #98A2B3;
+  border-radius: 8px;
+  background: #fff;
+}
+body.consolidation .sec.newpage h2 { margin: 0 0 8px; padding-bottom: 4px; }
+body.consolidation .sec.newpage h3 { font-size: 14px; margin: 8px 0 4px; }
+body.consolidation .sec.newpage .cap { font-size: 12px; line-height: 1.35; margin: 4px 0 6px; }
+body.consolidation .sec.newpage ul.notes { font-size: 12px; line-height: 1.35; margin: 4px 0 6px 16px; }
+body.consolidation .sec.newpage ul.notes li { margin: 1px 0; }
+body.consolidation .sec.newpage ul.notes.cols2 { font-size: 11.5px; line-height: 1.3; column-gap: 16px; }
+body.consolidation .sec.newpage th { font-size: 10.5px; }
+body.consolidation .sec.newpage td { font-size: 12px; line-height: 1.3; }
+body.consolidation .sec.newpage th,
+body.consolidation .sec.newpage td { padding: 3px 7px; }
+body.consolidation .sec.newpage .tbl { margin: 0 0 6px; }
+body.consolidation .sec.newpage .grid { gap: 10px; margin: 0 0 8px; }
+body.consolidation .sec.newpage .panel,
+body.consolidation .sec.newpage .card { padding: 8px 10px; }
+body.consolidation .sec.newpage .callout { padding: 6px 10px; margin-bottom: 6px; }
+body.consolidation .sec.newpage .stat { padding: 8px 10px; }
+body.consolidation .sec.newpage .stat .v { font-size: 16px; }
+body.consolidation .sec.newpage .legend { font-size: 11px; margin-top: 4px; }
+body.consolidation .sec.newpage .foot { margin-top: 8px; font-size: 11px; }
+body.consolidation .sec.newpage .rec { padding: 6px 10px; margin: 0 0 6px; font-size: 12px; line-height: 1.3; }
+body.consolidation .sec.newpage .rec .e,
+body.consolidation .sec.newpage .rec .docs { margin-top: 2px; }
+body.consolidation .sec.newpage ul.notes.cols3 { font-size: 10.5px; line-height: 1.25; column-gap: 12px; }
+body.consolidation .sec.newpage ul.notes.cols5 { font-size: 9px; line-height: 1.2; column-gap: 10px; margin: 4px 0 4px 14px; }
+body.consolidation .sec.newpage ul.notes.cols4 { font-size: 9.5px; line-height: 1.2; column-gap: 10px; margin: 4px 0 4px 14px; }
 """
 
 
@@ -1463,8 +1552,12 @@ def consolidation_inputs_html(acc: dict) -> str:
     return "<h3>Data used, and how the headline is calculated</h3>" + body
 
 
-def serverless_component_slide(acc: dict, *, new_page: bool = True, bare: bool = False) -> str:
-    """Component dollars and the sizing inputs. Bare HTML sits beside the deployment-count chart."""
+def serverless_component_slide(acc: dict, *, new_page: bool = True, bare: bool = False, beside: bool = False) -> str:
+    """Component dollars and the sizing inputs. Bare HTML sits beside the deployment-count chart.
+
+    `beside` is the two tables on the deployment-count page, under the chart.
+    The per-region list stays on the reconciliation page.
+    """
     c = acc.get("consolidation") or {}
     svl = c.get("serverless") or {}
     by_sol = svl.get("by_solution") or {}
@@ -1497,18 +1590,21 @@ def serverless_component_slide(acc: dict, *, new_page: bool = True, bare: bool =
         else:
             parts = []
         comp_rows.append([k.title(), " + ".join(parts) or "—", usd(v.get("total_mo")), estimator_label(v.get("pricing"))])
-    left = "<h3>By component</h3>" + table(
+    comp_table = "<h3>By component</h3>" + table(
         ["Project", "Components / mo", "Estimate / mo", "Estimator"], comp_rows, ["left", "left", "right", "left"],
-    ) + bullets([
-        "On a Search row, add the component dollars to get the monthly total. Support is 15% of the other Search components.",
-        "Observability and Security list one read-back per region. Those regions add up to the estimate.",
-    ])
+    )
     cons = sz.get("consolidated") or {}
     right = "<h3>Sizing inputs</h3>" + table(
         ["Solution", "Deployments", "ECU/mo", "Stored GB", "Kept (mo)", "GB/day"],
         [[k.title(), v.get("deployments"), n0(v.get("ecu_monthly_avg")), n0(v.get("stored_gb")), v.get("retention_months"), n1(v.get("daily_raw_gb"))] for k, v in cons.items()],
         ["left", "right", "right", "right", "right", "right"],
     )
+    if beside:
+        return grid(comp_table, right, ratio="1.05fr 1.15fr", gap="12px")
+    left = comp_table + bullets([
+        "On a Search row, add the component dollars to get the monthly total. Support is 15% of the other Search components.",
+        "Observability and Security list one read-back per region. Those regions add up to the estimate.",
+    ])
     diag_cov = sz.get("diagnostics") or {}
     if diag_cov.get("active_month"):
         month = diag_cov.get("active_month")
@@ -1636,7 +1732,7 @@ def metered_rate_section(acc: dict) -> str:
     if accounted:
         rate_lead = "The GB/day in this table is compressioncalc_accounted_for, bulk multiplied by 0.60. Metered GB/day is that figure × 1.595. Logs are 90% and metrics are 10%. Each stream walks the Observability ingest bands on its own. The rate is that deployment's blended dollars per metered GB when it is its own project."
     else:
-        rate_lead = "Metered GB/day is raw bulk × 1.595. Logs are 90% and metrics are 10%. Each stream walks the Observability ingest bands on its own. The rate is that deployment's blended dollars per metered GB when it is its own project."
+        rate_lead = "Metered GB/day is raw bulk × 1.595. That 1.595 expansion is this band walk, not G27 on the Observability sheet. Logs are 90% and metrics are 10%. Each stream walks the Observability ingest bands on its own. The rate is that deployment's blended dollars per metered GB when it is its own project."
     body = bullets([
         rate_lead,
         "The first 50 metered GB/day are $0.50 per GB. The bands then step to $0.325, $0.225, $0.15, $0.105, $0.10, $0.095, and $0.0925. A deployment inside the first band on both streams is $0.500, and that row is marked in red. A deployment with no bulk has no rate.",
@@ -1795,7 +1891,7 @@ def search_power_section(acc: dict, *, new_page: bool = True) -> str:
             ["success" if str(p.get("Search Power Setting")) == "on-demand" else None for p in profiles],
         )
         body += bullets([
-            "On-demand, performant, and high availability are the three search-power settings. High availability is the highly-performant option: it keeps the most search capacity ready.",
+            "On-demand, performant, and high availability are the three search-power settings. High availability is the notebook's third band: it keeps the most search capacity ready.",
             f"The bars use {stored_bit}, the measured query rate, and Premium support. They are not added to the Observability ingest quote.",
             "Y: dollars per month. X: search power.",
         ])
@@ -2327,7 +2423,7 @@ def _plan_rows(acc: dict) -> list[list]:
     month = "Every project is written as 1 month." if thirty else "Retention on a project is that group's measured months, rounded up."
     n = _plan_n(plan)
     floor = _plan_floor(acc)
-    n_bit = f" The ceiling is {n}, one project per ECH deployment." if n is not None else ""
+    n_bit = f" The ceiling is {n}, the cover count. Each is 30 days of complete billing." if n is not None else ""
     floor_bit = f" The floor is {floor}, one project per feature per region."
     rows = [[
         "Deployment-count steps",
@@ -2425,6 +2521,7 @@ def appendix_b_section(acc: dict, *, new_page: bool = True) -> str:
         _formula_group("Bulk and retention", _bulk_rows(acc)),
         _formula_group("30-day and compression scales", _scale_rows(acc)),
         _formula_group("Search workload", _workload_rows(acc)),
+        _formula_group("Raw bulk ingest", _raw_ingest_rows(acc)),
         _formula_group("Metered ingest rate", _metered_rows(acc)),
         _formula_group("Deployment count", _plan_rows(acc)),
         _formula_group("Fleet scales", _fleet_rows(acc)),
@@ -2467,6 +2564,303 @@ def _priced_project_count(svl: dict) -> int | None:
     return n or None
 
 
+METERED_EXPANSION = 1.595
+SHORT_UPTIME_DAYS = 2.0
+COMPRESSION_RATIO = 0.60
+
+
+def raw_ingest_by_deployment(acc: dict) -> dict:
+    """Raw bulk GB/day for every sized deployment, before and after the pace factor.
+
+    `quoted` is what the estimators receive (the pace factor already applied).
+    `measured` is that value ÷ the pace factor: the Σ est_bytes_per_day from the
+    bundle. The compression-applied run stores bulk × 0.60 in daily_raw_gb, so
+    the bulk is recovered from compressioncalc_accounted_for ÷ its ratio.
+    """
+    factor = (acc.get("ecu") or {}).get("quote_usage_factor")
+    try:
+        factor = float(factor) if factor else None
+    except (TypeError, ValueError):
+        factor = None
+    rows = []
+    for dep in (acc.get("solutions") or {}).get("by_deployment") or []:
+        if not isinstance(dep, dict):
+            continue
+        ratio = dep.get("compression_ratio")
+        accounted = dep.get("compressioncalc_accounted_for")
+        if ratio and accounted is not None:
+            quoted = float(accounted) / float(ratio)
+        else:
+            quoted = float(dep.get("daily_raw_gb") or 0)
+        measured = quoted / factor if factor else quoted
+        stored = dep.get("gb")
+        stored = float(stored) if stored not in (None, "") else None
+        hot_days = None
+        if stored is not None and measured > 0:
+            hot_days = stored / (measured * COMPRESSION_RATIO)
+        up = dep.get("uptime_days_min")
+        rows.append({
+            "name": dep.get("name") or "",
+            "solution": dep.get("solution") or "",
+            "source": dep.get("ingest_source") or "",
+            "measured": measured,
+            "quoted": quoted,
+            "stored_gb": stored,
+            "retention_days": dep.get("retention_days"),
+            "uptime_days": float(up) if up not in (None, "") else None,
+            "hot_days": hot_days,
+        })
+    rows.sort(key=lambda r: (-r["quoted"], r["name"].lower()))
+    total_q = sum(r["quoted"] for r in rows)
+    total_m = sum(r["measured"] for r in rows)
+    by_solution: dict[str, dict] = {}
+    for r in rows:
+        s = by_solution.setdefault(r["solution"] or "other", {"measured": 0.0, "quoted": 0.0, "n": 0, "with_bulk": 0})
+        s["measured"] += r["measured"]
+        s["quoted"] += r["quoted"]
+        s["n"] += 1
+        s["with_bulk"] += 1 if r["quoted"] > 0 else 0
+    for r in rows:
+        r["share"] = (r["quoted"] / total_q) if total_q > 0 else 0.0
+    return {
+        "rows": rows,
+        "factor": factor,
+        "total_measured": total_m,
+        "total_quoted": total_q,
+        "by_solution": by_solution,
+    }
+
+
+def raw_ingest_chart(data: dict, *, width: int = 1060, accounted: bool = False) -> str:
+    """Stacked horizontal bars: quoted GB/day per solution, one segment per deployment."""
+    rows = [r for r in data["rows"] if r["quoted"] > 0]
+    if not rows:
+        return ""
+    scale = COMPRESSION_RATIO if accounted else 1.0
+    named = [r["name"] for r in rows[:6]]
+    colors = {n: PALETTE[i % len(PALETTE)] for i, n in enumerate(named)}
+    other_color = "#C5CBD6"
+    solutions = sorted({(r["solution"] or "other") for r in rows}, key=lambda s: -sum(r["quoted"] for r in rows if (r["solution"] or "other") == s))
+    bars = []
+    for s in solutions:
+        segs, rest, n_rest = [], 0.0, 0
+        for r in rows:
+            if (r["solution"] or "other") != s:
+                continue
+            if r["name"] in colors:
+                segs.append((r["name"], r["quoted"] * scale, colors[r["name"]]))
+            else:
+                rest += r["quoted"] * scale
+                n_rest += 1
+        if rest > 0:
+            segs.append((f"Other {s} ({n_rest})", rest, other_color))
+        bars.append((s.title(), segs))
+    top = max(sum(v for _, v, _ in segs) for _, segs in bars)
+    axis_max = _nice_max(top)
+    left, right, bh, gap, head = 108, 150, 24, 8, 4
+    plot = width - left - right
+    height = head + len(bars) * (bh + gap) + 24
+    out = [f"<svg viewBox='0 0 {width} {height}' width='100%' xmlns='http://www.w3.org/2000/svg' font-size='12' font-family='inherit'>"]
+    for tick in range(0, 5):
+        x = left + plot * tick / 4
+        out.append(f"<line x1='{x:.1f}' y1='{head}' x2='{x:.1f}' y2='{height - 20}' stroke='#E3E8F0'/>")
+        out.append(f"<text x='{x:.1f}' y='{height - 6}' text-anchor='middle' fill='#69707D'>{_short(axis_max * tick / 4)}</text>")
+    for i, (label, segs) in enumerate(bars):
+        y = head + i * (bh + gap)
+        out.append(f"<text x='{left - 8}' y='{y + bh / 2 + 4:.1f}' text-anchor='end' font-weight='600' fill='#343741'>{esc(label)}</text>")
+        x = float(left)
+        total = 0.0
+        for name, value, color in segs:
+            w = plot * value / axis_max
+            out.append(f"<rect x='{x:.1f}' y='{y}' width='{max(w, 0.5):.1f}' height='{bh}' fill='{color}' stroke='#fff' stroke-width='1'><title>{esc(name)}: {value:,.0f} GB/day</title></rect>")
+            if w > 46:
+                out.append(f"<text x='{x + w / 2:.1f}' y='{y + bh / 2 + 4:.1f}' text-anchor='middle' fill='#fff' font-weight='600'>{_short(value)}</text>")
+            x += w
+            total += value
+        out.append(f"<text x='{x + 8:.1f}' y='{y + bh / 2 + 4:.1f}' fill='#343741' font-weight='600'>{total:,.0f} GB/day</text>")
+    out.append("</svg>")
+    names, cols = [], []
+    for _, segs in bars:
+        for name, _, color in segs:
+            if name not in names:
+                names.append(name)
+                cols.append(color)
+    return "".join(out) + _legend(names, cols)
+
+
+def raw_ingest_section(acc: dict, *, new_page: bool = True) -> str:
+    """Raw bulk ingest by deployment, with every calculation from bundle to estimator input."""
+    data = raw_ingest_by_deployment(acc)
+    rows = data["rows"]
+    if not rows or data["total_quoted"] <= 0:
+        return ""
+    e = acc.get("ecu") or {}
+    factor = data["factor"]
+    days = e.get("quote_lookback_days")
+    accounted = _compression_on(acc)
+    top = [r for r in rows if r["quoted"] > 0]
+    top4 = top[:4]
+    top4_share = sum(r["quoted"] for r in top4) / data["total_quoted"] if top4 else 0.0
+    shown = top[:15]
+    rest = [r for r in top if r not in shown]
+    idle = [r for r in rows if r["quoted"] <= 0]
+
+    def fmt(v, places=1):
+        return "—" if v is None else f"{v:,.{places}f}"
+
+    def line(r: dict) -> list:
+        q = r["quoted"] * (COMPRESSION_RATIO if accounted else 1)
+        cells = [
+            r["name"],
+            (r["solution"] or "").title(),
+            "no bundle" if r["source"] == "active_no_bundle" else fmt(r["measured"]),
+            "no bundle" if r["source"] == "active_no_bundle" else fmt(r["quoted"]),
+        ]
+        if accounted:
+            cells.append(fmt(q))
+        cells += [
+            f"{r['share'] * 100:.1f}%",
+            fmt(r["stored_gb"], 0),
+            fmt(float(r["retention_days"]), 1) if r["retention_days"] not in (None, "") else "—",
+            fmt(r["uptime_days"], 1),
+            fmt(r["hot_days"], 1),
+        ]
+        return cells
+
+    headers = ["Deployment", "Solution", "Bundle GB/d", "Quoted GB/d"]
+    align = ["left", "left", "right", "right"]
+    if accounted:
+        headers.append("Accounted GB/d")
+        align.append("right")
+    headers += ["Share", "Stored GB", "Retention d", "Uptime d", "Days in store"]
+    align += ["right"] * 5
+    tones = ["warning" if (r["uptime_days"] is not None and r["uptime_days"] < SHORT_UPTIME_DAYS and r["quoted"] > 0) else None for r in shown]
+    table_rows = [line(r) for r in shown]
+    if rest:
+        rest_q = sum(r["quoted"] for r in rest)
+        rest_m = sum(r["measured"] for r in rest)
+        pad = [f"{len(rest)} other deployments", "", fmt(rest_m), fmt(rest_q)]
+        if accounted:
+            pad.append(fmt(rest_q * COMPRESSION_RATIO))
+        pad += [f"{(rest_q / data['total_quoted'] * 100):.1f}%", "", "", "", ""]
+        table_rows.append(pad)
+        tones.append(None)
+    total = ["Total", "", fmt(data["total_measured"]), fmt(data["total_quoted"])]
+    if accounted:
+        total.append(fmt(data["total_quoted"] * COMPRESSION_RATIO))
+    total += ["100.0%", "", "", "", ""]
+    table_rows.append(total)
+    tones.append(None)
+
+    sol_rows = []
+    for name, s in sorted(data["by_solution"].items()):
+        sol_rows.append([name.title(), f"{s['with_bulk']} of {s['n']}", fmt(s["measured"]), fmt(s["quoted"])])
+    sol_table = table(["Solution", "Deployments with bulk", "Bundle GB/day", "Quoted GB/day"], sol_rows, ["left", "right", "right", "right"])
+
+    window = f"the last {int(days)} billed days" if days else "the quote window"
+    lead = [
+        "Raw bulk is the write-index request bytes before compression, the volume the Observability and Security estimators price. It is not stored GB.",
+        "Quoted GB/day is bundle GB/day × the pace factor, and is what each estimator receives."
+        + (f" Pace factor {factor:.6f} = {window} daily ECU average ÷ complete-month daily average." if factor else " No pace factor applies to this run."),
+        f"The four largest deployments are {top4_share * 100:.0f}% of quoted bulk: " + ", ".join(r["name"] for r in top4) + ".",
+        "Days in store is stored GB ÷ (bundle GB/day × 0.60). It is how many days of compressed ingest the local primary store holds. A value far below Retention means most retained data sits outside that store, for example in searchable snapshots, or the stored-GB snapshot is older than the bundle.",
+        "Shaded rows have a node up for under 2 days, so the rate is measured over a short window.",
+    ]
+    page_a = (
+        bullets([lead[0], lead[1], lead[2] + (f" {len(idle)} more have no bulk." if idle else "")])
+        + table(headers, table_rows, align, tones)
+        + "<h3>Quoted GB/day by solution and deployment (grey is every other deployment in that solution)</h3>"
+        + raw_ingest_chart(data, accounted=accounted)
+    )
+    body = bullets([lead[3], lead[4]]) + "<h3>By solution</h3>" + sol_table
+
+    # Calculations, in the order they run, with this account's numbers filled in.
+    big = top[0]
+    calc: list[list] = [[
+        "1. Per write index",
+        "bytes/day = primaries.bulk.total_size_in_bytes × 86,400 ÷ write_phase_sec, truncated to a whole byte. write_phase_sec is creation until rollover, or the index age while the ILM action is rollover. A missing or zero write phase is 0. Write indices are the last index of each data stream and any alias marked is_write_index.",
+        "Elasticsearch diagnostic bundle: indices_stats, ilm_explain, data_stream, alias.",
+        "per index",
+    ], [
+        "2. Per deployment",
+        "Bundle GB/day = Σ write-index bytes/day ÷ 1e9.",
+        f"{big['name']}: {fmt(big['measured'], 3)} GB/day",
+        f"{fmt(big['measured'])} GB/day",
+    ]]
+    if factor:
+        calc.append([
+            "3. Pace factor",
+            "Quote-window daily ECU average ÷ complete-month daily ECU average. Quoted GB/day = bundle GB/day × factor.",
+            f"{fmt(big['measured'], 3)} × {factor:.6f} = {fmt(big['quoted'], 3)} GB/day for {big['name']}",
+            f"{factor:.6f}",
+        ])
+    calc.append([
+        "4. Fleet total",
+        "Quoted GB/day = Σ deployments. A deployment with no bundle adds 0. Observability and Search are summed separately.",
+        "; ".join(f"{n.title()} {fmt(s['quoted'])}" for n, s in sorted(data["by_solution"].items())),
+        f"{fmt(data['total_quoted'])} GB/day",
+    ])
+    obs = (acc.get("sizing") or {}).get("consolidated", {}).get("observability") or {}
+    if obs.get("logs_gb_day") is not None:
+        calc.append([
+            "5. Logs and metrics split",
+            "Logs = 0.90 × Observability bulk. Metrics = 0.10 × Observability bulk.",
+            f"Observability bulk {fmt(obs.get('bulk_gb_day'))} GB/day",
+            f"logs {fmt(obs.get('logs_gb_day'))} · metrics {fmt(obs.get('metrics_gb_day'))}",
+        ])
+        calc.append([
+            "6. Metered ingest",
+            f"Metered GB/day = bulk × {METERED_EXPANSION}. Each stream walks the Observability ingest bands on its own metered GB. The monthly dollar is the estimator read-back, not this arithmetic.",
+            f"{fmt(obs.get('bulk_gb_day'))} × {METERED_EXPANSION}",
+            f"{fmt(float(obs.get('bulk_gb_day') or 0) * METERED_EXPANSION)} metered GB/day",
+        ])
+    if accounted:
+        calc.append([
+            "7. Compression-applied",
+            "Accounted GB/day = quoted bulk × 0.60. It prices the same way and does not replace the bulk quote.",
+            f"{fmt(data['total_quoted'])} × 0.60",
+            f"{fmt(data['total_quoted'] * COMPRESSION_RATIO)} GB/day",
+        ])
+    calc.append([
+        "Days in store",
+        "Stored GB ÷ (bundle GB/day × 0.60).",
+        (f"{big['name']}: {fmt(big['stored_gb'], 0)} ÷ ({fmt(big['measured'])} × 0.60)" if big["stored_gb"] is not None else "no stored GB for the largest deployment"),
+        f"{fmt(big['hot_days'], 1)} days" if big["hot_days"] is not None else "—",
+    ])
+    body += "<h3>Calculation</h3>" + table(["Step", "Formula", "Inputs used", "Result"], calc, ["left", "left", "left", "left"])
+    return (
+        section("Raw bulk ingest by deployment", page_a, new_page=new_page)
+        + section("Raw bulk ingest, calculation and cross-check", body, new_page=True)
+    )
+
+
+def _raw_ingest_rows(acc: dict) -> list[list]:
+    """Appendix B rows for the raw bulk ingest section."""
+    data = raw_ingest_by_deployment(acc)
+    if not data["rows"] or data["total_quoted"] <= 0:
+        return []
+    out = [[
+        "Bundle GB/day, per deployment",
+        "Σ over write indices of primaries.bulk.total_size_in_bytes × 86,400 ÷ write_phase_sec ÷ 1e9.",
+        f"{len([r for r in data['rows'] if r['quoted'] > 0])} deployments with bulk",
+        f"{_formula_num(data['total_measured'], 1)} GB/day in total",
+    ]]
+    if data["factor"]:
+        out.append([
+            "Quoted GB/day, per deployment",
+            "Bundle GB/day × pace factor.",
+            f"pace factor {data['factor']:.6f}",
+            f"{_formula_num(data['total_quoted'], 1)} GB/day in total",
+        ])
+    out.append([
+        "Days in store",
+        "Stored GB ÷ (bundle GB/day × 0.60).",
+        "Local primary store. Searchable snapshots stay out.",
+        "per deployment, in Raw bulk ingest by deployment",
+    ])
+    return out
+
+
 def deployment_spend_block(c: dict) -> str:
     """Top deployments by ECU. First page of consolidation section 1."""
     per_all = c.get("by_deployment") or []
@@ -2495,12 +2889,84 @@ def deployment_spend_block(c: dict) -> str:
     return body
 
 
-def deployment_plan_section(c: dict, sv: dict, *, alongside: str = "") -> str:
-    """Observability monthly estimate at 0/25/50/75/100% fewer deployments.
+def _regions_under_minimum(c: dict) -> list[dict]:
+    """Floor projects at or under $10/mo. Structured rows win. Older runs keep the same list in a note."""
+    rows = c.get("regions_under_minimum")
+    if isinstance(rows, list) and rows:
+        out = []
+        for row in rows:
+            if not isinstance(row, dict) or row.get("projected_monthly") is None:
+                continue
+            out.append(row)
+        if out:
+            return out
+    found = []
+    for note in c.get("notes") or []:
+        text = str(note)
+        marker = "Left out: "
+        if marker not in text:
+            continue
+        tail = text.split(marker, 1)[1].strip().rstrip(".")
+        for part in tail.split(";"):
+            part = part.strip()
+            if " $" not in part:
+                continue
+            name, money = part.rsplit(" $", 1)
+            bits = name.split(" ", 1)
+            if len(bits) != 2:
+                continue
+            try:
+                projected = float(money.replace(",", ""))
+            except ValueError:
+                continue
+            found.append({"solution": bits[0], "region": bits[1], "projected_monthly": projected})
+    return found
 
-    When `alongside` is set, horizontal bars fill the left column and that
-    HTML is the right column of the same page.
-    """
+
+def _floor_sheet_note(c: dict) -> str:
+    """Why the estimate folder has fewer sheets than the floor project count."""
+    left = _regions_under_minimum(c)
+    if not left:
+        return ""
+    floor_n = c.get("deployment_plan_floor")
+    try:
+        floor_n = int(floor_n) if floor_n is not None else None
+    except (TypeError, ValueError):
+        floor_n = None
+    n_left = len(left)
+    sheets = floor_n - n_left if floor_n is not None and floor_n >= n_left else None
+    if sheets is not None and floor_n is not None:
+        sheet_word = "sheet was" if sheets == 1 else "sheets were"
+        floor_word = "project" if floor_n == 1 else "projects"
+        kept = "This project stays" if n_left == 1 else f"These {n_left} projects stay"
+        lead = (
+            f"The floor is {floor_n} {floor_word}, one per feature per region. "
+            f"{sheets} estimate {sheet_word} written. "
+            f"An estimate sheet is written only when the projected sizing is more than $10/mo. "
+            f"{kept} in the floor:"
+        )
+    else:
+        kept = "This project stays" if n_left == 1 else "These projects stay"
+        lead = (
+            "An estimate sheet is written only when the projected sizing is more than $10/mo. "
+            f"{kept} in the floor:"
+        )
+    rows = [
+        [str(row.get("solution") or "").title(), str(row.get("region") or ""), f"${float(row['projected_monthly']):,.2f}"]
+        for row in left
+    ]
+    head = ["Solution", "Region", "$/mo"]
+    align = ["left", "left", "right"]
+    if len(rows) <= 3:
+        return caption(lead) + table(["Solution", "Region", "Projected $/mo"], rows, align)
+    cols = 3
+    per = math.ceil(len(rows) / cols)
+    chunks = [rows[i:i + per] for i in range(0, len(rows), per)]
+    return caption(lead) + grid(*[table(head, chunk, align) for chunk in chunks], ratio=" ".join(["1fr"] * len(chunks)), gap="10px")
+
+
+def deployment_plan_body(c: dict, sv: dict, *, alongside: str = "", width: int = 920, short: bool = False) -> str:
+    """Deployment-count bars, caption, optional component tables, and the floor note."""
     plan = c.get("deployment_plan") or []
     if not plan:
         return ""
@@ -2520,24 +2986,40 @@ def deployment_plan_section(c: dict, sv: dict, *, alongside: str = "") -> str:
         plan_ret = "Retention on each serverless project is its measured months, rounded up."
     n = _plan_n(plan)
     n_bit = f" N = {n}." if n is not None else ""
-    chart = plan_hbar(rows, width=460, ech=ech)
-    chart += caption(
-        "The project count is on the right. The arrow beside it points down the column."
-        + n_bit
-        + " Ceiling is one serverless project per ECH deployment, aligned to that deployment's feature. "
-        + "Each later bar is round(previous × 0.75), half-to-even. "
-        + f"The floor is one project per feature per region, {int(c.get('deployment_plan_floor') or 1)} projects, and the series stops there. "
-        + "The upper bar is serverless at list. The lower bar is the ECH bill, the same on every step. "
-        + "The amount under the project count is that ECH bill minus serverless at list. "
-        + plan_ret
-    )
-    if alongside:
-        chart = grid(
-            chart,
-            "<h3>Estimated monthly serverless total, by component</h3>" + alongside,
-            ratio="0.86fr 1.14fr",
+    chart = plan_hbar(rows, width=width, ech=ech, compact=True)
+    if short:
+        chart += caption(
+            "Ceiling matches the cover count."
+            + n_bit
+            + " Each is 30 days of complete billing. "
+            + "Each later bar is round(previous × 0.75). "
+            + f"Floor is one project per feature per region, {int(c.get('deployment_plan_floor') or 1)}. "
+            + "Upper bar is serverless at list; lower is the ECH bill. "
+            + plan_ret
         )
-    return section("Monthly estimate as deployments become projects", f"<div class='keep'>{chart}</div>", new_page=False)
+    else:
+        chart += caption(
+            "The project count is on the right. The arrow beside it points down the column."
+            + n_bit
+            + " The ceiling matches the cover count: one serverless project per deployment with a bill in the last 30 days of complete billing, aligned to that deployment's feature. "
+            + "The cover count and this ceiling are the same deployments. Each is 30 days of complete billing. "
+            + "Each later bar is round(previous × 0.75), half-to-even. "
+            + f"The floor is one project per feature per region, {int(c.get('deployment_plan_floor') or 1)} projects, and the series stops there. "
+            + "The upper bar is serverless at list. The lower bar is the ECH bill, the same on every step. "
+            + "The amount under the project count is that ECH bill minus serverless at list. "
+            + plan_ret
+        )
+    if alongside:
+        chart += "<h3>Estimated monthly serverless total, by component</h3>" + alongside
+    return f"<div class='keep'>{chart}</div>" + _floor_sheet_note(c)
+
+
+def deployment_plan_section(c: dict, sv: dict, *, alongside: str = "", new_page: bool = True) -> str:
+    """Deployment-count bars. On the consolidation cover they sit beside the usage chart."""
+    body = deployment_plan_body(c, sv, alongside=alongside)
+    if not body:
+        return ""
+    return section("Monthly estimate as deployments become projects", body, new_page=new_page)
 
 
 def _contract_usd_per_ecu(cr: dict) -> float | None:
@@ -2658,7 +3140,7 @@ def egress_section(acc: dict) -> str:
         "The hosted bill records ECU, not GB. This page does not convert that ECU into a serverless dollar.",
     ])
     body = f"<p style='margin:0 0 8px'>{esc(intro)}</p><h3>What the hosted bill charged</h3>" + billed + "<h3>What changes on serverless</h3>" + carry + notes
-    return section("Data egress, and what carries over to serverless", body, new_page=False)
+    return section("Data egress, and what carries over to serverless", body, new_page=True)
 
 
 # --------------------------------------------------------------------------- consolidation (§11)
@@ -2695,13 +3177,16 @@ def render_consolidation_html(acc: dict) -> str:
     quote_days = b0.get("quote_lookback_days")
     ecu_basis = f"{int(quote_days)}-day lookback" if quote_days else "complete-month avg"
     ecu_src = b0.get("ech_monthly_ecu")
-    if active_cov.get("inactive_excluded"):
+    if active_cov.get("window_days"):
+        dep_label = f"{dep_n} deployments in the last {int(active_cov['window_days'])} days"
+        ecu_label = f"{n0(ecu_src)} ECU/mo account bill ({ecu_basis})"
+    elif active_cov.get("inactive_excluded"):
         dep_label = f"{dep_n} active deployments"
         ecu_label = f"{n0(ecu_src)} ECU/mo account bill ({ecu_basis})"
     else:
         dep_label = f"{dep_n} ECH deployments"
         ecu_label = f"{n0(ecu_src)} ECU/mo ({ecu_basis})"
-    B.append("<header class='masthead'><div class='brand'>Elastic<i></i></div>"
+    B.append("<div class='cover'><header class='masthead'><div class='brand'>Elastic<i></i></div>"
              f"<h1>{headline}</h1>"
              f"<div class='sub'>{dep_label} · {ecu_label} · {n0(b0.get('stored_gb'))} GB stored · {esc(cloud.get('provider'))} {esc(cloud.get('region'))} · {esc(m.get('date'))}{source_bit}</div></header>")
     rc = c.get("reconciliation") or {}
@@ -2763,7 +3248,7 @@ def render_consolidation_html(acc: dict) -> str:
         rate_label = caption(f"Contract rate ${cr.get('implied_usd_per_ecu')} per ECU")
     B.append(f"<h3>{esc(chart_title)}</h3>" + bar_chart(
         chart_cats, chart_series,
-        stacked=True, width=700, height=250, show_values=True, prefix="$", exact_values=True, colors=chart_colors,
+        stacked=True, width=940, height=168, show_values=True, prefix="$", exact_values=True, colors=chart_colors,
         sublabels=chart_subs) + rate_label)
     quote_bits = []
     for q in rc.get("quotes") or []:
@@ -2790,6 +3275,9 @@ def render_consolidation_html(acc: dict) -> str:
             "Billed: ECU from K360 billing at list, $1 per ECU. Estimate: from the serverless estimators, not a quote or a bill.",
             ("The serverless estimate is " + " plus ".join(quote_bits) + ".") if quote_bits else "The serverless estimate is one project per solution.",
         ]
+    cover_notes.append(
+        "The deployment count on this page and the ceiling on the deployment-count page are the same deployments. Each is 30 days of complete billing."
+    )
     if diag and c.get("ingest_basis") == "compressioncalc_accounted_for":
         ratio = c.get("compression_ratio")
         ratio_bit = "unset" if ratio is None else str(ratio)
@@ -2821,13 +3309,14 @@ def render_consolidation_html(acc: dict) -> str:
             )
     else:
         cover_notes.append("Ingest is the K360 backup: stored GB ÷ assumed retention. K360 does not provide a raw ingest total, so this can sit far below the bulk payload the cluster accepted.")
-    B.append(bullets(cover_notes))
-    detail = serverless_component_slide(acc, bare=True)
+    B.append(bullets(cover_notes, columns=2))
+    B.append("</div>")
+    detail = serverless_component_slide(acc, bare=True, beside=True)
     plan_page = deployment_plan_section(c, sv, alongside=detail)
     if plan_page:
         B.append(plan_page)
     else:
-        B.append(section("Estimated monthly serverless total, by component", detail, new_page=False))
+        B.append(section("Estimated monthly serverless total, by component", detail, new_page=True))
 
     # 1
     if dom.get("daily_metered_gb") or dom.get("sheet_metered_gb_day"):
@@ -2929,7 +3418,11 @@ def render_consolidation_html(acc: dict) -> str:
     spend_detail = callouts_html + bullets(spend_notes)
     spend_body = spend_table + spend_detail
     if spend_body:
-        B.append(section("Where ECH spend sits", spend_body, new_page=False))
+        B.append(section("Where ECH spend sits", spend_body, new_page=True))
+    if diag:
+        raw_ingest = raw_ingest_section(acc, new_page=True)
+        if raw_ingest:
+            B.append(raw_ingest)
     if lookback_total is not None and contract_rate:
         build_notes = [
             f"Full lookback: ECU over {n0(b0.get('lookback_days'))} days, divided into a month and split by tier, at the contract rate.",
@@ -2958,7 +3451,7 @@ def render_consolidation_html(acc: dict) -> str:
             "Serverless: dollars per month from the serverless build-up.",
             "Y axis mixes ECU and dollars because list price treats 1 ECU as $1.",
         ]
-    B.append(section("What you pay for today, and what replaces it", grid(unit, "<h3>Monthly build-up</h3>" + chart, ratio="1.05fr 1fr") + "<h3>Projects</h3>" + projects + bullets(build_notes), new_page=False))
+    B.append(section("What you pay for today, and what replaces it", grid(unit, "<h3>Monthly build-up</h3>" + chart, ratio="1.05fr 1fr") + "<h3>Projects</h3>" + projects + bullets(build_notes), new_page=True))
 
     search_blk = (svl.get("by_solution") or {}).get("search") or {}
     eis_rows = search_blk.get("eis_workloads") or []
@@ -2987,7 +3480,7 @@ def render_consolidation_html(acc: dict) -> str:
                 f"Another {n0(search_blk.get('other_ml_ecu'))} ECU of ML nodes have no jina SKU and are not in the line. "
                 "The node ECU is the capacity on the same deployment, not a per-model meter.",
             ) + eis_table,
-            new_page=False,
+            new_page=True,
         ))
 
     # 2
@@ -3037,12 +3530,12 @@ def render_consolidation_html(acc: dict) -> str:
                      bullets([
                          f"These are nodes that do not hold data: master, Kibana, coordinating, integrations, enterprise search, and APM. Together they are {n0(shown_fixed)} ECU/mo{pace_bit}.{year_bit} Serverless does not charge for them.",
                          ml_line,
-                     ]) + grid(left, tail_card), new_page=False))
+                     ]) + grid(left, tail_card), new_page=True))
     B.append(egress_section(acc))
 
     # 3
     per_all = c.get("by_deployment") or []
-    ecu_bar = hbar_chart([(r["name"], float(r.get("ech_ecu_mo") or 0)) for r in per_all[:8]], width=460, label_w=170)
+    ecu_bar = hbar_chart([(r["name"], float(r.get("ech_ecu_mo") or 0)) for r in per_all[:5]], width=460, label_w=160)
     with_gb = fr.get("n_with_gb")
     gaps = fr.get("size_gaps") or []
     size_line = (f"{with_gb} of {fr.get('n_deployments')} deployments have a size on the snapshot day ({n0(fr.get('stored_gb'))} GB). {fr.get('n_size_moved')} now report under a sibling name already in that total. {fr.get('n_size_never')} have never reported a size."
@@ -3070,9 +3563,9 @@ def render_consolidation_html(acc: dict) -> str:
                     for p in misses
                 ))
         arch_notes.append("Prod and non-prod can also be separate projects. Each extra project needs its own estimate.")
-        arch_html = "<h3>How ECH deployments map to serverless projects</h3>" + architecture_svg(arch["groups"], arch["projects"]) + bullets(arch_notes)
+        arch_html = "<h3>How ECH deployments map to serverless projects</h3>" + architecture_svg(arch["groups"], arch["projects"]) + bullets(arch_notes, columns=2)
     title3 = "One project per solution in each region" if arch.get("per_region") else "One project per solution, not one per deployment"
-    B.append(section(title3, grid(left3, "<h3>ECH ECU per month, largest deployments</h3>" + ecu_bar) + arch_html, new_page=False))
+    B.append(section(title3, grid(left3, "<h3>ECH ECU per month, largest deployments</h3>" + ecu_bar) + arch_html, new_page=True))
 
     # 5
     sens = c.get("sensitivity") or {}
@@ -3135,7 +3628,7 @@ def render_consolidation_html(acc: dict) -> str:
     if has_svl:
         fleet_series.append(("Serverless at list" if cover_rate is not None else "Serverless, estimate", [f.get("serverless_mo") or 0 for f in fleet]))
         colors5.append(PALETTE[2])
-    fc = bar_chart([_fleet_axis(f["scenario"]) for f in fleet], fleet_series, width=920, height=300, show_values=True, prefix="$", colors=colors5, exact_values=True)
+    fc = bar_chart([_fleet_axis(f["scenario"]) for f in fleet], fleet_series, width=920, height=240, show_values=True, prefix="$", colors=colors5, exact_values=True)
     if has_contract and cover_rate is not None:
         ft_headers = ["Usage", "ECH at contract rate", "Serverless at list", "Savings vs. contract rate"]
         ft_rows = [[
@@ -3176,17 +3669,29 @@ def render_consolidation_html(acc: dict) -> str:
                      "<h3>How long Search data is kept</h3>" + rt + bullets([ret_note])
                      + "<h3>ECH vs. the serverless estimate as usage changes</h3>" + fc
                      + ft + bullets(fleet_notes),
-                     new_page=False))
+                     new_page=True))
 
     # 6
     quotes = rc.get("quotes") or []
     if quotes:
+        quote_rows = [
+            [
+                q.get("solution", "").title(),
+                estimator_label(q.get("source")),
+                usd(q.get("monthly")),
+                usd(q.get("annual_year1")),
+                usd(q.get("annual_steady_state")),
+                link(q.get("url"), "Open") if q.get("url") else "",
+            ]
+            for q in quotes
+        ]
+        quote_rows.append(["Total", "both estimators", usd(rc.get("total_mo")), "—", "—", ""])
         card = ("<div class='card'><div class='hd'>Serverless estimators<span>the prices in this report</span></div>"
-                + table(["Solution", "Estimator", "$ / mo", "Year 1", "Steady annual"],
-                        [[q.get("solution", "").title(), estimator_label(q.get("source")), usd(q.get("monthly")), usd(q.get("annual_year1")), usd(q.get("annual_steady_state"))] for q in quotes]
-                        + [["Total", "both estimators", usd(rc.get("total_mo")), "—", "—"]])
-                + "<br>".join(str(link(q.get("url"), f"Open the {estimator_label(q.get('source')).split(',')[0]} estimator")) for q in quotes if q.get("url"))
-                + bullets(["These are the serverless estimates. They add up to the headline. The fleet sensitivity scales them for quieter and busier months."])
+                + table(
+                    ["Solution", "Estimator", "$ / mo", "Year 1", "Steady annual", ""],
+                    quote_rows,
+                    ["left", "left", "right", "right", "right", "left"],
+                )
                 + "</div>")
     elif rc:
         est = ((acc.get("sizing") or {}).get("estimators") or {})
@@ -3224,15 +3729,19 @@ def render_consolidation_html(acc: dict) -> str:
             "Serverless is the estimator price and is not discounted. Verify the contract with the AE.",
         ])
     note_items = [x for x in (c.get("caveats") or []) + (c.get("notes") or []) if x]
+    estimates_note = "These are the serverless estimates. They add up to the headline. The fleet sensitivity scales them for quieter and busier months."
+    if contract_items and quotes:
+        contract_items.insert(0, estimates_note)
     if contract_items:
-        recon = grid(card, "<h3>Before you quote</h3>" + bullets(contract_items), ratio="1.15fr 1fr")
+        recon = grid(card, "<h3>Before you quote</h3>" + bullets(contract_items), ratio="3.4fr 0.9fr", gap="10px")
     else:
         recon = card
     if note_items:
-        recon += bullets(note_items, columns=2)
+        recon += bullets(note_items, columns=5)
     foot_src = "Elasticsearch diagnostics joined to K360 billing" if _from_diagnostics(acc) else "K360 cloud-tracker billing + telemetry"
-    B.extend(cost_sizing_sections(acc, sizing=False, new_page=False, numbered=False))
-    B.append(section("Reconciliation and what to confirm before quoting", recon + f"<div class='foot'>Source: {foot_src} · {esc(svl.get('pricing_source'))} · generated {esc(m.get('generated_at'))} · only estimator read-backs are quotable $</div>", new_page=False))
+    B.extend(cost_sizing_sections(acc, sizing=False, new_page=True, numbered=False))
+    pricing_src = re.sub(r"\s*parent \S+ \([^)]*\)", "", str(svl.get("pricing_source") or "")).strip(" ·")
+    B.append(section("Reconciliation and what to confirm before quoting", recon + f"<div class='foot'>Source: {foot_src}{(' · ' + esc(pricing_src)) if pricing_src else ''} · generated {esc(m.get('generated_at'))} · only estimator read-backs are quotable $</div>", new_page=True))
     return page(f"{m.get('customer')} — serverless consolidation savings", "".join(B), kind="consolidation")
 
 

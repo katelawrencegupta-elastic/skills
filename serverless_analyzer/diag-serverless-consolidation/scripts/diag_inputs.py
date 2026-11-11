@@ -150,61 +150,6 @@ def pooled_deployments(rows: list[dict], threshold: float = POOL_UNDER_GB_DAY) -
     return groups
 
 
-# A plan does not consolidate below this many projects. A smaller fleet stays at N.
-# An account that needs more solution-and-region projects uses that larger count.
-MINIMUM_PLAN_PROJECTS = 8
-
-
-def project_count(n: int, pct: int) -> int:
-    """Projects kept when `pct` is the share of the 1:1 deployment count.
-
-    100% is one serverless project per ECH deployment. 75%, 50%, and 25% keep
-    round(N × that share). 0% is the unfloored minimum, one project. A middle
-    step can still round to 0.
-    """
-    if n <= 0:
-        return 0
-    if pct >= 100:
-        return n
-    if pct <= 0:
-        return 1
-    return int(round(n * pct / 100.0))
-
-
-def apply_project_floor(raw: int, floor: int, n: int) -> int:
-    """Raise a cut to the region-and-solution floor. A half-to-even 0 stays 0 when the floor is 1."""
-    if n <= 0:
-        return 0
-    floor_n = min(max(int(floor or 1), 1), n)
-    if raw <= 0 and floor_n <= 1:
-        return raw
-    return max(floor_n, raw)
-
-
-def deployment_count_plans(rows: list[dict], floor: int = 1) -> list[dict]:
-    """Five Observability packs. 100% is one project per deployment, then 75, 50, 25, and the minimum."""
-    n = len(rows)
-    plans = []
-    ordered = sorted(rows, key=lambda r: -_num(r, "bulk_gb_day"))
-    for pct in (100, 75, 50, 25, 0):
-        count = apply_project_floor(project_count(n, pct), floor, n)
-        if count <= 0 or n == 0:
-            groups: list[list[dict]] = []
-        elif pct >= 100:
-            groups = [[row] for row in ordered]
-        elif count == 1:
-            groups = [list(rows)]
-        else:
-            groups = pack(rows, count)
-        plans.append({
-            "cut_pct": pct,
-            "label": f"{pct}%",
-            "projects": len(groups) if groups else count,
-            "groups": groups,
-        })
-    return plans
-
-
 def _pair_key(row: dict) -> tuple[str, str]:
     return (str(row.get("region") or "unknown"), str(row.get("solution") or "observability"))
 

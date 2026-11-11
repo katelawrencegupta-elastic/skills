@@ -1,12 +1,12 @@
 # Diagnostic consolidation arithmetic
 
-`DAYS_PER_MONTH` = 30.416. Every quoted project uses rows from `sizing_from_diags.json` for deployments that billed in the latest lookback month.
+`DAYS_PER_MONTH` = 30.416. Every quoted project uses rows from `sizing_from_diags.json` for deployments that billed in the last 30 days.
 
 ## Active deployments
 
-A deployment is active when its billing ECU in the latest lookback month is above zero. The month is named, including when it is partial. Deployments with no bill that month are counted and then left out of the sizing. Their last telemetry snapshot is not added to stored GB and is not converted to GB/day. A sibling that is still active keeps its own current size. The old snapshot is not added on top.
+A deployment is on the quote when its billing ECU in the last 30 days is above zero. The window ends on the last day with a positive total. Trailing days with no bill are left out. A partial calendar month is not the window. Deployments with no bill in that window are counted and then left out of the sizing. Their last telemetry snapshot is not added to stored GB and is not converted to GB/day. A sibling that billed in the window keeps its own current size. The old snapshot is not added on top.
 
-ECU/mo on the sizing row is the last complete month, summed over the active deployments. A partial final month does not shrink that bill.
+ECU/mo on the sizing row is the last complete month, summed over that roster. An open month does not shrink that row. The cover ECU is those same 30 billed days, expressed as a month.
 
 An active deployment with no bundle adds no ingest. Its current stored GB can stay. A diagnostic bundle whose deployment is inactive is not priced.
 
@@ -68,7 +68,7 @@ G26 on the Observability sheet displays as an integer. Read it unformatted. Acce
 
 Security E74 is the monthly quote only when parsed E73 is 0. A blank or unreadable E73 blocks, and so does a non-zero value. A parenthesized credit stays negative. Call that check only after a Security sheet was read. A region that was never sized is a missing sheet, not a blank E73. E73 is not subtracted from E74. Add-on inputs are cleared on the copy. The golden template is not edited.
 
-A regional estimate is written only when that region's projected monthly sizing is more than $10. Observability and Security project from that region's bulk and retention. Search projects that region's share of the solution ballpark. A region at or under $10 is left out and does not count as a missing read-back. A region with bulk and no measured age has no month of its own. If another region supplied the solution month, that region is written at the solution month. A solution with no measured age anywhere is not written. One regional G26 miss, a blank regional E73, or a non-zero regional E73 leaves that whole Observability or Security solution out, including regions whose own read-back was accepted. Regional dollars use one mode. When every region has its own accepted read-back, the headline is the sum of those read-backs. Otherwise the headline stays the one consolidated read-back and every region, including Search, is a stored-GB share of that total. A region's own read-back is not added to another region's share. Year 1 follows the same mode. A region with bulk and no local bytes contributes $0 on a store split.
+A regional Observability estimate is written only when the Observability ladder on that region's bulk and retention is more than $10. Search is written only when that region's share of the solution ballpark is more than $10. Security is written whenever the region has bulk and a month, and it stays in the quote only when E74 is more than $10. A region at or under $10 is left out and does not count as a missing read-back. A region with bulk and no measured age has no month of its own. If another region supplied the solution month, that region is written at the solution month. A solution with no measured age anywhere is not written. One regional G26 miss, a blank regional E73, or a non-zero regional E73 leaves that whole Observability or Security solution out, including regions whose own read-back was accepted. Regional dollars use one mode. When every included region has its own accepted read-back, the headline is the sum of those read-backs. A missing read-back leaves that solution out. A stored-GB split is used only when the fleet total is already a quotable read-back. A region's own read-back is not added to another region's share. Year 1 follows the same mode. A region with bulk and no local bytes contributes $0 on a store split.
 
 ## Per deployment
 
@@ -76,17 +76,34 @@ A deployment at or above 50 GB/day is its own project. Every deployment under 50
 
 ## Deployment-count plan
 
-The ceiling is one serverless project per ECH deployment, aligned to that deployment's feature. The floor is one project per feature that exists in each region (Observability, Search, or Security). A region and feature with no deployments adds nothing. Each later count is round(previous × 0.75), half-to-even. If that round does not decrease, subtract 1. A result at or under the floor is the floor, and the series stops. Labels are Ceiling, −25% on each middle step, and Floor.
+The ceiling is the cover count: one serverless project per deployment that billed in the last 30 days of complete billing, aligned to that deployment's feature. The cover count and the ceiling are the same deployments. Each is 30 days of complete billing. The floor is one project per feature that exists in each region (Observability, Search, or Security). A region and feature with no deployments adds nothing. Each later count is round(previous × 0.75), half-to-even. If that round does not decrease, subtract 1. A result at or under the floor is the floor, and the series stops. Labels are Ceiling, −25% on each middle step, and Floor.
 
-A bar's monthly is the sum of its projects. Search is the on-demand es3 read-back. Observability is the D32 read-back for that group's region and provider. The headline Observability read-back is reused only when the ceiling is already one project. A floor of 1 reached by cutting is priced as that packed group.
+A bar's monthly is the sum of its projects. Search is the on-demand es3 read-back. A Search project with no on-demand total leaves the bars unpriced. On the 30-day PDF, Search disk is measured store × (1 / written months). Observability is the D32 read-back for that group's region and provider. Security is the E74 read-back, and only when E73 is 0. The headline Observability read-back is reused only when the ceiling is already one project, and that bar is labeled Ceiling. A floor of 1 reached by cutting is priced as that packed group.
 
 Packing stays inside one region and one feature. The ceiling is one group per deployment. At or under the number of region-and-feature pairs, each pair is one group. Between those, extra projects above the floor go to the largest pairs. On the rounded PDF, retention on a project is that group's measured months, rounded up. On the 30-day PDF, every project is written as 1 month and Search disk scales to that month. Bulk does not change. On the rounded PDF, a project with bulk and no measured month omits the whole bar set.
 
 When a contract rate exists, the chart draws serverless at list and that ECH bill on every step. The amount under the project count is the ECH bill minus serverless at list. Serverless is not drawn at the contract rate on this chart, the cover, the monthly build-up, the usage chart, or the search-power appendix.
 
+## Raw bulk ingest by deployment
+
+Own page in both bulk PDFs, after "Where ECH spend sits". It lists every sized deployment's raw bulk GB/day and the arithmetic from bundle to estimator input. Appendix B repeats the formulas under "Raw bulk ingest". It is not a quote. The estimator read-back stays the dollar.
+
+```
+bytes_per_day(index) = primaries.bulk.total_size_in_bytes × 86,400 ÷ write_phase_sec   (whole bytes)
+bundle_gb_day(dep)   = Σ write indices bytes_per_day ÷ 1e9
+quoted_gb_day(dep)   = bundle_gb_day × pace_factor            (pace_factor = ecu.quote_usage_factor)
+fleet                = Σ deployments, by solution; a deployment with no bundle adds 0
+share(dep)           = quoted_gb_day ÷ fleet quoted
+logs / metrics       = 0.90 / 0.10 × Observability quoted bulk
+metered_gb_day       = bulk × 1.595
+days_in_store(dep)   = stored_gb ÷ (bundle_gb_day × 0.60)
+```
+
+`write_phase_sec` is creation until rollover, or the index age while the ILM action is rollover. Write indices are the last index of each data stream and any alias marked `is_write_index`. A missing or zero write phase is 0. Days in store compares the local primary store with ingest: a value far below retention days means retained data sits outside that store (searchable snapshots) or the stored-GB snapshot is older than the bundle. A node up under 2 days measures the rate over a short window, so that row is shaded. On the compression-applied PDF, bulk is recovered as `compressioncalc_accounted_for ÷ compression_ratio` and an Accounted GB/day column (bulk × 0.60) is added.
+
 ## Deployment consolidation analysis across metered ingest rates
 
-This is the Observability ingest rate for one deployment priced alone. It is not a D32 quote and it does not include retention or support.
+This is the Observability ingest rate for one deployment priced alone. It is a band walk. The 1.595 factor is this walk's expansion, not G27 on the Observability sheet. It is not a D32 quote and it does not include retention or support.
 
 ```
 metered_gb_day = bulk_gb_day × 1.595
@@ -112,7 +129,7 @@ A deployment whose logs stream and metrics stream are both inside the first 50 G
 
 ## Search-power projection
 
-On-demand, performant, and high availability are priced with the es3 estimator when Search was estimated. High availability is the highly-performant setting. Show monthly and steady annual (monthly × 12) for each. When Search was not estimated, `search_power` is absent and the Appendix does not include the chart. These dollars stay at estimator list and are not added to D32 or E74. The contract rate is not applied. When the quoted solution is Search, the quote stays the on-demand read-back. The chart, when present, is in Appendix A of serverless_consolidation_analysis_appendix, after the input arithmetic and the metered-rate tables. The quote integrity table follows it. Appendix B follows Appendix A in that same document.
+On-demand, performant, and high availability are priced with the es3 estimator when Search was estimated. High availability is the notebook's third search-power band. Show monthly and steady annual (monthly × 12) for each. When Search was not estimated, `search_power` is absent and the Appendix does not include the chart. These dollars stay at estimator list and are not added to D32 or E74. The contract rate is not applied. When the quoted solution is Search, the quote stays the on-demand read-back. The chart, when present, is in Appendix A of serverless_consolidation_analysis_appendix, after the input arithmetic and the metered-rate tables. The quote integrity table follows it. Appendix B follows Appendix A in that same document.
 
 ## Quote integrity
 
@@ -129,8 +146,6 @@ The score is the mean of the checks that apply. A check with no inputs is n/a an
 
 The detail prints both cents and the gap. A missing monthly or a missing steady annual on a quote line scores 0 for that line. The overall result passes when the score is 0.90 or higher, and also when every scored check passes. A check below its own bar stays flagged and its detail still names the gap. Bundle coverage below 1.0 names each deployment that has no bundle.
 
-Same formulas inside each project. Each project is its own estimator copy. The month written is the project's measured months rounded up. Observability and Security projects also get a 30-day read at 1 month on the same bulk. Search does not. Its only price is the full-retention read-back, and the 30-day total keeps that figure. Sum of the read-backs is the split-fleet price, once at the measured month and once at 30 days. Compare each sum with the matching one-project read-back. The difference is the cost of staying split. A user-set retention month replaces the headline month on every project, including the pool, and does not change Σ bulk.
-
 ## 2–5 projects
 
 1. Sort rows by `store_gb` descending.
@@ -138,6 +153,8 @@ Same formulas inside each project. Each project is its own estimator copy. The m
 3. Price each pack with the formulas above, not with `store_gb / (3 × 30.416)`.
 
 State the pack's stored GB only as a label for what was grouped. The ingest input is the pack's Σ bulk.
+
+The consolidation run writes a 30-day Search sheet. Its disk is measured store × (1 / written months). The 2–5 project pack prints inputs only. It does not price Search a second time. Observability and Security projects also get a 30-day read at 1 month on the same bulk. Sum of the read-backs is the split-fleet price, once at the measured month and once at 30 days. Compare each sum with the matching one-project read-back. The difference is the cost of staying split. A user-set retention month replaces the headline month on every project, including the pool, and does not change Σ bulk.
 
 ## Gap against K360
 

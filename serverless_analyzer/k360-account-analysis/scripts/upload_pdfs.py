@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Upload the canvas PDF exports into the customer's Drive folder (Sheets venv).
 
-Consolidation PDFs at measured retention go in `full_retention`. 30-day PDFs go in `30d`.
-The account PDF stays in the customer root. Same-named files are updated in place.
+The bulk consolidation PDFs (full retention and 30-day), the account PDF, and the appendix stay in the customer root.
+Compression-applied PDFs go in `full_retention` or `30d`. Same-named files are updated in place.
 Writes `exports.<kind>.drive_url` back to account.json.
 
   ~/.config/serverless-analyzer/venv/bin/python upload_pdfs.py --account-json <key>_account.json

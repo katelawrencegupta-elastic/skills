@@ -1300,9 +1300,22 @@ def main() -> None:
         },
     }
 
+    billed_rows = list(zip(days, total_daily, day_active_deps))
+    while billed_rows and billed_rows[-1][1] <= 0:
+        billed_rows.pop()
+    billed_rows = billed_rows[-30:]
+    billed_names: set[str] = set()
+    for _day, _ecu, active in billed_rows:
+        billed_names |= active
+    billed_window = {
+        "start": billed_rows[0][0] if billed_rows else None,
+        "end": billed_rows[-1][0] if billed_rows else None,
+        "days": len(billed_rows),
+        "names": sorted(billed_names),
+    }
     if args.chart == "week":
         c_days, c_series, c_total = rollup_weekly(days, series_list, total_daily)
-        chart = {"grain": "week", "days": c_days, "series_names": names, "ecu_series": c_series, "total": c_total}
+        chart = {"grain": "week", "days": c_days, "series_names": names, "ecu_series": c_series, "total": c_total, "billed_window": billed_window}
     else:
         chart = {
             "grain": "day",
@@ -1310,6 +1323,7 @@ def main() -> None:
             "series_names": names,
             "ecu_series": series_list,
             "total": total_daily,
+            "billed_window": billed_window,
         }
 
     # Distinct named deployments with billing spend > 0 per week / month

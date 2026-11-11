@@ -21,7 +21,6 @@ import argparse
 import json
 import os
 import re
-import statistics
 import time
 import urllib.error
 import urllib.parse
@@ -311,7 +310,18 @@ def _user_index(name: str) -> bool:
 
 
 def _zip_json(archive: zipfile.ZipFile, suffix: str):
-    name = next((n for n in archive.namelist() if n.endswith(suffix) and not n.endswith("/")), None)
+    """One member of a bundle, by its path inside the archive.
+
+    An admin-console bundle nests every file under `api-diagnostics-<ts>/`, so the
+    leading slash matches. A bundle written by the standalone `esdiag` runner has
+    those same files at the archive root, with no folder to match the slash, so a
+    root-relative name is accepted too.
+    """
+    root = suffix.lstrip("/")
+    names = [n for n in archive.namelist() if not n.endswith("/")]
+    name = next((n for n in names if n.endswith(suffix)), None) or next(
+        (n for n in names if n == root), None
+    )
     if not name:
         return None
     return json.loads(archive.read(name))
@@ -355,51 +365,6 @@ def _est_bytes_per_day(bulk_bytes: int, creation: int | None, lifecycle: int | N
 
 # The second estimate keeps 60% of write-index bulk.
 COMPRESSION_RATIO = 0.60
-
-
-def compression_share(bulks: list[float], indexes: list[float]) -> float | None:
-    """On-disk ÷ bulk. The ratio stays at or below 1.
-
-    Each write index with both rates contributes min(1, index ÷ bulk). The total is
-    Σ index ÷ Σ bulk, including bulk whose on-disk rate is 0. When that total is
-    above 1, the median of the capped per-index ratios is used instead.
-    """
-    ratios: list[float] = []
-    bulk_sum = 0.0
-    index_sum = 0.0
-    for bulk, index in zip(bulks, indexes):
-        bulk = float(bulk or 0)
-        index = float(index or 0)
-        if bulk <= 0:
-            continue
-        bulk_sum += bulk
-        index_sum += max(index, 0.0)
-        if index > 0:
-            ratios.append(min(1.0, index / bulk))
-    if bulk_sum <= 0 or not ratios:
-        return None
-    share = index_sum / bulk_sum
-    if share > 1:
-        share = float(statistics.median(ratios))
-    return min(1.0, share)
-
-
-def compression_share_from_ratios(bulks: list[float], ratios: list[float | None]) -> float | None:
-    """Bulk-weighted total of ratios that are already on-disk ÷ bulk. Never above 1."""
-    capped: list[float] = []
-    weights: list[float] = []
-    for bulk, ratio in zip(bulks, ratios):
-        bulk = float(bulk or 0)
-        if bulk <= 0 or ratio is None:
-            continue
-        capped.append(min(1.0, float(ratio)))
-        weights.append(bulk)
-    if not weights:
-        return None
-    share = sum(weight * ratio for weight, ratio in zip(weights, capped)) / sum(weights)
-    if share > 1:
-        share = float(statistics.median(capped))
-    return min(1.0, share)
 
 
 def _write_indices(streams: list, alias: dict) -> set[str]:

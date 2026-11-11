@@ -317,6 +317,9 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
         "retention_clamped": clamped_notes,
         "active_month": active_info.get("month"),
         "active_month_partial": bool(active_info.get("partial")),
+        "window_start": active_info.get("window_start"),
+        "window_end": active_info.get("window_end"),
+        "window_days": active_info.get("window_days"),
         "active_deployments": len(active_names) if use_active else None,
         "ecu_month": active_info.get("ecu_month"),
         "inactive_excluded": inactive,
@@ -335,13 +338,22 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
         names = ", ".join(f"{s['name']} ({s['uptime_days']}d)" for s in short[:8])
         notes.append(f"Nodes up for under 2 days: {names}. The bulk rate is still the index write phase.")
     if use_active:
-        month = active_info.get("month")
-        partial = " That month is partial." if active_info.get("partial") else ""
-        notes.insert(0, (
-            f"Sized {len(active_names)} deployments with a bill in {month}.{partial} "
-            f"{inactive} deployments had no bill that month. Their last stored snapshot, {dropped_gb:,.0f} GB, is not carried into the sizing."
-        ))
-        if active_info.get("partial") and active_info.get("ecu_month"):
+        if active_info.get("window_start") and active_info.get("window_end"):
+            notes.insert(0, (
+                f"Sized {len(active_names)} deployments with a bill from {active_info['window_start']} through {active_info['window_end']} "
+                f"({active_info.get('window_days')} days). "
+                f"{inactive} deployments had no bill in that window. Their last stored snapshot, {dropped_gb:,.0f} GB, is not carried into the sizing."
+            ))
+        else:
+            month = active_info.get("month")
+            partial = " That month is partial." if active_info.get("partial") else ""
+            notes.insert(0, (
+                f"Sized {len(active_names)} deployments with a bill in {month}.{partial} "
+                f"{inactive} deployments had no bill that month. Their last stored snapshot, {dropped_gb:,.0f} GB, is not carried into the sizing."
+            ))
+        if active_info.get("ecu_month") and active_info.get("window_end") and not str(active_info.get("window_end")).startswith(str(active_info.get("ecu_month"))):
+            notes.append(f"ECU/mo on the sizing row is {active_info['ecu_month']} billing for those deployments, the last complete month.")
+        elif active_info.get("partial") and active_info.get("ecu_month"):
             notes.append(f"ECU/mo on the sizing row is {active_info['ecu_month']} billing for those deployments, the last complete month.")
     if inactive_bundles:
         notes.append(f"{len(inactive_bundles)} diagnostic bundles belong to deployments with no bill in {active_info.get('month')} and are not priced.")

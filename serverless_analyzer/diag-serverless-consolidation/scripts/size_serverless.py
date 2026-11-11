@@ -52,7 +52,7 @@ K360_SCRIPTS = scripts_dir(_account_root)
 sys.path.insert(0, str(K360_SCRIPTS))
 sys.path.insert(0, str(ORG_SKILL / "scripts"))
 from privacy import seal_dir, seal_file, seal_text  # noqa: E402
-from quote_checks import addon_off_value, g26_gate, money as sheet_money  # noqa: E402
+from quote_checks import addon_off_value, e73_blocks_quote, g26_gate, money as sheet_money  # noqa: E402
 try:
     from sheets_auth import get_creds  # noqa: E402
 except ImportError as e:  # pragma: no cover
@@ -1055,25 +1055,33 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
             if gb <= 0 and not (g.get("daily_raw_gb") or 0):
                 continue
             source_months = g.get("retention_months") if g.get("retention_months") is not None else (con.get(sol) or {}).get("retention_months")
-            projected = projected_region_monthly(
-                sol,
-                stored_gb=gb,
-                daily_raw_gb=g.get("daily_raw_gb"),
-                retention_months=source_months,
-                solution_stored_gb=total_gb,
-                workload=workload if sol == "search" else None,
-            )
-            if projected <= REGION_ESTIMATE_MIN_USD:
-                continue
-            region = g["region"]
-            title = estimate_title(key, sol, name_suffix, region)
             retention = _months_for_sheet({"retention_months": source_months}, force_months)
-            if sol != "search" and retention is None:
-                continue
+            if sol == "security":
+                try:
+                    security_daily = float(g.get("daily_raw_gb") or 0)
+                except (TypeError, ValueError):
+                    security_daily = 0.0
+                if security_daily <= 0 or retention is None:
+                    continue
+            else:
+                projected = projected_region_monthly(
+                    sol,
+                    stored_gb=gb,
+                    daily_raw_gb=g.get("daily_raw_gb"),
+                    retention_months=source_months,
+                    solution_stored_gb=total_gb,
+                    workload=workload if sol == "search" else None,
+                )
+                if projected <= REGION_ESTIMATE_MIN_USD:
+                    continue
+                if sol != "search" and retention is None:
+                    continue
             if g.get("daily_raw_gb") is not None:
                 daily = float(g["daily_raw_gb"])
             else:
                 daily = gb / (float(retention or 3) * DAYS_PER_MONTH) if (retention or 3) else 0.0
+            region = g["region"]
+            title = estimate_title(key, sol, name_suffix, region)
             job = {
                 "solution": sol,
                 "region": region,
@@ -1171,43 +1179,82 @@ def assemble_plan_bars(specs: list[dict], fills: list[dict]) -> dict:
     return {"bars": bars}
 
 
-def _search_group_price(group: list[dict], *, workload: dict, org_gb: float, support: str, force_months: int | None, cache: dict) -> float:
-    """On-demand Search price for one project. An empty project still pays the estimator minimum."""
-    store = sum(float(row.get("store_gb") or 0) for row in group)
+def _plan_written_months(group: list[dict]) -> int | None:
+    """Whole retention month for one deployment-count project, before a 30-day force.
+
+    Bulk weights the month when any row has bulk. A Search project with store and
+    a measured age but no write-index bulk uses store as the weight.
+    """
     diag = _diag_inputs()
-    written = (diag.summarize(group, force_months).get("months_written") or 1)
-    scale = float(force_months) / float(written) if force_months and written else 1.0
-    stored = store * scale
-    org = float(org_gb or 0) * scale
+    written = diag.summarize(group).get("months_written")
+    if written:
+        return int(written)
+    weight = 0.0
+    weighted_days = 0.0
+    for row in group:
+        try:
+            store = float(row.get("store_gb") or 0)
+            days = float(row.get("retention_days"))
+        except (TypeError, ValueError):
+            continue
+        if store > 0 and days > 0:
+            weight += store
+            weighted_days += store * days
+    if weight <= 0:
+        return None
+    return diag.whole_months(weighted_days / weight / diag.DAYS_PER_MONTH)
+
+
+def search_plan_disk(group: list[dict], force_months: int | None) -> tuple[float, float, int | None]:
+    """Search disk for one bar. A forced month shrinks store by measured months.
+
+    Returns scaled store, the scale, and the measured whole month. The force
+    month is not written back into the measured month before the division.
+    """
+    store = sum(float(row.get("store_gb") or 0) for row in group)
+    written = _plan_written_months(group)
+    scale = 1.0
+    if force_months and written:
+        scale = float(int(min(36, max(1, force_months)))) / float(written)
+    return store * scale, scale, written
+
+
+def _search_group_price(group: list[dict], *, workload: dict, org_gb: float, support: str, force_months: int | None, cache: dict) -> tuple[float | None, str | None]:
+    """On-demand Search price for one project. A missing notebook total is an error."""
+    stored, _scale, _written = search_plan_disk(group, force_months)
+    store = sum(float(row.get("store_gb") or 0) for row in group)
+    org = float(org_gb or 0) * (_scale if store else 1.0)
     share = (store / float(org_gb)) if org_gb else 0.0
     region = str(group[0].get("region") or "")
     provider = str(group[0].get("provider") or "")
+    if stored <= 0:
+        return 0.0, None
     key = (provider, region, round(stored, 3), round(share, 6), support)
     if key in cache:
-        return cache[key]
-    from fetch_org import price_es3_search
+        return cache[key], None
     wl = _scale_qps(workload, share) if org_gb else (workload or {})
-    money = None
-    if stored > 0:
-        result = run_es3({
-            "stored_gb": stored,
-            "org_stored_gb": org or stored,
-            "provider": provider,
-            "region": region,
-            "support_tier": support,
-            "workload": wl,
-        })
-        money = ((result.get("readback") or {}).get("monthly_steady_state"))
+    result = run_es3({
+        "stored_gb": stored,
+        "org_stored_gb": org or stored,
+        "provider": provider,
+        "region": region,
+        "support_tier": support,
+        "workload": wl,
+    })
+    money = ((result.get("readback") or {}).get("monthly_steady_state"))
     if money is None:
-        money = price_es3_search(stored, wl).get("total_mo") or 0
+        where = region or "the project"
+        return None, f"Deployment-count plan was not priced: Search in {where} returned no on-demand total."
     cache[key] = round(float(money), 2)
-    return cache[key]
+    return cache[key], None
 
 
-def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_months: int | None, o11y_id: str, parent_id: str, reuse: bool, provider, region_name, support: str, feature_tier, workload: dict | None = None, org_gb: float = 0) -> tuple[list[dict], list[dict], str | None, int]:
-    """Bar specs plus the Observability sheet jobs they point at.
+def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_months: int | None, o11y_id: str, security_id: str, parent_id: str, reuse: bool, provider, region_name, support: str, feature_tier, workload: dict | None = None, org_gb: float = 0) -> tuple[list[dict], list[dict], str | None, int]:
+    """Bar specs plus the sheet jobs they point at.
 
-    Search projects are priced here. A missing Observability month fails before any copy.
+    Observability projects read D32. Security projects read E74. Search projects
+    are the on-demand notebook. A missing month or a missing Search total fails
+    before the remaining copies are treated as a quote.
     """
     diag = _diag_inputs()
     specs: list[dict] = []
@@ -1218,7 +1265,7 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
     for plan in diag.region_feature_plans(rows):
         pct = plan["cut_pct"]
         if pct <= 0 and plan["projects"] <= 1:
-            specs.append({"cut_pct": 0, "label": "0%", "projects": 1, "reused_headline": True, "groups": []})
+            specs.append({"cut_pct": 0, "label": "Ceiling", "projects": 1, "reused_headline": True, "groups": []})
             continue
         packed = shared.get(plan["projects"])
         if packed is not None:
@@ -1235,7 +1282,7 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
             summary = diag.summarize(group, force_months)
             solution = str((group[0] if group else {}).get("solution") or "observability")
             if solution == "search":
-                money = _search_group_price(
+                money, err = _search_group_price(
                     group,
                     workload=workload or {},
                     org_gb=float(org_gb or 0),
@@ -1243,6 +1290,8 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
                     force_months=force_months,
                     cache=search_cache,
                 )
+                if err:
+                    return [], [], err, floor
                 groups.append({
                     "sheet": None,
                     "names": summary.get("names") or [],
@@ -1251,17 +1300,21 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
                     "monthly": money,
                 })
                 continue
+            if solution not in {"observability", "security"}:
+                solution = "observability"
             bulk = float(summary.get("bulk_gb_day") or 0)
             if bulk <= 0:
                 groups.append({"sheet": None, "names": summary.get("names") or [], "bulk_gb_day": 0})
                 continue
             written = force_months or summary.get("months_written")
             if not written:
-                return [], [], "Observability deployment-count plan was not priced: a project has bulk and no measured retention.", floor
+                label = "Security" if solution == "security" else "Observability"
+                return [], [], f"{label} deployment-count plan was not priced: a project has bulk and no measured retention.", floor
             group_region = str((group[0] if group else {}).get("region") or region_name or "")
             group_provider = str((group[0] if group else {}).get("provider") or provider or "")
             slug = re.sub(r"[\\/:\s]+", "-", group_region.strip()).strip("-")
-            title = f"{run_key}_Observability_plan_{pct}pct_{plan['projects']}projects_{index}"
+            kind = "Security" if solution == "security" else "Observability"
+            title = f"{run_key}_{kind}_plan_{pct}pct_{plan['projects']}projects_{index}"
             if slug:
                 title = f"{title}_{slug}"
             title = f"{title}{name_suffix}"
@@ -1272,7 +1325,8 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
                 "months_written": int(written),
             })
             jobs.append({
-                "template_id": o11y_id,
+                "solution": solution,
+                "template_id": security_id if solution == "security" else o11y_id,
                 "title": title,
                 "parent_id": parent_id,
                 "reuse": reuse,
@@ -1295,16 +1349,32 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
 
 
 def fill_plan_sheet(job: dict, creds) -> dict:
-    """Copy one plan workbook, write it, and read D32. A 429 or 503 is retried inside the request."""
+    """Copy one plan workbook and read its quote cell. A 429 or 503 is retried inside the request.
+
+    Observability reads D32 after the G26 gate. Security reads E74 after E73 is 0.
+    """
     sheets, drive = services_from(creds)
+    solution = job.get("solution") or "observability"
+    label = "Security" if solution == "security" else "Observability"
     try:
         copied, _reused = copy_template(drive, job["template_id"], job["title"], job["parent_id"], reuse=job["reuse"])
         opts = region_options(sheets, copied["id"])
         reg, _how = match_region(job["provider"], job["region_name"], opts)
-        cells = observability_input_cells(
-            {"sizing": {"feature_tier": job.get("feature_tier")}},
-            job["support"], reg, int(job["months_written"]), float(job["bulk"]),
-        )
+        account = {"sizing": {"feature_tier": job.get("feature_tier")}}
+        if solution == "security":
+            clear_security_addons(sheets, copied["id"], SEC_TAB)
+            cells = security_input_cells(account, job["support"], reg, int(job["months_written"]), float(job["bulk"]))
+            push_cells(sheets, copied["id"], SEC_TAB, cells, allowed_text=set(opts))
+            rb = read_cells(sheets, copied["id"], SEC_TAB, SEC_READBACK)
+            if e73_blocks_quote(rb.get("cps_addon_monthly")):
+                addon = sheet_money(rb.get("cps_addon_monthly"))
+                reason = "E73 was blank" if addon is None else f"E73 is {addon:g}"
+                return {"error": f"Security deployment-count plan was not priced: {job['title']} {reason}."}
+            price = sheet_money(rb.get("monthly_steady_state"))
+            if price is None:
+                return {"error": f"Security deployment-count plan was not priced: {job['title']} has no E74 read-back."}
+            return {"monthly": round(price, 2), "url": copied.get("url")}
+        cells = observability_input_cells(account, job["support"], reg, int(job["months_written"]), float(job["bulk"]))
         push_cells(sheets, copied["id"], O11Y_TAB, cells, allowed_text=set(opts))
         rb = read_cells(sheets, copied["id"], O11Y_TAB, O11Y_READBACK)
         gate = g26_gate(float(job["bulk"]), rb.get("total_raw_gb_day"))
@@ -1318,7 +1388,7 @@ def fill_plan_sheet(job: dict, creds) -> dict:
             return {"error": f"Observability deployment-count plan was not priced: {job['title']} has no D32 read-back."}
         return {"monthly": round(price, 2), "url": copied.get("url")}
     except Exception as ex:  # noqa: BLE001
-        return {"error": f"Observability deployment-count plan was not priced: {ex}"}
+        return {"error": f"{label} deployment-count plan was not priced: {ex}"}
 
 
 def _plan_solution(cloud_row: dict, measured: dict) -> str:
@@ -1335,10 +1405,37 @@ def _plan_solution(cloud_row: dict, measured: dict) -> str:
     return "search"
 
 
-def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str, support: str, provider, force_months: int | None, name_suffix: str, fresh: bool) -> dict:
-    """Price five cuts from one project per ECH deployment down to one per region and feature.
+def plan_roster(acc: dict) -> list[dict]:
+    """Deployments on the cover. The ceiling is one project for each of them.
 
-    Observability projects are D32 read-backs. Search projects are the on-demand estimator.
+    That list is the last 30 days of complete billing. A deployment with no
+    bill in that window stays off the ceiling.
+    """
+    measured = [
+        dep for dep in (acc.get("solutions") or {}).get("by_deployment") or []
+        if dep.get("platform") != "serverless" and dep.get("ingest_source") != "inactive"
+    ]
+    cloud_rows = [
+        dep for dep in ((acc.get("cloud") or {}).get("by_deployment") or [])
+        if dep.get("platform") != "serverless"
+    ]
+    cloud_by_name = {dep.get("name"): dep for dep in cloud_rows}
+    if measured:
+        return [cloud_by_name.get(dep.get("name")) or dep for dep in measured]
+    names = set(((acc.get("deployments") or {}).get("active") or {}).get("names") or [])
+    if names:
+        picked = [dep for dep in cloud_rows if dep.get("name") in names]
+        if picked:
+            return picked
+    return cloud_rows
+
+
+def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str, security_id: str, support: str, provider, force_months: int | None, name_suffix: str, fresh: bool) -> dict:
+    """Price the cuts from the cover count down to one project per region and feature.
+
+    Observability projects are D32 read-backs. Security projects are E74 read-backs.
+    Search projects are the on-demand estimator. A 30-day force scales Search disk
+    by the measured month.
     """
     del sheets, drive
     measured = {
@@ -1346,13 +1443,8 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
         for dep in (acc.get("solutions") or {}).get("by_deployment") or []
         if dep.get("platform") != "serverless"
     }
-    cloud_rows = [
-        dep for dep in ((acc.get("cloud") or {}).get("by_deployment") or [])
-        if dep.get("platform") != "serverless"
-    ]
-    source = cloud_rows or list(measured.values())
     rows = []
-    for dep in source:
+    for dep in plan_roster(acc):
         rec = measured.get(dep.get("name")) or dep
         rows.append({
             "name": dep.get("name") or "",
@@ -1372,6 +1464,7 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
         name_suffix=name_suffix,
         force_months=force_months,
         o11y_id=o11y_id,
+        security_id=security_id,
         parent_id=folder["id"],
         reuse=not fresh,
         provider=provider,
@@ -1390,7 +1483,7 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
             creds = load_sheet_creds()
             fills = map_in_order(lambda job: fill_plan_sheet(job, creds), jobs)
         except Exception as ex:  # noqa: BLE001
-            return {"bars": [], "error": f"Observability deployment-count plan was not priced: {ex}"}
+            return {"bars": [], "error": f"Deployment-count plan was not priced: {ex}"}
         built = assemble_plan_bars(specs, fills)
     if not built.get("error"):
         built["floor"] = floor
@@ -1529,7 +1622,8 @@ def main() -> None:
         plan_folder = ensure_drive_folder(drive, PLAN_FOLDER_NAME, estimates_root["id"])
         lines.append(f"Plan folder → {plan_folder['url']}")
         plan = size_deployment_plan(
-            acc, sheets, drive, plan_folder, o11y_id=args.o11y_id, support=support, provider=provider,
+            acc, sheets, drive, plan_folder, o11y_id=args.o11y_id, security_id=args.security_id,
+            support=support, provider=provider,
             force_months=args.force_months, name_suffix=suffix, fresh=args.fresh,
         )
         sz["deployment_plan"] = plan

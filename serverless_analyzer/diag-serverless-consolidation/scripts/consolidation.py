@@ -48,11 +48,12 @@ def quote_lookback_days(days) -> int:
 
 
 def _window_daily_avg(ecu: dict, days: int) -> float | None:
-    totals = ecu.get("daily_totals") or []
-    if totals:
-        window = [float(v or 0) for v in totals[-days:]]
-        if window:
-            return sum(window) / len(window)
+    totals = [float(v or 0) for v in (ecu.get("daily_totals") or [])]
+    while totals and totals[-1] <= 0:
+        totals.pop()
+    if len(totals) >= days:
+        window = totals[-days:]
+        return sum(window) / len(window)
     if days <= 30 and ecu.get("last_30d_daily_avg") is not None:
         return float(ecu["last_30d_daily_avg"])
     fetched = int(ecu.get("lookback_days") or 0)
@@ -211,11 +212,12 @@ def projected_region_monthly(
     solution_stored_gb: float,
     workload: dict | None,
 ) -> float:
-    """Monthly sizing before a regional sheet is written.
+    """Monthly sizing before an Observability or Search regional sheet is written.
 
-    Observability and Security use the ladder on that region's bulk and retention.
+    Observability uses the Observability ladder on that region's bulk and retention.
     Search is that region's share of the solution ballpark, so a per-region
-    minimum does not turn a few stored GB into a sheet.
+    minimum does not turn a few stored GB into a sheet. Security is not projected
+    here. A Security region with bulk and a month is written, and E74 decides the $10 line.
     """
     gb = float(stored_gb or 0)
     months = float(retention_months or 1)
@@ -229,67 +231,6 @@ def projected_region_monthly(
     if daily is None:
         daily = gb / (months * DAYS_PER_MONTH) if months else 0.0
     return float(price_o11y_serverless(float(daily or 0), months).get("total_mo") or 0)
-
-
-def logical_project_floor(acc: dict, solutions: tuple[str, ...] | None = None) -> int:
-    """Fewest serverless projects the regions and solutions still require.
-
-    One project per solution per region, and only a region whose projected
-    sizing is more than $10/mo. A solution that lives in one region still
-    counts. With no regional split on the account, the floor stays 1.
-    `solutions` limits the count to those solutions.
-    """
-    groups = ((acc.get("consolidation") or {}).get("architecture") or {}).get("groups") or []
-    if not groups:
-        return 1
-    by_sol: dict[str, list] = {}
-    for group in groups:
-        sol = group.get("solution") or "search"
-        if solutions is not None and sol not in solutions:
-            continue
-        by_sol.setdefault(sol, []).append(group)
-    con = (acc.get("sizing") or {}).get("consolidated") or {}
-    workload = (con.get("search") or {}).get("workload") or acc.get("workload") or {}
-    kept = 0
-    for sol, rows in by_sol.items():
-        total_gb = sum(float(row.get("stored_gb") or 0) for row in rows)
-        for row in rows:
-            gb = float(row.get("stored_gb") or 0)
-            daily = row.get("daily_raw_gb")
-            if sol == "search" and gb <= 0:
-                continue
-            if gb <= 0 and not daily:
-                continue
-            months = row.get("retention_months")
-            if months is None:
-                months = (con.get(sol) or {}).get("retention_months")
-            projected = projected_region_monthly(
-                sol,
-                stored_gb=gb,
-                daily_raw_gb=daily,
-                retention_months=months,
-                solution_stored_gb=total_gb,
-                workload=workload if sol == "search" else None,
-            )
-            if projected > REGION_ESTIMATE_MIN_USD:
-                kept += 1
-    return kept or 1
-
-
-def plan_project_floor(acc: dict, n: int) -> int:
-    """Fewest projects on the Observability deployment-count chart.
-
-    The chart prices Observability and Security. Search regions stay off it.
-    A fleet whose priced regions collapse to one stays at 8 projects when it
-    has that many deployments. A step can then merge deployments that have
-    ingest instead of stopping on empty ones.
-    """
-    from diag_inputs import MINIMUM_PLAN_PROJECTS
-    logical = logical_project_floor(acc, solutions=("observability", "security"))
-    floor = MINIMUM_PLAN_PROJECTS if logical <= 1 else logical
-    if n <= 0:
-        return max(int(floor), 1)
-    return min(max(int(floor), 1), n)
 
 
 def _price_slice(solution: str, gb: float, retention_months: float, workload: dict | None) -> dict:
@@ -498,7 +439,8 @@ def _deployment_groups(acc: dict, infra: dict | None, months: float) -> list[dic
         if g["has_daily"]:
             row["daily_raw_gb"] = round(g["daily_raw_gb"], 3)
             if g["retention_bulk"] > 0:
-                row["retention_months"] = round((g["retention_weighted"] / g["retention_bulk"]) / DAYS_PER_MONTH, 2)
+                # Keep the fraction. Rounding to 2 decimals first turns 12.004 months into 12, and the fleet sheet writes 13.
+                row["retention_months"] = round((g["retention_weighted"] / g["retention_bulk"]) / DAYS_PER_MONTH, 6)
         groups.append(row)
     order = {"search": 0, "observability": 1, "security": 2}
     groups.sort(key=lambda g: (order.get(g["solution"], 9), -g["ech_ecu_mo"]))
@@ -638,13 +580,17 @@ def regional_quote(
     }
 
 
-def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes: list[str]) -> bool:
-    """One serverless project per solution per region. Each project uses its own sizing when one was written."""
+def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes: list[str]) -> tuple[bool, list[dict]]:
+    """One serverless project per solution per region. Each project uses its own sizing when one was written.
+
+    The second value is each region whose projected sizing is $10/mo or less.
+    Those regions stay in the deployment-count floor and do not get an estimate sheet.
+    """
     spans = {}
     for g in groups:
         spans.setdefault(g["solution"], set()).add(g["region"])
     if not any(len(v) > 1 for v in spans.values()):
-        return False
+        return False, []
     cloud = (acc.get("cloud") or {}).get("summary") or {}
     provider = cloud.get("provider")
     org_gb = float((acc.get("storage") or {}).get("data_stored_gb") or 0)
@@ -654,7 +600,7 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
     saved = _saved_projects(acc)
     store_split = False
     regional_quoted = False
-    omitted_small: list[str] = []
+    omitted_small: list[dict] = []
     profile_keys = ("Total $/month", "Provisioned Search VCU/h", "Idle Search VCU/h", "Search $/month", "Ingest $/month", "Storage $/month", "Support $/month")
     for sol, regions in spans.items():
         if len(regions) <= 1:
@@ -666,17 +612,30 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
         total_gb = sum(g["stored_gb"] for g in rows) or float(blk.get("stored_gb") or 0)
         classified = []
         for g in rows:
-            projected = projected_region_monthly(
-                sol,
-                stored_gb=g.get("stored_gb") or 0,
-                daily_raw_gb=g.get("daily_raw_gb"),
-                retention_months=g.get("retention_months") if g.get("retention_months") is not None else blk.get("retention_months"),
-                solution_stored_gb=total_gb,
-                workload=workload if sol == "search" else None,
-            )
-            if projected <= REGION_ESTIMATE_MIN_USD:
-                omitted_small.append(f"{sol} {g['region']} ${projected:,.2f}")
-                continue
+            source_months = g.get("retention_months") if g.get("retention_months") is not None else blk.get("retention_months")
+            try:
+                region_daily = float(g.get("daily_raw_gb") or 0)
+            except (TypeError, ValueError):
+                region_daily = 0.0
+            if sol == "security":
+                if region_daily <= 0:
+                    continue
+            else:
+                projected = projected_region_monthly(
+                    sol,
+                    stored_gb=g.get("stored_gb") or 0,
+                    daily_raw_gb=g.get("daily_raw_gb"),
+                    retention_months=source_months,
+                    solution_stored_gb=total_gb,
+                    workload=workload if sol == "search" else None,
+                )
+                if projected <= REGION_ESTIMATE_MIN_USD:
+                    omitted_small.append({
+                        "solution": sol,
+                        "region": g["region"],
+                        "projected_monthly": round(float(projected), 2),
+                    })
+                    continue
             share = (g["stored_gb"] / total_gb) if total_gb else 0.0
             saved_hit = saved.get((sol, g["region"])) or {}
             saved_rb = saved_hit.get("readback") or {}
@@ -694,7 +653,7 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                 monthly = _money(rb.get("monthly_steady_state"))
                 classified.append({
                     "region": g["region"], "stored_gb": g["stored_gb"],
-                    "retention_months": g.get("retention_months"),
+                    "retention_months": source_months,
                     "kind": "own" if monthly is not None else "missing",
                     "own_monthly": monthly, "own_pricing": "re-estimated on-demand",
                     "own_annual": _money(rb.get("annual_year1")),
@@ -736,9 +695,16 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                 })
                 continue
             sheet_monthly = _money(saved_rb.get("monthly_steady_state"))
+            if sol == "security" and sheet_monthly is not None and sheet_monthly <= REGION_ESTIMATE_MIN_USD:
+                omitted_small.append({
+                    "solution": sol,
+                    "region": g["region"],
+                    "projected_monthly": round(sheet_monthly, 2),
+                })
+                continue
             classified.append({
                 "region": g["region"], "stored_gb": g["stored_gb"],
-                "retention_months": g.get("retention_months"),
+                "retention_months": source_months,
                 "kind": "own" if sheet_monthly is not None else "missing",
                 "own_monthly": sheet_monthly,
                 "own_pricing": "sheet read-back" if sheet_monthly is not None else "",
@@ -778,8 +744,14 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                     else f"{sol.title()} sheet read-back (quotable)"
                 )
             regional_quoted = True
-        else:
+        elif "quotable" in str(blk.get("pricing") or ""):
             store_split = True
+        else:
+            blk["regional_mode"] = "missing"
+            blk["pricing"] = "omitted — a region had no read-back"
+            blk["total_mo"] = 0.0
+            blk["total_yr"] = 0.0
+            notes.append(f"{sol.title()} was left out of the quote because a region had no read-back.")
         if sol == "search" and quote["mode"] == "per_region":
             for key in ("search_mo", "ingest_mo", "retention_mo", "support_mo"):
                 vals = [p.get(key) for p in quote["rows"] if p.get(key) is not None]
@@ -822,12 +794,16 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
     if store_split:
         note += " Where a region had no read-back of its own, that solution keeps the consolidated total and every region is a stored-GB share of it."
     if omitted_small:
+        listed = "; ".join(
+            f"{row['solution']} {row['region']} ${row['projected_monthly']:,.2f}" for row in omitted_small
+        )
         note += (
-            f" A regional estimate is produced only when the projected sizing is more than ${REGION_ESTIMATE_MIN_USD:.0f}/mo. "
-            "Left out: " + "; ".join(omitted_small) + "."
+            f" A regional estimate stays in the quote only when it is more than ${REGION_ESTIMATE_MIN_USD:.0f}/mo. "
+            "Observability and Search use the projection. Security uses the E74 read-back. "
+            "Left out: " + listed + "."
         )
     notes.append(note)
-    return regional_quoted
+    return regional_quoted, omitted_small
 
 
 def _search_eis(acc: dict, months: float) -> dict | None:
@@ -1159,7 +1135,8 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         _omit_unquoted(blk, notes, sol)
     svls_total_mo = sum(float(p.get("total_mo") or 0) for p in by_solution.values())
     region_groups = _deployment_groups(acc, infra, months)
-    quoted = _replicate_by_region(acc, by_solution, region_groups, notes) or quoted
+    regional_quoted, regions_under_minimum = _replicate_by_region(acc, by_solution, region_groups, notes)
+    quoted = regional_quoted or quoted
     _apply_search_eis(acc, by_solution, months, notes)
     svls_total_mo = sum(float(p.get("total_mo") or 0) for p in by_solution.values())
     if quoted:
@@ -1518,6 +1495,7 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         "metered_rates": observability_metered_rates(((acc.get("solutions") or {}).get("by_deployment") or [])) if (sz.get("ingest_source") == "diagnostics") else [],
         "deployment_plan": _deployment_bars(sz, by_solution, notes),
         "deployment_plan_floor": int((sz.get("deployment_plan") or {}).get("floor") or 1),
+        "regions_under_minimum": regions_under_minimum,
         "search_power": _search_power(sz, by_solution, acc),
         "fragmentation": fragmentation,
         "architecture": architecture,

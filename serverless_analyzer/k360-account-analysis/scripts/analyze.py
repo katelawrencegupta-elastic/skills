@@ -1505,45 +1505,113 @@ def sizing_inputs(acc: dict, org: dict, retention_months: float, security_retent
 
 
 # --------------------------------------------------------------------------- main build
-def active_deployment_set(org: dict) -> dict:
-    """Deployments with billing ECU in the latest lookback month.
+def _month_ecu(series: dict, months: list, month: str) -> float:
+    labels = list(series.get("months") or months)
+    values = series.get("ecu") or []
+    if month not in labels:
+        return 0.0
+    i = labels.index(month)
+    return float(values[i] or 0) if i < len(values) else 0.0
 
-    A deployment with no bill that month is out of the sizing. Its last
-    telemetry snapshot is not a source of stored GB. ECU for the sized set is
-    the last complete month, so a partial final month does not shrink the bill.
-    """
+
+def _complete_months(org: dict) -> tuple[list, list, str | None]:
+    """Calendar months in the lookback, and the last one that is not still open."""
     monthly = org.get("monthly") or {}
     months = list(monthly.get("months") or [])
-    by_dep = monthly.get("by_deployment") or {}
-    if not months:
-        return {"month": None, "partial": False, "ecu_month": None, "count": 0, "names": [], "ecu_complete_month": {}}
-    latest = months[-1]
     rng = org.get("range") or {}
     start = str(rng.get("start") or "")
     cur_ym = datetime.now(timezone.utc).date().strftime("%Y-%m")
-    partial_months = {m for m in months if m == cur_ym or (start and m == start[:7] and not start.endswith("-01"))}
-    complete = [m for m in months if m not in partial_months]
-    ecu_month = complete[-1] if complete else latest
+    partial = {m for m in months if m == cur_ym or (start and m == start[:7] and not start.endswith("-01"))}
+    complete = [m for m in months if m not in partial]
+    ecu_month = complete[-1] if complete else (months[-1] if months else None)
+    return months, complete, ecu_month
 
-    def ecu_in(series: dict, month: str) -> float:
-        labels = list(series.get("months") or months)
-        values = series.get("ecu") or []
-        if month not in labels:
-            return 0.0
-        i = labels.index(month)
-        return float(values[i] or 0) if i < len(values) else 0.0
 
+def quote_billing_window(org: dict, days_n: int = 30) -> dict:
+    """Who billed in the last `days_n` days with a positive org total.
+
+    Trailing days with no bill are not part of the window. A partial calendar
+    month is not the window. Names saved on the chart are that exact set.
+    Without them, a named daily series is summed across the window, and any
+    other deployment counts when a month the window touches still has ECU.
+    """
+    chart = org.get("chart") or {}
+    stored = chart.get("billed_window") or {}
+    if stored.get("names") and stored.get("start") and stored.get("end"):
+        return {
+            "start": stored.get("start"),
+            "end": stored.get("end"),
+            "days": int(stored.get("days") or 0),
+            "names": sorted(stored.get("names") or []),
+        }
+    days = [str(d)[:10] for d in (chart.get("days") or [])]
+    total = [float(v or 0) for v in (chart.get("total") or [])]
+    n = min(len(days), len(total))
+    rows = list(zip(days[:n], total[:n]))
+    while rows and rows[-1][1] <= 0:
+        rows.pop()
+    window = rows[-days_n:] if chart.get("grain") in (None, "day") else []
+    if len(window) < days_n:
+        months, _complete, ecu_month = _complete_months(org)
+        by_dep = (org.get("monthly") or {}).get("by_deployment") or {}
+        names = []
+        if ecu_month:
+            for name, series in by_dep.items():
+                if isinstance(series, dict) and _month_ecu(series, months, ecu_month) > 0:
+                    names.append(name)
+        names.sort()
+        return {"start": None, "end": None, "days": 0, "names": names, "month": ecu_month}
+    start, end = window[0][0], window[-1][0]
+    index = {d: i for i, d in enumerate(days)}
+    idxs = [index[d] for d, _v in window if d in index]
+    daily_sum: dict[str, float] = {}
+    series = chart.get("ecu_series") or []
+    if isinstance(series, list):
+        for name, vals in zip(chart.get("series_names") or [], series):
+            if name == "Other" or not isinstance(vals, list):
+                continue
+            daily_sum[name] = sum(float(vals[i] or 0) for i in idxs if i < len(vals))
+    overlap = {start[:7], end[:7]}
+    monthly = org.get("monthly") or {}
+    months = list(monthly.get("months") or [])
     names = []
-    ecu_complete: dict[str, float] = {}
-    for name, series in by_dep.items():
-        if not isinstance(series, dict) or ecu_in(series, latest) <= 0:
+    for name, series_row in (monthly.get("by_deployment") or {}).items():
+        if not isinstance(series_row, dict):
             continue
-        names.append(name)
-        ecu_complete[name] = round(ecu_in(series, ecu_month), 2)
+        if name in daily_sum:
+            if daily_sum[name] > 0:
+                names.append(name)
+            continue
+        if any(_month_ecu(series_row, months, month) > 0 for month in overlap):
+            names.append(name)
     names.sort()
+    return {"start": start, "end": end, "days": len(window), "names": names}
+
+
+def active_deployment_set(org: dict) -> dict:
+    """Deployments with a bill in the last 30 days.
+
+    Page 1 of the quote uses this set. A partial calendar month is not the
+    filter. ECU on the sizing row is still the last complete month, so an
+    open month does not shrink that row.
+    """
+    months, _complete, ecu_month = _complete_months(org)
+    by_dep = (org.get("monthly") or {}).get("by_deployment") or {}
+    window = quote_billing_window(org)
+    names = list(window.get("names") or [])
+    ecu_complete: dict[str, float] = {}
+    if ecu_month:
+        for name in names:
+            series = by_dep.get(name) or {}
+            if isinstance(series, dict):
+                ecu_complete[name] = round(_month_ecu(series, months, ecu_month), 2)
+    end = window.get("end")
     return {
-        "month": latest,
-        "partial": latest in partial_months,
+        "month": (end or "")[:7] or window.get("month") or ecu_month,
+        "partial": False,
+        "window_start": window.get("start"),
+        "window_end": window.get("end"),
+        "window_days": window.get("days") or None,
         "ecu_month": ecu_month,
         "count": len(names),
         "names": names,
