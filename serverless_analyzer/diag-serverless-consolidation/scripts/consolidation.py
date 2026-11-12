@@ -19,7 +19,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from quote_checks import e73_blocks_quote, g26_gate, integrity_score, money as _money
+from quote_checks import e73_blocks_quote, g28_gate, integrity_score, money as _money
 from skill_paths import find_skill
 
 DAYS_PER_MONTH = 30.416
@@ -73,16 +73,20 @@ def _scale_ingest(row: dict, factor: float) -> None:
 
 
 def apply_quote_lookback(acc: dict, days: int = 30) -> float:
-    """Price ECH and the estimator ingest at the last `days` of billed ECU.
+    """Price ECH at the last `days` of billed ECU.
 
-    Diagnostic bulk stays the measured rate when the window matches the
-    complete-month pace. A shorter window writes bulk × (window pace ÷
-    complete-month pace) so the sheet read-back is that lookback.
+    The window sets the ECH month and `quote_usage_factor`, the window pace ÷
+    the complete-month pace, which scales the ECH figures. Diagnostic bulk is
+    a rate measured at capture, so it is written to the estimators as measured:
+    `quote_ingest_factor` is 1.0 and a billing ratio does not change it. The
+    K360 backup has no measured rate, so its stored-GB ingest still takes the
+    billing pace. Search docs/s is a K360 rate and takes the pace in both.
     """
     window = quote_lookback_days(days)
     ecu = acc.setdefault("ecu", {})
     if ecu.get("quote_ingest_scaled") and int(ecu.get("quote_lookback_days") or 0) == window:
         return float(ecu.get("quote_usage_factor") or 1)
+    measured = (acc.get("sizing") or {}).get("ingest_source") == "diagnostics"
     daily = _window_daily_avg(ecu, window)
     complete = ecu.get("monthly_avg_complete_months")
     if complete:
@@ -97,16 +101,18 @@ def apply_quote_lookback(acc: dict, days: int = 30) -> float:
     else:
         monthly = daily * DAYS_PER_MONTH
         factor = (daily / base_daily) if base_daily else 1.0
+    ingest_factor = 1.0 if measured else factor
     if not ecu.get("quote_ingest_scaled"):
-        for dep in (acc.get("solutions") or {}).get("by_deployment") or []:
-            if isinstance(dep, dict):
-                _scale_ingest(dep, factor)
-        for block in ((acc.get("sizing") or {}).get("consolidated") or {}).values():
-            if isinstance(block, dict):
-                _scale_ingest(block, factor)
-        diagnostics = (acc.get("sizing") or {}).get("diagnostics") or {}
-        if isinstance(diagnostics, dict):
-            _scale_ingest(diagnostics, factor)
+        if ingest_factor != 1.0:
+            for dep in (acc.get("solutions") or {}).get("by_deployment") or []:
+                if isinstance(dep, dict):
+                    _scale_ingest(dep, ingest_factor)
+            for block in ((acc.get("sizing") or {}).get("consolidated") or {}).values():
+                if isinstance(block, dict):
+                    _scale_ingest(block, ingest_factor)
+            diagnostics = (acc.get("sizing") or {}).get("diagnostics") or {}
+            if isinstance(diagnostics, dict):
+                _scale_ingest(diagnostics, ingest_factor)
         ingest = ((acc.get("workload") or {}).get("ingest") or {})
         if ingest.get("docs_per_sec") is not None:
             try:
@@ -118,6 +124,7 @@ def apply_quote_lookback(acc: dict, days: int = 30) -> float:
     ecu["quote_daily_avg"] = None if daily is None else round(daily, 2)
     ecu["quote_monthly_ecu"] = round(monthly, 2)
     ecu["quote_usage_factor"] = round(factor, 6)
+    ecu["quote_ingest_factor"] = round(ingest_factor, 6)
     return float(ecu["quote_usage_factor"])
 
 
@@ -178,7 +185,7 @@ def observability_metered_rates(rows: list[dict]) -> list[dict]:
 
     Metered GB/day is raw bulk times 1.595. Logs are 90% of that and metrics
     are 10%. Each stream walks the ingest bands. The rate is ingest dollars
-    per metered GB. A row with no bulk has no rate. This is not a D32 quote.
+    per metered GB. A row with no bulk has no rate. This is not a D38 quote.
     """
     out = []
     for row in rows:
@@ -356,7 +363,7 @@ def _omit_unquoted(blk: dict, notes: list[str], solution: str) -> None:
 
 
 def _search_power(sz: dict, by_solution: dict, _acc: dict | None = None) -> dict | None:
-    """es3 profiles when Search was estimated. They are not added to D32 or E74.
+    """es3 profiles when Search was estimated. They are not added to D38 or E74.
 
     No profiles, and no page, when the Search estimator was skipped or never ran.
     The sized stored GB is not priced as Search in that case.
@@ -424,31 +431,51 @@ def per_cluster_plan(sz: dict, acc: dict, infra: dict | None) -> dict | None:
     for d in (acc.get("solutions") or {}).get("by_deployment") or []:
         meta[d.get("name")] = {"solution": d.get("solution"), "region": region_by_name.get(d.get("name"))}
     steps = [{"label": b.get("label") or "", "projects": b.get("projects"), "monthly": b.get("monthly")} for b in bars]
+    by_name = {d.get("name"): d for d in (acc.get("solutions") or {}).get("by_deployment") or []}
     rows: dict[str, dict] = {}
+    unallocated = [0.0] * len(steps)
     for si, bar in enumerate(bars):
         for g in bar["groups"]:
             names = [n for n in g.get("names") or [] if n]
             if not names:
                 continue
-            bulk = {n: float(((next((d for d in (acc.get("solutions") or {}).get("by_deployment") or [] if d.get("name") == n), {}) or {}).get("daily_raw_gb")) or 0) for n in names}
+            bulk = {n: float((by_name.get(n) or {}).get("daily_raw_gb") or 0) for n in names}
             total_bulk = sum(bulk.values())
             money = float(g.get("monthly") or 0)
+            # A cluster with a bundle and no bulk is not sized. One with no bundle is flagged missing.
+            # Money a project carries for clusters that are not sized stays unallocated, so each
+            # column still adds up to its bar.
+            def _status(n: str) -> str:
+                src = (by_name.get(n) or {}).get("ingest_source")
+                if src == "active_no_bundle":
+                    return "missing_diag"
+                return "no_bulk" if bulk[n] < 0.0005 and src == "diagnostics" else "sized"
+
+            sized = [n for n in names if _status(n) == "sized"]
+            sized_bulk = sum(bulk[n] for n in sized)
             for n in names:
-                share = bulk[n] / total_bulk if total_bulk > 0 else 1.0 / len(names)
+                status = _status(n)
                 row = rows.setdefault(n, {
                     "name": n, "solution": (meta.get(n) or {}).get("solution"), "region": (meta.get(n) or {}).get("region"),
-                    "bulk_gb_day": round(bulk[n], 3), "steps": [None] * len(steps),
+                    "bulk_gb_day": round(bulk[n], 3), "status": status, "steps": [None] * len(steps),
                 })
+                if status != "sized":
+                    row["steps"][si] = {"monthly": None, "project_monthly": round(money, 2), "pack": len(names)}
+                    continue
+                share = bulk[n] / sized_bulk if sized_bulk > 0 else 1.0 / len(sized)
                 row["steps"][si] = {"monthly": round(money * share, 2), "project_monthly": round(money, 2), "pack": len(names)}
-    out_rows = sorted(rows.values(), key=lambda r: -float((r["steps"][0] or {}).get("monthly") or 0))
+            if not sized:
+                unallocated[si] = round(unallocated[si] + money, 2)
+    out_rows = sorted(rows.values(), key=lambda r: (r.get("status") != "sized", -float((r["steps"][0] or {}).get("monthly") or 0)))
     for r in out_rows:
         first = (r["steps"][0] or {}).get("monthly")
-        r["under_minimum"] = first is not None and float(first) <= FLOOR_PROJECT_MIN_USD
+        r["under_minimum"] = r.get("status") == "sized" and first is not None and float(first) <= FLOOR_PROJECT_MIN_USD
     if len(out_rows) < 2:
         return None
     return {
         "steps": steps,
         "rows": out_rows,
+        "unallocated": unallocated,
         "min_usd": FLOOR_PROJECT_MIN_USD,
         "method": "Each project's priced $/mo shared across its clusters by bulk GB/day; evenly when the project has no bulk.",
     }
@@ -719,17 +746,17 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                     "url": saved_hit.get("url"),
                 })
                 continue
-            gate = (saved_hit.get("g26_gate") or {}) if sol == "observability" else {}
-            g26_rejected = sol == "observability" and (
+            gate = (saved_hit.get("g28_gate") or saved_hit.get("g26_gate") or {}) if sol == "observability" else {}
+            g28_rejected = sol == "observability" and (
                 bool(saved_hit.get("readback_rejected")) or (bool(gate) and not gate.get("accepted"))
             )
             sheet_read = _security_sheet_was_read(saved_hit)
             e73_rejected = sol == "security" and sheet_read and e73_blocks_quote(saved_rb.get("cps_addon_monthly"))
-            if g26_rejected:
-                notes.append(f"Observability {g['region']} G26 differed from the written bulk, so that region was not quoted.")
+            if g28_rejected:
+                notes.append(f"Observability {g['region']} G28 differed from the written bulk, so that region was not quoted.")
                 classified.append({
                     "region": g["region"], "stored_gb": g["stored_gb"], "kind": "rejected",
-                    "own_pricing": "rejected — G26 differs from the written bulk",
+                    "own_pricing": "rejected — G28 differs from the written bulk",
                     "region_match": saved_hit.get("region_match"), "url": saved_hit.get("url"),
                 })
                 continue
@@ -1052,7 +1079,7 @@ def _has_workload(blk: dict) -> bool:
 
 
 def _integrity(acc: dict, sz: dict, by_solution: dict, quotes: list[dict], headline: float) -> dict:
-    """Six integrity checks. The mean skips a check that does not apply."""
+    """Seven integrity checks. The mean skips a check that does not apply."""
     estimators = sz.get("estimators") or {}
     o11y = estimators.get("observability") or {}
     security = estimators.get("security") or {}
@@ -1079,6 +1106,7 @@ def _integrity(acc: dict, sz: dict, by_solution: dict, quotes: list[dict], headl
             "fallback_names": coverage.get("fallback_names") or [],
             "bulk_gb_day": coverage.get("bulk_gb_day"),
             "unmeasured_bulk": unmeasured,
+            "unrated": coverage.get("unrated"),
         },
         "solutions": [
             {
@@ -1112,8 +1140,11 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         notes.append(
             f"Quote lookback is {int(e['quote_lookback_days'])} days. "
             f"ECH is that daily average × 30.416, {ech_mo:,.2f} ECU/mo. "
-            f"Ingest written to the estimators is diagnostic bulk × {usage:.3f}, "
-            "that pace divided by the complete-month pace."
+            + (
+                "Ingest written to the estimators is the diagnostic bulk as measured. The billing window does not scale it."
+                if float(e.get("quote_ingest_factor") if e.get("quote_ingest_factor") is not None else usage) == 1.0
+                else f"Ingest written to the estimators is stored-GB ingest × {usage:.3f}, that pace divided by the complete-month pace."
+            )
         )
 
     # ---- ECH composition (per-deployment tiers from infra)
@@ -1158,11 +1189,11 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         blk = by_solution[sol]
         readback = est.get("readback") or {}
         if sol == "observability" and readback and not est.get("readback_rejected"):
-            gate = est.get("g26_gate") or g26_gate(float(blk.get("daily_raw_gb") or 0), readback.get("total_raw_gb_day"))
+            gate = est.get("g28_gate") or est.get("g26_gate") or g28_gate(float(blk.get("daily_raw_gb") or 0), readback.get("total_raw_gb_day"))
             if not gate.get("accepted"):
-                blk["pricing"] = "rejected — G26 differs from the written bulk"
+                blk["pricing"] = "rejected — G28 differs from the written bulk"
                 notes.append(
-                    f"Observability sheet G26 is {gate.get('sheet_raw_gb_day')} GB/day against {gate.get('written_bulk')} GB/day written. D32 was not quoted."
+                    f"Observability sheet G28 is {gate.get('sheet_raw_gb_day')} GB/day against {gate.get('written_bulk')} GB/day written. D38 was not quoted."
                 )
                 continue
         if sol == "security" and readback and e73_blocks_quote(readback.get("cps_addon_monthly")):

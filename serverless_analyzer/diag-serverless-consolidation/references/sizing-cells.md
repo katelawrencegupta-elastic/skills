@@ -8,11 +8,12 @@ Trigger: `platform.ech_share_pct > 50` (ECU-weighted, ECH vs serverless projects
 - A consolidation PDF is `<customer>_<date>_<full retention|30d>_<bulk|compression-applied>_serverless_consolidation_plan`. A K360 backup uses `k360` in the basis slot. The account PDF is `<customer>_<date>_Account_analysis`. Same-named PDFs are updated in place. Deployment-plan sheets are named `<run_key>_Observability_plan_` or `<run_key>_Security_plan_` and stay in `plan_sheets`.
 - Copies: `<customer>_<date>_observability_full retention_bulk_<region>_serverless_estimate`, and the same pattern for security and search. Each solution with a workload is written four times: bulk and compression-applied, at full retention and at 30 days. A solution with no workload is skipped. Search is the es3-estimator CSV report, uploaded as a Google Sheet. The 30-day Search sheet scales disk by 1 / written months. A compression-applied Search sheet scales disk by 0.60. Both scales apply together on the 30-day compression sheet. Org store scales by the same factor, so the ingest share stays put.
 - Same-named copies in the folder are **reused** on re-runs (cells rewritten); `--fresh` forces new copies. Golden templates are never written to.
+- **Layout check.** Every copy, new or reused, is checked before a cell is written (`verify_template`). The labels beside the cells below must be in place (`TEMPLATE_ANCHORS` in `quote_checks.py`), and the last version on the `Version Control` tab must be readable and at least Observability 1.22 or Security 2.6. A miss raises `TemplateMismatch`, trashes a copy made by that call, exits `size_serverless.py` with status 3, and stops `run_consolidation.py`. When a new estimator version moves a row, change the cell map, `TEMPLATE_ANCHORS`, and this file together.
 
 ## Golden templates (fixed — always copy these, never edit in place)
 | Kind | Template | Override |
 |------|----------|----------|
-| Observability (v1.19) | [1bu-qjVIab-rbWb7zvCEq6QEoLdKpi0vfw3yDj9_VJuE](https://docs.google.com/spreadsheets/d/1bu-qjVIab-rbWb7zvCEq6QEoLdKpi0vfw3yDj9_VJuE/edit?usp=drive_link) | `O11Y_SHEET_ID` / `--o11y-id` |
+| Observability (v1.22) | [1tUdwJbTmd4helFOzEHMi_gpHw7qu_aCgprjlqmHh2hs](https://docs.google.com/spreadsheets/d/1tUdwJbTmd4helFOzEHMi_gpHw7qu_aCgprjlqmHh2hs/edit) | `O11Y_SHEET_ID` / `--o11y-id` |
 | Security (v2.6) | [1b91Uoa2e4vBrep_7I4RoY_8Mr19poqaUgWl7LqhIOqY](https://docs.google.com/spreadsheets/d/1b91Uoa2e4vBrep_7I4RoY_8Mr19poqaUgWl7LqhIOqY/edit?usp=drive_link) | `SECURITY_SHEET_ID` / `--security-id` |
 | Search | es3-estimator `estimate_serverless_pricing` (clone via `ES3_ESTIMATOR_DIR`, venv via `ES3_ESTIMATOR_PY`) | on-demand profile is the quotable $ |
 

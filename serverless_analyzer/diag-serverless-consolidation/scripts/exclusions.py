@@ -113,7 +113,7 @@ def apply_exclusions(acc: dict, org: dict, excluded: list[dict]) -> dict:
         peak = max(range(len(daily)), key=lambda i: daily[i])
         if ecu.get("daily_peak"):
             ecu["daily_peak"] = {"day": days[peak], "ecu": daily[peak]}
-    for key in ("quote_ingest_scaled", "quote_lookback_days", "quote_daily_avg", "quote_monthly_ecu", "quote_usage_factor"):
+    for key in ("quote_ingest_scaled", "quote_lookback_days", "quote_daily_avg", "quote_monthly_ecu", "quote_usage_factor", "quote_ingest_factor"):
         ecu.pop(key, None)
 
     dep = acc.setdefault("deployments", {})

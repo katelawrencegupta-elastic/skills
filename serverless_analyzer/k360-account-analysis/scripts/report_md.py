@@ -408,7 +408,7 @@ def consolidation_section(acc: dict) -> list[str]:
         L.append("\n### Appendix\n")
         L.append(lead)
         L.append("")
-        L.append("The score is the mean of the checks that apply. A check that does not apply is n/a and stays out of the mean. A score of 0.90 or higher passes. A check that misses its own bar stays flagged. A G26 gap of 0.51 scores 0 on that component and still passes that component. This is not a serverless bill.")
+        L.append("The score is the mean of the checks that apply. A check that does not apply is n/a and stays out of the mean. A score of 0.90 or higher passes. A check that misses its own bar stays flagged. A G28 gap of 0.51 scores 0 on that component and still passes that component. This is not a serverless bill.")
         L.append("")
         L.append(table(
             ["Check", "Score", "Pass", "Measured"],

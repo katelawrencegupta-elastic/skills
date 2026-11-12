@@ -1542,9 +1542,9 @@ def consolidation_inputs_html(acc: dict) -> str:
         size_src = "Elasticsearch diagnostic bundle, local primary store. Searchable snapshots are left out. A deployment with no bundle keeps its K360 size."
         size_math = "Observability and Security GB/day is measured bulk index bytes per day. K360 has no raw ingest total; stored GB ÷ assumed retention is the --k360-ingest backup and can sit far below this bulk rate. Search disk is the diagnostic store size."
         ret_src = "Size-weighted ILM delete age, else data-stream retention, else the oldest index. Ingest-weighted across the solution. The estimator accepts 1–36 months."
-        if e.get("quote_lookback_days"):
+        if e.get("quote_lookback_days") and _ingest_factor(acc):
             ret_math = (
-                f"The GB/day written to the estimator is diagnostic bulk × {e.get('quote_usage_factor')}, "
+                f"The GB/day written to the estimator is diagnostic bulk × {_ingest_factor(acc)}, "
                 f"the {int(e['quote_lookback_days'])}-day pace divided by the complete-month pace. "
                 "The sensitivity table still shows stored GB ÷ retention and does not reprice the estimate."
             )
@@ -1755,7 +1755,7 @@ def _metered_cell(v: float) -> str:
 
 
 def metered_rate_section(acc: dict) -> str:
-    """Per-deployment Observability ingest rate. Not a D32 quote."""
+    """Per-deployment Observability ingest rate. Not a D38 quote."""
     c = acc.get("consolidation") or {}
     rates = list(c.get("metered_rates") or [])
     if not rates and _from_diagnostics(acc):
@@ -1838,7 +1838,7 @@ def _integrity_block(acc: dict) -> str:
         + bullets([
             headline,
             "The score is the mean of the checks that apply. A check that does not apply is n/a and stays out of the mean.",
-            "A score of 0.90 or higher passes. A check that misses its own bar stays flagged. A G26 gap of 0.51 scores 0 on that component and still passes that component. E73 must be 0.",
+            "A score of 0.90 or higher passes. A check that misses its own bar stays flagged. A G28 gap of 0.51 scores 0 on that component and still passes that component. E73 must be 0.",
             "This scores whether the written inputs, the sheet echo, and the published totals agree. It is not a serverless bill.",
         ])
         + table(["Check", "Score", "Pass", "Measured"], rows, ["left", "right", "left", "left"], tones)
@@ -1963,9 +1963,10 @@ def search_power_section(acc: dict, *, new_page: bool = True) -> str:
 
 
 _INTEGRITY_FORMULA = {
-    "Sheet echo": "Mean of the G26 component and the E73 component, for each solution that has a workload and a sheet. G26 component = 1 − min(|G26 − written bulk| / 0.51, 1). A blank G26 scores 0. E73 scores 1 when the parsed amount is 0, and 0 when it is blank or the amount is above 0.005.",
+    "Sheet echo": "Mean of the G28 component and the E73 component, for each solution that has a workload and a sheet. G28 component = 1 − min(|G28 − written bulk| / 0.51, 1). A blank G28 scores 0. E73 scores 1 when the parsed amount is 0, and 0 when it is blank or the amount is above 0.005.",
     "Bundle coverage": "Matched deployments ÷ active deployments. When the active count is absent, the denominator is matched bundles plus bundles that fell back.",
     "Measured retention": "1 − (bulk with no measured age ÷ Σ bulk).",
+    "Rated ingest": "1 − (store in indices that took bulk writes and have no rate ÷ local store). Those indices are not a data stream, a write alias, or an ILM rollover, or their write index has no write phase. Passes at 5% or less.",
     "Direct read-back": "Solutions on their own read-back ÷ solutions with a workload. One region counts. A store split does not.",
     "Line agreement": "1 − min(|sum of quote lines − headline| / headline, 1). Both $0 scores 1.",
     "Year agreement": "For each quote line, 1 − min(|steady annual − 12 × unrounded monthly| / |steady annual|, 1), then the mean. Both sides are rounded to cents first.",
@@ -2053,7 +2054,7 @@ def _quote_window_rows(acc: dict) -> list[list]:
             inputs += f". Complete-month average {complete} ECU/month"
         rows.append([
             "Pace factor",
-            "Quote-window daily average ÷ complete-month daily average.",
+            "Quote-window daily average ÷ complete-month daily average. It scales ECH ECU. Measured diagnostic bulk is not scaled by it.",
             inputs,
             _formula_num(factor, 6),
         ])
@@ -2062,7 +2063,7 @@ def _quote_window_rows(acc: dict) -> list[list]:
         if "quotable" not in str((quote or {}).get("pricing") or ""):
             continue
         if name == "observability":
-            formula = "Observability monthly is the D32 read-back. Quoted only when G26 is within 0.51 GB/day of the written bulk."
+            formula = "Observability monthly is the D38 read-back. Quoted only when G28 is within 0.51 GB/day of the written bulk."
         elif name == "security":
             formula = "Security monthly is the E74 read-back. Quoted only when parsed E73 is 0."
         elif name == "search":
@@ -2125,9 +2126,26 @@ def _quote_window_rows(acc: dict) -> list[list]:
     return [row for row in rows if _keep(row)]
 
 
+def _ingest_factor(acc: dict) -> float | None:
+    """Factor applied to ingest before the estimators. None when ingest was written as measured.
+
+    A diagnostic run writes bulk unscaled (`quote_ingest_factor` 1.0). An account
+    saved before that field existed scaled ingest by `quote_usage_factor`.
+    """
+    e = acc.get("ecu") or {}
+    raw = e.get("quote_ingest_factor") if e.get("quote_ingest_factor") is not None else e.get("quote_usage_factor")
+    try:
+        factor = float(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
+    if factor is None or abs(factor - 1.0) < 1e-9:
+        return None
+    return factor
+
+
 def _bulk_rows(acc: dict) -> list[list]:
     c = acc.get("consolidation") or {}
-    factor = (acc.get("ecu") or {}).get("quote_usage_factor")
+    factor = _ingest_factor(acc)
     thirty = c.get("retention_set_days") == 30
     rows: list[list] = []
     for name, blk, _priced in _solution_measured(acc):
@@ -2461,16 +2479,16 @@ def _plan_dollar_line(acc: dict, label: str, monthly) -> str:
         if money:
             monies.append(money)
         if bulk is not None and money:
-            bits.append(f"{names}, {float(bulk):.3f} GB/day, D32 {money}")
+            bits.append(f"{names}, {float(bulk):.3f} GB/day, D38 {money}")
         elif money:
-            bits.append(f"{names}, D32 {money}")
+            bits.append(f"{names}, D38 {money}")
     if len(monies) > 1:
         return "; ".join(bits) + ". " + " + ".join(monies) + f" = {_formula_money(monthly)}."
     if bits:
         return bits[0] + "."
     if monthly is not None and float(monthly or 0) == 0:
-        return "No project is filled, so there is no D32 to add."
-    return "Sum of the Observability D32 read-backs at this cut."
+        return "No project is filled, so there is no D38 to add."
+    return "Sum of the Observability D38 read-backs at this cut."
 
 
 def _plan_rows(acc: dict) -> list[list]:
@@ -2628,18 +2646,14 @@ COMPRESSION_RATIO = 0.60
 
 
 def raw_ingest_by_deployment(acc: dict) -> dict:
-    """Raw bulk GB/day for every sized deployment, before and after the pace factor.
+    """Raw bulk GB/day for every sized deployment, measured and as written.
 
-    `quoted` is what the estimators receive (the pace factor already applied).
-    `measured` is that value ÷ the pace factor: the Σ est_bytes_per_day from the
-    bundle. The compression-applied run stores bulk × 0.60 in daily_raw_gb, so
+    `quoted` is what the estimators receive. `measured` is the Σ est_bytes_per_day
+    from the bundle. The two are equal on a diagnostic run. They differ only on an
+    account whose ingest was scaled by a pace factor. The compression-applied run stores bulk × 0.60 in daily_raw_gb, so
     the bulk is recovered from compressioncalc_accounted_for ÷ its ratio.
     """
-    factor = (acc.get("ecu") or {}).get("quote_usage_factor")
-    try:
-        factor = float(factor) if factor else None
-    except (TypeError, ValueError):
-        factor = None
+    factor = _ingest_factor(acc)
     rows = []
     for dep in (acc.get("solutions") or {}).get("by_deployment") or []:
         if not isinstance(dep, dict):
@@ -2829,8 +2843,11 @@ def raw_ingest_section(acc: dict, *, new_page: bool = True) -> str:
     window = f"the last {int(days)} billed days" if days else "the quote window"
     lead = [
         "Raw bulk is the write-index request bytes before compression, the volume the Observability and Security estimators price. It is not stored GB.",
-        "Quoted GB/day is bundle GB/day × the pace factor, and is what each estimator receives."
-        + (f" Pace factor {factor:.6f} = {window} daily ECU average ÷ complete-month daily average." if factor else " No pace factor applies to this run."),
+        (
+            f"Quoted GB/day is bundle GB/day × the pace factor, and is what each estimator receives. Pace factor {factor:.6f} = {window} daily ECU average ÷ complete-month daily average."
+            if factor else
+            "Quoted GB/day is the bundle GB/day, as measured, and is what each estimator receives. The billing window does not scale it."
+        ),
         f"The four largest deployments are {top4_share * 100:.0f}% of quoted bulk: " + ", ".join(r["name"] for r in top4) + ".",
         "Days in store is stored GB ÷ (bundle GB/day × 0.60). It is how many days of compressed ingest the local primary store holds. A value far below Retention means most retained data sits outside that store, for example in searchable snapshots, or the stored-GB snapshot is older than the bundle.",
         "Shaded rows have a node up for under 2 days, so the rate is measured over a short window.",
@@ -3107,21 +3124,30 @@ def per_cluster_section(c: dict, *, new_page: bool = True) -> str:
         shown, folded = rows_in[:PER_CLUSTER_MAX_ROWS - 1], rows_in[PER_CLUSTER_MAX_ROWS - 1:]
     for r in shown:
         cells = [r.get("name"), str(r.get("solution") or "").title(), r.get("region") or "—", n0(r.get("bulk_gb_day"))]
+        status = r.get("status")
         for cell in r.get("steps") or []:
-            if cell is None:
+            if status == "missing_diag":
+                cells.append("missing diagnostic")
+            elif status == "no_bulk" and (cell is None or cell.get("monthly") is None):
+                cells.append("not sized")
+            elif cell is None:
                 cells.append("—")
             elif cell.get("pack", 1) > 1:
                 cells.append(f"{usd(cell.get('monthly'))} (of {cell.get('pack')})")
             else:
                 cells.append(usd(cell.get("monthly")))
         rows.append(cells)
-        tones.append("muted" if r.get("under_minimum") else None)
+        tones.append("warning" if r.get("status") == "missing_diag" else ("muted" if r.get("under_minimum") or r.get("status") == "no_bulk" else None))
     if folded:
         rest = []
         for i in range(len(steps)):
             vals = [float((r["steps"][i] or {}).get("monthly") or 0) for r in folded]
             rest.append(usd(sum(vals)))
         rows.append([f"{len(folded)} smaller clusters", "", "", n0(sum(float(r.get("bulk_gb_day") or 0) for r in folded))] + rest)
+        tones.append("muted")
+    un = plan.get("unallocated") or []
+    if any(float(v or 0) > 0.5 for v in un):
+        rows.append(["Priced in the plan for projects with no sized cluster", "", "", ""] + [usd(v) if float(v or 0) > 0.5 else "—" for v in un])
         tones.append("muted")
     rows.append(["Total", "", "", n0(sum(float(r.get("bulk_gb_day") or 0) for r in rows_in))] + [usd(st.get("monthly")) for st in steps])
     tones.append(None)
@@ -3131,6 +3157,10 @@ def per_cluster_section(c: dict, *, new_page: bool = True) -> str:
         "Ceiling is every cluster as its own serverless project. Each later step packs clusters into fewer projects, cutting the project count 25% at a time down to the floor.",
         "A cluster in a packed project shows its share of that project's price, by bulk GB/day. “(of N)” is the number of clusters sharing the project. Each column adds up to that step's bar on the previous page.",
     ]
+    if any(r.get("status") == "no_bulk" for r in rows_in):
+        notes.append("Grey “not sized” rows have a diagnostic bundle that measured no bulk. They are not sized and take no share of a packed project. When every cluster in a project is unsized, the project's plan price shows on its own line so each column still adds up to its bar.")
+    if any(r.get("status") == "missing_diag" for r in rows_in):
+        notes.append("Shaded “missing diagnostic” rows are active deployments with no diagnostic bundle. Their ingest is not measured, so they are not sized.")
     if any(r.get("under_minimum") for r in rows_in):
         notes.append(f"Grey rows are clusters whose own project is ${float(plan.get('min_usd') or 10):,.0f}/mo or less at the ceiling.")
     return section("Serverless cost per cluster, from one project each down to the floor", body + bullets(notes), new_page=new_page)

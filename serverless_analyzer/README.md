@@ -72,7 +72,7 @@ Prices Observability and Security from Elasticsearch diagnostic bundles. Daily G
 | `size_serverless.py` | Copies the golden Observability and Security sheets, writes the cells, and reads the dollars back. Keeps one sheet per title and trashes older copies (`--dedupe`, `--dedupe-dry-run`) |
 | `es3_estimate.py` | Prices a Search slice with the es3-estimator library |
 | `consolidation.py` | Builds the savings, deployment-count plan, per-cluster cost table, metered rates, and quote integrity from the read-backs |
-| `quote_checks.py` | Checks the sheet echo, coverage, retention, and published totals. No network |
+| `quote_checks.py` | Checks the estimator layout before a write, the sheet echo, coverage, retention, unrated ingest, and published totals. No network |
 | `diag_inputs.py` | Prints 2–5 project packs and per-deployment inputs. It does not quote dollars |
 | `privacy.py` | Sets private file modes and warns when `.env` or `diag_artifacts/` would be committed |
 | `test_diag_quote.py` | Offline unit tests. No Google account and no sheets |
@@ -90,4 +90,4 @@ References: `calculations.md` is the arithmetic. `sizing-cells.md` is the estima
 
 ## How a quote is assembled
 
-`k360-org-report` writes `<customer>_<date>_org_report.json`. `k360-account-analysis` can reuse that file for the summary. `diag-serverless-consolidation` reuses it again, then replaces ingest and retention with the diagnostic measurements. Observability monthly is D32. Security monthly is E74. Search is the es3 on-demand profile. The account PDF stays in the customer folder. Measured-retention consolidation PDFs go in `full_retention/`. 30-day PDFs go in `30d/`.
+`k360-org-report` writes `<customer>_<date>_org_report.json`. `k360-account-analysis` can reuse that file for the summary. `diag-serverless-consolidation` reuses it again, then replaces ingest and retention with the diagnostic measurements. Observability monthly is D38. Security monthly is E74. Search is the es3 on-demand profile. The account PDF stays in the customer folder. Measured-retention consolidation PDFs go in `full_retention/`. 30-day PDFs go in `30d/`.

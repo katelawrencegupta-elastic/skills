@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,7 +33,10 @@ from diag_account import _sheet_months, apply_diagnostics, compressioncalc_accou
 from diag_inputs import summarize, whole_months  # noqa: E402
 from k360_infra import es_base_and_key  # noqa: E402
 from privacy import seal_dir, seal_text, unignored_secret_warnings  # noqa: E402
-from quote_checks import addon_off_value, e73_blocks_quote, g26_gate, integrity_score, money  # noqa: E402
+from quote_checks import (  # noqa: E402
+    TEMPLATE_ANCHORS, addon_off_value, e73_blocks_quote, g28_gate, integrity_score, money,
+    template_check, template_version,
+)
 from run_consolidation import _compression_totals, _estimator_flags, consolidation_brief, quote_pdf_jobs  # noqa: E402
 from render_pdf import consolidation_pdf_stem, deployment_plan_section, pdf_folder_name, render_appendix_html, render_consolidation_html, search_power_section, stat  # noqa: E402
 from size_serverless import (  # noqa: E402
@@ -48,7 +52,7 @@ from size_serverless import (  # noqa: E402
 from vpn_check import tunnel_reaches  # noqa: E402
 
 
-def _quote_account(*, g26: float, e73, observability_monthly: float = 100) -> dict:
+def _quote_account(*, g28: float, e73, observability_monthly: float = 100) -> dict:
     return {
         "ecu": {"lookback_days": 365, "total_lookback": 120, "monthly_avg_complete_months": 10},
         "storage": {"data_stored_gb": 0},
@@ -74,7 +78,7 @@ def _quote_account(*, g26: float, e73, observability_monthly: float = 100) -> di
                 "observability": {
                     "readback": {
                         "monthly_steady_state": observability_monthly,
-                        "total_raw_gb_day": g26,
+                        "total_raw_gb_day": g28,
                         "metered_gb_day": 16,
                         "annual_year1": observability_monthly * 12,
                     },
@@ -230,9 +234,9 @@ class RetentionTests(unittest.TestCase):
 
 
 class GateTests(unittest.TestCase):
-    def test_g26_accepts_half_a_gigabyte_and_refuses_past_it(self):
-        self.assertTrue(g26_gate(10, 10.51)["accepted"])
-        self.assertFalse(g26_gate(10, 10.52)["accepted"])
+    def test_g28_accepts_half_a_gigabyte_and_refuses_past_it(self):
+        self.assertTrue(g28_gate(10, 10.51)["accepted"])
+        self.assertFalse(g28_gate(10, 10.52)["accepted"])
         self.assertEqual(money("($1,234)"), -1234.0)
         self.assertTrue(e73_blocks_quote("($1,234)"))
         self.assertTrue(e73_blocks_quote(None))
@@ -243,7 +247,7 @@ class GateTests(unittest.TestCase):
         self.assertFalse(e73_blocks_quote(0.0))
 
     def test_overhead_callout_uses_the_active_deployments(self):
-        acc = _quote_account(g26=10, e73=0)
+        acc = _quote_account(g28=10, e73=0)
         acc["ecu"]["quote_usage_factor"] = 0.5
         acc["ecu"]["quote_lookback_days"] = 30
         acc["ecu"]["total_lookback"] = 24000
@@ -266,7 +270,7 @@ class GateTests(unittest.TestCase):
         self.assertIn("1 deployment with no bill", overhead["detail"])
 
     def test_readback_keeps_written_bulk_and_clears_unit_rates(self):
-        quoted = build_consolidation(_quote_account(g26=10.51, e73=0), None)
+        quoted = build_consolidation(_quote_account(g28=10.51, e73=0), None)
         observability = quoted["serverless"]["by_solution"]["observability"]
         security = quoted["serverless"]["by_solution"]["security"]
         self.assertIn("quotable", observability["pricing"])
@@ -288,14 +292,14 @@ class GateTests(unittest.TestCase):
         page = search_power_section({"consolidation": quoted})
         self.assertIn("Quote integrity 0.875", page)
         self.assertIn(">Pass<", page)
-        bare = _quote_account(g26=10, e73=0)
+        bare = _quote_account(g28=10, e73=0)
         bare["sizing"]["estimators"]["search"] = {"status": "skipped"}
         bare["storage"]["data_stored_gb"] = 100
         unpriced = build_consolidation(bare, None)
         self.assertIsNone(unpriced["search_power"])
         self.assertEqual(unpriced["savings"]["serverless_mo"], 180)
         self.assertEqual([row["monthly"] for row in quoted["deployment_plan"]], [40, 100])
-        skipped = _quote_account(g26=10, e73=0)
+        skipped = _quote_account(g28=10, e73=0)
         skipped["sizing"]["estimators"]["search"] = {"status": "skipped — no search workload detected"}
         skipped["storage"]["data_stored_gb"] = 100
         skipped["workload"] = {"search": {"peak": {"qps": 50}}}
@@ -308,22 +312,22 @@ class GateTests(unittest.TestCase):
         page = search_power_section({"consolidation": {**no_search, "search_power": skipped["sizing"]["search_power"]}, "sizing": skipped["sizing"]})
         self.assertNotIn("Monthly search-power estimate", page)
 
-    def test_g26_miss_and_nonzero_e73_leave_the_solution_unquoted(self):
-        missed = build_consolidation(_quote_account(g26=10.52, e73=0), None)
+    def test_g28_miss_and_nonzero_e73_leave_the_solution_unquoted(self):
+        missed = build_consolidation(_quote_account(g28=10.52, e73=0), None)
         observability = missed["serverless"]["by_solution"]["observability"]
         self.assertTrue(observability["pricing"].startswith("rejected"))
         self.assertEqual(observability["total_mo"], 0)
         self.assertTrue(any("10.52" in note and "10" in note for note in missed["notes"]))
-        blocked = build_consolidation(_quote_account(g26=10, e73="($25)"), None)
+        blocked = build_consolidation(_quote_account(g28=10, e73="($25)"), None)
         security = blocked["serverless"]["by_solution"]["security"]
         self.assertTrue(security["pricing"].startswith("rejected"))
         self.assertEqual(security["total_mo"], 0)
         for blank in (None, ""):
-            blanked = build_consolidation(_quote_account(g26=10, e73=blank), None)
+            blanked = build_consolidation(_quote_account(g28=10, e73=blank), None)
             blank_security = blanked["serverless"]["by_solution"]["security"]
             self.assertTrue(blank_security["pricing"].startswith("rejected"))
             self.assertEqual(blank_security["total_mo"], 0)
-        kept = build_consolidation(_quote_account(g26=10, e73=0), None)
+        kept = build_consolidation(_quote_account(g28=10, e73=0), None)
         self.assertIn("quotable", kept["serverless"]["by_solution"]["security"]["pricing"])
         self.assertFalse(missed["integrity"]["passed"])
         self.assertFalse(blanked["integrity"]["passed"])
@@ -1003,7 +1007,7 @@ class RegionalQuoteTests(unittest.TestCase):
                 {
                     "solution": "observability", "region": "east", "status": "filled",
                     "readback": {"monthly_steady_state": 180, "total_raw_gb_day": 10, "annual_year1": 2160, "annual_steady_state": 2160},
-                    "g26_gate": {"accepted": True},
+                    "g28_gate": {"accepted": True},
                 },
             ]}},
             "workload": {},
@@ -1096,11 +1100,11 @@ class EfficiencyTests(unittest.TestCase):
         self.assertEqual(map_in_order(slow, [0, 1, 2]), [0, 1, 2])
 
     def test_consolidation_brief_is_the_quote_slice(self):
-        acc = _quote_account(g26=10, e73=0)
+        acc = _quote_account(g28=10, e73=0)
         acc["analysis"] = {"burndown": {"level": "ok", "series": {"months": []}}}
         acc["platform"] = {"label": "ECH"}
         acc["sizing"]["diagnostics"] = {"inactive_excluded": 2, "snapshot_gb": 0, "k360_fallback": 1}
-        acc["sizing"]["estimators"]["observability"]["g26_gate"] = {
+        acc["sizing"]["estimators"]["observability"]["g28_gate"] = {
             "accepted": True, "written_bulk": 10, "sheet_raw_gb_day": 10.1,
         }
         acc["sizing"]["estimators"]["observability"]["cells"] = {"G11": 1, "G21": 9, "G23": 1}
@@ -1123,7 +1127,7 @@ class EfficiencyTests(unittest.TestCase):
             {"label": "100%", "monthly": 100, "projects": 1},
         ])
         self.assertEqual(brief["thirty_day"]["monthly"], 50)
-        self.assertTrue(brief["estimators"]["observability"]["g26_gate"]["accepted"])
+        self.assertTrue(brief["estimators"]["observability"]["g28_gate"]["accepted"])
         self.assertEqual(brief["estimators"]["observability"]["cells"]["G21"], 9)
         self.assertNotIn("url", brief["deployment_plan"][0])
         self.assertTrue(brief["metered_rates"][0]["at_half_dollar"])
@@ -1339,7 +1343,7 @@ class PrivacyTests(unittest.TestCase):
 
 class ConsolidationLayoutTests(unittest.TestCase):
     def test_body_flows_and_the_appendix_is_its_own_document(self):
-        acc = _quote_account(g26=10, e73=0)
+        acc = _quote_account(g28=10, e73=0)
         acc["consolidation"] = build_consolidation(acc, None)
         html = render_consolidation_html(acc)
         appendix = render_appendix_html(acc)
@@ -1406,6 +1410,16 @@ class ConsolidationLayoutTests(unittest.TestCase):
         self.assertIn("Fleet total 125.0 GB/day", html)
         self.assertIn("background:#FFF8E6", html)   # fresh: node up under 2 days
         self.assertIn("× 1.595", html)
+        # A diagnostic run writes bulk as measured: no pace factor, quoted equals measured.
+        unscaled = json.loads(json.dumps(acc))
+        unscaled["ecu"] = {"quote_usage_factor": 1.25, "quote_ingest_factor": 1.0, "quote_lookback_days": 30}
+        flat = raw_ingest_by_deployment(unscaled)
+        self.assertIsNone(flat["factor"])
+        self.assertAlmostEqual(flat["rows"][0]["measured"], 100.0)
+        self.assertAlmostEqual(flat["total_measured"], flat["total_quoted"])
+        flat_html = raw_ingest_section(unscaled)
+        self.assertIn("The billing window does not scale it.", flat_html)
+        self.assertNotIn("1.250000", flat_html)
         # compression-applied run: daily_raw_gb is already × 0.60, bulk comes back from the ratio
         comp = json.loads(json.dumps(acc))
         for dep in comp["solutions"]["by_deployment"]:
@@ -1419,7 +1433,7 @@ class ConsolidationLayoutTests(unittest.TestCase):
         self.assertEqual(raw_ingest_section({"solutions": {"by_deployment": []}}), "")
 
     def test_appendix_b_prints_formulas_and_skips_an_unpriced_solution(self):
-        acc = _quote_account(g26=10, e73=0)
+        acc = _quote_account(g28=10, e73=0)
         acc["workload"] = {
             "window_days": 21,
             "indices": 40,
@@ -1493,25 +1507,42 @@ class ConsolidationLayoutTests(unittest.TestCase):
         self.assertEqual(exact["names"], ["kept"])
         self.assertFalse(exact["partial"])
 
-    def test_default_lookback_writes_the_30_day_pace_into_the_estimate(self):
-        acc = _quote_account(g26=10, e73=0)
-        acc["ecu"]["last_30d_daily_avg"] = 0.2
+    def test_k360_backup_ingest_still_takes_the_billing_pace(self):
+        acc = _quote_account(g28=10, e73=0)
+        acc["sizing"]["ingest_source"] = "k360"
         acc["ecu"]["daily_totals"] = [1.0] * 335 + [0.2] * 30 + [0.0]
         factor = apply_quote_lookback(acc, 30)
         expected = 0.2 / (10 / 30.416)
-        self.assertAlmostEqual(factor, expected, places=4)
+        self.assertAlmostEqual(acc["ecu"]["quote_ingest_factor"], factor, places=6)
         self.assertAlmostEqual(
-            acc["sizing"]["consolidated"]["observability"]["daily_raw_gb"],
-            round(10 * expected, 3),
-            places=3,
+            acc["sizing"]["consolidated"]["observability"]["daily_raw_gb"], round(10 * expected, 3), places=3,
         )
+        apply_quote_lookback(acc, 30)
+        self.assertAlmostEqual(
+            acc["sizing"]["consolidated"]["observability"]["daily_raw_gb"], round(10 * expected, 3), places=3,
+        )
+
+    def test_default_lookback_prices_ech_at_30_days_and_leaves_measured_bulk_alone(self):
+        acc = _quote_account(g28=10, e73=0)
+        acc["ecu"]["last_30d_daily_avg"] = 0.2
+        acc["ecu"]["daily_totals"] = [1.0] * 335 + [0.2] * 30 + [0.0]
+        acc["workload"] = {"ingest": {"docs_per_sec": 100.0}}
+        acc["solutions"]["by_deployment"] = [{"name": "d", "daily_raw_gb": 10.0, "compressioncalc_accounted_for": 6.0}]
+        factor = apply_quote_lookback(acc, 30)
+        expected = 0.2 / (10 / 30.416)
+        # The billing pace is still the ECH factor. It no longer touches measured bulk.
+        self.assertAlmostEqual(factor, expected, places=4)
+        self.assertEqual(acc["ecu"]["quote_ingest_factor"], 1.0)
+        self.assertEqual(acc["sizing"]["consolidated"]["observability"]["daily_raw_gb"], 10)
+        self.assertEqual(acc["sizing"]["consolidated"]["security"]["daily_raw_gb"], 4)
+        self.assertEqual(acc["solutions"]["by_deployment"][0]["daily_raw_gb"], 10.0)
+        self.assertEqual(acc["solutions"]["by_deployment"][0]["compressioncalc_accounted_for"], 6.0)
+        # Search docs/s is a K360 rate, not a bundle measurement, so it keeps the pace.
+        self.assertAlmostEqual(acc["workload"]["ingest"]["docs_per_sec"], round(100 * expected, 3), places=3)
         again = apply_quote_lookback(acc, 30)
         self.assertAlmostEqual(again, factor, places=4)
-        self.assertAlmostEqual(
-            acc["sizing"]["consolidated"]["observability"]["daily_raw_gb"],
-            round(10 * expected, 3),
-            places=3,
-        )
+        self.assertEqual(acc["sizing"]["consolidated"]["observability"]["daily_raw_gb"], 10)
+        self.assertAlmostEqual(acc["workload"]["ingest"]["docs_per_sec"], round(100 * expected, 3), places=3)
         with self.assertRaises(ValueError):
             apply_quote_lookback(acc, 366)
         acc["consolidation"] = build_consolidation(acc, None)
@@ -1533,7 +1564,7 @@ class ConsolidationLayoutTests(unittest.TestCase):
         self.assertNotIn("ECH today", build)
 
     def test_cover_flips_reduction_to_increase_when_serverless_costs_more(self):
-        acc = _quote_account(g26=10, e73=0)
+        acc = _quote_account(g28=10, e73=0)
         acc["meta"]["org"]["ARR"] = 1825
         acc["ecu"]["contract"] = {"commit_pace_ecu_per_day": 10}
         acc["consolidation"] = build_consolidation(acc, None)
@@ -1549,7 +1580,7 @@ class ConsolidationLayoutTests(unittest.TestCase):
         self.assertNotIn("-$", cover.split("</style>")[-1])
 
     def test_cover_keeps_reduction_when_serverless_costs_less(self):
-        acc = _quote_account(g26=10, e73=0)
+        acc = _quote_account(g28=10, e73=0)
         acc["meta"]["org"]["ARR"] = 1825
         acc["ecu"]["contract"] = {"commit_pace_ecu_per_day": 10}
         acc["consolidation"] = build_consolidation(acc, None)
@@ -1561,7 +1592,7 @@ class ConsolidationLayoutTests(unittest.TestCase):
         self.assertNotIn("class='up'", cover.split("</style>")[-1])
 
     def test_contract_rate_is_drawn_beside_the_list_price(self):
-        acc = _quote_account(g26=10, e73=0)
+        acc = _quote_account(g28=10, e73=0)
         acc["meta"]["org"]["ARR"] = 1825
         acc["ecu"]["contract"] = {"commit_pace_ecu_per_day": 10}
         acc["consolidation"] = build_consolidation(acc, None)
@@ -1585,7 +1616,7 @@ class ConsolidationLayoutTests(unittest.TestCase):
         self.assertIn("ECH at contract rate", usage)
 
     def test_cover_stays_on_the_complete_month_average_without_a_30_day_rate(self):
-        acc = _quote_account(g26=10, e73=0)
+        acc = _quote_account(g28=10, e73=0)
         acc["consolidation"] = build_consolidation(acc, None)
         html = render_consolidation_html(acc)
         header = html.split("</header>", 1)[0]
@@ -1857,6 +1888,24 @@ class PerClusterPlanTests(unittest.TestCase):
             self.assertAlmostEqual(sum(r["steps"][i]["monthly"] for r in plan["rows"]), step["monthly"], places=1)
         self.assertEqual({n: r["under_minimum"] for n, r in rows.items()}, {"a": False, "b": True, "c": True})
 
+    def test_zero_bulk_with_a_bundle_is_not_sized_and_no_bundle_is_flagged(self):
+        from consolidation import per_cluster_plan
+        from render_pdf import per_cluster_section
+        acc = self._acc()
+        for d in acc["solutions"]["by_deployment"]:
+            d["ingest_source"] = "diagnostics"
+        acc["solutions"]["by_deployment"][1].update({"daily_raw_gb": 0, "ingest_source": "diagnostics"})
+        acc["solutions"]["by_deployment"][2].update({"daily_raw_gb": 0, "ingest_source": "active_no_bundle"})
+        plan = per_cluster_plan(self._sz(), acc, None)
+        rows = {r["name"]: r for r in plan["rows"]}
+        self.assertEqual((rows["b"]["status"], rows["c"]["status"]), ("no_bulk", "missing_diag"))
+        self.assertEqual(rows["a"]["steps"][1]["monthly"], 80.0)
+        self.assertIsNone(rows["b"]["steps"][1]["monthly"])
+        self.assertEqual([r["name"] for r in plan["rows"]][0], "a")
+        html = per_cluster_section({"per_cluster_plan": plan, "deployment_plan": [1]})
+        self.assertIn("not sized", html)
+        self.assertIn("missing diagnostic", html)
+
     def test_a_long_fleet_folds_its_smallest_clusters_into_one_row(self):
         from render_pdf import per_cluster_section, PER_CLUSTER_MAX_ROWS
         rows = [{"name": f"c{i}", "solution": "search", "region": "r", "bulk_gb_day": 1, "under_minimum": False,
@@ -1883,6 +1932,156 @@ class PerClusterPlanTests(unittest.TestCase):
         self.assertEqual(html.count("background:#EEF0F3"), 2)
         self.assertIn("Total", html)
         self.assertEqual(per_cluster_section({"per_cluster_plan": plan}), "")
+
+
+class TemplateGuardTests(unittest.TestCase):
+    @staticmethod
+    def _labels(kind: str) -> dict:
+        return {cell: f"What is the {text.upper()}?\n\nNote: more text" for cell, text in TEMPLATE_ANCHORS[kind]["labels"].items()}
+
+    def test_matching_layout_passes_for_both_estimators(self):
+        for kind, version in (("observability", "1.22"), ("security", "2.6")):
+            check = template_check(kind, self._labels(kind), version)
+            self.assertEqual(check["problems"], [], kind)
+            self.assertFalse(check["newer"])
+
+    def test_a_moved_row_is_refused_and_names_the_cell(self):
+        # The v1.19 layout had total raw GB/day two rows higher, where traces per minute is now.
+        labels = self._labels("observability")
+        labels["D26"], labels["D28"] = labels["D28"], "Cross-Project Search Add-on"
+        problems = template_check("observability", labels, "1.22")["problems"]
+        self.assertEqual(len(problems), 2)
+        self.assertTrue(problems[0].startswith("D26 should read 'traces per minute'"))
+        self.assertTrue(problems[1].startswith("D28 should read 'total raw ingest in gb/day'"))
+
+    def test_blank_label_is_refused(self):
+        labels = self._labels("security")
+        labels["D74"] = None
+        problems = template_check("security", labels, "2.6")["problems"]
+        self.assertEqual(problems, ["D74 should read 'total monthly charges' and is 'blank'"])
+
+    def test_version_older_or_unreadable_is_refused_and_newer_is_marked(self):
+        labels = self._labels("observability")
+        self.assertIn("older than 1.22", template_check("observability", labels, "1.19")["problems"][0])
+        # The sheet prints 1.20 as 1.2, which is still older than 1.22.
+        self.assertIn("older than 1.22", template_check("observability", labels, "1.2")["problems"][0])
+        self.assertIn("no readable version", template_check("observability", labels, None)["problems"][0])
+        self.assertIn("no readable version", template_check("observability", labels, "Version")["problems"][0])
+        newer = template_check("observability", labels, "1.23")
+        self.assertEqual(newer["problems"], [])
+        self.assertTrue(newer["newer"])
+        self.assertTrue(template_check("nope", {}, "1.0")["problems"])
+
+    def test_version_is_the_last_filled_cell(self):
+        self.assertEqual(template_version(["Version", "0.1", "1.21", "1.22", "", None]), "1.22")
+        self.assertIsNone(template_version([]))
+
+    def test_a_fresh_copy_is_trashed_when_its_layout_does_not_match(self):
+        import size_serverless as ss
+
+        trashed = []
+        copied = {"id": "copy-1", "name": "t", "url": "u"}
+        for reused, expect in ((False, ["copy-1"]), (True, [])):
+            trashed.clear()
+            with mock.patch.object(ss, "copy_template", return_value=(copied, reused)), \
+                 mock.patch.object(ss, "verify_template", side_effect=ss.TemplateMismatch("bad layout")), \
+                 mock.patch.object(ss, "trash_file", side_effect=lambda _drive, fid: trashed.append(fid)):
+                with self.assertRaises(ss.TemplateMismatch):
+                    ss.copy_verified(None, None, "tpl", "t", "parent", reuse=True, kind="observability", tab=ss.O11Y_TAB)
+            self.assertEqual(trashed, expect)
+
+    def test_template_mismatch_stops_the_run(self):
+        import subprocess as sp
+        import run_consolidation as rc
+
+        with mock.patch.object(rc, "_run_command", side_effect=sp.CalledProcessError(rc.TEMPLATE_MISMATCH_EXIT, ["x"])):
+            with self.assertRaises(SystemExit):
+                rc._run(["x"])
+        with mock.patch.object(rc, "_run_command", side_effect=sp.CalledProcessError(1, ["x"])):
+            with self.assertRaises(sp.CalledProcessError):
+                rc._run(["x"])
+
+
+class UnratedIngestTests(unittest.TestCase):
+    @staticmethod
+    def _ix(bulk: int, store: int = 1_000_000_000) -> dict:
+        return {"primaries": {"bulk": {"total_size_in_bytes": bulk}, "store": {"size_in_bytes": store}}}
+
+    def test_only_written_indices_with_no_rate_and_no_successor_are_listed(self):
+        from admin_diags import unrated_ingest
+
+        stats = {
+            ".ds-logs-a-000002": self._ix(500),          # rated write index
+            ".ds-logs-a-000001": self._ix(900),          # rolled generation of that stream
+            "app-000007": self._ix(300),                 # alias write index, rated
+            "app-000006": self._ix(800),                 # rolled under the same write alias
+            "rolled-by-ilm": self._ix(700),              # ILM rollover, no alias left
+            "daily-2026.11.12": self._ix(4_000_000_000, 6_000_000_000),   # written by name
+            "daily-2026.11.01": self._ix(0),             # no bulk since its shard started
+            "orders": self._ix(2_000_000_000, 3_000_000_000),             # write alias, not ILM managed
+            ".kibana_1": self._ix(999),                  # system
+            "partial-.ds-logs-a-000000": self._ix(999),  # searchable snapshot
+        }
+        streams = [{"indices": [{"index_name": ".ds-logs-a-000001"}, {"index_name": ".ds-logs-a-000002"}]}]
+        alias = {
+            "app-000007": {"aliases": {"app": {"is_write_index": True}}},
+            "app-000006": {"aliases": {"app": {"is_write_index": False}}},
+            "orders": {"aliases": {"orders-write": {"is_write_index": True}}},
+        }
+        explain = {"rolled-by-ilm": {"index_creation_date_millis": 1_000, "lifecycle_date_millis": 9_000}}
+        rated = {".ds-logs-a-000002": 10, "app-000007": 10, "orders": 0}
+        out = unrated_ingest(stats, streams, alias, explain, rated)
+        self.assertEqual(out["unrated_indices"], 2)
+        self.assertEqual([row["index"] for row in out["unrated_top"]], ["daily-2026.11.12", "orders"])
+        self.assertEqual(out["unrated_top"][0]["reason"], "not a data stream, write alias, or rollover")
+        self.assertEqual(out["unrated_top"][1]["reason"], "write index with no write phase")
+        self.assertEqual(out["unrated_store_gb"], 9.0)
+        self.assertEqual(out["unrated_bulk_gb"], 6.0)
+
+    def test_coverage_note_and_integrity_check_carry_the_unrated_store(self):
+        acc = {
+            "solutions": {"by_deployment": [
+                {"name": "a", "solution": "observability", "platform": "ech", "gb": 1},
+                {"name": "b", "solution": "observability", "platform": "ech", "gb": 1},
+            ], "totals": {}},
+            "sizing": {"consolidated": {}},
+        }
+        rows = [
+            {"name": "a", "bulk_gb_day": 10, "store_gb": 80, "retention_days": 30,
+             "unrated_indices": 3, "unrated_store_gb": 20, "unrated_bulk_gb": 7,
+             "unrated_top": [{"index": "daily-1", "reason": "x", "store_gb": 20, "bulk_gb": 7}]},
+            {"name": "b", "bulk_gb_day": 5, "store_gb": 20, "retention_days": 30,
+             "unrated_indices": 0, "unrated_store_gb": 0, "unrated_bulk_gb": 0, "unrated_top": []},
+        ]
+        out = apply_diagnostics(acc, rows)
+        unrated = out["sizing"]["diagnostics"]["unrated"]
+        self.assertEqual((unrated["indices"], unrated["store_gb"], unrated["share_of_store"]), (3, 20.0, 0.2))
+        self.assertEqual([row["name"] for row in unrated["deployments"]], ["a"])
+        self.assertTrue(any("have no ingest rate" in note and "20.0% of local store" in note for note in out["sizing"]["notes"]))
+        # The measured bulk is unchanged: the unrated volume is reported, not added.
+        self.assertEqual(out["sizing"]["diagnostics"]["bulk_gb_day"], 15)
+
+        def rated(cov):
+            result = integrity_score({"coverage": cov})
+            return next(row for row in result["checks"] if row["check"] == "Rated ingest")
+
+        flagged = rated({"unrated": unrated})
+        self.assertEqual((flagged["score"], flagged["passed"]), (0.8, False))
+        self.assertIn("a (20 GB)", flagged["detail"])
+        small = rated({"unrated": {"indices": 1, "store_gb": 4, "share_of_store": 0.04, "deployments": []}})
+        self.assertEqual((small["score"], small["passed"]), (0.96, True))
+        clean = rated({"unrated": {"indices": 0, "store_gb": 0, "share_of_store": 0.0, "deployments": []}})
+        self.assertEqual((clean["score"], clean["passed"]), (1.0, True))
+
+    def test_rows_parsed_before_the_count_existed_leave_the_check_out(self):
+        acc = {
+            "solutions": {"by_deployment": [{"name": "a", "solution": "observability", "platform": "ech", "gb": 1}], "totals": {}},
+            "sizing": {"consolidated": {}},
+        }
+        out = apply_diagnostics(acc, [{"name": "a", "bulk_gb_day": 10, "store_gb": 80, "retention_days": 30}])
+        self.assertIsNone(out["sizing"]["diagnostics"]["unrated"])
+        row = next(r for r in integrity_score({"coverage": {"unrated": None}})["checks"] if r["check"] == "Rated ingest")
+        self.assertIsNone(row["score"])
 
 
 if __name__ == "__main__":

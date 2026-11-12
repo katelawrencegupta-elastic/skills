@@ -37,13 +37,31 @@ from render_pdf import export_documents  # noqa: E402
 from report_md import render  # noqa: E402
 from run_account_analysis import (  # noqa: E402
     _est,
-    _run,
+    _run as _run_command,
     _sheets_py,
     agent_brief,
     finish_account,
     parse_args,
     prepare_account,
 )
+
+
+# size_serverless.py exits with this status when an estimator copy does not have
+# the layout its cell addresses were written for.
+TEMPLATE_MISMATCH_EXIT = 3
+
+
+def _run(cmd: list[str]) -> None:
+    """Run one step. A template mismatch stops the whole run instead of quoting without it."""
+    try:
+        _run_command(cmd)
+    except subprocess.CalledProcessError as exc:
+        if exc.returncode == TEMPLATE_MISMATCH_EXIT:
+            raise SystemExit(
+                "ERROR: an estimator copy does not match the layout this skill writes (see the message above). "
+                "The run stopped before a quote was written."
+            ) from exc
+        raise
 
 
 def _sidecar(extra: list[str], name: str) -> list[str]:
@@ -74,7 +92,7 @@ def _half_dollar(rate) -> bool:
 
 
 def _estimator_quote(entry: dict) -> dict:
-    keep = ("title", "url", "status", "readback", "region_match", "g26_gate", "readback_rejected", "cells")
+    keep = ("title", "url", "status", "readback", "region_match", "g28_gate", "readback_rejected", "cells")
     return {k: entry[k] for k in keep if k in entry}
 
 

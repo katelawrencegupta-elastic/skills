@@ -217,6 +217,8 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
     dropped_gb = 0.0
     snapshot_gb = 0.0
     unmeasured: list[dict] = []
+    unrated_rows: list[dict] = []
+    unrated_known = False
     active_info = (out.get("deployments") or {}).get("active") or {}
     active_names = set(active_info.get("names") or [])
     use_active = bool(active_info.get("month")) and bool(active_names)
@@ -244,6 +246,20 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
             dep["compression_ratio"] = ratio
             dep[COMPRESSIONCALC] = accounted
             snapshot_gb += float(hit.get("snapshot_gb") or 0)
+            # A row parsed before this field existed says nothing either way.
+            if hit.get("unrated_indices") is not None:
+                unrated_known = True
+                dep["unrated_indices"] = int(hit.get("unrated_indices") or 0)
+                dep["unrated_store_gb"] = round(float(hit.get("unrated_store_gb") or 0), 2)
+                dep["unrated_bulk_gb"] = round(float(hit.get("unrated_bulk_gb") or 0), 2)
+                if dep["unrated_indices"]:
+                    unrated_rows.append({
+                        "name": dep.get("name"),
+                        "indices": dep["unrated_indices"],
+                        "store_gb": dep["unrated_store_gb"],
+                        "bulk_gb": dep["unrated_bulk_gb"],
+                        "top": list(hit.get("unrated_top") or [])[:3],
+                    })
             days = _measured_days(hit.get("retention_days"))
             if days is None:
                 dep["retention_unmeasured"] = True
@@ -301,6 +317,18 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
     active_rows = [r for r in rows if r.get("name") in used and r.get("name") not in inactive_bundles]
     bulk_sum = sum(float(r.get("bulk_gb_day") or 0) for r in active_rows)
     accounted_sum, share = _accounted_from_bulk(bulk_sum)
+    active_store = sum(float(r.get("store_gb") or 0) for r in active_rows)
+    unrated_rows.sort(key=lambda row: -(row["store_gb"] or 0))
+    unrated_store = round(sum(row["store_gb"] for row in unrated_rows), 2)
+    unrated = None
+    if unrated_known:
+        unrated = {
+            "indices": sum(row["indices"] for row in unrated_rows),
+            "store_gb": unrated_store,
+            "bulk_gb": round(sum(row["bulk_gb"] for row in unrated_rows), 2),
+            "share_of_store": round(unrated_store / active_store, 4) if active_store > 0 else None,
+            "deployments": unrated_rows[:12],
+        }
     coverage = {
         "bundles": len(rows),
         "matched": matched,
@@ -314,6 +342,7 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
         "store_gb": round(sum(float(r.get("store_gb") or 0) for r in rows if r.get("name") in used and r.get("name") not in inactive_bundles), 2),
         "snapshot_gb": round(snapshot_gb, 2),
         "retention_unmeasured": unmeasured,
+        "unrated": unrated,
         "retention_clamped": clamped_notes,
         "active_month": active_info.get("month"),
         "active_month_partial": bool(active_info.get("partial")),
@@ -375,6 +404,14 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
         names = ", ".join(row["name"] for row in unmeasured[:8])
         notes.append(
             f"{len(unmeasured)} deployments have bulk and no measured retention ({names}). They stay out of the weighted month."
+        )
+    if unrated and unrated["indices"]:
+        names = ", ".join(f"{row['name']} ({row['store_gb']:,.0f} GB)" for row in unrated_rows[:6])
+        pct = f", {unrated['share_of_store'] * 100:.1f}% of local store" if unrated.get("share_of_store") is not None else ""
+        notes.append(
+            f"{unrated['indices']} indices took bulk writes and have no ingest rate: {unrated['store_gb']:,.0f} GB of store{pct} ({names}). "
+            "They are not a data stream, a write alias, or an ILM rollover, or their write index has no write phase. "
+            "Their ingest is not in bulk GB/day, so the estimate can sit below the real rate."
         )
     if unmatched_diags:
         notes.append(f"{len(unmatched_diags)} diagnostic bundles did not match a billed deployment name and are not in the estimate.")

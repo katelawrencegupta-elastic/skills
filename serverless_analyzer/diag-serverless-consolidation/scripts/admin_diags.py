@@ -420,6 +420,76 @@ def _write_indices(streams: list, alias: dict) -> set[str]:
     return write
 
 
+def _write_alias_names(alias: dict) -> set[str]:
+    """Aliases that have a write index. An index under one of them is a rolled generation."""
+    names: set[str] = set()
+    for body in (alias or {}).values():
+        for alias_name, st in (((body or {}).get("aliases")) or {}).items():
+            if (st or {}).get("is_write_index"):
+                names.add(alias_name)
+    return names
+
+
+def _rolled_over(info: dict) -> bool:
+    """ILM moved this index past rollover, so a later write index carries its series."""
+    created = (info or {}).get("index_creation_date_millis")
+    lifecycle = (info or {}).get("lifecycle_date_millis")
+    return bool(created and lifecycle and int(lifecycle) > int(created))
+
+
+def unrated_ingest(stats: dict, streams: list, alias: dict, explain: dict, rated: dict[str, int]) -> dict:
+    """User indices that took bulk writes and contribute nothing to bulk GB/day.
+
+    The rate is summed over write indices that have a write phase. Two kinds of
+    index fall outside it: a write index with no write phase (not managed by ILM,
+    or managed by a data stream lifecycle), and an index that is not in a data
+    stream, not under a write alias, and was never rolled over, such as a daily
+    index written by name. A rolled generation is not listed, because its series
+    is rated on the current write index.
+
+    `bulk_gb` is the bulk counter on those indices since their shards started. It
+    is a volume, not a rate, and it is not added to bulk GB/day.
+    """
+    members = {
+        (ix or {}).get("index_name")
+        for ds in streams or [] for ix in (ds.get("indices") or [])
+    }
+    write = _write_indices(streams, alias)
+    write_aliases = _write_alias_names(alias)
+    found: list[dict] = []
+    for name, body in (stats or {}).items():
+        if not _user_index(name):
+            continue
+        primaries = (body or {}).get("primaries") or {}
+        bulk_bytes = int(((primaries.get("bulk") or {}).get("total_size_in_bytes")) or 0)
+        if bulk_bytes <= 0 or rated.get(name, 0) > 0:
+            continue
+        if name in write:
+            reason = "write index with no write phase"
+        else:
+            own_aliases = set((((alias or {}).get(name) or {}).get("aliases")) or {})
+            if name in members or own_aliases & write_aliases or _rolled_over((explain or {}).get(name) or {}):
+                continue
+            reason = "not a data stream, write alias, or rollover"
+        store_bytes = int(((primaries.get("store") or {}).get("size_in_bytes")) or 0)
+        found.append({"index": name, "reason": reason, "store_bytes": store_bytes, "bulk_bytes": bulk_bytes})
+    found.sort(key=lambda row: -row["bulk_bytes"])
+    return {
+        "unrated_indices": len(found),
+        "unrated_store_gb": round(sum(row["store_bytes"] for row in found) / 1e9, 2),
+        "unrated_bulk_gb": round(sum(row["bulk_bytes"] for row in found) / 1e9, 2),
+        "unrated_top": [
+            {
+                "index": row["index"],
+                "reason": row["reason"],
+                "store_gb": round(row["store_bytes"] / 1e9, 2),
+                "bulk_gb": round(row["bulk_bytes"] / 1e9, 2),
+            }
+            for row in found[:5]
+        ],
+    }
+
+
 def analyze_bundle(path: Path, *, captured: datetime) -> dict:
     """Bulk GB/day, retention, and primary store size from one diagnostic zip."""
     with zipfile.ZipFile(path) as archive:
@@ -444,6 +514,7 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         if ts > collection:
             collection = ts
     est_bytes = 0
+    rated: dict[str, int] = {}
     for name in _write_indices(streams, alias):
         body = stats.get(name) or {}
         primaries = body.get("primaries") or {}
@@ -452,7 +523,8 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         created_ms = info.get("index_creation_date_millis")
         lifecycle_ms = info.get("lifecycle_date_millis")
         action = info.get("action")
-        est_bytes += _est_bytes_per_day(int(bulk_bytes), created_ms, lifecycle_ms, action, collection)
+        rated[name] = _est_bytes_per_day(int(bulk_bytes), created_ms, lifecycle_ms, action, collection)
+        est_bytes += rated[name]
     gb_day = est_bytes / 1e9
     # compressioncalc_accounted_for = bulk GB/day × 0.60.
     # On-disk bytes do not change it.
@@ -547,6 +619,7 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         "store_gb": round(local / 1e9, 2),
         "dataset_gb": round((dataset + snapshot) / 1e9, 2),
         "snapshot_gb": round(((dataset - local) + snapshot) / 1e9, 2),
+        **unrated_ingest(stats, streams, alias, explain, rated),
     }
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 
-G26_TOLERANCE_GB_DAY = 0.51
+G28_TOLERANCE_GB_DAY = 0.51
 
 
 def money(value) -> float | None:
@@ -28,19 +28,111 @@ def money(value) -> float | None:
     return number
 
 
-def g26_gate(written_bulk: float, sheet_raw) -> dict:
-    """Accept Observability only when G26 is within 0.51 GB/day of the bulk written."""
+def g28_gate(written_bulk: float, sheet_raw) -> dict:
+    """Accept Observability only when G28 is within 0.51 GB/day of the bulk written."""
     sheet = money(sheet_raw)
     try:
         written = float(written_bulk)
     except (TypeError, ValueError):
         written = 0.0
-    accepted = sheet is not None and abs(sheet - written) <= G26_TOLERANCE_GB_DAY
+    accepted = sheet is not None and abs(sheet - written) <= G28_TOLERANCE_GB_DAY
     return {
         "written_bulk": round(written, 3),
         "sheet_raw_gb_day": None if sheet is None else round(sheet, 3),
         "accepted": accepted,
     }
+
+
+# Layout this skill writes and reads, by estimator. Each anchor is the text that
+# sits beside a cell the skill uses, so a moved row is caught before any write.
+# `min_version` is the oldest layout these addresses are known to fit. A sheet
+# reports 1.20 as "1.2", so versions compare as numbers.
+TEMPLATE_ANCHORS = {
+    "observability": {
+        "min_version": 1.22,
+        "labels": {
+            "D4": "feature tier",
+            "D5": "technical support tier",
+            "D8": "cloud provider and region",
+            "D11": "everything except tsds metrics",
+            "D12": "ingested tsds metrics",
+            "D15": "synthetic monitoring",
+            "D19": "estimated monthly (bytes)",
+            "D20": "estimated monthly (bytes)",
+            "D23": "daily logs raw data ingest",
+            "D24": "kubernetes",
+            "D25": "daily metrics raw data ingest",
+            "D26": "traces per minute",
+            "D27": "sampling rate",
+            "D28": "total raw ingest in gb/day",
+            "D29": "metered ingest in gb/day",
+            "D33": "cross-project search",
+            "D37": "monthly estimate (steady state)",
+            "E37": "annual estimate (first year)",
+            "F37": "annual estimate (steady state)",
+        },
+    },
+    "security": {
+        "min_version": 2.6,
+        "labels": {
+            "D4": "daily siem raw data ingest",
+            "E5": "actual metered ingest",
+            "D6": "retention period",
+            "D7": "cloud provider region",
+            "D8": "feature tier",
+            "D9": "elastic defend",
+            "D21": "technical support",
+            "D35": "annual estimate (year 1)",
+            "E35": "annual estimate (year 2)",
+            "F35": "annual estimate (year 3)",
+            "D73": "cps add-on charges",
+            "D74": "total monthly charges",
+        },
+    },
+}
+
+
+def template_version(column) -> str | None:
+    """Last filled cell of the Version Control tab's first column, the sheet's own version."""
+    last = None
+    for value in column or []:
+        text = str(value if value is not None else "").strip()
+        if text:
+            last = text
+    return last
+
+
+def _version_number(text) -> float | None:
+    match = re.fullmatch(r"v?(\d+(?:\.\d+)?)", str(text or "").strip(), re.IGNORECASE)
+    return float(match.group(1)) if match else None
+
+
+def template_check(kind: str, labels: dict, version) -> dict:
+    """Does this estimator copy have the layout the skill writes? No network.
+
+    `problems` is empty when every anchor label is where it is expected and the
+    version is readable and not older than `min_version`. A newer version with
+    every label in place is accepted and marked `newer`, because estimator
+    releases that only add regions keep the layout.
+    """
+    spec = TEMPLATE_ANCHORS.get(kind)
+    if spec is None:
+        return {"kind": kind, "version": None, "newer": False, "problems": [f"no layout is recorded for {kind!r}"]}
+    problems: list[str] = []
+    for cell, want in spec["labels"].items():
+        have = " ".join(str((labels or {}).get(cell) or "").lower().split())
+        if want not in have:
+            shown = have[:60] or "blank"
+            problems.append(f"{cell} should read '{want}' and is '{shown}'")
+    number = _version_number(version)
+    newer = False
+    if number is None:
+        problems.append(f"the Version Control tab gave no readable version ({version!r})")
+    elif number < spec["min_version"] - 1e-9:
+        problems.append(f"version {version} is older than {spec['min_version']:g}, the layout these cells fit")
+    else:
+        newer = number > spec["min_version"] + 1e-9
+    return {"kind": kind, "version": None if version is None else str(version), "newer": newer, "problems": problems}
 
 
 def _integrity_row(name: str, score, passed, detail: str) -> dict:
@@ -53,7 +145,7 @@ def _integrity_row(name: str, score, passed, detail: str) -> dict:
 
 
 def _sheet_echo(observability: dict, security: dict) -> dict:
-    """G26 distance and a parsed E73 of 0. A missing sheet is left out of this check."""
+    """G28 distance and a parsed E73 of 0. A missing sheet is left out of this check."""
     parts: list[float] = []
     passes: list[bool] = []
     bits: list[str] = []
@@ -63,12 +155,12 @@ def _sheet_echo(observability: dict, security: dict) -> dict:
         if sheet is None:
             parts.append(0.0)
             passes.append(False)
-            bits.append("G26 was blank or unreadable")
+            bits.append("G28 was blank or unreadable")
         else:
             gap = abs(sheet - written)
-            parts.append(1.0 - min(gap / G26_TOLERANCE_GB_DAY, 1.0))
-            passes.append(gap <= G26_TOLERANCE_GB_DAY)
-            bits.append(f"G26 is {gap:.3f} GB/day from the written bulk")
+            parts.append(1.0 - min(gap / G28_TOLERANCE_GB_DAY, 1.0))
+            passes.append(gap <= G28_TOLERANCE_GB_DAY)
+            bits.append(f"G28 is {gap:.3f} GB/day from the written bulk")
     if security.get("has_workload") and security.get("sheet_read"):
         amount = money(security.get("e73"))
         if amount is None:
@@ -125,6 +217,36 @@ def _retention_row(coverage: dict | None) -> dict:
         unmeasured == 0,
         f"{unmeasured:.3f} GB/day of {bulk:.3f} has no measured age.",
     )
+
+
+# Share of local store that may sit in unrated indices before the check is flagged.
+UNRATED_STORE_PASS = 0.05
+
+
+def _rated_row(coverage: dict | None) -> dict:
+    """Store in indices that took bulk writes and have no rate, as a share of local store."""
+    unrated = (coverage or {}).get("unrated")
+    if not coverage or unrated is None:
+        return _integrity_row("Rated ingest", None, None, "The bundles were parsed without the unrated-index count.")
+    count = int(unrated.get("indices") or 0)
+    store = float(unrated.get("store_gb") or 0)
+    share = unrated.get("share_of_store")
+    if count == 0:
+        return _integrity_row("Rated ingest", 1.0, True, "Every index that took bulk writes is rated or is a rolled generation.")
+    if share is None:
+        return _integrity_row(
+            "Rated ingest", 0.0, False,
+            f"{count} indices took bulk writes and have no rate, and there is no local store to compare them with.",
+        )
+    share = min(max(float(share), 0.0), 1.0)
+    detail = (
+        f"{count} indices took bulk writes and have no rate. They hold {store:,.1f} GB, "
+        f"{share * 100:.1f}% of local store. Their ingest is not in bulk GB/day."
+    )
+    names = [f"{row.get('name')} ({float(row.get('store_gb') or 0):,.0f} GB)" for row in (unrated.get("deployments") or [])[:6] if row.get("name")]
+    if names:
+        detail += " Largest: " + ", ".join(names) + "."
+    return _integrity_row("Rated ingest", 1.0 - share, share <= UNRATED_STORE_PASS, detail)
 
 
 def _direct_row(solutions: list[dict]) -> dict:
@@ -231,7 +353,7 @@ def integrity_score(facts: dict) -> dict:
     """Quote integrity, 0 to 1. The mean skips a check that does not apply.
 
     A score of 0.90 or higher passes. A check that misses its own bar stays
-    flagged. A quote whose every scored check passes also passes. A G26 gap of
+    flagged. A quote whose every scored check passes also passes. A G28 gap of
     0.51 scores 0 on that component and still passes that component. This is
     not a serverless bill.
     """
@@ -240,6 +362,7 @@ def integrity_score(facts: dict) -> dict:
         _sheet_echo(facts.get("observability") or {}, facts.get("security") or {}),
         _coverage_row(coverage),
         _retention_row(coverage),
+        _rated_row(coverage),
         _direct_row(list(facts.get("solutions") or [])),
         _line_row(facts.get("headline_monthly"), list(facts.get("lines") or [])),
         _year_row(list(facts.get("lines") or [])),

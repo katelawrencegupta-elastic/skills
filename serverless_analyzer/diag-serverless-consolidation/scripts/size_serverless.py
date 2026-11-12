@@ -52,14 +52,17 @@ K360_SCRIPTS = scripts_dir(_account_root)
 sys.path.insert(0, str(K360_SCRIPTS))
 sys.path.insert(0, str(ORG_SKILL / "scripts"))
 from privacy import seal_dir, seal_file, seal_text  # noqa: E402
-from quote_checks import addon_off_value, e73_blocks_quote, g26_gate, money as sheet_money  # noqa: E402
+from quote_checks import (  # noqa: E402
+    TEMPLATE_ANCHORS, addon_off_value, e73_blocks_quote, g28_gate, money as sheet_money,
+    template_check, template_version,
+)
 try:
     from sheets_auth import get_creds  # noqa: E402
 except ImportError as e:  # pragma: no cover
     raise SystemExit(f"sheets_auth.py not found under {ORG_SKILL}/scripts — set K360_ORG_SKILL_DIR") from e
 
 # Golden templates (user-specified; copied, never edited in place):
-#   Observability → https://docs.google.com/spreadsheets/d/1bu-qjVIab-rbWb7zvCEq6QEoLdKpi0vfw3yDj9_VJuE/edit?usp=drive_link
+#   Observability → https://docs.google.com/spreadsheets/d/1tUdwJbTmd4helFOzEHMi_gpHw7qu_aCgprjlqmHh2hs/edit (v1.22)
 #   Security      → https://docs.google.com/spreadsheets/d/1b91Uoa2e4vBrep_7I4RoY_8Mr19poqaUgWl7LqhIOqY/edit?usp=drive_link
 # Override with O11Y_SHEET_ID / SECURITY_SHEET_ID or --o11y-id / --security-id (ID or full URL).
 DEFAULT_O11Y = "1tUdwJbTmd4helFOzEHMi_gpHw7qu_aCgprjlqmHh2hs"  # Observability estimator v1.22
@@ -309,6 +312,63 @@ def copy_template(drive, template_id: str, title: str, parent_id: str, *, reuse:
     # --fresh replaces the title's copy. The earlier one goes to the trash so there is one estimate per title.
     trash_same_title(drive, parent_id, title, meta["id"])
     return _sheet_record(meta), False
+
+
+VERSION_TAB = "Version Control"
+# Exit status when an estimator copy does not have the layout this skill writes.
+TEMPLATE_MISMATCH_EXIT = 3
+
+
+class TemplateMismatch(RuntimeError):
+    """The estimator copy is not the layout these cell addresses were written for."""
+
+
+def verify_template(sheets, sid: str, kind: str, tab: str) -> dict:
+    """Read the labels beside every cell the skill uses, and the sheet's version.
+
+    Raises TemplateMismatch before anything is written when a label is not where
+    it is expected or the version is older than the recorded layout. The check
+    reads the copy, never the golden template.
+    """
+    assert_not_template(sid)
+    cells = list(TEMPLATE_ANCHORS[kind]["labels"])
+    ranges = [f"'{tab}'!{a1}" for a1 in cells] + [f"'{VERSION_TAB}'!A1:A300"]
+    res = _execute(lambda: sheets.spreadsheets().values().batchGet(
+        spreadsheetId=sid, ranges=ranges, valueRenderOption="FORMATTED_VALUE",
+    ))
+    got = res.get("valueRanges") or []
+    labels = {}
+    for a1, vr in zip(cells, got):
+        labels[a1] = ((vr.get("values") or [[None]])[0] or [None])[0]
+    column = [(row or [None])[0] for row in ((got[len(cells)].get("values") if len(got) > len(cells) else None) or [])]
+    check = template_check(kind, labels, template_version(column))
+    if check["problems"]:
+        raise TemplateMismatch(
+            f"{kind.title()} estimator copy {sid} does not match the layout this skill writes. "
+            + "; ".join(check["problems"][:6])
+            + ". Nothing was written and no read-back was taken. "
+            "Point the template id at the current estimator, or update TEMPLATE_ANCHORS and the cell map together."
+        )
+    return {"version": check["version"], "newer_than_validated": check["newer"]}
+
+
+def copy_verified(drive, sheets, template_id: str, title: str, parent_id: str, *, reuse: bool, kind: str, tab: str) -> tuple[dict, bool, dict]:
+    """Copy (or reuse) an estimator and check its layout before any cell is written.
+
+    A copy made by this call is trashed when the check fails, so an unfilled
+    sheet does not stay behind under an estimate title.
+    """
+    copied, reused = copy_template(drive, template_id, title, parent_id, reuse=reuse)
+    try:
+        layout = verify_template(sheets, copied["id"], kind, tab)
+    except TemplateMismatch:
+        if not reused:
+            try:
+                trash_file(drive, copied["id"])
+            except Exception:  # noqa: BLE001
+                pass
+        raise
+    return copied, reused, layout
 
 
 def export_xlsx(drive, spreadsheet_id: str, dest: Path) -> Path:
@@ -1055,7 +1115,9 @@ def _fill_regional_job(job: dict, creds) -> dict:
         if published.get("error"):
             entry["error"] = published["error"]
         return entry
-    copied, reused = copy_template(drive, job["template_id"], job["title"], job["parent_id"], reuse=job["reuse"])
+    copied, reused, layout = copy_verified(
+        drive, sheets, job["template_id"], job["title"], job["parent_id"], reuse=job["reuse"], kind=sol, tab=job["tab"],
+    )
     opts = region_options(sheets, copied["id"])
     reg, how = match_region(job["provider"], job["region"], opts)
     if sol == "security":
@@ -1077,10 +1139,11 @@ def _fill_regional_job(job: dict, creds) -> dict:
         "spreadsheet_id": copied["id"], "url": copied["url"], "reused_existing_copy": reused,
         "cells": cells, "cells_written": n, "region_match": f"{reg} ({how})",
         "readback": rb, "status": "filled", "daily_raw_gb": round(job["daily"], 2),
+        "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"],
     }
     if sol == "observability":
-        entry["g26_gate"] = g26_gate(job["daily"], rb.get("total_raw_gb_day"))
-        if not entry["g26_gate"]["accepted"]:
+        entry["g28_gate"] = g28_gate(job["daily"], rb.get("total_raw_gb_day"))
+        if not entry["g28_gate"]["accepted"]:
             entry["readback_rejected"] = "G28 differs from the written bulk by more than 0.51 GB/day"
     if not job["skip_xlsx"]:
         try:
@@ -1425,7 +1488,10 @@ def fill_plan_sheet(job: dict, creds) -> dict:
     solution = job.get("solution") or "observability"
     label = "Security" if solution == "security" else "Observability"
     try:
-        copied, _reused = copy_template(drive, job["template_id"], job["title"], job["parent_id"], reuse=job["reuse"])
+        copied, _reused, _layout = copy_verified(
+            drive, sheets, job["template_id"], job["title"], job["parent_id"], reuse=job["reuse"],
+            kind=solution, tab=SEC_TAB if solution == "security" else O11Y_TAB,
+        )
         opts = region_options(sheets, copied["id"])
         reg, _how = match_region(job["provider"], job["region_name"], opts)
         account = {"sizing": {"feature_tier": job.get("feature_tier")}}
@@ -1445,7 +1511,7 @@ def fill_plan_sheet(job: dict, creds) -> dict:
         cells = observability_input_cells(account, job["support"], reg, int(job["months_written"]), float(job["bulk"]))
         push_cells(sheets, copied["id"], O11Y_TAB, cells, allowed_text=set(opts))
         rb = read_cells(sheets, copied["id"], O11Y_TAB, O11Y_READBACK)
-        gate = g26_gate(float(job["bulk"]), rb.get("total_raw_gb_day"))
+        gate = g28_gate(float(job["bulk"]), rb.get("total_raw_gb_day"))
         if not gate["accepted"]:
             return {"error": (
                 "Observability deployment-count plan was not priced: "
@@ -1455,6 +1521,8 @@ def fill_plan_sheet(job: dict, creds) -> dict:
         if price is None:
             return {"error": f"Observability deployment-count plan was not priced: {job['title']} has no D38 read-back."}
         return {"monthly": round(price, 2), "url": copied.get("url")}
+    except TemplateMismatch:
+        raise
     except Exception as ex:  # noqa: BLE001
         return {"error": f"{label} deployment-count plan was not priced: {ex}"}
 
@@ -1501,7 +1569,7 @@ def plan_roster(acc: dict) -> list[dict]:
 def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str, security_id: str, support: str, provider, force_months: int | None, name_suffix: str, fresh: bool) -> dict:
     """Price the cuts from the cover count down to one project per region and feature.
 
-    Observability projects are D32 read-backs. Security projects are E74 read-backs.
+    Observability projects are D38 read-backs. Security projects are E74 read-backs.
     Search projects are the on-demand estimator. A 30-day force scales Search disk
     by the measured month.
     """
@@ -1550,6 +1618,8 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
         try:
             creds = load_sheet_creds()
             fills = map_in_order(lambda job: fill_plan_sheet(job, creds), jobs)
+        except TemplateMismatch:
+            raise
         except Exception as ex:  # noqa: BLE001
             return {"bars": [], "error": f"Deployment-count plan was not priced: {ex}"}
         built = assemble_plan_bars(specs, fills)
@@ -1735,7 +1805,7 @@ def main() -> None:
     else:
         title_o = estimate_title(key, "observability", suffix, o_scope)
         o_months = _months_for_sheet(o, args.force_months)
-        copied, reused = copy_template(drive, args.o11y_id, title_o, folder["id"], reuse=not args.fresh)
+        copied, reused, layout = copy_verified(drive, sheets, args.o11y_id, title_o, folder["id"], reuse=not args.fresh, kind="observability", tab=O11Y_TAB)
         opts = region_options(sheets, copied["id"])
         reg, how = match_region(provider, o_scope or region, opts)
         daily = float(o.get("daily_raw_gb") or 0)
@@ -1744,9 +1814,9 @@ def main() -> None:
         )
         n = push_cells(sheets, copied["id"], O11Y_TAB, cells, allowed_text=set(opts))
         rb = read_cells(sheets, copied["id"], O11Y_TAB, O11Y_READBACK)
-        entry = {"kind": "observability", "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.o11y_id, "reused_existing_copy": reused, "tab": O11Y_TAB, "cells": cells, "cells_written": n, "region_match": f"{reg} ({how})", "readback": rb, "status": "filled"}
-        entry["g26_gate"] = g26_gate(daily, rb.get("total_raw_gb_day"))
-        if not entry["g26_gate"]["accepted"]:
+        entry = {"kind": "observability", "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.o11y_id, "reused_existing_copy": reused, "tab": O11Y_TAB, "cells": cells, "cells_written": n, "region_match": f"{reg} ({how})", "readback": rb, "status": "filled", "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"]}
+        entry["g28_gate"] = g28_gate(daily, rb.get("total_raw_gb_day"))
+        if not entry["g28_gate"]["accepted"]:
             entry["readback_rejected"] = "G28 differs from the written bulk by more than 0.51 GB/day"
         if not args.skip_xlsx:
             try:
@@ -1774,14 +1844,14 @@ def main() -> None:
     else:
         title_s = estimate_title(key, "security", suffix, s_scope)
         s_months = _months_for_sheet(s, args.force_months)
-        copied, reused = copy_template(drive, args.security_id, title_s, folder["id"], reuse=not args.fresh)
+        copied, reused, layout = copy_verified(drive, sheets, args.security_id, title_s, folder["id"], reuse=not args.fresh, kind="security", tab=SEC_TAB)
         opts = region_options(sheets, copied["id"])
         reg, how = match_region(provider, s_scope or region, opts)
         clear_security_addons(sheets, copied["id"], SEC_TAB)
         cells = security_input_cells(acc, support, reg, s_months, float(s.get("siem_gb_day") if s.get("siem_gb_day") is not None else s.get("daily_raw_gb") or 0))
         n = push_cells(sheets, copied["id"], SEC_TAB, cells, allowed_text=set(opts))
         rb = read_cells(sheets, copied["id"], SEC_TAB, SEC_READBACK)
-        entry = {"kind": "security", "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.security_id, "reused_existing_copy": reused, "tab": SEC_TAB, "cells": cells, "cells_written": n, "region_match": f"{reg} ({how})", "readback": rb, "status": "filled"}
+        entry = {"kind": "security", "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.security_id, "reused_existing_copy": reused, "tab": SEC_TAB, "cells": cells, "cells_written": n, "region_match": f"{reg} ({how})", "readback": rb, "status": "filled", "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"]}
         if not args.skip_xlsx:
             try:
                 x = export_xlsx(drive, copied["id"], estimate_dir / f"{title_s}.xlsx")
@@ -1879,4 +1949,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except TemplateMismatch as mismatch:
+        print(f"ERROR: {mismatch}", file=sys.stderr)
+        sys.exit(TEMPLATE_MISMATCH_EXIT)
