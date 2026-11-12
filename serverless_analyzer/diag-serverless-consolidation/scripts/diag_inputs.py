@@ -75,12 +75,13 @@ def _measured_days(value) -> float | None:
 
 def _cells(bulk: float, written: int | None) -> tuple[dict, dict]:
     o11y = {
-        "G21_logs_gb_day": round(bulk * 0.90, 3),
-        "G23_metrics_gb_day": round(bulk * 0.10, 3),
+        "G23_logs_gb_day": round(bulk * 0.90, 3),
+        "G25_metrics_gb_day": round(bulk * 0.10, 3),
     }
     security = {"G4_siem_gb_day": round(bulk, 3)}
     if written:
         o11y["G11_retention_months"] = written
+        o11y["G12_tsds_retention_months"] = written
         security["G6_retention_months"] = written
     return o11y, security
 

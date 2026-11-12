@@ -986,7 +986,7 @@ class RegionalQuoteTests(unittest.TestCase):
         quote = regional_quote(
             [
                 {"region": "east", "stored_gb": 10, "kind": "own", "own_monthly": 180},
-                {"region": "west", "stored_gb": 10, "kind": "rejected", "own_pricing": "rejected — G26 differs from the written bulk"},
+                {"region": "west", "stored_gb": 10, "kind": "rejected", "own_pricing": "rejected — G28 differs from the written bulk"},
             ],
             300,
             solution="observability",
@@ -1081,9 +1081,9 @@ class EfficiencyTests(unittest.TestCase):
         self.assertEqual(built["bars"][0]["monthly"], 25)
         self.assertEqual(built["bars"][1]["monthly"], 22)
         self.assertTrue(built["bars"][2]["reused_headline"])
-        missed = assemble_plan_bars(specs, [fills[0], {"error": "G26 is 11 GB/day against 10 written."}, fills[2]])
+        missed = assemble_plan_bars(specs, [fills[0], {"error": "G28 is 11 GB/day against 10 written."}, fills[2]])
         self.assertEqual(missed["bars"], [])
-        self.assertIn("G26", missed["error"])
+        self.assertIn("G28", missed["error"])
 
     def test_sheet_pool_keeps_input_order(self):
         os.environ["SHEET_WORKERS"] = "4"
@@ -1383,10 +1383,15 @@ class ConsolidationLayoutTests(unittest.TestCase):
                 {"name": "fresh", "solution": "observability", "daily_raw_gb": 25.0, "gb": 5.0, "retention_days": 3,
                  "uptime_days_min": 0.5, "ingest_source": "diagnostics"},
                 {"name": "nobundle", "solution": "search", "daily_raw_gb": 0.0, "ingest_source": "active_no_bundle"},
+                {"name": "a-serverless-project", "solution": "observability", "platform": "serverless"},
             ]},
         }
         data = raw_ingest_by_deployment(acc)
+        # The serverless project has no bundle and no ECH bill, so it is not a row and
+        # is not counted in the by-solution deployment count.
         self.assertEqual([r["name"] for r in data["rows"]], ["big", "fresh", "nobundle"])
+        self.assertEqual(data["by_solution"]["observability"]["n"], 2)
+        self.assertEqual(data["by_solution"]["search"]["n"], 1)
         self.assertAlmostEqual(data["rows"][0]["measured"], 80.0)   # 100 ÷ 1.25
         self.assertAlmostEqual(data["total_quoted"], 125.0)
         self.assertAlmostEqual(data["total_measured"], 100.0)
@@ -1394,15 +1399,20 @@ class ConsolidationLayoutTests(unittest.TestCase):
         html = raw_ingest_section(acc)
         self.assertIn("<h2>Raw bulk ingest by deployment</h2>", html)
         self.assertIn("1.250000", html)
-        self.assertIn("no bundle", html)
+        # The active deployment with no bundle is a row of its own, not only a count.
+        self.assertIn("'>nobundle</td>", html)
+        self.assertIn("'>no bundle</td>", html)
+        self.assertNotIn("a-serverless-project", html)
+        self.assertIn("Fleet total 125.0 GB/day", html)
         self.assertIn("background:#FFF8E6", html)   # fresh: node up under 2 days
         self.assertIn("× 1.595", html)
         # compression-applied run: daily_raw_gb is already × 0.60, bulk comes back from the ratio
         comp = json.loads(json.dumps(acc))
         for dep in comp["solutions"]["by_deployment"]:
+            raw = float(dep.get("daily_raw_gb") or 0)
             dep["compression_ratio"] = 0.6
-            dep["compressioncalc_accounted_for"] = dep["daily_raw_gb"] * 0.6
-            dep["daily_raw_gb"] = dep["daily_raw_gb"] * 0.6
+            dep["compressioncalc_accounted_for"] = raw * 0.6
+            dep["daily_raw_gb"] = raw * 0.6
         comp["consolidation"] = {"ingest_basis": "compressioncalc_accounted_for"}
         self.assertAlmostEqual(raw_ingest_by_deployment(comp)["total_quoted"], 125.0)
         self.assertIn("Accounted GB/day", raw_ingest_section(comp))
@@ -1522,6 +1532,34 @@ class ConsolidationLayoutTests(unittest.TestCase):
         self.assertIn("30-day usage", build)
         self.assertNotIn("ECH today", build)
 
+    def test_cover_flips_reduction_to_increase_when_serverless_costs_more(self):
+        acc = _quote_account(g26=10, e73=0)
+        acc["meta"]["org"]["ARR"] = 1825
+        acc["ecu"]["contract"] = {"commit_pace_ecu_per_day": 10}
+        acc["consolidation"] = build_consolidation(acc, None)
+        html = render_consolidation_html(acc)
+        cover = html.split("<section class='sec newpage'>", 1)[0]
+        sv = acc["consolidation"]["savings"]
+        self.assertLess(sv["cost_mo"], 0)
+        self.assertIn("Estimated monthly increase at the contract rate", cover)
+        self.assertIn("Estimated increase at the contract rate", cover)
+        self.assertNotIn("Estimated monthly reduction", cover)
+        self.assertIn("class='up'", cover)
+        self.assertNotIn("class='down'", cover.split("<style>")[-1].split("</style>")[-1])
+        self.assertNotIn("-$", cover.split("</style>")[-1])
+
+    def test_cover_keeps_reduction_when_serverless_costs_less(self):
+        acc = _quote_account(g26=10, e73=0)
+        acc["meta"]["org"]["ARR"] = 1825
+        acc["ecu"]["contract"] = {"commit_pace_ecu_per_day": 10}
+        acc["consolidation"] = build_consolidation(acc, None)
+        sv = acc["consolidation"]["savings"]
+        sv["cost_mo"], sv["cost_pct"] = 50.0, 20.0
+        cover = render_consolidation_html(acc).split("<section class='sec newpage'>", 1)[0]
+        self.assertIn("Estimated monthly reduction at the contract rate", cover)
+        self.assertIn("class='down'", cover.split("</style>")[-1])
+        self.assertNotIn("class='up'", cover.split("</style>")[-1])
+
     def test_contract_rate_is_drawn_beside_the_list_price(self):
         acc = _quote_account(g26=10, e73=0)
         acc["meta"]["org"]["ARR"] = 1825
@@ -1533,7 +1571,7 @@ class ConsolidationLayoutTests(unittest.TestCase):
         self.assertNotIn("Serverless at contract rate", cover)
         self.assertIn("ECH at contract rate", cover)
         self.assertIn("Contract rate $0.5 per ECU", cover)
-        self.assertIn("minus serverless at list", cover)
+        self.assertIn("ECH at the contract rate and serverless at list", cover)
         self.assertNotIn("minus serverless at the contract rate", cover)
         plan = html.split("Monthly estimate as deployments become projects", 1)[1].split("<h2>", 1)[0]
         self.assertIn("Serverless at list", plan)
@@ -1606,6 +1644,245 @@ class SkillPathTests(unittest.TestCase):
                 self.assertEqual(find_skill("k360-org-report", HERE), Path(tmp))
             finally:
                 os.environ.pop("K360_ORG_SKILL_DIR", None)
+
+
+class _FakeDrive:
+    """Just enough of the Drive client for the estimate dedupe: a folder tree of named sheets."""
+
+    def __init__(self, files):
+        self.files_ = files
+        self.trashed: list[str] = []
+
+    def files(self):
+        return self
+
+    def list(self, q="", **_kw):
+        import re as _re
+        parent = _re.search(r"'([^']+)' in parents", q).group(1)
+        want = _re.search(r"name = '([^']+)'", q)
+        rows = [f for f in self.files_ if f["parent"] == parent and f["id"] not in self.trashed and (not want or f["name"] == want.group(1))]
+        rows.sort(key=lambda f: f["createdTime"], reverse=True)
+        return _Req({"files": rows})
+
+    def update(self, fileId, body=None, **_kw):
+        if (body or {}).get("trashed"):
+            self.trashed.append(fileId)
+        return _Req({})
+
+
+class _Req:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def execute(self):
+        return self.payload
+
+
+class EstimateDedupeTests(unittest.TestCase):
+    def test_one_sheet_per_title_keeps_the_newest_across_folders(self):
+        import size_serverless as z
+        sheet, folder = z.GSHEET_MIME, z.FOLDER_MIME
+        files = [
+            {"id": "sub", "name": "full_retention", "mimeType": folder, "parent": "root", "createdTime": "1"},
+            {"id": "a1", "name": "X_search_full retention_bulk_eastus_serverless_estimate", "mimeType": sheet, "parent": "sub", "createdTime": "2026-11-12T15"},
+            {"id": "a2", "name": "X_search_full retention_bulk_eastus_serverless_estimate", "mimeType": sheet, "parent": "sub", "createdTime": "2026-11-12T16"},
+            {"id": "a3", "name": "X_search_full retention_bulk_eastus_serverless_estimate", "mimeType": sheet, "parent": "root", "createdTime": "2026-11-12T10"},
+            {"id": "b1", "name": "X_search_30d_bulk_eastus_serverless_estimate", "mimeType": sheet, "parent": "sub", "createdTime": "2026-11-12T16"},
+        ]
+        drive = _FakeDrive(files)
+        orig_exec, orig_assert = z._execute, z.assert_not_template
+        z._execute = lambda build, attempts=6: build().execute()
+        z.assert_not_template = lambda _id: None
+        try:
+            dry = z.dedupe_estimates(drive, "root", dry_run=True)
+            self.assertEqual({r["id"] for r in dry}, {"a1", "a3"})
+            self.assertEqual(drive.trashed, [])
+            removed = z.dedupe_estimates(drive, "root")
+        finally:
+            z._execute, z.assert_not_template = orig_exec, orig_assert
+        self.assertEqual({r["id"] for r in removed}, {"a1", "a3"})
+        self.assertEqual(sorted(drive.trashed), ["a1", "a3"])
+        self.assertTrue(all(r["kept"] == "a2" for r in removed))
+
+
+class DiagDownloadTests(unittest.TestCase):
+    def _zip(self, path: Path, ok: bool = True) -> None:
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("a.json", "{}" * 100)
+        if not ok:
+            data = path.read_bytes()
+            path.write_bytes(data[: len(data) // 2])
+
+    def test_a_truncated_zip_is_not_complete(self):
+        import admin_diags
+        with tempfile.TemporaryDirectory() as tmp:
+            good, bad = Path(tmp) / "g.zip", Path(tmp) / "b.zip"
+            self._zip(good)
+            self._zip(bad, ok=False)
+            self.assertTrue(admin_diags._zip_ok(good))
+            self.assertTrue(admin_diags._is_zip(bad))
+            self.assertFalse(admin_diags._zip_ok(bad))
+
+    def test_capture_retries_three_times_then_reports_the_failure(self):
+        import admin_diags
+        calls = []
+
+        def boom(*_a, **_k):
+            calls.append(1)
+            raise RuntimeError("response was not a complete zip")
+
+        orig = admin_diags._capture_one
+        admin_diags._capture_one = boom
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                row = admin_diags._capture_with_retry("b", "k", {"id": "a" * 32, "name": "n"}, Path(tmp) / "x.zip", pause=0)
+        finally:
+            admin_diags._capture_one = orig
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(row["result"], "error")
+        self.assertEqual(row["attempts"], 4)
+
+    def test_capture_recovers_on_a_later_attempt(self):
+        import admin_diags
+        calls = []
+
+        def flaky(base, key, row, dest):
+            calls.append(1)
+            if len(calls) < 3:
+                raise RuntimeError("cut short")
+            return {**row, "result": "ok", "bytes": 1, "file": str(dest)}
+
+        orig = admin_diags._capture_one
+        admin_diags._capture_one = flaky
+        try:
+            row = admin_diags._capture_with_retry("b", "k", {"id": "a" * 32, "name": "n"}, Path("/nonexistent/x.zip"), pause=0)
+        finally:
+            admin_diags._capture_one = orig
+        self.assertEqual((row["result"], row["attempts"]), ("ok", 3))
+
+    def test_cover_names_deployments_with_no_bundle(self):
+        from render_pdf import _missing_diag_notes
+        self.assertEqual(_missing_diag_notes({}), [])
+        note = _missing_diag_notes({"download_failed": [{"name": "alpha"}], "k360_fallback": 1, "fallback_names": ["alpha"]})[0]
+        self.assertIn("alpha", note)
+        self.assertIn("could not be downloaded after retries", note)
+        note = _missing_diag_notes({"k360_fallback": 2, "fallback_names": ["a", "b"]})[0]
+        self.assertIn("2 active deployments are not measured", note)
+
+
+class ExcludeDeploymentTests(unittest.TestCase):
+    def _acc(self):
+        return {
+            "meta": {"run_key": "Acme_2026-11-12"},
+            "ecu": {
+                "monthly": {"months": ["2026-09", "2026-10", "2026-11"], "totals": [100.0, 100.0, 50.0], "partial_months": ["2026-11"]},
+                "monthly_avg_complete_months": 100.0, "monthly_avg_all": 83.33, "total_lookback": 250.0, "total_lookback_ech_named": 250.0,
+                "daily_days": ["2026-10-30", "2026-10-31", "2026-11-01"], "daily_totals": [4.0, 4.0, 2.0],
+                "daily_avg": 3.33, "daily_avg_active_days": 3.33, "last_30d_total": 10.0, "last_30d_daily_avg": 3.33,
+                "monthly_peak": {"month": "2026-09", "ecu": 100.0}, "monthly_low": {"month": "2026-11", "ecu": 50.0},
+                "daily_peak": {"day": "2026-10-30", "ecu": 4.0},
+            },
+            "deployments": {"count": 3, "ech_count": 3, "top": [{"name": "keep"}, {"name": "drop"}], "active": {"names": ["keep", "drop"], "count": 2}},
+            "solutions": {"by_deployment": [{"name": "keep", "platform": "ech"}, {"name": "drop", "platform": "ech"}]},
+            "storage": {"by_deployment": [{"name": "keep"}, {"name": "drop"}], "size_gaps": [{"name": "drop"}]},
+        }
+
+    def test_ids_must_be_deployment_ids(self):
+        from exclusions import parse_ids
+        good = "A" * 32
+        self.assertEqual(parse_ids([good, good.lower() + "," + "b" * 32]), ["a" * 32, "b" * 32])
+        with self.assertRaises(SystemExit):
+            parse_ids(["not-an-id"])
+
+    def test_unknown_id_stops_the_run(self):
+        from exclusions import resolve_names
+        with self.assertRaises(SystemExit):
+            resolve_names(["a" * 32], {"b" * 32: "other"})
+        self.assertEqual(resolve_names(["a" * 32], {"a" * 32: "drop"}), [{"id": "a" * 32, "name": "drop"}])
+
+    def test_excluded_deployment_leaves_billing_roster_and_counts(self):
+        from exclusions import apply_exclusions
+        acc = self._acc()
+        org = {"monthly": {"by_deployment": {"drop": {"months": ["2026-09", "2026-10", "2026-11"], "ecu": [40.0, 25.0, 10.0]}}}}
+        rec = apply_exclusions(acc, org, [{"id": "a" * 32, "name": "drop"}])
+        e = acc["ecu"]
+        self.assertEqual(e["monthly"]["totals"], [60.0, 75.0, 40.0])
+        self.assertEqual(rec["ecu_removed_over_lookback"], 75.0)
+        self.assertEqual(e["daily_totals"], [3.0, 3.0, 1.6])
+        self.assertEqual(e["monthly_avg_complete_months"], 67.5)
+        self.assertEqual(acc["deployments"]["count"], 2)
+        self.assertEqual(acc["deployments"]["active"]["names"], ["keep"])
+        self.assertEqual([d["name"] for d in acc["solutions"]["by_deployment"]], ["keep"])
+        self.assertEqual(acc["storage"]["size_gaps"], [])
+        self.assertEqual(acc["meta"]["excluded_deployments"]["deployments"][0]["name"], "drop")
+
+    def test_diagnostics_rows_of_excluded_ids_are_not_parsed(self):
+        import admin_diags
+        self.assertIn("exclude_ids", admin_diags.parse_diagnostics.__code__.co_varnames)
+        self.assertIn("exclude_ids", admin_diags.pull_diagnostics.__code__.co_varnames)
+
+    def test_cover_names_excluded_deployments(self):
+        from render_pdf import _excluded_notes
+        self.assertEqual(_excluded_notes(None), [])
+        note = _excluded_notes({"deployments": [{"id": "a" * 32, "name": "drop"}]})[0]
+        self.assertIn("drop", note)
+        self.assertIn("Excluded by id", note)
+
+
+class PerClusterPlanTests(unittest.TestCase):
+    def _sz(self):
+        def bar(label, groups):
+            return {"label": label, "projects": len(groups), "monthly": sum(g["monthly"] for g in groups), "groups": groups}
+        return {"deployment_plan": {"bars": [
+            bar("Ceiling", [{"names": ["a"], "monthly": 90.0}, {"names": ["b"], "monthly": 9.0}, {"names": ["c"], "monthly": 1.0}]),
+            bar("Floor", [{"names": ["a", "b", "c"], "monthly": 80.0}]),
+        ]}}
+
+    def _acc(self):
+        return {"solutions": {"by_deployment": [
+            {"name": "a", "solution": "observability", "daily_raw_gb": 80},
+            {"name": "b", "solution": "observability", "daily_raw_gb": 15},
+            {"name": "c", "solution": "observability", "daily_raw_gb": 5},
+        ]}, "cloud": {"by_deployment": [{"name": "a", "region": "eastus"}]}}
+
+    def test_each_cluster_is_priced_alone_then_packed_to_the_floor(self):
+        from consolidation import per_cluster_plan
+        plan = per_cluster_plan(self._sz(), self._acc(), None)
+        rows = {r["name"]: r for r in plan["rows"]}
+        self.assertEqual([r["name"] for r in plan["rows"]], ["a", "b", "c"])
+        self.assertEqual(rows["a"]["steps"][0]["monthly"], 90.0)
+        self.assertEqual(rows["a"]["steps"][1]["monthly"], 64.0)
+        self.assertEqual(rows["b"]["steps"][1]["pack"], 3)
+        for i, step in enumerate(plan["steps"]):
+            self.assertAlmostEqual(sum(r["steps"][i]["monthly"] for r in plan["rows"]), step["monthly"], places=1)
+        self.assertEqual({n: r["under_minimum"] for n, r in rows.items()}, {"a": False, "b": True, "c": True})
+
+    def test_a_long_fleet_folds_its_smallest_clusters_into_one_row(self):
+        from render_pdf import per_cluster_section, PER_CLUSTER_MAX_ROWS
+        rows = [{"name": f"c{i}", "solution": "search", "region": "r", "bulk_gb_day": 1, "under_minimum": False,
+                 "steps": [{"monthly": 100.0 - i, "pack": 1}]} for i in range(PER_CLUSTER_MAX_ROWS + 10)]
+        plan = {"steps": [{"label": "Ceiling", "projects": len(rows), "monthly": 1}], "rows": rows, "min_usd": 10}
+        html = per_cluster_section({"per_cluster_plan": plan, "deployment_plan": [1]})
+        self.assertIn("11 smaller clusters", html)
+        self.assertNotIn(">c45<", html)
+
+    def test_no_plan_when_the_bars_have_no_groups(self):
+        from consolidation import per_cluster_plan
+        sz = self._sz()
+        sz["deployment_plan"]["bars"][0].pop("groups")
+        self.assertIsNone(per_cluster_plan(sz, self._acc(), None))
+
+    def test_page_lists_clusters_with_grey_rows_and_totals(self):
+        from consolidation import per_cluster_plan
+        from render_pdf import per_cluster_section
+        plan = per_cluster_plan(self._sz(), self._acc(), None)
+        html = per_cluster_section({"per_cluster_plan": plan, "deployment_plan": [1]})
+        self.assertIn("Serverless cost per cluster", html)
+        self.assertIn("Floor, 1 project", html)
+        self.assertIn("(of 3)", html)
+        self.assertEqual(html.count("background:#EEF0F3"), 2)
+        self.assertIn("Total", html)
+        self.assertEqual(per_cluster_section({"per_cluster_plan": plan}), "")
 
 
 if __name__ == "__main__":

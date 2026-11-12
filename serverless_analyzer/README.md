@@ -65,17 +65,26 @@ Prices Observability and Security from Elasticsearch diagnostic bundles. Daily G
 | Script | What it does |
 |---|---|
 | `run_consolidation.py` | Reuses the org report, reads bundles, fills the estimators, and writes the consolidation PDFs |
-| `admin_diags.py` | Pulls or parses diagnostic zips and writes `sizing_from_diags.json` |
+| `admin_diags.py` | Pulls or parses diagnostic zips and writes `sizing_from_diags.json`. Every zip is checked whole, a failed capture is retried three times, and a deployment that still fails stops the run |
+| `exclusions.py` | Leaves deployments out of a run by id: billing ECU, bundles, counts, plan, and estimates |
 | `vpn_check.py` | Opens a TLS connection to the admin host before a pull. The API key is not sent |
 | `diag_account.py` | Builds the diagnostics copy of the account. Ingest and retention come from the bundles |
-| `size_serverless.py` | Copies the golden Observability and Security sheets, writes the cells, and reads the dollars back |
+| `size_serverless.py` | Copies the golden Observability and Security sheets, writes the cells, and reads the dollars back. Keeps one sheet per title and trashes older copies (`--dedupe`, `--dedupe-dry-run`) |
 | `es3_estimate.py` | Prices a Search slice with the es3-estimator library |
-| `consolidation.py` | Builds the savings, deployment-count plan, metered rates, and quote integrity from the read-backs |
+| `consolidation.py` | Builds the savings, deployment-count plan, per-cluster cost table, metered rates, and quote integrity from the read-backs |
 | `quote_checks.py` | Checks the sheet echo, coverage, retention, and published totals. No network |
 | `diag_inputs.py` | Prints 2–5 project packs and per-deployment inputs. It does not quote dollars |
 | `privacy.py` | Sets private file modes and warns when `.env` or `diag_artifacts/` would be committed |
 | `test_diag_quote.py` | Offline unit tests. No Google account and no sheets |
 | `skill_paths.py` | Finds `k360-org-report` and `k360-account-analysis` for this run. The same file is in the other two skills |
+
+Run options worth knowing:
+
+- `--exclude-deployment <id>` (repeat or comma list) removes a deployment from the whole run. The run key gains `_excluding_<n>`, and page 1 names what was left out.
+- `--allow-missing-diags` continues when a diagnostic download still fails after its retries. Page 1 then lists the deployments that were not measured.
+- When serverless at list costs more than ECH at the contract rate, page 1 reads "increase" with an up arrow instead of "reduction".
+- The bulk PDFs carry a per-cluster page after the deployment-count page: each cluster's serverless $/mo as its own project, then at every step down to the floor.
+- A 30-day pass writes `sizing_30d.json`, not `sizing.json`.
 
 References: `calculations.md` is the arithmetic. `sizing-cells.md` is the estimator cell map.
 

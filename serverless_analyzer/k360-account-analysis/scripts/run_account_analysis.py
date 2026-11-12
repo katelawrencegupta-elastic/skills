@@ -259,14 +259,47 @@ def parse_args(argv=None, description: str | None = None):
     ap.add_argument("--xlsx", action="store_true", help="Also write local xlsx copies of the filled estimators")
     ap.add_argument("--skip-xlsx", action="store_true", help="Skip xlsx export (this is the default)")
     ap.add_argument("--always-copy", action="store_true", help="Copy estimators even for empty slices")
+    ap.add_argument("--fresh", action="store_true", help="Always copy new estimator sheets instead of reusing same-named copies in the Drive folder (use after changing the template)")
     ap.add_argument("--skip-pdf", action="store_true", help="No PDF export of the canvases")
     ap.add_argument("--skip-pdf-upload", action="store_true", help="Keep PDFs local (no Drive upload)")
     ap.add_argument("--skip-diags", action="store_true", help="Do not pull diagnostics. The quote uses the K360 backup (stored GB ÷ assumed retention)")
     ap.add_argument("--diags-dir", default=None, help="Existing directory of admin-console diagnostic zips. Skips the admin API and parses this folder")
     ap.add_argument("--k360-ingest", action="store_true", help="Also price serverless from K360 stored GB ÷ assumed retention. K360 has no raw ingest total, so this backup can sit far below diagnostic bulk. Used automatically when bundles are unavailable")
     ap.add_argument("--skip-vpn-check", action="store_true", help="Pull diagnostics without checking that the Aviatrix VPN tunnel is up")
+    ap.add_argument("--exclude-deployment", action="append", default=None, metavar="ID", help="Leave this deployment out of the whole run (billing, bundles, plan, estimates). Repeat, or pass a comma list. 32-character deployment id")
     ap.add_argument("--skip-deployment-plan", action="store_true", help="Skip the Observability 0/25/50/75/100%% deployment-count sheets. The headline quote still runs")
-    return ap.parse_args(argv)
+    args = ap.parse_args(argv)
+    if args.exclude_deployment:
+        from exclusions import parse_ids
+        args.exclude_ids = parse_ids(args.exclude_deployment)
+    return args
+
+
+def resolve_excluded(args, env: dict, org: dict, ids: list[str]) -> list[dict]:
+    """Map each excluded deployment id to its name: diagnostic manifests on disk first, then the admin listing."""
+    from exclusions import manifest_names, resolve_names
+
+    id_to_name: dict[str, str] = {}
+    dirs = [Path(args.diags_dir)] if getattr(args, "diags_dir", None) else []
+    for d in dirs:
+        mf = d / "manifest.json"
+        if mf.is_file():
+            id_to_name.update(manifest_names(json.loads(mf.read_text())))
+    if not all(i in id_to_name for i in ids):
+        meta_org = (org.get("organization") or {})
+        org_ids = [str(i) for i in (getattr(args, "org_id", None) or ([meta_org.get("id")] if meta_org.get("id") else [])) if i]
+        try:
+            sys.path.insert(0, str(HERE.parent.parent / "diag-serverless-consolidation" / "scripts"))
+            from admin_diags import admin_base, list_deployments
+            key = env.get("FOUND_ADMIN_API_KEY")
+            if key:
+                base = admin_base(env)
+                for oid in org_ids:
+                    for dep in list_deployments(base, key, oid):
+                        id_to_name[str(dep.get("id")).lower()] = dep.get("name")
+        except Exception as ex:  # noqa: BLE001
+            print(f"WARN: admin deployment list unavailable ({ex!r})", file=sys.stderr)
+    return resolve_names(ids, id_to_name)
 
 
 def prepare_account(args):
@@ -310,6 +343,13 @@ def prepare_account(args):
     # 3. analyze
     when = date.fromisoformat(args.date) if args.date else datetime.now(timezone.utc).date()
     acc = build_account(org, infra, when=when, retention_months=args.retention_months, security_retention_months=args.security_retention_months)
+    excluded = []
+    exclude_ids = getattr(args, "exclude_ids", None)
+    if exclude_ids:
+        from exclusions import apply_exclusions, run_key_suffix
+        excluded = args.excluded = resolve_excluded(args, env, org, exclude_ids)
+        apply_exclusions(acc, org, excluded)
+        acc["meta"]["run_key"] = acc["meta"]["run_key"] + run_key_suffix(excluded)
     acc["storage"]["size_gaps"] = size_gaps(base, key, acc)
     run_key = acc["meta"]["run_key"]
     root = Path(args.artifacts_root) if args.artifacts_root else artifacts_root()

@@ -114,6 +114,21 @@ def _is_zip(path: Path) -> bool:
         return fh.read(2) == b"PK"
 
 
+def _zip_ok(path: Path) -> bool:
+    """A complete bundle: a readable zip whose every member passes its CRC check."""
+    if not _is_zip(path):
+        return False
+    try:
+        with zipfile.ZipFile(path) as zf:
+            return bool(zf.namelist()) and zf.testzip() is None
+    except (zipfile.BadZipFile, OSError, EOFError, RuntimeError):
+        return False
+
+
+# One try plus three retries before a deployment is reported as failed.
+CAPTURE_RETRIES = 3
+
+
 def _api(base: str, key: str, method: str, path: str, body: dict | None = None, timeout: int = 60) -> dict:
     data = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(
@@ -165,6 +180,7 @@ def _capture_one(base: str, key: str, row: dict, dest: Path) -> dict:
         },
     )
     with urllib.request.urlopen(req, timeout=300) as resp, dest.open("wb") as fh:
+        expected = resp.headers.get("Content-Length")
         n = 0
         while True:
             chunk = resp.read(1024 * 256)
@@ -172,21 +188,26 @@ def _capture_one(base: str, key: str, row: dict, dest: Path) -> dict:
                 break
             fh.write(chunk)
             n += len(chunk)
-    if not _is_zip(dest):
+    if expected and expected.isdigit() and int(expected) != n:
         dest.unlink(missing_ok=True)
-        raise RuntimeError("response was not a zip")
+        raise RuntimeError(f"download was cut short ({n} of {expected} bytes)")
+    if not _zip_ok(dest):
+        dest.unlink(missing_ok=True)
+        raise RuntimeError("response was not a complete zip")
     seal_file(dest)
     return {**row, "result": "ok", "bytes": n, "file": str(dest)}
 
 
-def _capture_with_retry(base: str, key: str, row: dict, dest: Path) -> dict:
+def _capture_with_retry(base: str, key: str, row: dict, dest: Path, *, retries: int = CAPTURE_RETRIES, pause: float = 10) -> dict:
     last = "unknown error"
-    for attempt in range(4):
+    attempts = retries + 1
+    for attempt in range(attempts):
         try:
-            return _capture_one(base, key, row, dest)
+            done = _capture_one(base, key, row, dest)
+            return {**done, "attempts": attempt + 1}
         except ValueError as exc:
             dest.unlink(missing_ok=True)
-            return {**row, "result": "skipped", "error": str(exc)}
+            return {**row, "result": "skipped", "error": str(exc), "attempts": attempt + 1}
         except urllib.error.HTTPError as exc:
             body = exc.read(300).decode("utf-8", "replace")
             try:
@@ -195,21 +216,21 @@ def _capture_with_retry(base: str, key: str, row: dict, dest: Path) -> dict:
                 msg = body[:180]
             last = f"HTTP {exc.code}: {msg}"
             dest.unlink(missing_ok=True)
-            if exc.code == 429 and attempt < 3:
-                time.sleep(20 * (attempt + 1))
+            if attempt + 1 < attempts:
+                time.sleep(2 * pause * (attempt + 1) if exc.code == 429 else pause)
                 continue
             break
         except Exception as exc:
             last = f"{type(exc).__name__}: {exc}"
             dest.unlink(missing_ok=True)
-            if attempt < 3:
-                time.sleep(10)
+            if attempt + 1 < attempts:
+                time.sleep(pause)
                 continue
             break
-    return {**row, "result": "error", "error": last}
+    return {**row, "result": "error", "error": last, "attempts": attempts}
 
 
-def pull_diagnostics(env: dict[str, str], org_id: str, out_dir: Path, *, workers: int = 2) -> list[dict]:
+def pull_diagnostics(env: dict[str, str], org_id: str, out_dir: Path, *, workers: int = 2, exclude_ids: set[str] | None = None) -> list[dict]:
     """Download one full Elasticsearch bundle per started deployment. Existing zips are reused."""
     safe_id(org_id, "organization id")
     key = env.get("FOUND_ADMIN_API_KEY")
@@ -236,6 +257,9 @@ def pull_diagnostics(env: dict[str, str], org_id: str, out_dir: Path, *, workers
         if row.get("result") == "skipped":
             skipped.append(row)
             continue
+        if exclude_ids and str(row["id"]).lower() in exclude_ids:
+            skipped.append({**row, "result": "skipped", "error": "excluded by --exclude-deployment"})
+            continue
         if row["status"] == "started" and row["id"]:
             targets.append(row)
         else:
@@ -245,6 +269,9 @@ def pull_diagnostics(env: dict[str, str], org_id: str, out_dir: Path, *, workers
     pending: list[tuple[dict, Path]] = []
     for row in targets:
         dest = out_dir / f"{_safe(row['name'])}__{row['id']}.zip"
+        if dest.exists() and not _zip_ok(dest):
+            print(f"diagnostics: {dest.name} on disk is not a complete zip; capturing it again", flush=True)
+            dest.unlink(missing_ok=True)
         if _is_zip(dest):
             seal_file(dest)
             reused.append({**row, "result": "ok", "bytes": dest.stat().st_size, "file": str(dest), "reused": True})
@@ -265,6 +292,16 @@ def pull_diagnostics(env: dict[str, str], org_id: str, out_dir: Path, *, workers
                     print(f"SKIP {row['name']} {row.get('error', '')[:160]}", flush=True)
                 else:
                     print(f"ERR {row['name']} {row.get('error', '')[:160]}", flush=True)
+    # A last pass over what still failed, one at a time so the console is not rate limited.
+    failed = [r for r in fresh if r.get("result") == "error"]
+    if failed:
+        print(f"diagnostics: retrying {len(failed)} failed deployments one at a time", flush=True)
+        by_id = {r["id"]: dest for r, dest in pending}
+        for bad_row in failed:
+            again = _capture_with_retry(base, key, {k: v for k, v in bad_row.items() if k not in ("result", "error", "attempts")}, by_id[bad_row["id"]])
+            again["attempts"] = int(bad_row.get("attempts") or 0) + int(again.get("attempts") or 0)
+            fresh[fresh.index(bad_row)] = again
+            print(("ok " if again["result"] == "ok" else "ERR ") + f"{again['name']} after {again['attempts']} attempts", flush=True)
     manifest = sorted(reused + fresh, key=lambda r: (r.get("name") or "").lower()) + skipped
     seal_text(out_dir / "manifest.json", json.dumps(manifest, indent=2))
     ok = [r for r in manifest if r.get("result") == "ok"]
@@ -535,7 +572,7 @@ def _parse_zip(payload: tuple[str, str, dict]) -> dict:
     return row
 
 
-def parse_diagnostics(out_dir: Path, *, captured: datetime | None = None, workers: int | None = None) -> list[dict]:
+def parse_diagnostics(out_dir: Path, *, captured: datetime | None = None, workers: int | None = None, exclude_ids: set[str] | None = None) -> list[dict]:
     """Read every zip in the directory. Writes sizing_from_diags.json and returns the rows.
 
     Parsing starts after the downloads return, so each zip is complete. Two or more
@@ -558,6 +595,8 @@ def parse_diagnostics(out_dir: Path, *, captured: datetime | None = None, worker
     for item in parsed:
         if item.get("warn"):
             print(item["warn"], flush=True)
+            continue
+        if exclude_ids and str(item.get("id") or "").lower() in exclude_ids:
             continue
         rows.append(item)
     rows.sort(key=lambda r: -(r.get("bulk_gb_day") or 0))

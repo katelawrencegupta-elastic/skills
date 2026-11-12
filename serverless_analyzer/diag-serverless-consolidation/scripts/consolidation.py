@@ -402,6 +402,58 @@ def _deployment_bars(sz: dict, by_solution: dict, notes: list[str]) -> list:
     return bars
 
 
+FLOOR_PROJECT_MIN_USD = 10.0
+
+
+def per_cluster_plan(sz: dict, acc: dict, infra: dict | None) -> dict | None:
+    """Serverless $/mo for each cluster at every deployment-count step, from the ceiling (1:1) to the floor.
+
+    A cluster's cost at a step is its project's priced total shared by bulk GB/day. A project with
+    no bulk is shared evenly. The columns add up to the bars. None when there is nothing to split.
+    """
+    raw = sz.get("deployment_plan") or {}
+    bars = [b for b in (raw.get("bars") or []) if isinstance(b, dict)]
+    if raw.get("error") or len(bars) < 1 or any(not b.get("groups") for b in bars):
+        return None
+    meta: dict[str, dict] = {}
+    region_by_name = {
+        d.get("name"): d.get("region")
+        for d in ((infra or {}).get("by_deployment") or []) + (((acc.get("cloud") or {}).get("by_deployment")) or [])
+        if d.get("region")
+    }
+    for d in (acc.get("solutions") or {}).get("by_deployment") or []:
+        meta[d.get("name")] = {"solution": d.get("solution"), "region": region_by_name.get(d.get("name"))}
+    steps = [{"label": b.get("label") or "", "projects": b.get("projects"), "monthly": b.get("monthly")} for b in bars]
+    rows: dict[str, dict] = {}
+    for si, bar in enumerate(bars):
+        for g in bar["groups"]:
+            names = [n for n in g.get("names") or [] if n]
+            if not names:
+                continue
+            bulk = {n: float(((next((d for d in (acc.get("solutions") or {}).get("by_deployment") or [] if d.get("name") == n), {}) or {}).get("daily_raw_gb")) or 0) for n in names}
+            total_bulk = sum(bulk.values())
+            money = float(g.get("monthly") or 0)
+            for n in names:
+                share = bulk[n] / total_bulk if total_bulk > 0 else 1.0 / len(names)
+                row = rows.setdefault(n, {
+                    "name": n, "solution": (meta.get(n) or {}).get("solution"), "region": (meta.get(n) or {}).get("region"),
+                    "bulk_gb_day": round(bulk[n], 3), "steps": [None] * len(steps),
+                })
+                row["steps"][si] = {"monthly": round(money * share, 2), "project_monthly": round(money, 2), "pack": len(names)}
+    out_rows = sorted(rows.values(), key=lambda r: -float((r["steps"][0] or {}).get("monthly") or 0))
+    for r in out_rows:
+        first = (r["steps"][0] or {}).get("monthly")
+        r["under_minimum"] = first is not None and float(first) <= FLOOR_PROJECT_MIN_USD
+    if len(out_rows) < 2:
+        return None
+    return {
+        "steps": steps,
+        "rows": out_rows,
+        "min_usd": FLOOR_PROJECT_MIN_USD,
+        "method": "Each project's priced $/mo shared across its clusters by bulk GB/day; evenly when the project has no bulk.",
+    }
+
+
 def _deployment_groups(acc: dict, infra: dict | None, months: float) -> list[dict]:
     """ECH deployments grouped by solution and region. A serverless project lives in one region."""
     region_by_name = {
@@ -1495,6 +1547,7 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         "metered_rates": observability_metered_rates(((acc.get("solutions") or {}).get("by_deployment") or [])) if (sz.get("ingest_source") == "diagnostics") else [],
         "deployment_plan": _deployment_bars(sz, by_solution, notes),
         "deployment_plan_floor": int((sz.get("deployment_plan") or {}).get("floor") or 1),
+        "per_cluster_plan": per_cluster_plan(sz, acc, infra) if sz.get("deployment_plan") and not (sz.get("deployment_plan") or {}).get("error") else None,
         "regions_under_minimum": regions_under_minimum,
         "search_power": _search_power(sz, by_solution, acc),
         "fragmentation": fragmentation,

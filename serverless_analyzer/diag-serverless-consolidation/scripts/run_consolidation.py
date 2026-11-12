@@ -46,6 +46,14 @@ from run_account_analysis import (  # noqa: E402
 )
 
 
+def _sidecar(extra: list[str], name: str) -> list[str]:
+    """The sizing flags with --sizing-json pointed at another file, so a 30-day pass cannot overwrite sizing.json."""
+    out = list(extra)
+    if "--sizing-json" in out:
+        out[out.index("--sizing-json") + 1] = name
+    return out
+
+
 def _estimator_flags(args) -> list[str]:
     """Flags for size_serverless.py. xlsx export is off unless --xlsx was passed."""
     flags: list[str] = []
@@ -53,6 +61,8 @@ def _estimator_flags(args) -> list[str]:
         flags.append("--xlsx")
     if getattr(args, "always_copy", False):
         flags.append("--always-copy")
+    if getattr(args, "fresh", False):
+        flags.append("--fresh")
     return flags
 
 
@@ -154,6 +164,7 @@ def consolidation_brief(acc: dict) -> dict:
         "contract_rate": cons.get("contract_rate"),
         "notes": list((cons.get("notes") or [])[:12]),
         "diagnostics_coverage": sz.get("diagnostics") if (cons.get("source") == "diagnostics" or sz.get("ingest_source") == "diagnostics") else None,
+        "excluded_deployments": m.get("excluded_deployments"),
         "compressioncalc_accounted_for": acc.get("compressioncalc_accounted_for"),
         "thirty_day": cons.get("thirty_day"),
         "deployment_plan": _plan_brief(cons.get("deployment_plan")),
@@ -300,6 +311,8 @@ def _run_compressioncalc(diag: dict, diag_path: Path, infra: dict, py: Path, arg
         flags.append("--xlsx")
     if args.always_copy:
         flags.append("--always-copy")
+    if args.fresh:
+        flags.append("--fresh")
     try:
         _run([
             str(py), str(HERE / "size_serverless.py"),
@@ -414,6 +427,7 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
     if not org_ids and org_id:
         org_ids = [str(org_id)]
     when = (acc.get("meta") or {}).get("date")
+    download_failed: list[dict] = []
     if args.diags_dir:
         out_dir = Path(args.diags_dir)
         if not out_dir.is_dir():
@@ -448,10 +462,20 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
             errors = []
             for oid in org_ids:
                 try:
-                    pull_diagnostics(env, oid, out_dir)
+                    pulled = pull_diagnostics(env, oid, out_dir, exclude_ids=set(getattr(args, "exclude_ids", None) or []))
+                    download_failed.extend(
+                        {"name": r.get("name"), "id": r.get("id"), "error": r.get("error"), "attempts": r.get("attempts")}
+                        for r in pulled if r.get("result") == "error"
+                    )
                 except Exception as ex:
                     errors.append(f"{oid}: {ex!r}")
                     print(f"WARN: diagnostic pull failed for {oid} ({ex!r})", file=sys.stderr)
+            if download_failed and not getattr(args, "allow_missing_diags", False):
+                names = ", ".join(str(r["name"]) for r in download_failed)
+                raise SystemExit(
+                    f"ERROR: {len(download_failed)} diagnostic download(s) failed after retries: {names}. "
+                    "Rerun to collect them, or pass --allow-missing-diags to quote without them."
+                )
             if errors and not any(out_dir.glob("*.zip")):
                 sz["diagnostics_status"] = "; ".join(errors)
                 return None
@@ -462,7 +486,7 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
         return None
     captured = datetime.fromtimestamp(max(p.stat().st_mtime for p in zips), timezone.utc)
     try:
-        rows = parse_diagnostics(out_dir, captured=captured)
+        rows = parse_diagnostics(out_dir, captured=captured, exclude_ids=set(getattr(args, "exclude_ids", None) or []))
     except Exception as ex:
         print(f"WARN: diagnostic parse failed ({ex!r})", file=sys.stderr)
         sz["diagnostics_status"] = f"diagnostic parse failed ({ex!r})"
@@ -471,18 +495,24 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
         sz["diagnostics_status"] = "no diagnostic rows"
         return None
     diag = apply_diagnostics(acc, rows)
+    if download_failed:
+        diag["sizing"].setdefault("diagnostics", {})["download_failed"] = download_failed
     apply_quote_lookback(diag, args.lookback_days)
     diag_path = folder / f"{acc['meta']['run_key']}_diags_account.json"
     seal_text(diag_path, json.dumps(diag, indent=2))
     py = _sheets_py()
     sizing_ran = False
     extra = ["--sizing-json", "sizing.json"]
+    if args.fresh:
+        extra.append("--fresh")
     if py.is_file():
         cmd = [str(py), str(HERE / "size_serverless.py"), "--account-json", str(diag_path), *extra]
         if args.xlsx:
             cmd.append("--xlsx")
         if args.always_copy:
             cmd.append("--always-copy")
+        if args.fresh:
+            cmd.append("--fresh")
         try:
             _run(cmd)
             sizing_ran = True
@@ -540,12 +570,12 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
                     (diag_30.get("sizing") or {}).pop("deployment_plan", None)
                 path_30 = diag_path.with_name(diag_path.stem + "_30d.json")
                 seal_text(path_30, json.dumps(diag_30, indent=2))
-                month_cmd = [str(py), str(HERE / "size_serverless.py"), "--account-json", str(path_30), "--name-suffix", "_30d", "--force-months", "1", *extra]
+                month_cmd = [str(py), str(HERE / "size_serverless.py"), "--account-json", str(path_30), "--name-suffix", "_30d", "--force-months", "1", *_sidecar(extra, "sizing_30d.json")]
                 if args.xlsx:
                     month_cmd.append("--xlsx")
                 _run(month_cmd)
                 if not args.skip_deployment_plan:
-                    plan_30 = [str(py), str(HERE / "size_serverless.py"), "--account-json", str(path_30), "--deployment-plan", "--name-suffix", "_30d", "--force-months", "1", *extra]
+                    plan_30 = [str(py), str(HERE / "size_serverless.py"), "--account-json", str(path_30), "--deployment-plan", "--name-suffix", "_30d", "--force-months", "1", *_sidecar(extra, "sizing_30d.json")]
                     if args.xlsx:
                         plan_30.append("--xlsx")
                     try:
@@ -631,6 +661,8 @@ def main() -> None:
                 cmd.append("--xlsx")
             if args.always_copy:
                 cmd.append("--always-copy")
+            if args.fresh:
+                cmd.append("--fresh")
             try:
                 _run(cmd)
                 sizing_ran = True
@@ -697,6 +729,18 @@ def main() -> None:
         if cost:
             acc.setdefault("analysis", {})["cost"] = cost
         seal_text(acc_path, json.dumps(acc, indent=2))
+
+    # 4b. One estimate per title: after every sizing pass, trash older same-titled sheets.
+    dedupe_py = _sheets_py()
+    sized_acc = diag_acc if diag_acc is not None else acc
+    if dedupe_py.is_file() and (sized_acc.get("sizing") or {}).get("drive_folder"):
+        dedupe_src = folder / f"{acc['meta']['run_key']}_diags_account.json"
+        if not dedupe_src.is_file():
+            dedupe_src = acc_path
+        try:
+            _run([str(dedupe_py), str(HERE / "size_serverless.py"), "--account-json", str(dedupe_src), "--dedupe"])
+        except subprocess.CalledProcessError as e:
+            print(f"WARN: estimate dedupe failed ({e}); check the Drive folder for repeated titles", file=sys.stderr)
 
     # 5. report
     run_key = acc["meta"]["run_key"]

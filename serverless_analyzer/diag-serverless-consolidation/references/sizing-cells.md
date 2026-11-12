@@ -29,16 +29,18 @@ The default quote does not back-calculate. `daily_raw_gb` is the sum of measured
 | G4 | `Complete` | feature tier (dropdown: Complete / Logs Essentials) |
 | G5 | `Premium` | support (Limited / Base / Enhanced / Premium) — like-for-like with ECH Enterprise |
 | G8 | region option | matched dropdown string, e.g. `AWS: us-east-1 (Virginia)` |
-| G11 | retention months | measured retention, rounded up (1–36). `--retention-months` is the K360 backup only |
-| G14 | `No` | synthetics |
-| G18 | `0` | Option 1 (ECH-derived) left empty — we use Option 2 raw data |
-| G21 | logs GB/day | 90 % of `daily_raw_gb` |
-| G22 | `0%` | k8s share |
-| G23 | metrics GB/day | 10 % of `daily_raw_gb` |
-| G24 | `0` | traces/min |
-| G25 | `100%` | trace sampling |
+| G11 | retention months | measured retention, rounded up (1–36), for everything except TSDS metrics. `--retention-months` is the K360 backup only |
+| G12 | retention months | TSDS metrics retention, same value as G11 (the template default of 6 is overwritten) |
+| G15 | `No` | synthetics |
+| G19, G20 | `0` | Option 1 (ECH-derived) left at 0 — we use Option 2 raw data. G21 is unlabeled and left alone |
+| G23 | logs GB/day | 90 % of `daily_raw_gb` |
+| G24 | `0%` | k8s share |
+| G25 | metrics GB/day | 10 % of `daily_raw_gb` |
+| G26 | `0` | traces/min |
+| G27 | `100%` | trace sampling |
+| G33 | `No` | Cross-Project Search add-on |
 
-Read-back, unformatted: `G26` total raw GB/day · `G27` metered GB/day · `D32` monthly steady state · `E32` annual year 1 · `F32` annual steady state. G26 is accepted when it is within 0.51 GB/day of the bulk written to that sheet. A wider miss is recorded and Observability is left unquoted. The written bulk stays on the solution block.
+Read-back, unformatted: `G28` total raw GB/day · `G29` metered GB/day · `D38` monthly steady state · `E38` annual year 1 · `F38` annual steady state (estimator v1.22). G28 is accepted when it is within 0.51 GB/day of the bulk written to that sheet. A wider miss is recorded and Observability is left unquoted. The written bulk stays on the solution block.
 
 ## Security — tab `Security Estimator`
 | Cell | Value | Source |

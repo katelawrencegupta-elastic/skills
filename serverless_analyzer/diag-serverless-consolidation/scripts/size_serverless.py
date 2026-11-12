@@ -62,7 +62,7 @@ except ImportError as e:  # pragma: no cover
 #   Observability → https://docs.google.com/spreadsheets/d/1bu-qjVIab-rbWb7zvCEq6QEoLdKpi0vfw3yDj9_VJuE/edit?usp=drive_link
 #   Security      → https://docs.google.com/spreadsheets/d/1b91Uoa2e4vBrep_7I4RoY_8Mr19poqaUgWl7LqhIOqY/edit?usp=drive_link
 # Override with O11Y_SHEET_ID / SECURITY_SHEET_ID or --o11y-id / --security-id (ID or full URL).
-DEFAULT_O11Y = "1bu-qjVIab-rbWb7zvCEq6QEoLdKpi0vfw3yDj9_VJuE"
+DEFAULT_O11Y = "1tUdwJbTmd4helFOzEHMi_gpHw7qu_aCgprjlqmHh2hs"  # Observability estimator v1.22
 DEFAULT_SECURITY = "1b91Uoa2e4vBrep_7I4RoY_8Mr19poqaUgWl7LqhIOqY"
 
 
@@ -140,11 +140,11 @@ REF_TAB = "Estimator_Reference"
 
 # Read-back cells (see ../references/sizing-cells.md)
 O11Y_READBACK = {
-    "total_raw_gb_day": "G26",
-    "metered_gb_day": "G27",
-    "monthly_steady_state": "D32",
-    "annual_year1": "E32",
-    "annual_steady_state": "F32",
+    "total_raw_gb_day": "G28",
+    "metered_gb_day": "G29",
+    "monthly_steady_state": "D38",
+    "annual_year1": "E38",
+    "annual_steady_state": "F38",
 }
 SEC_READBACK = {
     "metered_gb_day": "G5",
@@ -221,11 +221,72 @@ def ensure_drive_folder(drive, name: str, parent_id: str | None = None) -> dict:
     return {"id": meta["id"], "name": meta["name"], "url": meta.get("webViewLink") or f"https://drive.google.com/drive/folders/{meta['id']}"}
 
 
-def find_in_folder(drive, parent_id: str, name: str) -> dict | None:
+def list_in_folder(drive, parent_id: str, name: str) -> list[dict]:
+    """Every live file with this exact name in the folder, newest first."""
     parent_id = require_customer_parent(parent_id)
     q = f"'{parent_id}' in parents and name = '{_esc(name)}' and trashed = false"
-    files = _execute(lambda: drive.files().list(q=q, spaces="drive", fields="files(id,name,webViewLink,mimeType)", pageSize=5)).get("files") or []
+    return _execute(lambda: drive.files().list(
+        q=q, spaces="drive", fields="files(id,name,webViewLink,mimeType,createdTime)", pageSize=50, orderBy="createdTime desc",
+    )).get("files") or []
+
+
+def find_in_folder(drive, parent_id: str, name: str) -> dict | None:
+    files = list_in_folder(drive, parent_id, name)
     return files[0] if files else None
+
+
+def trash_file(drive, file_id: str) -> None:
+    """Move a file to the Drive trash. It can still be restored from there."""
+    assert_not_template(file_id)
+    _execute(lambda: drive.files().update(fileId=file_id, body={"trashed": True}, supportsAllDrives=True))
+
+
+def trash_same_title(drive, parent_id: str, name: str, keep_id: str | None) -> list[str]:
+    """One estimate per title: trash every same-titled file in the folder except the one kept."""
+    trashed = []
+    for f in list_in_folder(drive, parent_id, name):
+        if f["id"] != keep_id:
+            trash_file(drive, f["id"])
+            trashed.append(f["id"])
+    return trashed
+
+
+def dedupe_estimates(drive, root_id: str, *, dry_run: bool = False) -> list[dict]:
+    """Keep the newest sheet for each title anywhere under the run folder and trash the rest.
+
+    The title carries run key, solution, retention window, bulk or compression-applied, and
+    region, so two sheets with one title are the same estimate. PDFs are not touched.
+    """
+    seen: dict[str, list[dict]] = {}
+
+    def walk(folder_id: str, path: str) -> None:
+        token = None
+        while True:
+            r = _execute(lambda: drive.files().list(
+                q=f"'{folder_id}' in parents and trashed = false", spaces="drive",
+                fields="nextPageToken,files(id,name,mimeType,createdTime)", pageSize=200, pageToken=token,
+                supportsAllDrives=True, includeItemsFromAllDrives=True,
+            ))
+            for f in r.get("files") or []:
+                if f["mimeType"] == FOLDER_MIME:
+                    walk(f["id"], f"{path}/{f['name']}")
+                elif f["mimeType"] == GSHEET_MIME:
+                    seen.setdefault(f["name"], []).append({**f, "path": path})
+            token = r.get("nextPageToken")
+            if not token:
+                break
+
+    walk(root_id, "")
+    removed = []
+    for name, group in seen.items():
+        if len(group) < 2:
+            continue
+        group.sort(key=lambda f: f.get("createdTime") or "", reverse=True)
+        for f in group[1:]:
+            if not dry_run:
+                trash_file(drive, f["id"])
+            removed.append({"name": name, "id": f["id"], "path": f["path"], "kept": group[0]["id"]})
+    return removed
 
 
 def _sheet_record(meta: dict) -> dict:
@@ -242,8 +303,11 @@ def copy_template(drive, template_id: str, title: str, parent_id: str, *, reuse:
     if reuse:
         existing = find_in_folder(drive, parent_id, title)
         if existing:
+            trash_same_title(drive, parent_id, title, existing["id"])
             return _sheet_record(existing), True
     meta = _execute(lambda: drive.files().copy(fileId=template_id, body={"name": title, "parents": [parent_id]}, supportsAllDrives=True, fields="id,name,webViewLink"))
+    # --fresh replaces the title's copy. The earlier one goes to the trash so there is one estimate per title.
+    trash_same_title(drive, parent_id, title, meta["id"])
     return _sheet_record(meta), False
 
 
@@ -282,6 +346,7 @@ def upload_csv_as_sheet(drive, local: Path, parent_id: str, title: str) -> dict:
             media_body=media,
             fields="id,name,webViewLink",
         ).execute()
+    trash_same_title(drive, parent_id, title, meta["id"])
     return {"id": meta["id"], "name": meta["name"], "url": meta.get("webViewLink") or f"https://docs.google.com/spreadsheets/d/{meta['id']}/edit"}
 
 
@@ -397,13 +462,16 @@ def observability_input_cells(acc: dict, support: str, region, retention: int, d
         "G5": support,
         "G8": region,
         "G11": retention,
-        "G14": "No",
-        "G18": 0,
-        "G21": round(float(daily) * 0.90, 2) if logs is None else logs,
-        "G22": "0%",
-        "G23": round(float(daily) * 0.10, 2) if metrics is None else metrics,
-        "G24": 0,
-        "G25": "100%",
+        "G12": retention,
+        "G15": "No",
+        "G19": 0,
+        "G20": 0,
+        "G23": round(float(daily) * 0.90, 2) if logs is None else logs,
+        "G24": "0%",
+        "G25": round(float(daily) * 0.10, 2) if metrics is None else metrics,
+        "G26": 0,
+        "G27": "100%",
+        "G33": "No",
     }
 
 
@@ -1013,7 +1081,7 @@ def _fill_regional_job(job: dict, creds) -> dict:
     if sol == "observability":
         entry["g26_gate"] = g26_gate(job["daily"], rb.get("total_raw_gb_day"))
         if not entry["g26_gate"]["accepted"]:
-            entry["readback_rejected"] = "G26 differs from the written bulk by more than 0.51 GB/day"
+            entry["readback_rejected"] = "G28 differs from the written bulk by more than 0.51 GB/day"
     if not job["skip_xlsx"]:
         try:
             entry["local_xlsx"] = str(export_xlsx(drive, copied["id"], Path(job["local_dir"]) / f"{job['title']}.xlsx"))
@@ -1252,7 +1320,7 @@ def _search_group_price(group: list[dict], *, workload: dict, org_gb: float, sup
 def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_months: int | None, o11y_id: str, security_id: str, parent_id: str, reuse: bool, provider, region_name, support: str, feature_tier, workload: dict | None = None, org_gb: float = 0) -> tuple[list[dict], list[dict], str | None, int]:
     """Bar specs plus the sheet jobs they point at.
 
-    Observability projects read D32. Security projects read E74. Search projects
+    Observability projects read D38. Security projects read E74. Search projects
     are the on-demand notebook. A missing month or a missing Search total fails
     before the remaining copies are treated as a quote.
     """
@@ -1351,7 +1419,7 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
 def fill_plan_sheet(job: dict, creds) -> dict:
     """Copy one plan workbook and read its quote cell. A 429 or 503 is retried inside the request.
 
-    Observability reads D32 after the G26 gate. Security reads E74 after E73 is 0.
+    Observability reads D38 after the G28 gate. Security reads E74 after E73 is 0.
     """
     sheets, drive = services_from(creds)
     solution = job.get("solution") or "observability"
@@ -1381,11 +1449,11 @@ def fill_plan_sheet(job: dict, creds) -> dict:
         if not gate["accepted"]:
             return {"error": (
                 "Observability deployment-count plan was not priced: "
-                f"{job['title']} G26 is {gate['sheet_raw_gb_day']} GB/day against {gate['written_bulk']} written."
+                f"{job['title']} G28 is {gate['sheet_raw_gb_day']} GB/day against {gate['written_bulk']} written."
             )}
         price = sheet_money(rb.get("monthly_steady_state"))
         if price is None:
-            return {"error": f"Observability deployment-count plan was not priced: {job['title']} has no D32 read-back."}
+            return {"error": f"Observability deployment-count plan was not priced: {job['title']} has no D38 read-back."}
         return {"monthly": round(price, 2), "url": copied.get("url")}
     except Exception as ex:  # noqa: BLE001
         return {"error": f"{label} deployment-count plan was not priced: {ex}"}
@@ -1507,6 +1575,8 @@ def main() -> None:
     ap.add_argument("--sizing-json", default=None, help="Filename for the sizing sidecar (default sizing.json)")
     ap.add_argument("--force-months", type=int, default=None, help="Write this whole month when a measured month already exists")
     ap.add_argument("--skip-search", action="store_true", help="Keep the Search estimator already on the account JSON")
+    ap.add_argument("--dedupe", action="store_true", help="Trash all but the newest sheet for each estimate title under this run's Drive folder, then exit")
+    ap.add_argument("--dedupe-dry-run", action="store_true", help="With --dedupe: list the duplicates and trash nothing")
     ap.add_argument("--deployment-plan", action="store_true", help="Price the deployment-count bars from one project per ECH deployment down to one project per feature per region")
     args = ap.parse_args()
     args.skip_xlsx = not args.xlsx
@@ -1529,6 +1599,13 @@ def main() -> None:
 
     sheets, drive = services()
     root = ensure_drive_folder(drive, key)
+    if args.dedupe:
+        removed = dedupe_estimates(drive, root["id"], dry_run=args.dedupe_dry_run)
+        verb = "would trash" if args.dedupe_dry_run else "trashed"
+        for r in removed:
+            print(f"{verb} duplicate {r['name']} ({r['id']}) in {r['path'] or '/'}; kept {r['kept']}")
+        print(f"dedupe: {len(removed)} duplicate estimate(s) {verb.replace('would trash', 'found')}")
+        return
     folder, estimate_dir, estimates_root, moved = open_estimate_place(drive, root["id"], local_dir, suffix)
     lines = [f"Local folder → {estimate_dir}", f"Drive folder → {folder['url']}"]
     if moved:
@@ -1670,7 +1747,7 @@ def main() -> None:
         entry = {"kind": "observability", "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.o11y_id, "reused_existing_copy": reused, "tab": O11Y_TAB, "cells": cells, "cells_written": n, "region_match": f"{reg} ({how})", "readback": rb, "status": "filled"}
         entry["g26_gate"] = g26_gate(daily, rb.get("total_raw_gb_day"))
         if not entry["g26_gate"]["accepted"]:
-            entry["readback_rejected"] = "G26 differs from the written bulk by more than 0.51 GB/day"
+            entry["readback_rejected"] = "G28 differs from the written bulk by more than 0.51 GB/day"
         if not args.skip_xlsx:
             try:
                 x = export_xlsx(drive, copied["id"], estimate_dir / f"{title_o}.xlsx")

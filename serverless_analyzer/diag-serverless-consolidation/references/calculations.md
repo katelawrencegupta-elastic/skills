@@ -58,7 +58,7 @@ The rounded and 30-day PDFs are `<key>_full retention_compression-applied_server
 
 | Solution | Inputs | Quote cell |
 |----------|--------|------------|
-| Observability | G21 logs = 0.90 × bulk_gb_day, G23 metrics = 0.10 × bulk_gb_day, G22 0%, G24 0, G25 100%, G11 months, G4 Complete, G5 Premium, G8 region, G14 No, G18 0 | D32 monthly, E32 year 1, F32 steady annual |
+| Observability | G23 logs = 0.90 × bulk_gb_day, G25 metrics = 0.10 × bulk_gb_day, G24 0%, G26 0, G27 100%, G11 and G12 months, G4 Complete, G5 Premium, G8 region, G15 No, G19 and G20 0, G33 No | D32 monthly, E32 year 1, F32 steady annual |
 | Security | G4 = bulk_gb_day (all of it), G6 months, G7 region, G8 Complete, G21 Premium | E74 monthly |
 | Search | disk = Σ local `store_gb`. Ingest docs/s is the K360 org rate × local search store ÷ org store. On one region, query rate stays the org window. A regional split scales query rate by that region's share of search store. es3 on-demand | `monthly_steady_state` |
 
