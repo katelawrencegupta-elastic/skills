@@ -75,7 +75,7 @@ Bulk already carries the metadata overhead: the shipper's fields and the pipelin
 
 ## Compression-applied set (retired)
 
-The run no longer produces a compression-applied set (`RUN_COMPRESSION_SET` is False in `run_consolidation.py`). It wrote bulk × 0.60 into the raw-data cells, where the sheets multiply by 1.66. 0.60 × 1.66 is 0.996, so it was the metered quote within 0.4% under another name. Bulk now goes into the metered cells directly. `compressioncalc_accounted_for` is absent from the brief, and no `compression_applied` folders or `compression-applied` file names are written. The 0.60 constant remains only in the "Days in store" column (see Raw bulk ingest).
+The run no longer produces a compression-applied set (`RUN_COMPRESSION_SET` is False in `run_consolidation.py`). It wrote bulk × 0.60 into the raw-data cells, where the sheets multiply by 1.66. 0.60 × 1.66 is 0.996, so it was the metered quote within 0.4% under another name. Bulk now goes into the metered cells directly. `compressioncalc_accounted_for` is absent from the brief, and no `compression_applied` folders or `compression-applied` file names are written. No 0.60 constant remains in the quote or the report.
 
 ## Which estimator
 
@@ -119,7 +119,7 @@ fleet                = Σ deployments, by solution; a deployment with no bundle 
 share(dep)           = quoted_gb_day ÷ fleet quoted
 logs / metrics / traces = the measured split of Observability bulk (0.90 / 0.10 / 0 when no split was measured)
 metered_gb_day       = bulk                                   (× 1.595 only on a raw K360 rate)
-days_in_store(dep)   = stored_gb ÷ (bundle_gb_day × 0.60)
+days_in_store(dep)   = stored_gb ÷ bundle_gb_day              (indicative: stored GB is compressed, bulk is not)
 ```
 
 `write_phase_sec` is creation until rollover, or the index age while the ILM action is rollover. Write indices are the last index of each data stream and any alias marked `is_write_index`. A missing or zero write phase is 0. Days in store compares the local primary store with ingest: a value far below retention days means retained data sits outside that store (searchable snapshots) or the stored-GB snapshot is older than the bundle. A node up under 2 days measures the rate over a short window, so that row is shaded.

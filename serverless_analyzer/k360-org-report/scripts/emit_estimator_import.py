@@ -24,6 +24,13 @@ def main() -> None:
     payload = data.get("offload", {}).get("apps_script_payload")
     if not payload:
         raise SystemExit("No offload.apps_script_payload — re-run fetch_org.py")
+    if payload.get("o11y"):
+        # An org JSON fetched before estimator v1.22 carries the old cell addresses.
+        from estimator_layout import upgrade_observability_cells
+        try:
+            payload = {**payload, "o11y": upgrade_observability_cells(payload["o11y"])}
+        except ValueError as ex:
+            raise SystemExit(f"ERROR: {ex}") from ex
 
     if args.kind == "o11y":
         out = {"org": payload.get("org"), "o11y": payload["o11y"]}

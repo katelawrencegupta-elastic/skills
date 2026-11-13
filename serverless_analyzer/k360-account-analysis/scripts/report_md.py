@@ -277,9 +277,9 @@ def consolidation_section(acc: dict) -> list[str]:
     search = bs_early.get("search") or {}
     if str(search.get("pricing") or "").startswith("es3-estimator"):
         L.append(
-            f"Search Serverless, on-demand: "
+            f"Search Serverless, performant: "
             f"search VCU {usd(search.get('search_mo'))} + ingest {usd(search.get('ingest_mo'))} + storage {usd(search.get('retention_mo'))} + support {usd(search.get('support_mo'))} "
-            f"= **{usd(search.get('total_mo'))}/mo**. Provisioned search VCU {s(next((p.get('Provisioned Search VCU/h') for p in (search.get('regional_profiles') or []) if str(p.get('Search Power Setting')) == 'on-demand'), search.get('peak_vcu')))}, idle VCU {s(next((p.get('Idle Search VCU/h') for p in (search.get('regional_profiles') or []) if str(p.get('Search Power Setting')) == 'on-demand'), search.get('idle_vcu')))}."
+            f"= **{usd(search.get('total_mo'))}/mo**. Provisioned search VCU {s(next((p.get('Provisioned Search VCU/h') for p in (search.get('regional_profiles') or []) if str(p.get('Search Power Setting')) == 'performant'), search.get('peak_vcu')))}, idle VCU {s(next((p.get('Idle Search VCU/h') for p in (search.get('regional_profiles') or []) if str(p.get('Search Power Setting')) == 'performant'), search.get('idle_vcu')))}."
         )
         L.append("")
     elif search.get("peak_vcu") is not None:
@@ -303,7 +303,7 @@ def consolidation_section(acc: dict) -> list[str]:
     L.append("")
     bs = svl.get("by_solution") or {}
     L.append(table(["Project", "Deps", "Stored GB", "Raw GB/d", "Metered GB/d", "Ingest $/mo", "Retain $/mo", "Support", "Total $/mo", "ECH ECU/mo", "Pricing"],
-                   [[k.title(), s(v.get("deployments")), n0(v.get("stored_gb")), n1(v.get("daily_raw_gb")), n0(v.get("daily_metered_gb")), usd(v.get("ingest_mo")), usd(v.get("retention_mo")), usd(v.get("support_mo")), usd(v.get("total_mo")), n0(v.get("ech_ecu_mo")), "Search Serverless, on-demand" if str(v.get("pricing") or "").startswith("es3") else ("Observability Serverless" if "observability" in str(v.get("pricing") or "").lower() and "quotable" in str(v.get("pricing") or "") else s(v.get("pricing")))] for k, v in bs.items() if (v.get("stored_gb") or 0) > 0 or (v.get("ech_ecu_mo") or 0) > 0]))
+                   [[k.title(), s(v.get("deployments")), n0(v.get("stored_gb")), n1(v.get("daily_raw_gb")), n0(v.get("daily_metered_gb")), usd(v.get("ingest_mo")), usd(v.get("retention_mo")), usd(v.get("support_mo")), usd(v.get("total_mo")), n0(v.get("ech_ecu_mo")), "Search Serverless, performant" if str(v.get("pricing") or "").startswith("es3") else ("Observability Serverless" if "observability" in str(v.get("pricing") or "").lower() and "quotable" in str(v.get("pricing") or "") else s(v.get("pricing")))] for k, v in bs.items() if (v.get("stored_gb") or 0) > 0 or (v.get("ech_ecu_mo") or 0) > 0]))
     L.append("")
     search_blk_early = bs.get("search") or {}
     eis_rows = search_blk_early.get("eis_workloads") or []
@@ -408,7 +408,7 @@ def consolidation_section(acc: dict) -> list[str]:
         L.append("\n### Appendix\n")
         L.append(lead)
         L.append("")
-        L.append("The score is the mean of the checks that apply. A check that does not apply is n/a and stays out of the mean. A score of 0.90 or higher passes. A check that misses its own bar stays flagged. A G28 gap of 0.51 scores 0 on that component and still passes that component. This is not a serverless bill.")
+        L.append("The score is the mean of the checks that apply. A check that does not apply is n/a and stays out of the mean. A score of 0.90 or higher passes. A check that misses its own bar stays flagged. An echo gap of 0.51 scores 0 on that component and still passes that component. This is not a serverless bill.")
         L.append("")
         L.append(table(
             ["Check", "Score", "Pass", "Measured"],

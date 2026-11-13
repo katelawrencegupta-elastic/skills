@@ -1104,8 +1104,7 @@ def estimate_title(run_key: str, solution: str, name_suffix: str | None = "", re
 def _sheet_retention(months) -> int | None:
     """Estimator retention rows are the integers 1–36. A missing month is not invented.
 
-    A remainder under 0.001 month is the 30.416 truncation, not another month.
-    365 / 30.416 is 12.000263 and stays 12. A real extra day still rounds up.
+    Rounding is `diag_inputs.whole_months`, the one shared rule.
     """
     if months is None or months == "":
         return None
@@ -1113,11 +1112,8 @@ def _sheet_retention(months) -> int | None:
         value = float(months)
     except (TypeError, ValueError):
         return None
-    whole = math.floor(value)
-    if whole >= 1 and 0 <= (value - whole) < 0.001:
-        value = float(whole)
-    value = min(36.0, max(1.0, value))
-    return int(min(36, max(1, math.ceil(value - 1e-9))))
+    from diag_inputs import whole_months
+    return whole_months(value)
 
 
 def _months_for_sheet(block: dict, force: int | None) -> int | None:

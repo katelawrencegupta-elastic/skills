@@ -1619,18 +1619,23 @@ def main() -> None:
         },
         "o11y": {
             "sheet_tab": "Observability Estimator",
+            # Cell addresses for Observability estimator v1.22 (estimator_layout.py).
+            "layout": "1.22",
             "cells": {
                 "G4": si.get("feature_tier", "Complete"),
                 "G5": si.get("support", "Premium"),
                 "G8": o11y_sheet_region,
                 "G11": si.get("retention_months", 3),
-                "G14": si.get("synthetics", "No"),
-                "G18": 0,
-                "G21": si.get("logs_gb_day"),
-                "G22": si.get("k8s_logs_pct", "0%"),
-                "G23": si.get("metrics_gb_day"),
-                "G24": si.get("traces_per_min", 0),
-                "G25": "100%",
+                "G12": si.get("retention_months", 3),   # TSDS metrics keep the same month
+                "G15": si.get("synthetics", "No"),
+                "G19": 0,                                # Option 1 is not used
+                "G20": 0,
+                "G23": si.get("logs_gb_day"),
+                "G24": si.get("k8s_logs_pct", "0%"),
+                "G25": si.get("metrics_gb_day"),
+                "G26": si.get("traces_per_min", 0),
+                "G27": "100%",
+                "G33": "No",                             # cross-project search add-on
             },
         },
     }

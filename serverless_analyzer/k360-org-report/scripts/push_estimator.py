@@ -28,9 +28,10 @@ from pathlib import Path
 from report_mode import add_report_arg, html_name, normalize_report, pdf_name
 from sheets_auth import get_creds
 from skill_paths import artifacts_root
+from estimator_layout import check_value_ranges, layout_ranges, upgrade_observability_cells
 
 DEFAULT_ES3 = "1Jsi5cMIDGfaP-S1_xqDcGeMYJSgklcBbu4dSJAEjlA0"
-DEFAULT_O11Y = "1bu-qjVIab-rbWb7zvCEq6QEoLdKpi0vfw3yDj9_VJuE"
+DEFAULT_O11Y = "1tUdwJbTmd4helFOzEHMi_gpHw7qu_aCgprjlqmHh2hs"  # Observability estimator v1.22
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 PDF_MIME = "application/pdf"
 FOLDER_MIME = "application/vnd.google-apps.folder"
@@ -225,6 +226,21 @@ def push_cells(service, spreadsheet_id: str, sheet_tab: str, cells: dict) -> int
         body={"valueInputOption": "USER_ENTERED", "data": data},
     ).execute()
     return len(data)
+
+
+def layout_problems(service, spreadsheet_id: str, kind: str, sheet_tab: str) -> list[str]:
+    """Why this copy is not the layout the cells were built for. Empty means it matches.
+
+    Reads the label beside every cell the fill uses and the sheet's version.
+    """
+    cells, ranges = layout_ranges(kind, sheet_tab)
+    res = (
+        service.spreadsheets()
+        .values()
+        .batchGet(spreadsheetId=spreadsheet_id, ranges=ranges, valueRenderOption="FORMATTED_VALUE")
+        .execute()
+    )
+    return check_value_ranges(kind, cells, res.get("valueRanges") or [])["problems"]
 
 
 def read_ranges(service, spreadsheet_id: str, ranges: list[str]) -> dict:
@@ -457,8 +473,26 @@ def main() -> None:
                 pass
 
     if args.kind in ("o11y", "both"):
-        block = payload["o11y"]
+        try:
+            block = upgrade_observability_cells(payload["o11y"])
+        except ValueError as ex:
+            raise SystemExit(f"ERROR: {ex}") from ex
+        if block.get("upgraded_from"):
+            lines.append(f"O11y cells were built for estimator v{block['upgraded_from']} and were moved to the v{block['layout']} addresses")
         sid = target_id("o11y", args.o11y_id, "Observability")
+        problems = layout_problems(sheets, sid, "observability", block["sheet_tab"])
+        if problems:
+            # Fail closed: nothing is written to a sheet whose rows are not where the cells expect.
+            if drive and not args.no_copy:
+                try:
+                    drive.files().update(fileId=sid, body={"trashed": True}, supportsAllDrives=True).execute()
+                except Exception:
+                    pass
+            raise SystemExit(
+                f"ERROR: Observability estimator copy {sid} does not match the layout these cells were built for. "
+                + "; ".join(problems[:6])
+                + ". Nothing was written. Point --o11y-id at the current estimator, or update estimator_layout.py and the cell map together."
+            )
         n = push_cells(sheets, sid, block["sheet_tab"], block["cells"])
         lines.append(f"O11y {block['sheet_tab']}: {n} cells → {sid}")
         if args.read_back:
@@ -466,10 +500,10 @@ def main() -> None:
                 sheets,
                 sid,
                 [
-                    f"'{block['sheet_tab']}'!G21",
-                    f"'{block['sheet_tab']}'!G23",
-                    f"'{block['sheet_tab']}'!G26",
-                    f"'{block['sheet_tab']}'!D32",
+                    f"'{block['sheet_tab']}'!G23",   # logs GB/day
+                    f"'{block['sheet_tab']}'!G25",   # metrics GB/day
+                    f"'{block['sheet_tab']}'!G28",   # total raw GB/day
+                    f"'{block['sheet_tab']}'!D38",   # monthly, steady state
                 ],
             )
             lines.append(f"  read-back: {rb}")

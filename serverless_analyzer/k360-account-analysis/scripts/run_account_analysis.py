@@ -267,6 +267,7 @@ def parse_args(argv=None, description: str | None = None):
     ap.add_argument("--k360-ingest", action="store_true", help="Also price serverless from K360 stored GB ÷ assumed retention. K360 has no raw ingest total, so this backup can sit far below diagnostic bulk. Used automatically when bundles are unavailable")
     ap.add_argument("--skip-vpn-check", action="store_true", help="Pull diagnostics without checking that the Aviatrix VPN tunnel is up")
     ap.add_argument("--exclude-deployment", action="append", default=None, metavar="ID", help="Leave this deployment out of the whole run (billing, bundles, plan, estimates). Repeat, or pass a comma list. 32-character deployment id")
+    ap.add_argument("--keep-monitoring", action="store_true", help="Consolidation only: keep stack-monitoring deployments (names containing 'monitoring'). They are left out by default")
     ap.add_argument("--skip-deployment-plan", action="store_true", help="Skip the Observability 0/25/50/75/100%% deployment-count sheets. The headline quote still runs")
     args = ap.parse_args(argv)
     if args.exclude_deployment:
@@ -275,9 +276,13 @@ def parse_args(argv=None, description: str | None = None):
     return args
 
 
-def resolve_excluded(args, env: dict, org: dict, ids: list[str]) -> list[dict]:
-    """Map each excluded deployment id to its name: diagnostic manifests on disk first, then the admin listing."""
-    from exclusions import manifest_names, resolve_names
+def load_id_to_name(args, env: dict, org: dict, need: list[str] | None = None, names: list[str] | None = None) -> dict[str, str]:
+    """Deployment id → name: diagnostic manifests on disk first, then the admin listing.
+
+    The admin listing is skipped when the manifest already covers every id in `need`, or every
+    name in `names`. With neither, the listing is always read.
+    """
+    from exclusions import manifest_names
 
     id_to_name: dict[str, str] = {}
     dirs = [Path(args.diags_dir)] if getattr(args, "diags_dir", None) else []
@@ -285,7 +290,9 @@ def resolve_excluded(args, env: dict, org: dict, ids: list[str]) -> list[dict]:
         mf = d / "manifest.json"
         if mf.is_file():
             id_to_name.update(manifest_names(json.loads(mf.read_text())))
-    if not all(i in id_to_name for i in ids):
+    covered = (need is not None and all(i in id_to_name for i in need)) or (
+        names is not None and set(names) <= set(id_to_name.values()))
+    if not covered:
         meta_org = (org.get("organization") or {})
         org_ids = [str(i) for i in (getattr(args, "org_id", None) or ([meta_org.get("id")] if meta_org.get("id") else [])) if i]
         try:
@@ -299,7 +306,40 @@ def resolve_excluded(args, env: dict, org: dict, ids: list[str]) -> list[dict]:
                         id_to_name[str(dep.get("id")).lower()] = dep.get("name")
         except Exception as ex:  # noqa: BLE001
             print(f"WARN: admin deployment list unavailable ({ex!r})", file=sys.stderr)
-    return resolve_names(ids, id_to_name)
+    return id_to_name
+
+
+def resolve_excluded(args, env: dict, org: dict, ids: list[str]) -> list[dict]:
+    """Map each excluded deployment id to its name. An id that matches nothing stops the run."""
+    from exclusions import resolve_names
+
+    return resolve_names(ids, load_id_to_name(args, env, org, ids))
+
+
+def auto_exclude_monitoring(args, env: dict, org: dict, acc: dict) -> list[str]:
+    """Add stack-monitoring deployments to the exclusion ids. Returns the names found.
+
+    Consolidation only (`args.auto_exclude_monitoring`). Names come from the account's own
+    deployment rows, so billing, stored GB and the plan drop them even when no id can be
+    resolved; the ids are what keep their diagnostic bundles from being pulled or parsed.
+    """
+    from exclusions import ids_for_names, monitoring_names
+
+    if not getattr(args, "auto_exclude_monitoring", False):
+        return []
+    rows = ((acc.get("solutions") or {}).get("by_deployment") or []) + (((acc.get("cloud") or {}).get("by_deployment")) or [])
+    names = monitoring_names(d.get("name") for d in rows if d.get("platform") != "serverless")
+    if not names:
+        return []
+    ids, unresolved = ids_for_names(names, load_id_to_name(args, env, org, None, names))
+    if unresolved:
+        print(f"WARN: no deployment id for monitoring cluster(s) {', '.join(unresolved)}: they are left out of billing and the plan, but a bundle on disk for them is not skipped. Pass --exclude-deployment <id> to be sure.", file=sys.stderr)
+    merged = list(getattr(args, "exclude_ids", None) or [])
+    merged += [i for i in ids if i not in merged]
+    args.exclude_ids = merged
+    args.auto_excluded_names = names
+    print(f"leaving out monitoring cluster(s): {', '.join(names)} (--keep-monitoring to include)", flush=True)
+    return names
 
 
 def prepare_account(args):
@@ -344,10 +384,17 @@ def prepare_account(args):
     when = date.fromisoformat(args.date) if args.date else datetime.now(timezone.utc).date()
     acc = build_account(org, infra, when=when, retention_months=args.retention_months, security_retention_months=args.security_retention_months)
     excluded = []
+    auto_names = auto_exclude_monitoring(args, env, org, acc)
     exclude_ids = getattr(args, "exclude_ids", None)
-    if exclude_ids:
+    if exclude_ids or auto_names:
         from exclusions import apply_exclusions, run_key_suffix
-        excluded = args.excluded = resolve_excluded(args, env, org, exclude_ids)
+        excluded = args.excluded = resolve_excluded(args, env, org, exclude_ids or [])
+        # A monitoring cluster with no resolvable id is still removed, by name.
+        have = {e["name"] for e in excluded}
+        excluded += [{"id": None, "name": n, "reason": "monitoring cluster"} for n in auto_names if n not in have]
+        for e in excluded:
+            if e["name"] in auto_names:
+                e["reason"] = "monitoring cluster"
         apply_exclusions(acc, org, excluded)
         acc["meta"]["run_key"] = acc["meta"]["run_key"] + run_key_suffix(excluded)
     acc["storage"]["size_gaps"] = size_gaps(base, key, acc)

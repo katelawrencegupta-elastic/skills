@@ -11,7 +11,7 @@
  *
  * JSON shape:
  *   { "es3": { "sheet_tab": "Estimator", "cells": { "C19": 50, ... } },
- *     "o11y": { "sheet_tab": "Observability Estimator", "cells": { "G21": 962, ... } } }
+ *     "o11y": { "sheet_tab": "Observability Estimator", "cells": { "G23": 962, ... } } }
  * Or a single map: { "sheet_tab": "Estimator", "cells": { ... } }
  */
 

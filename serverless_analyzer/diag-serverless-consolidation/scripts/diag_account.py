@@ -25,6 +25,8 @@ import math
 import re
 from pathlib import Path
 
+from diag_inputs import whole_months
+
 DAYS_PER_MONTH = 30.416
 RETENTION_MIN = 1.0
 RETENTION_MAX = 36.0
@@ -45,19 +47,7 @@ def _clamp_months(months: float) -> float:
     return min(RETENTION_MAX, max(RETENTION_MIN, float(months)))
 
 
-def _sheet_months(months: float) -> int:
-    """Whole months, 1–36. Round up so the estimator's integer retention row matches.
-
-    A remainder under 0.001 month is the 30.416 truncation, not another month.
-    365 / 30.416 is 12.000263 and stays 12. A real extra day still rounds up.
-    """
-    months = float(months)
-    whole = math.floor(months)
-    if whole >= 1 and 0 <= (months - whole) < 0.001:
-        months = float(whole)
-    clamped = _clamp_months(months)
-    whole = math.ceil(clamped - 1e-9)
-    return int(min(RETENTION_MAX, max(RETENTION_MIN, whole)))
+_sheet_months = whole_months  # one shared rounding rule, defined in diag_inputs
 
 
 def _measured_days(value) -> float | None:

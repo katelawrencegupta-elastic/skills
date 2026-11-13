@@ -31,6 +31,7 @@ Fetches one Elastic Cloud organization from K360 and writes an exec report or a 
 | `report_mode.py` | Shared `exec` and `full` names for the PDF, HTML, and canvas |
 | `emit_canvas_data.py` | Writes the small canvas and summary JSON so the full org JSON stays closed |
 | `push_estimator.py` | Copies the golden estimator workbooks, fills them, and can upload the PDF |
+| `estimator_layout.py` | The Observability and Security estimator layouts: the label beside every cell the scripts use, and the oldest version those addresses fit. Every fill checks its copy against it first |
 | `render_org_pdf.py` | Renders the exec or full HTML and PDF and uploads the PDF |
 | `emit_estimator_import.py` | Writes Apps Script JSON for a manual estimator fill |
 | `sheets_auth.py` | One-time Sheets and Drive sign-in. The token stays in `~/.config/serverless-analyzer` |
@@ -58,7 +59,7 @@ References: `setup.md` is the machine setup. `output-schema.md` is the account J
 
 ## diag-serverless-consolidation
 
-Prices Observability and Security from Elasticsearch diagnostic bundles. Daily GB is bulk on the write indices. Retention is the measured age, written as a whole month. Search disk is local store, and Search ingest stays the K360 rate scaled by that store. The estimator read-back is the dollar. A second estimate, `compressioncalc_accounted_for`, is bulk × 0.60 and does not replace the bulk quote.
+Prices Observability and Security from Elasticsearch diagnostic bundles. Daily GB is bulk on the write indices. Retention is the measured age, written as a whole month. Search disk is local store, and Search ingest stays the K360 rate scaled by that store. The estimator read-back is the dollar. Bulk is measured after ingest pipelines and before compression, so it is written to the estimators as metered ingest: Observability through the Option 1 cells, Security as bulk ÷ the sheet's expansion factor. The earlier compression-applied set (bulk × 0.60) is retired.
 
 `python <skill>/scripts/run_consolidation.py --org "ORG NAME" --reuse <org_report.json> --diags-dir <bundles>`
 
@@ -90,4 +91,4 @@ References: `calculations.md` is the arithmetic. `sizing-cells.md` is the estima
 
 ## How a quote is assembled
 
-`k360-org-report` writes `<customer>_<date>_org_report.json`. `k360-account-analysis` can reuse that file for the summary. `diag-serverless-consolidation` reuses it again, then replaces ingest and retention with the diagnostic measurements. Observability monthly is D38. Security monthly is E74. Search is the es3 on-demand profile. The account PDF stays in the customer folder. Measured-retention consolidation PDFs go in `full_retention/`. 30-day PDFs go in `30d/`.
+`k360-org-report` writes `<customer>_<date>_org_report.json`. `k360-account-analysis` can reuse that file for the summary. `diag-serverless-consolidation` reuses it again, then replaces ingest and retention with the diagnostic measurements. Observability monthly is D38. Security monthly is E74, or the sheet's month 36 when retention is above 12 months. Search is the es3 performant profile. The account PDF stays in the customer folder. Measured-retention consolidation PDFs go in `full_retention/`. 30-day PDFs go in `30d/`.

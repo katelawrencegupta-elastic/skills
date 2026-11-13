@@ -1496,7 +1496,7 @@ def sizing_inputs(acc: dict, org: dict, retention_months: float, security_retent
         "consolidated": {"observability": o, "security": s, "search": se},
         "notes": [
             f"K360 backup only: K360 does not provide a raw ingest total, so daily_raw_gb = stored_gb / (retention_months × {DAYS_PER_MONTH}). Confirm retention with the account team. This can sit far below measured bulk.",
-            "Observability split 90% logs / 10% metrics; Security = SIEM ingest; Search is priced by es3-estimator during sizing (on-demand is the quotable profile)",
+            "Observability split 90% logs / 10% metrics; Security = SIEM ingest; Search is priced by es3-estimator during sizing (performant is the quotable profile)",
             "gb_estimated_from_ecu_share = no telemetry for that slice; GB prorated by ECU share",
             "stored_gb comes from ECH telemetry — existing serverless projects contribute ECU but no GB",
         ],

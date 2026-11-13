@@ -1414,7 +1414,7 @@ class ConsolidationLayoutTests(unittest.TestCase):
         self.assertAlmostEqual(data["rows"][0]["measured"], 80.0)   # 100 ÷ 1.25
         self.assertAlmostEqual(data["total_quoted"], 125.0)
         self.assertAlmostEqual(data["total_measured"], 100.0)
-        self.assertAlmostEqual(data["rows"][0]["hot_days"], 60.0 / (80.0 * 0.6))
+        self.assertAlmostEqual(data["rows"][0]["hot_days"], 60.0 / 80.0)
         html = raw_ingest_section(acc)
         self.assertIn("<h2>Raw bulk ingest by deployment</h2>", html)
         self.assertIn("1.250000", html)

@@ -2,23 +2,14 @@
 name: diag-serverless-consolidation
 description: >-
   Diagnostic-to-Serverless consolidation report for one Elastic Cloud account.
-  Prices Observability and Security from Elasticsearch diagnostic bundles:
-  bulk GB/day and measured retention, through the matching estimator
-  read-back. Search disk is local store. Search ingest docs/s stays the
-  K360 rate scaled by that store. Sizes deployments with a bill in the
-  latest month.
-  Leaves out a decommissioned deployment and does not carry its last
-  snapshot. Covers one project per solution, per-deployment projects that
-  pool ingest under 50 GB/day, a whole-month retention rounded up, a 30-day
-  read on the same bulk, two consolidation PDFs (rounded month and 30
-  days), a deployment-count plan from the cover count, cut 25% at a time until one project per feature per region, the
-  blended metered ingest rate for each active deployment, with $0.50 rows
-  marked in red, a raw bulk ingest page listing every deployment's GB/day with its calculation, a search-power chart when Search was estimated, not added to the quote,
-  a per-cluster serverless cost table from one project each down to the floor, deployment ids that can be left out of a run, Appendix B with each calculated value and its formula, 2–5 project packs,
-  and a gap against the K360 stored-GB method.
-  Does not use stored GB ÷ assumed retention as the quoted ingest. Triggers:
-  diag consolidation, diagnostic bundles, serverless consolidation report,
-  price serverless from diags, per-cluster serverless, 2-5 projects, ingest gap.
+  Prices Observability and Security from Elasticsearch diagnostic bundles
+  (measured bulk GB/day and retention) through the matching estimator
+  read-back, and Search from local store on es3. Produces consolidation PDFs
+  at rounded-month and 30-day retention, a deployment-count plan, per-cluster
+  costs, a raw bulk ingest page, and an appendix of formulas. Can leave
+  deployments out of a run. Triggers: diag consolidation, diagnostic bundles,
+  serverless consolidation report, price serverless from diags, per-cluster
+  serverless, 2-5 projects, ingest gap.
 ---
 
 # Diagnostic Serverless consolidation
@@ -78,7 +69,7 @@ Quote only when `ingest_source` is `diagnostics`. Build `<slug>-serverless-conso
 
 **Report.** Consolidation headings are not numbered. Each heading is the title of that section. Appendix A and Appendix B are one document, `serverless_consolidation_analysis_appendix`, in the run folder. The consolidation PDFs do not repeat them. Appendix A holds the input arithmetic, the metered-rate tables, the search-power chart when Search was estimated, and the quote integrity score. Appendix B lists each calculated value with its formula, the inputs used, and the result already on the full-retention bulk quote. A row is omitted when that value was not calculated. Sheet dollars on Appendix B stay read-backs. Omit the Monthly search-power estimate when `search_power` is absent. Search-power dollars stay at list. Do not price the Observability store as Search. Fixed overhead in the report is the active deployments on the quote window, as a share of their ECU. The full-lookback overhead includes deployments with no bill in the latest month, so the two figures differ. The smallest clusters' ECU is their whole bill. Their fixed overhead is a separate figure, and the merge saving is a quarter of their bill. Bar charts have a top face and a side face. The usage chart under “What if data is kept longer, or the fleet is busier” is full width. Consolidation type is larger than the account report.
 
-**Raw bulk ingest page.** Required on every diagnostic consolidation PDF, directly after "Where ECH spend sits". It is titled "Raw bulk ingest by deployment" and lists each sized deployment: bundle GB/day (Σ write-index `bulk × 86,400 ÷ write_phase_sec`), quoted GB/day (the same figure on a diagnostic run; a pace factor applies only to the K360 backup), share of the fleet, stored GB, retention days, uptime days, and days in store (stored GB ÷ (bundle GB/day × 0.60)). A by-solution table and a Calculation table follow, with every step and this account's numbers. A node up under 2 days is shaded. The deployment count on this page is the cover count: a serverless project has no bundle and no ECH bill, so it is not a row and is not counted by solution. An active deployment with no bundle gets its own row, marked `no bundle`, and adds no ingest; only a deployment whose bundle measured zero bulk is left to the count under the table. The chart's heading carries the fleet total, and it is the table's Total row. Do not read it as a price: the estimator read-back stays the dollar. Appendix B carries the same formulas under "Raw bulk ingest". Say in chat when the top four deployments are most of the bulk, or when days in store sits far below retention.
+**Raw bulk ingest page.** Required on every diagnostic consolidation PDF, directly after "Where ECH spend sits". It is titled "Raw bulk ingest by deployment" and lists each sized deployment: bundle GB/day (Σ write-index `bulk × 86,400 ÷ write_phase_sec`), quoted GB/day (the same figure on a diagnostic run; a pace factor applies only to the K360 backup), share of the fleet, stored GB, retention days, uptime days, and days in store (stored GB ÷ bundle GB/day, indicative because stored GB is compressed and bulk is not). A by-solution table and a Calculation table follow, with every step and this account's numbers. A node up under 2 days is shaded. The deployment count on this page is the cover count: a serverless project has no bundle and no ECH bill, so it is not a row and is not counted by solution. An active deployment with no bundle gets its own row, marked `no bundle`, and adds no ingest; only a deployment whose bundle measured zero bulk is left to the count under the table. The chart's heading carries the fleet total, and it is the table's Total row. Do not read it as a price: the estimator read-back stays the dollar. Appendix B carries the same formulas under "Raw bulk ingest". Say in chat when the top four deployments are most of the bulk, or when days in store sits far below retention.
 
 **Serverless cost per cluster.** Required on the full-retention and 30-day bulk PDFs when `deployment_plan` has rows, directly after the deployment-count page and before "Where ECH spend sits" (brief: `per_cluster_plan`). One row per cluster, from the Ceiling (each cluster its own project) down every step to the Floor. A cluster in a packed project shows its share of that project's price by bulk GB/day, marked "(of N)", and each column adds up to that step's bar. A cluster whose own project is $10/mo or less at the ceiling is grey. A cluster with a diagnostic bundle that measured no bulk is not sized (grey, "not sized") and takes no share of a packed project. An active cluster with no bundle is flagged "missing diagnostic" and is not sized. A fleet over 36 clusters folds its smallest into one row.
 

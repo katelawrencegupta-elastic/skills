@@ -231,7 +231,7 @@ def estimator_label(text) -> str:
     """Plain name for a pricing source. Internal keys such as es3-estimator stay in the data."""
     low = str(text or "").strip().lower()
     if "es3" in low:
-        return "Search Serverless, on-demand"
+        return "Search Serverless, performant"
     if "security" in low and ("sheet" in low or "quotable" in low):
         return "Security Serverless"
     if low == "sheet" or ("observability" in low and ("sheet" in low or "quotable" in low)):
@@ -1154,7 +1154,7 @@ def cost_sizing_sections(acc: dict, *, sizing: bool = True, new_page: bool = Tru
                 inner += caption(x["note"])
             inner += str(link(x.get("url"), "Open estimator")) if x.get("url") else caption(str(status))
             title = {"search": "Search Serverless", "observability": "Observability Serverless", "security": "Security Serverless"}.get(k, k.title())
-            badge = "on-demand" if k == "search" and rb else ("Complete" if rb else "not priced")
+            badge = "performant" if k == "search" and rb else ("Complete" if rb else "not priced")
             cards.append(f"<div class='card'><div class='hd'>{esc(title)}<span>{esc(badge)}</span></div>{inner}</div>")
         body += grid(*cards)
     body += f"<div class='foot'>Source: K360 cloud-tracker (billing, telemetry, features, organization_pivot) · generated {esc(m.get('generated_at'))} · only estimator read-backs are quotable $</div>"
@@ -1676,6 +1676,11 @@ def serverless_component_slide(acc: dict, *, new_page: bool = True, bare: bool =
             )
         if diag_cov.get("ecu_month") and diag_cov.get("active_month_partial"):
             roster_notes.append(f"ECU/mo is {diag_cov.get('ecu_month')} billing for the active deployments, the last complete month.")
+        if diag_cov.get("decommissioned"):
+            n = int(float(diag_cov.get("decommissioned") or 0))
+            names = [str(x) for x in (diag_cov.get("decommissioned_names") or []) if x]
+            named = f" ({', '.join(names[:8])})" if names else ""
+            roster_notes.append(f"{n0(n)} billed {'deployment is' if n == 1 else 'deployments are'} decommissioned, not in the admin console{named}. No diagnostic can be captured and {'it adds' if n == 1 else 'they add'} no ingest.")
         if diag_cov.get("k360_fallback"):
             n = int(float(diag_cov.get("k360_fallback") or 0))
             noun = "deployment" if n == 1 else "deployments"
@@ -1765,7 +1770,7 @@ def metered_rate_section(acc: dict) -> str:
         if str(diag_scripts) not in sys.path:
             sys.path.insert(0, str(diag_scripts))
         from consolidation import observability_metered_rates
-        rates = observability_metered_rates((acc.get("solutions") or {}).get("by_deployment") or [])
+        rates = observability_metered_rates((acc.get("solutions") or {}).get("by_deployment") or [], 1.0)
     if not rates:
         return ""
 
@@ -1783,14 +1788,17 @@ def metered_rate_section(acc: dict) -> str:
         return rate is not None and abs(float(rate) - 0.5) < 1e-6
 
     accounted = c.get("ingest_basis") == "compressioncalc_accounted_for"
-    headers = ["Deployment", "Accounted GB/day" if accounted else "Raw GB/day", "Metered GB/day", "Metered rate"]
+    expansion = _metered_expansion(acc)
+    headers = ["Deployment", "Accounted GB/day" if accounted else ("Bulk GB/day" if expansion == 1 else "Raw GB/day"), "Metered GB/day", "Metered rate"]
     align = ["left", "right", "right", "right"]
     mid = (len(rates) + 1) // 2
     left, right = rates[:mid], rates[mid:]
     if accounted:
         rate_lead = "The GB/day in this table is compressioncalc_accounted_for, bulk multiplied by 0.60. Metered GB/day is that figure × 1.595. Logs are 90% and metrics are 10%. Each stream walks the Observability ingest bands on its own. The rate is that deployment's blended dollars per metered GB when it is its own project."
+    elif expansion == 1:
+        rate_lead = "Diagnostic bulk is the metered GB/day: it is measured after ingest pipelines and before compression, so no expansion factor is applied. Logs are taken as 90% and metrics as 10% in this band walk. Each stream walks the Observability ingest bands on its own. The rate is that deployment's blended dollars per metered GB when it is its own project."
     else:
-        rate_lead = "Metered GB/day is raw bulk × 1.595. That 1.595 expansion is this band walk, not G27 on the Observability sheet. Logs are 90% and metrics are 10%. Each stream walks the Observability ingest bands on its own. The rate is that deployment's blended dollars per metered GB when it is its own project."
+        rate_lead = "Metered GB/day is raw bulk × 1.595. That 1.595 expansion is this band walk, not G29 or G30 on the Observability sheet. Logs are 90% and metrics are 10%. Each stream walks the Observability ingest bands on its own. The rate is that deployment's blended dollars per metered GB when it is its own project."
     body = bullets([
         rate_lead,
         "The first 50 metered GB/day are $0.50 per GB. The bands then step to $0.325, $0.225, $0.15, $0.105, $0.10, $0.095, and $0.0925. A deployment inside the first band on both streams is $0.500, and that row is marked in red. A deployment with no bulk has no rate.",
@@ -1838,7 +1846,7 @@ def _integrity_block(acc: dict) -> str:
         + bullets([
             headline,
             "The score is the mean of the checks that apply. A check that does not apply is n/a and stays out of the mean.",
-            "A score of 0.90 or higher passes. A check that misses its own bar stays flagged. A G28 gap of 0.51 scores 0 on that component and still passes that component. E73 must be 0.",
+            "A score of 0.90 or higher passes. A check that misses its own bar stays flagged. An echo gap of 0.51 scores 0 on that component and still passes that component. E73 must be 0.",
             "This scores whether the written inputs, the sheet echo, and the published totals agree. It is not a serverless bill.",
         ])
         + table(["Check", "Score", "Pass", "Measured"], rows, ["left", "right", "left", "left"], tones)
@@ -1892,7 +1900,7 @@ def _search_profile_fallback(acc: dict) -> str:
         headers,
         rows,
         ["left"] + ["right"] * (len(headers) - 1),
-        tones=["success" if str(p.get("Search Power Setting")) == "on-demand" else None for p in profiles],
+        tones=["success" if str(p.get("Search Power Setting")) == "performant" else None for p in profiles],
     )
     return (
         "<h3>Search Serverless price by profile</h3>"
@@ -1903,7 +1911,7 @@ def _search_profile_fallback(acc: dict) -> str:
         )
         + prof_table
         + bullets([
-            "On-demand is the sum of the regional Search projects used in this report. Performant and high availability keep more search capacity ready, so they cost more for the same GB." if regional_profiles else "On-demand is the Search Serverless price used in this report. Performant and high availability keep more search capacity ready, so they cost more for the same GB.",
+            "Performant is the sum of the regional Search projects used in this report. On-demand keeps less search capacity ready and high availability keeps more, so they cost less and more for the same GB." if regional_profiles else "Performant is the Search Serverless price used in this report. On-demand keeps less search capacity ready and high availability keeps more, so they cost less and more for the same GB.",
             "Y: dollars per month. X: Search Serverless power setting.",
             "Ingest is $0 on every profile when average document size is missing.",
             (f"EIS is {usd(eis_profile)} on every profile, and it is inside $ / mo. Search $ + storage $ + EIS $ + support $ = $ / mo." if eis_profile else ""),
@@ -1946,7 +1954,7 @@ def search_power_section(acc: dict, *, new_page: bool = True) -> str:
                 usd(p.get("Support $/month")),
             ] for p in profiles],
             ["left"] + ["right"] * (len(power_headers) - 1),
-            ["success" if str(p.get("Search Power Setting")) == "on-demand" else None for p in profiles],
+            ["success" if str(p.get("Search Power Setting")) == "performant" else None for p in profiles],
         )
         body += bullets([
             "On-demand, performant, and high availability are the three search-power settings. High availability is the notebook's third band: it keeps the most search capacity ready.",
@@ -1963,7 +1971,7 @@ def search_power_section(acc: dict, *, new_page: bool = True) -> str:
 
 
 _INTEGRITY_FORMULA = {
-    "Sheet echo": "Mean of the G28 component and the E73 component, for each solution that has a workload and a sheet. G28 component = 1 − min(|G28 − written bulk| / 0.51, 1). A blank G28 scores 0. E73 scores 1 when the parsed amount is 0, and 0 when it is blank or the amount is above 0.005.",
+    "Sheet echo": "Mean of the echo component and the E73 component, for each solution that has a workload and a sheet. echo component = 1 − min(|echo − written bulk| / 0.51, 1). A blank G28 scores 0. E73 scores 1 when the parsed amount is 0, and 0 when it is blank or the amount is above 0.005.",
     "Bundle coverage": "Matched deployments ÷ active deployments. When the active count is absent, the denominator is matched bundles plus bundles that fell back.",
     "Measured retention": "1 − (bulk with no measured age ÷ Σ bulk).",
     "Rated ingest": "1 − (store in indices that took bulk writes and have no rate ÷ local store). Those indices are not a data stream, a write alias, or an ILM rollover, or their write index has no write phase. Passes at 5% or less.",
@@ -2063,11 +2071,11 @@ def _quote_window_rows(acc: dict) -> list[list]:
         if "quotable" not in str((quote or {}).get("pricing") or ""):
             continue
         if name == "observability":
-            formula = "Observability monthly is the D38 read-back. Quoted only when G28 is within 0.51 GB/day of the written bulk."
+            formula = "Observability monthly is the D38 read-back. Quoted only when the sheet echo is within 0.51 GB/day of the written bulk."
         elif name == "security":
             formula = "Security monthly is the E74 read-back. Quoted only when parsed E73 is 0."
         elif name == "search":
-            formula = "Search monthly is the es3 on-demand read-back."
+            formula = "Search monthly is the es3 performant read-back."
         else:
             formula = "Estimator read-back."
         rows.append([f"{name.title()} monthly", formula, "Sheet read-back. Not recomputed here.", _formula_money(quote.get("total_mo"))])
@@ -2248,12 +2256,19 @@ def _scale_rows(acc: dict) -> list[list]:
             cells = ((sz.get("estimators") or {}).get(name) or {}).get("cells") or {}
             if name == "observability":
                 bits = []
+                measured_split = blk.get("mix_basis") in ("measured", "mixed")
                 if cells.get("G23") is not None:
-                    bits.append(f"logs G23 {_formula_num(cells.get('G23'), 2)} GB/day = 90% of the written GB/day")
+                    bits.append(f"logs G23 {_formula_num(cells.get('G23'), 2)} GB/day" + ("" if measured_split else " = 90% of the written GB/day"))
                 if cells.get("G25") is not None:
-                    bits.append(f"metrics G25 {_formula_num(cells.get('G25'), 2)} GB/day = 10%")
+                    bits.append(f"metrics G25 {_formula_num(cells.get('G25'), 2)} GB/day" + ("" if measured_split else " = 10%"))
+                if measured_split and cells.get("G26"):
+                    bits.append(f"traces G26 {_formula_num(cells.get('G26'), 3)} per minute")
                 inputs = ". ".join(bits) or "Logs are 90% and metrics are 10% of the written GB/day."
-                formula = "Observability writes the accounted GB/day. Logs = 0.90 × that rate. Metrics = 0.10 × that rate."
+                formula = (
+                    "Observability writes the accounted GB/day, split into logs, metrics, and traces in the proportions the bundles measured from data stream names."
+                    if measured_split else
+                    "Observability writes the accounted GB/day. Logs = 0.90 × that rate. Metrics = 0.10 × that rate."
+                )
             else:
                 g4 = cells.get("G4")
                 inputs = f"G4 {_formula_num(g4, 2)} GB/day" if g4 is not None else "Security takes all of the accounted GB/day on G4."
@@ -2382,7 +2397,7 @@ def _metered_rows(acc: dict) -> list[list]:
     half = [r for r in priced if abs(float(r.get("usd_per_gb") or 0) - 0.5) < 1e-6]
     return [[
         "Metered ingest rate",
-        "Metered GB/day = bulk × 1.595. Logs = 0.90 × metered. Metrics = 0.10 × metered. Rate = (tier(logs) + tier(metrics)) ÷ metered GB/day. Bands per metered GB: 0–50 at $0.50, then $0.325, $0.225, $0.15, $0.105, $0.10, $0.095, and $0.0925.",
+        ("Metered GB/day = bulk. " if _metered_expansion(acc) == 1 else "Metered GB/day = bulk × 1.595. ") + "Logs = 0.90 × metered. Metrics = 0.10 × metered. Rate = (tier(logs) + tier(metrics)) ÷ metered GB/day. Bands per metered GB: 0–50 at $0.50, then $0.325, $0.225, $0.15, $0.105, $0.10, $0.095, and $0.0925.",
         f"{len(priced)} deployments with a rate. {len(half)} sit at $0.50 because both streams are inside the first 50 GB/day.",
         "not the monthly quote",
     ]]
@@ -2641,6 +2656,15 @@ def _priced_project_count(svl: dict) -> int | None:
 
 
 METERED_EXPANSION = 1.595
+
+
+def _metered_expansion(acc: dict) -> float:
+    """Factor from the GB/day in the report to metered GB/day. 1 when the report's bulk is already metered."""
+    value = (acc.get("consolidation") or {}).get("metered_expansion")
+    try:
+        return float(value) if value else METERED_EXPANSION
+    except (TypeError, ValueError):
+        return METERED_EXPANSION
 SHORT_UPTIME_DAYS = 2.0
 COMPRESSION_RATIO = 0.60
 
@@ -2673,7 +2697,7 @@ def raw_ingest_by_deployment(acc: dict) -> dict:
         stored = float(stored) if stored not in (None, "") else None
         hot_days = None
         if stored is not None and measured > 0:
-            hot_days = stored / (measured * COMPRESSION_RATIO)
+            hot_days = stored / measured
         up = dep.get("uptime_days_min")
         rows.append({
             "name": dep.get("name") or "",
@@ -2782,8 +2806,8 @@ def raw_ingest_section(acc: dict, *, new_page: bool = True) -> str:
     # A deployment that is billing but has no bundle still gets a row, marked "no bundle",
     # so the page lists every sized deployment. Only one whose bundle measured zero bulk
     # is left to the count under the table.
-    unbundled = [r for r in rows if r["quoted"] <= 0 and r["source"] == "active_no_bundle"]
-    idle = [r for r in rows if r["quoted"] <= 0 and r["source"] != "active_no_bundle"]
+    unbundled = [r for r in rows if r["quoted"] <= 0 and r["source"] in ("active_no_bundle", "decommissioned")]
+    idle = [r for r in rows if r["quoted"] <= 0 and r["source"] not in ("active_no_bundle", "decommissioned")]
 
     def fmt(v, places=1):
         return "—" if v is None else f"{v:,.{places}f}"
@@ -2793,8 +2817,8 @@ def raw_ingest_section(acc: dict, *, new_page: bool = True) -> str:
         cells = [
             r["name"],
             (r["solution"] or "").title(),
-            "no bundle" if r["source"] == "active_no_bundle" else fmt(r["measured"]),
-            "no bundle" if r["source"] == "active_no_bundle" else fmt(r["quoted"]),
+            "no bundle" if r["source"] == "active_no_bundle" else "decommissioned" if r["source"] == "decommissioned" else fmt(r["measured"]),
+            "no bundle" if r["source"] == "active_no_bundle" else "decommissioned" if r["source"] == "decommissioned" else fmt(r["quoted"]),
         ]
         if accounted:
             cells.append(fmt(q))
@@ -2849,7 +2873,7 @@ def raw_ingest_section(acc: dict, *, new_page: bool = True) -> str:
             "Quoted GB/day is the bundle GB/day, as measured, and is what each estimator receives. The billing window does not scale it."
         ),
         f"The four largest deployments are {top4_share * 100:.0f}% of quoted bulk: " + ", ".join(r["name"] for r in top4) + ".",
-        "Days in store is stored GB ÷ (bundle GB/day × 0.60). It is how many days of compressed ingest the local primary store holds. A value far below Retention means most retained data sits outside that store, for example in searchable snapshots, or the stored-GB snapshot is older than the bundle.",
+        "Days in store is stored GB ÷ bundle GB/day. It is an indicative figure: stored GB is compressed and bundle GB/day is not, so it reads high against true days held. A value far below Retention means most retained data sits outside that store, for example in searchable snapshots, or the stored-GB snapshot is older than the bundle.",
         "Shaded rows have a node up for under 2 days, so the rate is measured over a short window.",
     ]
     page_a = (
@@ -2891,16 +2915,26 @@ def raw_ingest_section(acc: dict, *, new_page: bool = True) -> str:
     obs = (acc.get("sizing") or {}).get("consolidated", {}).get("observability") or {}
     if obs.get("logs_gb_day") is not None:
         calc.append([
-            "5. Logs and metrics split",
-            "Logs = 0.90 × Observability bulk. Metrics = 0.10 × Observability bulk.",
-            f"Observability bulk {fmt(obs.get('bulk_gb_day'))} GB/day",
-            f"logs {fmt(obs.get('logs_gb_day'))} · metrics {fmt(obs.get('metrics_gb_day'))}",
+            "5. Logs, metrics, and traces split",
+            (
+                "Each rated series is logs, metrics, or traces by its data stream name: metrics-* and time-series indices are metrics, traces-* are traces, the rest are logs. logs-kubernetes.* is the Kubernetes share of logs (G24). Traces are written as traces per minute (G26) through the sheet's own APM arithmetic."
+                if obs.get("mix_basis") in ("measured", "mixed") else
+                "Logs = 0.90 × Observability bulk. Metrics = 0.10 × Observability bulk."
+            ),
+            f"Observability bulk {fmt(obs.get('bulk_gb_day'))} GB/day" + (f", split {obs.get('mix_basis')}" if obs.get("mix_basis") else ""),
+            f"logs {fmt(obs.get('logs_gb_day'))} · metrics {fmt(obs.get('metrics_gb_day'))}"
+            + (f" · traces {fmt(obs.get('traces_gb_day'))}" if obs.get("traces_gb_day") else "")
+            + (f" · Kubernetes {float(obs.get('k8s_logs_share') or 0) * 100:.1f}% of logs" if obs.get("k8s_logs_share") else ""),
         ])
         calc.append([
             "6. Metered ingest",
-            f"Metered GB/day = bulk × {METERED_EXPANSION}. Each stream walks the Observability ingest bands on its own metered GB. The monthly dollar is the estimator read-back, not this arithmetic.",
-            f"{fmt(obs.get('bulk_gb_day'))} × {METERED_EXPANSION}",
-            f"{fmt(float(obs.get('bulk_gb_day') or 0) * METERED_EXPANSION)} metered GB/day",
+            (
+                "Bulk GB/day is the metered GB/day. It is written to the sheet's Option 1 cells as monthly GB (GB/day × 730 ÷ 24), G19 for logs and traces and G20 for TSDS metrics, and the sheet applies no expansion factor. The monthly dollar is the estimator read-back."
+                if _metered_expansion(acc) == 1 else
+                f"Metered GB/day = bulk × {METERED_EXPANSION}. Each stream walks the Observability ingest bands on its own metered GB. The monthly dollar is the estimator read-back, not this arithmetic."
+            ),
+            f"{fmt(obs.get('bulk_gb_day'))} × {_metered_expansion(acc):g}",
+            f"{fmt(float(obs.get('bulk_gb_day') or 0) * _metered_expansion(acc))} metered GB/day",
         ])
     if accounted:
         calc.append([
@@ -2911,8 +2945,8 @@ def raw_ingest_section(acc: dict, *, new_page: bool = True) -> str:
         ])
     calc.append([
         "Days in store",
-        "Stored GB ÷ (bundle GB/day × 0.60).",
-        (f"{big['name']}: {fmt(big['stored_gb'], 0)} ÷ ({fmt(big['measured'])} × 0.60)" if big["stored_gb"] is not None else "no stored GB for the largest deployment"),
+        "Stored GB ÷ bundle GB/day (indicative: stored GB is compressed, bulk is not).",
+        (f"{big['name']}: {fmt(big['stored_gb'], 0)} ÷ {fmt(big['measured'])}" if big["stored_gb"] is not None else "no stored GB for the largest deployment"),
         f"{fmt(big['hot_days'], 1)} days" if big["hot_days"] is not None else "—",
     ])
     body += "<h3>Calculation</h3>" + table(["Step", "Formula", "Inputs used", "Result"], calc, ["left", "left", "left", "left"])
@@ -2942,7 +2976,7 @@ def _raw_ingest_rows(acc: dict) -> list[list]:
         ])
     out.append([
         "Days in store",
-        "Stored GB ÷ (bundle GB/day × 0.60).",
+        "Stored GB ÷ bundle GB/day (indicative: stored GB is compressed, bulk is not).",
         "Local primary store. Searchable snapshots stay out.",
         "per deployment, in Raw bulk ingest by deployment",
     ])
@@ -3105,6 +3139,19 @@ def deployment_plan_body(c: dict, sv: dict, *, alongside: str = "", width: int =
 PER_CLUSTER_MAX_ROWS = 36
 
 
+def bulk_cell(value) -> str:
+    """GB/day to at most 2 decimals, trailing zeros dropped. A real rate under 0.005 shows as <0.01, a true zero as 0."""
+    try:
+        v = float(value or 0)
+    except (TypeError, ValueError):
+        return "—"
+    if v <= 0:
+        return "0"
+    if v < 0.005:
+        return "<0.01"
+    return f"{v:,.2f}".rstrip("0").rstrip(".")
+
+
 def per_cluster_section(c: dict, *, new_page: bool = True) -> str:
     """Serverless $/mo for every cluster as if each were its own project, then at each step down to the floor."""
     plan = c.get("per_cluster_plan") or {}
@@ -3123,10 +3170,12 @@ def per_cluster_section(c: dict, *, new_page: bool = True) -> str:
     if len(rows_in) > PER_CLUSTER_MAX_ROWS:
         shown, folded = rows_in[:PER_CLUSTER_MAX_ROWS - 1], rows_in[PER_CLUSTER_MAX_ROWS - 1:]
     for r in shown:
-        cells = [r.get("name"), str(r.get("solution") or "").title(), r.get("region") or "—", n0(r.get("bulk_gb_day"))]
+        cells = [r.get("name"), str(r.get("solution") or "").title(), r.get("region") or "—", bulk_cell(r.get("bulk_gb_day"))]
         status = r.get("status")
         for cell in r.get("steps") or []:
-            if status == "missing_diag":
+            if status == "decommissioned":
+                cells.append("decommissioned")
+            elif status == "missing_diag":
                 cells.append("missing diagnostic")
             elif status == "no_bulk" and (cell is None or cell.get("monthly") is None):
                 cells.append("not sized")
@@ -3143,13 +3192,13 @@ def per_cluster_section(c: dict, *, new_page: bool = True) -> str:
         for i in range(len(steps)):
             vals = [float((r["steps"][i] or {}).get("monthly") or 0) for r in folded]
             rest.append(usd(sum(vals)))
-        rows.append([f"{len(folded)} smaller clusters", "", "", n0(sum(float(r.get("bulk_gb_day") or 0) for r in folded))] + rest)
+        rows.append([f"{len(folded)} smaller clusters", "", "", bulk_cell(sum(float(r.get("bulk_gb_day") or 0) for r in folded))] + rest)
         tones.append("muted")
     un = plan.get("unallocated") or []
     if any(float(v or 0) > 0.5 for v in un):
         rows.append(["Priced in the plan for projects with no sized cluster", "", "", ""] + [usd(v) if float(v or 0) > 0.5 else "—" for v in un])
         tones.append("muted")
-    rows.append(["Total", "", "", n0(sum(float(r.get("bulk_gb_day") or 0) for r in rows_in))] + [usd(st.get("monthly")) for st in steps])
+    rows.append(["Total", "", "", bulk_cell(sum(float(r.get("bulk_gb_day") or 0) for r in rows_in))] + [usd(st.get("monthly")) for st in steps])
     tones.append(None)
     align = ["left", "left", "left", "right"] + ["right"] * len(steps)
     body = f"<div class='pc'>{table(headers, rows, align, tones)}</div>"
@@ -3159,6 +3208,8 @@ def per_cluster_section(c: dict, *, new_page: bool = True) -> str:
     ]
     if any(r.get("status") == "no_bulk" for r in rows_in):
         notes.append("Grey “not sized” rows have a diagnostic bundle that measured no bulk. They are not sized and take no share of a packed project. When every cluster in a project is unsized, the project's plan price shows on its own line so each column still adds up to its bar.")
+    if any(r.get("status") == "decommissioned" for r in rows_in):
+        notes.append("Shaded “decommissioned” rows are billed deployments that are no longer in the admin console, so no diagnostic can be captured. They are not sized.")
     if any(r.get("status") == "missing_diag" for r in rows_in):
         notes.append("Shaded “missing diagnostic” rows are active deployments with no diagnostic bundle. Their ingest is not measured, so they are not sized.")
     if any(r.get("under_minimum") for r in rows_in):
@@ -3491,10 +3542,10 @@ def render_consolidation_html(acc: dict) -> str:
         rates = " · ".join(rate_bits) if rate_bits else "One monthly total"
         billed = "Metered ingest GB + retained GB (+ support)"
     elif str(dom.get("pricing") or "").startswith("es3-estimator"):
-        od = next((p for p in (dom.get("regional_profiles") or []) if str(p.get("Search Power Setting")) == "on-demand"), None)
+        od = next((p for p in (dom.get("regional_profiles") or []) if str(p.get("Search Power Setting")) == "performant"), None)
         vcu = (od or {}).get("Provisioned Search VCU/h", dom.get("peak_vcu"))
         volume = f"{n1(dom.get('storage_gb') or dom.get('stored_gb'))} GB stored · {vcu} provisioned search VCU"
-        rates = "Search Serverless, on-demand"
+        rates = "Search Serverless, performant"
         billed = "Search VCU-hours + storage + support"
     elif dom.get("peak_vcu") is not None:
         volume = f"{n1(dom.get('storage_gb') or dom.get('stored_gb'))} GB stored · {dom.get('peak_vcu')} search VCU"
@@ -3875,7 +3926,7 @@ def render_consolidation_html(acc: dict) -> str:
                     + bullets([
                         f"The headline was not matched to this sheet. The dominant solution is {dom_key}.",
                         "Quote the Observability sheet for that slice.",
-                        "Quote the es3-estimator on-demand figure for Search, not the storage-floor model.",
+                        "Quote the es3-estimator performant figure for Search, not the storage-floor model.",
                         "Cells written: " + written,
                     ]) + "</div>")
         else:
