@@ -2,7 +2,7 @@
 """Render Org report HTML+PDF into the artifacts folder and upload to Drive.
 
   python render_org_pdf.py --report exec --canvas …/…_canvas.json
-  python render_org_pdf.py --report full --org-json /tmp/org_report.json
+  python render_org_pdf.py --report full --org-json <folder>/<key>_org_report.json
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from report_mode import add_report_arg, html_name, normalize_report, pdf_name
+from report_mode import add_report_arg, html_name, normalize_report, pdf_name, seal_file, write_private
 
 
 def _esc(x) -> str:
@@ -49,6 +49,125 @@ def _find_chrome() -> str | None:
     return None
 
 
+def _label(row, key: str) -> str:
+    """Display text for one infrastructure row: `{"provider": "AWS", "deployments": 3}` → `AWS`."""
+    if isinstance(row, dict):
+        return str(row.get(key) or "—")
+    return str(row) if row not in (None, "") else "—"
+
+
+def range_text(rng) -> str:
+    """`2025-11-14 → 2026-11-13 (365 days)` from the fetch range."""
+    if not isinstance(rng, dict):
+        return str(rng) if rng else "—"
+    start, end, days = rng.get("start"), rng.get("end"), rng.get("days")
+    text = f"{start or '?'} → {end or '?'}"
+    return text + (f" ({days} days)" if days else "")
+
+
+def runout_text(bd: dict) -> str:
+    """Runout against the contract end, from the two dates themselves."""
+    runout, end = bd.get("runout_date"), bd.get("nearest_contract_end")
+    days = bd.get("runway_days")
+    if not runout:
+        return "no runout date" + (f"; contract end {str(end)[:10]}" if end else "")
+    text = f"runout {str(runout)[:10]}" + (f" ({days}d)" if days is not None else "")
+    if end:
+        r, e = str(runout)[:10], str(end)[:10]
+        text += f" {'before' if r < e else ('after' if r > e else 'on')} contract end {e}"
+    return text
+
+
+def save_text(fs: dict) -> str:
+    """One sentence on the serverless comparison, for the snapshot box."""
+    if not fs.get("lines"):
+        return "No serverless comparison in this report."
+    if "priced_n" in fs and not fs.get("priced_n"):
+        return "No deployment could be compared with Serverless."
+    try:
+        save = float(fs.get("save_vs_ech_yr"))
+    except (TypeError, ValueError):
+        return "No serverless comparison in this report."
+    scope = f" on {fs['priced_n']} compared deployments" if fs.get("priced_n") else ""
+    if save >= 0:
+        return f"Ballpark serverless saving {_money(save)}/yr{scope}."
+    return f"Serverless is a ballpark {_money(-save)}/yr more than ECH{scope}."
+
+
+def not_compared_text(fs: dict, max_names: int = 12) -> str:
+    """Who was left off both sides of the ECH-vs-Serverless comparison, and why."""
+    rows = fs.get("not_priced") or []
+    n = int(fs.get("not_priced_n") or len(rows))
+    if not n:
+        return ""
+    why = "; ".join(f"{v.get('n')} {reason}" for reason, v in (fs.get("not_priced_by_reason") or {}).items())
+    names = ", ".join(f"{r.get('name')} ({_num(r.get('ecu_mo'), 0)} ECU/mo)" for r in rows[:max_names])
+    more = f", and {n - max_names} more" if n > max_names else ""
+    return (
+        f"Not compared: {n} deployments, {_num(fs.get('not_priced_ecu_mo'), 0)} ECU/mo"
+        + (f" ({why})" if why else "")
+        + ". They are on neither side of the totals above"
+        + (f": {names}{more}." if names else ".")
+    )
+
+
+def storage_text(storage: dict) -> str:
+    """Stale snapshots and deployments left out of stored GB."""
+    parts = []
+    stale_n = storage.get("stale_n", len(storage.get("stale") or []))
+    if stale_n:
+        ages = [x.get("age_days") for x in storage.get("stale") or [] if x.get("age_days") is not None]
+        parts.append(
+            f"{stale_n} of {storage.get('deployments_with_telemetry')} storage snapshots are more than "
+            f"{storage.get('stale_after_days', 45)} days old"
+            + (f" (oldest snapshot {storage.get('as_of_oldest')})" if storage.get("as_of_oldest") else (f" (oldest {max(ages)} days)" if ages else ""))
+        )
+    gone_n = storage.get("not_billing_n", len(storage.get("not_billing") or []))
+    if gone_n:
+        parts.append(
+            f"{gone_n} deployments with no bill in the last {storage.get('billing_window_days', 90)} days are left out of "
+            f"stored GB ({_num(storage.get('not_billing_gb'), 1)} GB)"
+        )
+    return ". ".join(parts) + ("." if parts else "")
+
+
+def recommendations(bd: dict, fs: dict, storage: dict) -> list[str]:
+    """Recommendation lines that follow this org's own numbers."""
+    recs: list[str] = []
+    reasons = "; ".join(bd.get("reasons") or [])
+    if bd.get("priority"):
+        recs.append("Address overage / runway risk" + (f": {reasons}" if reasons else ""))
+    elif bd.get("watch"):
+        recs.append("Watch runway" + (f": {reasons}" if reasons else ""))
+    else:
+        recs.append("Monitor burndown; no overage flag")
+    lines = [l for l in (fs.get("lines") or []) if (l.get("n") if "n" in l else float(l.get("ech_mo") or 0) > 0)]
+    lines.sort(key=lambda l: -float(l.get("save_mo") or 0))
+    saving = [l for l in lines if float(l.get("save_mo") or 0) > 0]
+    for i, l in enumerate(saving):
+        proxy = " (priced on the Observability ladders; confirm with the Security estimator)" if "proxy" in str(l.get("project") or "").lower() else ""
+        recs.append(
+            f"Move {l.get('name')} to {l.get('project')}: about {_money(l.get('save_mo'))}/mo less than ECH "
+            f"({_money(l.get('ech_mo'))} → {_money(l.get('serverless_mo'))})"
+            + (", the largest saving line" if i == 0 and len(saving) > 1 else "")
+            + proxy
+        )
+    for l in lines:
+        if float(l.get("save_mo") or 0) <= 0:
+            recs.append(
+                f"Keep {l.get('name')} on ECH for now: the Serverless estimate is {_money(-float(l.get('save_mo') or 0))}/mo more "
+                f"({_money(l.get('ech_mo'))} → {_money(l.get('serverless_mo'))})"
+            )
+    if fs.get("not_priced_n"):
+        recs.append(
+            f"Size the {fs['not_priced_n']} deployments left out of the comparison "
+            f"({_num(fs.get('not_priced_ecu_mo'), 0)} ECU/mo) before quoting a total"
+        )
+    if storage.get("stale_n", len(storage.get("stale") or [])):
+        recs.append("Confirm stored GB with the customer: storage snapshots are stale")
+    return [f"P{i} — {text}" for i, text in enumerate(recs)]
+
+
 def render_html(canvas: dict, offload: dict, report: str = "exec") -> str:
     org = _esc(canvas.get("org"))
     bd = canvas.get("burndown") or {}
@@ -60,50 +179,75 @@ def render_html(canvas: dict, offload: dict, report: str = "exec") -> str:
     items = canvas.get("items") or []
     providers = infra.get("providers") or []
     regions = infra.get("regions") or []
-    cloud = providers[0] if providers else "—"
-    region = regions[0] if regions else "—"
+    summary = infra.get("summary") or {}
+    cloud = summary.get("provider") or (_label(providers[0], "provider") if providers else "—")
+    region = summary.get("region") or (_label(regions[0], "region") if regions else "—")
+    if len(providers) > 1:
+        cloud = f"{cloud} +{len(providers) - 1}"
+    if len(regions) > 1:
+        region = f"{region} +{len(regions) - 1}"
     ver = dep.get("by_version") or []
     v8 = sum(x.get("count") or 0 for x in ver if str(x.get("version", "")).startswith("8."))
     v9 = sum(x.get("count") or 0 for x in ver if str(x.get("version", "")).startswith("9."))
     kind_label = "Full report" if report == "full" else "Exec report"
     top_n = 15 if report == "full" else 8
+    ecu_mo = canvas.get("ecu_mo") if canvas.get("ecu_mo") is not None else canvas.get("ecu_monthly_avg")
 
-    snap = (
-        f"{_esc(bd.get('level'))}: runout {_esc(bd.get('runout_date'))} "
-        f"({_esc(bd.get('runway_days'))}d) before {_esc(bd.get('nearest_contract_end'))}. "
-        f"Ballpark serverless save {_money(fs.get('save_vs_ech_yr'))}/yr."
-    )
+    snap = f"{_esc(bd.get('level'))}: {_esc(runout_text(bd))}. {_esc(save_text(fs))}"
+
+    def dep_mo(i: dict):
+        return i.get("ecu_mo") if i.get("ecu_mo") is not None else (i.get("ecu_monthly_avg") or i.get("ecu"))
 
     dep_rows = "".join(
         f"<tr><td class='name'>{_esc(i.get('name'))}</td><td>{_esc(i.get('version'))}</td>"
-        f"<td class='num'>{_num(i.get('ecu_monthly_avg') or i.get('ecu'), 1)}</td>"
+        f"<td class='num'>{_num(dep_mo(i), 1)}</td>"
         f"<td class='num'>{_num(i.get('ml_ecu'), 0) if i.get('ml_ecu') else '—'}</td></tr>"
         for i in items[:top_n]
     )
     save_rows = "".join(
         f"<tr><td>{_esc(r.get('name'))}</td><td>{_esc(r.get('project'))}</td>"
+        f"<td class='num'>{_esc(r.get('n')) if r.get('n') is not None else '—'}</td>"
         f"<td class='num'>{_money(r.get('ech_mo'))}</td>"
         f"<td class='num'>{_money(r.get('serverless_mo'))}</td>"
         f"<td class='num'>{_money(r.get('save_mo'))}</td></tr>"
         for r in lines
     )
     save_rows += (
-        f"<tr><td class='name'>Total</td><td></td>"
+        f"<tr><td class='name'>Total, compared deployments</td><td></td>"
+        f"<td class='num'>{_esc(fs.get('priced_n')) if fs.get('priced_n') is not None else '—'}</td>"
         f"<td class='num'>{_money(fs.get('full_ech_mo'))}</td>"
         f"<td class='num'>{_money(fs.get('serverless_total_mo'))}</td>"
         f"<td class='num'>{_money(fs.get('save_vs_ech_mo'))}</td></tr>"
     )
+    not_compared = not_compared_text(fs)
+    storage_note = storage_text(storage)
+    truncated = canvas.get("truncated") or []
+    truncated_note = (
+        "This organization has more deployments than the fetch reads (" + ", ".join(truncated) + "). Totals are low."
+        if truncated
+        else ""
+    )
+    months = canvas.get("lookback_months")
+    ecu_basis = (
+        f"ECU / mo is lookback ECU ÷ {_num(months, 2)} months ({_esc(canvas.get('lookback_days'))} days ÷ 30.416). "
+        "Section 10 uses the same divisor. 1 ECU is $1 as billed."
+        if months
+        else ""
+    )
 
-    recs = [
-        "P0 — Address overage / runway risk before contract end",
-        "P1 — Move o11y+logs to Observability Serverless (largest save line)",
-        "P2 — Right-size idle/low-QPS search deps; ES3 for search-only GB",
-        "P3 — Security project (Complete proxy) — confirm with Security estimator/ETT",
-    ]
-    if not bd.get("priority"):
-        recs[0] = "P0 — Monitor burndown; no priority overage flag"
+    try:
+        save_yr = float(fs.get("save_vs_ech_yr"))
+        save_3yr = float(fs.get("save_vs_ech_3yr"))
+    except (TypeError, ValueError):
+        save_yr = save_3yr = None
+    if save_yr is None:
+        totals_note = ""
+    elif save_yr >= 0:
+        totals_note = f"Saving {_money(save_yr)}/yr · 3 yr {_money(save_3yr)}, compared deployments only."
+    else:
+        totals_note = f"Serverless is {_money(-save_yr)}/yr more · 3 yr {_money(-save_3yr)} more, compared deployments only."
 
-    rec_html = "".join(f"<li>{_esc(r)}</li>" for r in recs)
+    rec_html = "".join(f"<li>{_esc(r)}</li>" for r in recommendations(bd, fs, storage))
 
     env_heading = (
         "1–10. Environment & analysis (full)"
@@ -144,7 +288,7 @@ td.name {{ font-weight:550; }}
 <span class="pill">{_esc(canvas.get('segment'))}</span>
 <span class="pill">{_esc(canvas.get('geo'))}</span>
 <span class="pill warn">{_esc(bd.get('level'))}</span></div>
-<div class="meta">{_esc(canvas.get('range'))} · refreshed {_esc(canvas.get('generated_at'))} · org {_esc(canvas.get('org_id'))}</div>
+<div class="meta">{_esc(range_text(canvas.get('range')))} · refreshed {_esc(canvas.get('generated_at'))} · org {_esc(canvas.get('org_id'))}</div>
 <div class="callout"><div class="t">Executive snapshot</div>{snap}</div>
 <section class="card"><h2>{env_heading}</h2>
 <div class="stats">
@@ -155,12 +299,13 @@ td.name {{ font-weight:550; }}
 </div>
 <div class="stats">
 <div class="stat"><div class="v">{_num(canvas.get('total_ecu'),0)}</div><div class="l">ECU (lookback)</div></div>
-<div class="stat"><div class="v">{_num(canvas.get('ecu_monthly_avg'),0)}</div><div class="l">ECU / mo</div></div>
+<div class="stat"><div class="v">{_num(ecu_mo,0)}</div><div class="l">ECU / mo</div></div>
 <div class="stat"><div class="v">{_num(storage.get('data_stored_gb'),1)} GB</div><div class="l">Data stored</div></div>
 <div class="stat"><div class="v">{_esc(bd.get('runway_days'))}d</div><div class="l">Runway → {_esc(bd.get('runout_date'))}</div></div>
 </div>
+<p class="meta">{_esc(ecu_basis)} {_esc(storage_note)} {_esc(truncated_note)}</p>
 <h3>Top deployments</h3>
-<table><thead><tr><th>Deployment</th><th>Ver</th><th class="num">ECU / mo</th><th class="num">ML</th></tr></thead>
+<table><thead><tr><th>Deployment</th><th>Ver</th><th class="num">ECU / mo</th><th class="num">ML ECU (lookback)</th></tr></thead>
 <tbody>{dep_rows}</tbody></table>
 </section>
 <section class="card"><h2>9. Projected usage &amp; recommendations</h2>
@@ -168,14 +313,15 @@ td.name {{ font-weight:550; }}
 <p class="meta">Projection {_money(bd.get('annual_projection'))}/yr · ARR {_money(canvas.get('arr'))}</p>
 </section>
 <section class="card"><h2>10. Serverless move analysis (full_split)</h2>
-<table><thead><tr><th>Project</th><th>Method</th><th class="num">ECH $/mo</th>
+<table><thead><tr><th>Project</th><th>Method</th><th class="num">Deployments</th><th class="num">ECH $/mo</th>
 <th class="num">Serverless $/mo</th><th class="num">Save $/mo</th></tr></thead>
 <tbody>{save_rows}</tbody></table>
-<p class="meta">Save {_money(fs.get('save_vs_ech_yr'))}/yr · 3yr {_money(fs.get('save_vs_ech_3yr'))}.
+<p class="meta">{_esc(totals_note)}
 Retention { _esc(fs.get('retention_months_assumed')) } mo · Security = Complete proxy · confirm estimators/ETT.
 Do not put all data on ES3 Search (all_es3 anti-pattern).</p>
+<p class="meta">{_esc(not_compared)}</p>
 </section>
-<div class="footer">Generated by cloud-tracker-org-report · render_org_pdf.py</div>
+<div class="footer">Generated by k360-org-report · render_org_pdf.py</div>
 </body></html>
 """
 
@@ -240,7 +386,7 @@ def main() -> None:
     key = canvas_path.name.replace("_canvas.json", "")
     html_path = out_dir / html_name(key, report)
     pdf_path = out_dir / pdf_name(key, report)
-    html_path.write_text(render_html(canvas, offload, report=report))
+    write_private(html_path, render_html(canvas, offload, report=report))
     print(f"HTML → {html_path}", flush=True)
 
     wrote_pdf = False
@@ -248,6 +394,7 @@ def main() -> None:
         chrome = _find_chrome()
         if chrome:
             chrome_pdf(chrome, html_path, pdf_path)
+            seal_file(pdf_path)
             wrote_pdf = True
             print(f"PDF  → {pdf_path}", flush=True)
         else:

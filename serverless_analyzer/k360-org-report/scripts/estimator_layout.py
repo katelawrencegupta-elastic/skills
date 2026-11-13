@@ -2,6 +2,8 @@
 
 Every script that writes an estimator by cell address checks the copy against
 this file first, so a moved row stops the run instead of filling the wrong cell.
+The Search (ES3) estimator has no entry in TEMPLATE_ANCHORS yet, so no script
+fills it: see ES3_LAYOUT_MISSING.
 `diag-serverless-consolidation/scripts/quote_checks.py` re-exports these names.
 When an estimator release moves a row, change the cell maps, this file, and
 `diag-serverless-consolidation/references/sizing-cells.md` together.
@@ -13,6 +15,15 @@ import re
 VERSION_TAB = "Version Control"
 OBSERVABILITY_TAB = "Observability Estimator"
 SECURITY_TAB = "Security Estimator"
+ES3_TAB = "Estimator"
+REFERENCE_TAB = "Estimator_Reference"
+
+# Golden templates. They are copied, never written. The env names are the overrides
+# that point a run at another template; an id set there is a template too.
+GOLDEN_ES3 = "1Jsi5cMIDGfaP-S1_xqDcGeMYJSgklcBbu4dSJAEjlA0"
+GOLDEN_OBSERVABILITY = "1tUdwJbTmd4helFOzEHMi_gpHw7qu_aCgprjlqmHh2hs"  # v1.22
+GOLDEN_SECURITY = "1b91Uoa2e4vBrep_7I4RoY_8Mr19poqaUgWl7LqhIOqY"       # v2.6
+TEMPLATE_ENV = ("ES3_SHEET_ID", "O11Y_SHEET_ID", "SECURITY_SHEET_ID")
 
 # Each anchor is the text beside a cell a script writes or reads. `min_version`
 # is the oldest layout these addresses fit. A sheet prints 1.20 as "1.2", so
@@ -74,6 +85,126 @@ TEMPLATE_ANCHORS = {
         },
     },
 }
+
+# Cells fetch_org.py builds for the Search (ES3) estimator, tab `Estimator`.
+# Their meaning comes from the code that fills them. The label text beside each
+# cell on the sheet is not recorded anywhere in this repository, so there is no
+# "es3" entry in TEMPLATE_ANCHORS and the fill is refused. To turn it on, read
+# the label beside each of these cells (and beside C5 and C6) on the golden ES3
+# template, add them as TEMPLATE_ANCHORS["es3"] = {"min_version": <number, or
+# None when the workbook has no Version Control tab>, "labels": {...}}, and set
+# the block's `layout` in fetch_org.estimator_payload to that version.
+ES3_INPUT_CELLS = {
+    "C12": "search stored GB",
+    "C13": "documents",
+    "C14": "average document size, KB",
+    "C19": "peak QPS",
+    "C20": "peak query complexity",
+    "C21": "peak share of hours",
+    "C23": "non-peak QPS",
+    "C24": "non-peak query complexity",
+    "C25": "non-peak share of hours",
+    "C27": "idle share of hours",
+    "C30": "ingest documents per second",
+    "C31": "average document size, bytes",
+    "C32": "active ingest hours a month",
+}
+ES3_LAYOUT_MISSING = (
+    "The Search (ES3) estimator is not filled: estimator_layout.py records no layout for it, "
+    "so its copy cannot be checked before cells are written. "
+    "Add TEMPLATE_ANCHORS[\"es3\"] with the label beside each input cell to turn the fill on."
+)
+
+
+def layout_recorded(kind: str) -> bool:
+    """True when TEMPLATE_ANCHORS can check a copy of this estimator."""
+    spec = TEMPLATE_ANCHORS.get(kind)
+    return bool(spec and spec.get("labels"))
+
+
+def sheet_id(value) -> str:
+    """Spreadsheet id from a bare id or a docs.google.com/spreadsheets/d/<id>/… URL."""
+    text = str(value or "").strip()
+    match = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", text)
+    return match.group(1) if match else text
+
+
+def golden_template_ids(environ=None) -> set[str]:
+    """Ids no fill may write to: the built-in templates and any id the env overrides name."""
+    import os
+
+    env = os.environ if environ is None else environ
+    ids = {GOLDEN_ES3, GOLDEN_OBSERVABILITY, GOLDEN_SECURITY}
+    for name in TEMPLATE_ENV:
+        if env.get(name):
+            ids.add(sheet_id(env[name]))
+    return {i for i in ids if i}
+
+
+def is_golden_template(spreadsheet_id, environ=None) -> bool:
+    sid = sheet_id(spreadsheet_id)
+    return bool(sid) and sid in golden_template_ids(environ)
+
+
+# ----------------------------------------------------------------------------- region
+# Region dropdown strings on the estimators: "AWS: us-east-1 (Virginia)".
+_REGION_OPT = re.compile(r"^(AWS|AZURE|GCP)\s*:?\s*([a-z0-9\-]+)", re.IGNORECASE)
+_COMPASS = "east|west|north|south|central|southeast|northeast"
+_PLACES = (
+    "us|europe|asia|india|australia|uk|japan|brazil|canada|germany|france|norway|sweden|"
+    "switzerland|uae|korea|africa|qatar|poland|italy|israel|spain"
+)
+
+
+def _norm(text) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
+def _region_aliases(region: str) -> set[str]:
+    """`eastus2` and `us-east-2` are the same Azure region; so are `westeurope` and `europe-west`."""
+    r = _norm(re.sub(r"^(aws|gcp|azure)-", "", str(region or "").strip().lower()))
+    out = {r} if r else set()
+    m = re.match(rf"^({_COMPASS})({_PLACES})(\d*)$", r)
+    if m:
+        out.add(f"{m.group(2)}{m.group(1)}{m.group(3)}")
+    m = re.match(rf"^({_PLACES})({_COMPASS})(\d*)$", r)
+    if m:
+        out.add(f"{m.group(2)}{m.group(1)}{m.group(3)}")
+    return out
+
+
+def region_options(values) -> list[str]:
+    """Every 'PROVIDER: region (Name)' string in a block of sheet values, in sheet order."""
+    out: list[str] = []
+    for row in values or []:
+        for cell in row or []:
+            if isinstance(cell, str) and _REGION_OPT.match(cell.strip()) and cell.strip() not in out:
+                out.append(cell.strip())
+    return out
+
+
+def match_region(provider, region, options) -> tuple[str | None, str]:
+    """→ (option, how). how is exact, alias, or none.
+
+    Only an option of the same provider whose region is this region is a
+    match. With no match the option is None and how is "none": the caller
+    leaves the sheet's own value and never writes another cloud's or another
+    region's option.
+    """
+    prov = str(provider or "").strip().upper()
+    want = _region_aliases(region or "")
+    if not prov or not want:
+        return None, "none"
+    plain = _norm(re.sub(r"^(aws|gcp|azure)-", "", str(region or "").strip().lower()))
+    for option in options or []:
+        m = _REGION_OPT.match(option)
+        if not m or m.group(1).upper() != prov:
+            continue
+        token = _norm(m.group(2))
+        if token in want:
+            return option, "exact" if token == plain else "alias"
+    return None, "none"
+
 
 # Input cells on the Observability estimator, v1.22.
 OBSERVABILITY_LAYOUT = "1.22"
@@ -156,6 +287,9 @@ def template_check(kind: str, labels: dict, version) -> dict:
             problems.append(f"{cell} should read '{want}' and is '{shown}'")
     number = _version_number(version)
     newer = False
+    if spec.get("min_version") is None:
+        # This workbook has no version to read. The labels are the whole check.
+        return {"kind": kind, "version": None if version is None else str(version), "newer": False, "problems": problems}
     if number is None:
         problems.append(f"the Version Control tab gave no readable version ({version!r})")
     elif number < spec["min_version"] - 1e-9:
@@ -175,8 +309,12 @@ def cell_range(tab: str, a1: str) -> str:
 
 def layout_ranges(kind: str, tab: str) -> tuple[list[str], list[str]]:
     """Anchor cells, and the A1 ranges that read them plus the version column."""
-    cells = list(TEMPLATE_ANCHORS[kind]["labels"])
-    return cells, [cell_range(tab, a1) for a1 in cells] + [f"'{VERSION_TAB}'!A1:A300"]
+    spec = TEMPLATE_ANCHORS[kind]
+    cells = list(spec["labels"])
+    ranges = [cell_range(tab, a1) for a1 in cells]
+    if spec.get("min_version") is not None:
+        ranges.append(f"'{VERSION_TAB}'!A1:A300")
+    return cells, ranges
 
 
 def check_value_ranges(kind: str, cells: list[str], value_ranges: list[dict]) -> dict:

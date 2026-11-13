@@ -14,3 +14,5 @@ python3 -m venv ~/.config/serverless-analyzer/venv
 
 Env: `ES3_SHEET_ID`, `O11Y_SHEET_ID`, `SERVERLESS_SHEETS_PY`, `CHROME_PATH`.
 Re-auth if token predates Drive scopes. Apps Script fallback: [EstimatorImport.gs](apps-script/EstimatorImport.gs).
+
+`ES3_SHEET_ID`, `O11Y_SHEET_ID` and `SECURITY_SHEET_ID` name templates. A template is copied and never filled: `push_estimator.py --no-copy` and the Apps Script importer refuse those ids and the built-in golden ids.

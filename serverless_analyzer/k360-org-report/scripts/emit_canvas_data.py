@@ -3,7 +3,7 @@
 
 Keeps the agent from loading ~250KB payloads into context.
 
-  python emit_canvas_data.py --org-json /tmp/org_report.json --out-dir serverless_analyzer/diag_artifacts/Acme_2026-11-02
+  python emit_canvas_data.py --org-json <folder>/<key>_org_report.json --out-dir serverless_analyzer/diag_artifacts/Acme_2026-11-02
 """
 from __future__ import annotations
 
@@ -18,6 +18,8 @@ from report_mode import (
     canvas_suggestion,
     normalize_report,
     pdf_name,
+    seal_dir,
+    write_private,
 )
 from skill_paths import artifacts_root
 
@@ -43,6 +45,7 @@ def _trim_dep(d: dict) -> dict:
         "platform",
         "use_case",
         "ecu",
+        "ecu_mo",
         "ecu_monthly_avg",
         "ecu_monthly_avg_active",
         "months_active",
@@ -79,7 +82,20 @@ def _trim_ml(ml: dict) -> dict:
         out["by_deployment"] = by[:10]
     vec = ml.get("vectors") or {}
     if isinstance(vec, dict):
-        slim_v = {k: vec[k] for k in ("count", "dims", "notes", "total") if k in vec}
+        slim_v = {
+            k: vec[k]
+            for k in (
+                "count",
+                "with_elser",
+                "with_named_models",
+                "unnamed_model",
+                "model_counts",
+                "dims",
+                "notes",
+                "total",
+            )
+            if k in vec
+        }
         items = vec.get("by_deployment") or vec.get("items") or []
         if isinstance(items, list):
             slim_v["items"] = items[:10]
@@ -147,8 +163,16 @@ def _trim_monthly(monthly: dict, top_n: int = 8) -> dict:
         else:
             out["series_names"] = names
             out["ecu_series"] = series
-    by = monthly.get("by_deployment") or []
-    if isinstance(by, list):
+    # fetch_org.py writes by_deployment as {name: {months, ecu, avg, avg_active}}. Keep the
+    # top_n by ECU; the month labels are already in `months`.
+    by = monthly.get("by_deployment") or {}
+    if isinstance(by, dict):
+        ranked = sorted(
+            ((n, r) for n, r in by.items() if isinstance(r, dict)),
+            key=lambda x: -sum(float(v or 0) for v in (x[1].get("ecu") or [])),
+        )[:top_n]
+        out["by_deployment"] = {n: {k: r[k] for k in ("ecu", "avg", "avg_active") if k in r} for n, r in ranked}
+    elif isinstance(by, list):
         out["by_deployment"] = by[:top_n]
     return out
 
@@ -194,17 +218,23 @@ def _trim_chart(chart: dict, max_points: int = 52) -> dict:
 def build_canvas(data: dict, top_deps: int = 12) -> dict:
     org = data.get("organization") or {}
     deps = data.get("deployments") or {}
-    items = [_trim_dep(x) for x in _top(deps.get("items") or [], top_deps, "ecu_monthly_avg")]
+    totals = data.get("totals") or {}
+    items = [_trim_dep(x) for x in _top(deps.get("items") or [], top_deps, "ecu")]
     storage = data.get("storage") or {}
     storage_out = {
         k: storage[k]
         for k in (
             "as_of",
+            "as_of_oldest",
             "deployments_with_telemetry",
             "data_stored_gb",
             "docs_count",
             "avg_doc_kb",
             "calculated_data_stored_gb",
+            "stale_after_days",
+            "stale_gb",
+            "billing_window_days",
+            "not_billing_gb",
             "notes",
         )
         if k in storage
@@ -214,6 +244,12 @@ def build_canvas(data: dict, top_deps: int = 12) -> dict:
         storage_out["by_deployment"] = [
             _trim_storage_row(r) for r in _top(by_st, 15, "data_stored_gb")
         ]
+    # Counts are exact. The name lists are the largest 15 by stored GB.
+    for key in ("stale", "not_billing"):
+        rows = storage.get(key)
+        if isinstance(rows, list):
+            storage_out[f"{key}_n"] = len(rows)
+            storage_out[key] = rows[:15]
 
     infra = data.get("infrastructure") or {}
     infra_out = {
@@ -235,17 +271,26 @@ def build_canvas(data: dict, top_deps: int = 12) -> dict:
         "org_id": org.get("id"),
         "geo": org.get("geo") or org.get("region"),
         "segment": org.get("segment"),
-        "ae": (org.get("ae") or org.get("account_executive")),
-        "hv": org.get("hv") or org.get("high_value_contacts") or [],
-        "arr": org.get("arr"),
+        # fetch_org.py keeps the pivot's own field names: AE, HV, ARR.
+        "ae": org.get("AE") or org.get("ae") or org.get("account_executive"),
+        "hv": org.get("HV") or org.get("hv") or org.get("high_value_contacts") or [],
+        "arr": org.get("ARR") if org.get("ARR") is not None else org.get("arr"),
         "customer_type": org.get("customer_type"),
         "license": (data.get("license") or org.get("license")),
         "range": data.get("range"),
         "generated_at": data.get("generated_at"),
-        "total_ecu": (data.get("totals") or {}).get("ecu") or data.get("total_ecu"),
-        "ecu_monthly_avg": data.get("ecu_monthly_avg")
-        or (data.get("totals") or {}).get("ecu_monthly_avg"),
-        "months_n": data.get("months_n") or (data.get("totals") or {}).get("months_n"),
+        "total_ecu": totals.get("ecu") or data.get("total_ecu"),
+        # The report's ECU / mo: lookback ECU ÷ (days ÷ 30.416), the divisor §10 uses.
+        # `ecu_monthly_avg` carries the same figure so the two never differ on a page.
+        # An org JSON fetched before `ecu_mo` existed falls back to the calendar-month mean.
+        "ecu_mo": totals.get("ecu_mo") if totals.get("ecu_mo") is not None else totals.get("ecu_monthly_avg"),
+        "ecu_monthly_avg": totals.get("ecu_mo") if totals.get("ecu_mo") is not None else totals.get("ecu_monthly_avg"),
+        "lookback_days": totals.get("lookback_days") or (data.get("range") or {}).get("days"),
+        "lookback_months": totals.get("lookback_months"),
+        # Mean of calendar-month totals, and the number of calendar months the range touches.
+        "ecu_monthly_avg_calendar": totals.get("ecu_monthly_avg"),
+        "months_n": totals.get("months") or data.get("months_n"),
+        "truncated": data.get("truncated") or [],
         "burndown": data.get("burndown") or {},
         "deployments": {
             "count": deps.get("count"),
@@ -268,8 +313,12 @@ def build_canvas(data: dict, top_deps: int = 12) -> dict:
 
 def build_offload(data: dict) -> dict:
     off = data.get("offload") or {}
-    keep = ("by_kind", "full_split", "hybrid", "all_es3", "notes", "analysis")
+    keep = ("by_kind", "full_split", "hybrid", "all_es3", "search_share", "notes", "analysis")
     out = {k: off[k] for k in keep if k in off}
+    fs = out.get("full_split")
+    if isinstance(fs, dict) and isinstance(fs.get("not_priced"), list) and len(fs["not_priced"]) > 25:
+        # not_priced_n and not_priced_ecu_mo cover every deployment; the list is the largest 25.
+        out["full_split"] = {**fs, "not_priced": fs["not_priced"][:25], "not_priced_listed": 25}
     ea = off.get("estimator_artifacts")
     if ea:
         # Drop bulky nested sheet cell dumps if any; keep paths/urls
@@ -282,6 +331,7 @@ def build_offload(data: dict) -> dict:
                 "pdf",
                 "pdf_expected",
                 "artifacts",
+                "es3_not_filled",
                 "date",
                 "customer",
             )
@@ -290,9 +340,114 @@ def build_offload(data: dict) -> dict:
     return out
 
 
+def _usd(value) -> str:
+    try:
+        return f"${float(value):,.0f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _n0(value) -> str:
+    try:
+        return f"{float(value):,.0f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def runout_phrase(bd: dict) -> str:
+    """`runout D (Nd), before|after|on contract end E`, from the two dates themselves."""
+    runout, end = bd.get("runout_date"), bd.get("nearest_contract_end")
+    days = bd.get("runway_days")
+    text = f"runout {runout or 'unknown'}" + (f" ({days}d)" if days is not None else "")
+    if runout and end:
+        r, e = str(runout)[:10], str(end)[:10]
+        rel = "before" if r < e else ("after" if r > e else "on")
+        text += f", {rel} contract end {e}"
+    elif end:
+        text += f"; contract end {str(end)[:10]}"
+    return text
+
+
+def not_compared_phrase(fs: dict) -> str | None:
+    """How many deployments, and how much ECU a month, the ECH-vs-Serverless comparison leaves out."""
+    n = int(fs.get("not_priced_n") or 0)
+    if not n:
+        return None
+    why = "; ".join(
+        f"{v.get('n')} {reason}" for reason, v in (fs.get("not_priced_by_reason") or {}).items()
+    )
+    return (
+        f"{n} deployments ({_n0(fs.get('not_priced_ecu_mo'))} ECU/mo) are not in the Serverless comparison"
+        + (f": {why}" if why else "")
+    )
+
+
+def build_caveats(data: dict, offload: dict) -> list[str]:
+    """What a reader must know before quoting a number from this report."""
+    out: list[str] = []
+    fs = offload.get("full_split") or {}
+    phrase = not_compared_phrase(fs)
+    if phrase:
+        out.append(phrase)
+    st = data.get("storage") or {}
+    stale = st.get("stale") or []
+    if stale:
+        ages = [x.get("age_days") for x in stale if x.get("age_days") is not None]
+        out.append(
+            f"{len(stale)} of {st.get('deployments_with_telemetry')} storage snapshots are older than "
+            f"{st.get('stale_after_days', 45)} days" + (f" (oldest {max(ages)} days)" if ages else "")
+        )
+    gone = st.get("not_billing") or []
+    if gone:
+        out.append(
+            f"{len(gone)} deployments with no bill in the last {st.get('billing_window_days', 90)} days are left out of "
+            f"stored GB ({_n0(st.get('not_billing_gb'))} GB)"
+        )
+    if data.get("truncated"):
+        out.append("more deployments than the fetch reads: " + ", ".join(data["truncated"]) + " truncated")
+    payload = (data.get("offload") or {}).get("apps_script_payload") or {}
+    if ((payload.get("es3") or {}).get("hour_mix") or {}).get("assumed"):
+        out.append("Search hour mix is assumed (26% peak / 74% non-peak), not measured")
+    ea = (data.get("offload") or {}).get("estimator_artifacts") or {}
+    for a in ea.get("artifacts") or []:
+        if a.get("region_match") == "none":
+            w = a.get("region_wanted") or {}
+            out.append(
+                f"{a.get('product')} estimator has no option for {w.get('provider')} {w.get('region')}; "
+                "the copy keeps the template's region"
+            )
+    if ea.get("es3_not_filled"):
+        out.append("Search (ES3) estimator copy was not filled: no layout is recorded for it")
+    return out
+
+
 def build_summary(data: dict, canvas: dict, offload: dict, paths: dict, report: str) -> dict:
     bd = canvas.get("burndown") or {}
     fs = (offload.get("full_split") or {})
+    caveats = build_caveats(data, offload)
+    priced_n = fs.get("priced_n")
+    if fs.get("lines") and not priced_n and "priced_n" in fs:
+        split = "Serverless full_split: no deployment could be compared"
+    else:
+        save_mo = fs.get("save_vs_ech_mo")
+        try:
+            more = float(save_mo) < 0
+        except (TypeError, ValueError):
+            more = False
+        split = (
+            f"Serverless full_split: {'costs' if more else 'saves'} ~{_usd(abs(save_mo) if more else save_mo)}/mo "
+            f"(~{_usd(abs(fs.get('save_vs_ech_yr') or 0) if more else fs.get('save_vs_ech_yr'))}/yr)"
+            + (" more than ECH" if more else "")
+            + (f" on {priced_n} compared deployments" if priced_n is not None else "")
+        )
+    bullets = [
+        f"Report: {report} · {CANVAS_LAYOUT[report]} · {paths.get('folder')}",
+        f"Overage/runway: {bd.get('level')} · {runout_phrase(bd)}",
+        f"ECU/mo {_n0(canvas.get('ecu_mo'))} · projection ~{_usd(bd.get('annual_projection'))} vs ARR ~{_usd(canvas.get('arr'))}",
+        split,
+    ]
+    if caveats:
+        bullets.append("Caveats: " + "; ".join(caveats))
     return {
         "org": canvas.get("org"),
         "report": report,
@@ -305,21 +460,20 @@ def build_summary(data: dict, canvas: dict, offload: dict, paths: dict, report: 
         "contract_end": bd.get("nearest_contract_end"),
         "annual_projection": bd.get("annual_projection"),
         "arr": canvas.get("arr"),
+        "ecu_mo": canvas.get("ecu_mo"),
         "deps": (canvas.get("deployments") or {}).get("count"),
         "full_split_save_mo": fs.get("save_vs_ech_mo"),
         "full_split_save_yr": fs.get("save_vs_ech_yr"),
         "serverless_total_mo": fs.get("serverless_total_mo"),
         "full_ech_mo": fs.get("full_ech_mo"),
+        "compared_deployments": fs.get("priced_n"),
+        "not_compared_deployments": fs.get("not_priced_n"),
+        "not_compared_ecu_mo": fs.get("not_priced_ecu_mo"),
         "all_es3_mo": (fs.get("vs_all_es3") or offload.get("all_es3") or {}).get("all_es3_mo")
         or (offload.get("all_es3") or {}).get("mo"),
+        "caveats": caveats,
         "paths": paths,
-        "chat_bullets_hint": [
-            f"Report: {report} · {CANVAS_LAYOUT[report]}",
-            f"Overage/runway: {bd.get('level')} · runout {bd.get('runout_date')} ({bd.get('runway_days')}d)",
-            f"Projection ~${bd.get('annual_projection')} vs ARR ~${canvas.get('arr')}",
-            f"Serverless full_split save ~${fs.get('save_vs_ech_mo')}/mo (~${fs.get('save_vs_ech_yr')}/yr)",
-            f"Artifacts: {paths.get('folder')}",
-        ],
+        "chat_bullets_hint": bullets,
     }
 
 
@@ -356,7 +510,7 @@ def main() -> None:
         out_dir = org_path.parent
         if out_dir == Path("/tmp") or out_dir.resolve() == Path("/tmp"):
             out_dir = artifacts_root() / key
-    out_dir.mkdir(parents=True, exist_ok=True)
+    seal_dir(out_dir)
 
     canvas = build_canvas(data, top_deps=args.top_deps)
     offload = build_offload(data)
@@ -364,8 +518,8 @@ def main() -> None:
     offload_path = out_dir / f"{key}_offload.json"
     summary_path = out_dir / f"{key}_summary.json"
 
-    canvas_path.write_text(json.dumps(canvas, separators=(",", ":")))
-    offload_path.write_text(json.dumps(offload, separators=(",", ":")))
+    write_private(canvas_path, json.dumps(canvas, separators=(",", ":")))
+    write_private(offload_path, json.dumps(offload, separators=(",", ":")))
 
     paths = {
         "folder": str(out_dir),
@@ -379,7 +533,7 @@ def main() -> None:
         "canvas_file_hint": canvas_suggestion(slug, report),
     }
     summary = build_summary(data, canvas, offload, paths, report)
-    summary_path.write_text(json.dumps(summary, indent=2))
+    write_private(summary_path, json.dumps(summary, indent=2))
 
     print(
         json.dumps(

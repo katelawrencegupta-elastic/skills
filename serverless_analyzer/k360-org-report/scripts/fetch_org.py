@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fetch compact K360 org-report JSON for canvas embedding.
 
-  python scripts/fetch_org.py --org "Name" --out /tmp/org.json
+  python scripts/fetch_org.py --org "Name" --out <artifacts folder>/org_report.json
   # defaults: 365d lookback, weekly chart, compact (no indent, no per-type dump)
 """
 from __future__ import annotations
@@ -11,9 +11,10 @@ import json
 import re
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from statistics import median
 
@@ -28,6 +29,29 @@ ORG_KEEP = (
     "name", "id", "AE", "ARR", "HV", "segment", "geo", "region", "contract", "customer_type"
 )
 
+# One month is 30.416 days everywhere a lookback total becomes a monthly figure.
+DAYS_PER_MONTH = 30.416
+# Size of every terms aggregation on deployment.name. An aggregation that still
+# leaves deployments out is named in the output's `truncated` list.
+DEP_TERMS_SIZE = 300
+# A storage snapshot older than this many days before the range end is stale.
+STORAGE_STALE_DAYS = 45
+# A deployment with no bill in this many days before the range end is not in org stored GB.
+STORAGE_BILLING_DAYS = 90
+# Search hour mix used when no hour shares were measured: peak, non-peak, idle.
+ASSUMED_HOUR_MIX = (26.0, 74.0, 0.0)
+# Ingest hours a month used when no active hours were measured.
+ASSUMED_ACTIVE_HOURS = 730
+
+
+def lookback_months(days) -> float:
+    """Months in a lookback of `days` days. ECU over the lookback ÷ this is ECU a month."""
+    try:
+        n = float(days or 0)
+    except (TypeError, ValueError):
+        n = 0.0
+    return max(n, 1.0) / DAYS_PER_MONTH
+
 
 def load_env(path: Path) -> dict[str, str]:
     if not path.exists():
@@ -40,6 +64,20 @@ def load_env(path: Path) -> dict[str, str]:
         k, v = line.split("=", 1)
         env[k.strip()] = v.strip().strip("\"'")
     return env
+
+
+def es_base_and_key(env: dict[str, str]) -> tuple[str, str]:
+    """Elasticsearch base URL and API key from .env. The URL must be https with no credentials in it."""
+    kibana = (env.get("KIBANA_URL") or env.get("ELASTIC_KIBANA_URL") or "").strip()
+    key = env.get("ELASTIC_API_KEY") or env.get("ES_API_KEY")
+    if not kibana or not key:
+        raise SystemExit("Need KIBANA_URL and ELASTIC_API_KEY in .env")
+    parsed = urllib.parse.urlsplit(kibana)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise SystemExit("KIBANA_URL must be https")
+    if parsed.username or parsed.password:
+        raise SystemExit("KIBANA_URL must not include a username or password")
+    return kibana.rstrip("/").replace(".kb.", ".es."), key
 
 
 def es_post(base: str, key: str, path: str, body: dict) -> dict:
@@ -146,8 +184,17 @@ _ML_SKU_RE = re.compile(
     r"\.es\.ml\.([^_]+)_(.+?)_(\d+)_(\d+)$",
     re.IGNORECASE,
 )
+# Cloud-Enterprise_aws.es.ml.c5d_us-west-2_2048_3            (AWS: no provider prefix on the region)
+# Cloud-Enterprise_azure.es.datahot.edsv4_azure-eastus2_8192_2
+# Cloud-Standard_gcp.es.datafrozen.n2.68x10x95_gcp-europe-west1_61440_2
 _CLOUD_SKU_RE = re.compile(
-    r"Cloud-[^_]+_((?:aws|gcp|azure))\.(es\.(?:datahot|datawarm|datafrozen|datacold|master|ml|coordinating)\.[^_]+)_((?:aws|gcp|azure)-[a-z0-9-]+)_\d+_\d+",
+    r"Cloud-[^_]+_((?:aws|gcp|azure))\.(es\.(?:datahot|datawarm|datafrozen|datacold|master|ml|coordinating)\.[^_]+)"
+    r"_(?:(?:aws|gcp|azure)-)?([a-z0-9-]+)_\d+_\d+",
+    re.IGNORECASE,
+)
+# Provider and region of any Cloud-* SKU (Kibana, APM, legacy instance names).
+_CLOUD_REGION_RE = re.compile(
+    r"Cloud-[^_]+_((?:aws|gcp|azure))\.[^_]+_(?:(?:aws|gcp|azure)-)?([a-z0-9-]+)_\d+_\d+$",
     re.IGNORECASE,
 )
 
@@ -158,7 +205,11 @@ def is_ml_sku(sku: str) -> bool:
 
 
 def parse_cloud_sku(sku: str) -> dict | None:
-    """Extract provider / instance family / region from Cloud-* capacity SKUs."""
+    """Extract provider / instance family / region from Cloud-* capacity SKUs.
+
+    The region is returned without a provider prefix: `us-west-2`, `eastus2`,
+    `europe-west1`. AWS SKUs carry no prefix; Azure and GCP SKUs do.
+    """
     m = _CLOUD_SKU_RE.search(sku or "")
     if not m:
         return None
@@ -167,9 +218,17 @@ def parse_cloud_sku(sku: str) -> dict | None:
     return {
         "provider": provider.upper(),
         "instance": instance,
-        "region": region,
+        "region": region.lower(),
         "tier": tier,
     }
+
+
+def cloud_sku_region(sku: str) -> dict | None:
+    """Provider and region of any Cloud-* SKU, capacity or not. None when the SKU is not one."""
+    m = _CLOUD_REGION_RE.search(sku or "")
+    if not m:
+        return None
+    return {"provider": m.group(1).upper(), "region": m.group(2).lower()}
 
 
 def decode_ml_sku(sku: str) -> dict:
@@ -270,6 +329,27 @@ def _complexity(ms: float | None) -> str | None:
     if ms < 200:
         return "Medium"
     return "High"
+
+
+def hour_shares(qps: list[float]) -> tuple[float, float, float]:
+    """Peak, non-peak and idle share of days, in percent. Each is 0–100 and the three sum to 100.
+
+    Every day is in exactly one class. A day at or below 1 QPS and at or below
+    the 10th percentile is idle. Of the other days, those at or above the 75th
+    percentile are peak. The rest are non-peak.
+    """
+    vals = [float(q) for q in qps or []]
+    n = len(vals)
+    if not n:
+        return 0.0, 0.0, 0.0
+    p75 = _pctile(vals, 75)
+    p10 = _pctile(vals, 10)
+    idle_n = sum(1 for q in vals if q <= 1.0 and q <= p10)
+    peak_n = sum(1 for q in vals if not (q <= 1.0 and q <= p10) and q >= p75)
+    peak = min(100.0, max(0.0, round(100.0 * peak_n / n, 1)))
+    idle = min(100.0 - peak, max(0.0, round(100.0 * idle_n / n, 1)))
+    nonpeak = max(0.0, round(100.0 - peak - idle, 1))
+    return peak, nonpeak, round(idle, 1)
 
 
 def org_clause(org_ids: list[str]) -> dict:
@@ -398,7 +478,7 @@ def fetch_workload(base: str, key: str, org_id: str | list[str], avg_doc_bytes: 
     notes = [
         "Day averages from index_telemetry (≈1 sample/day); not peak-second QPS",
         "Complexity: Δsearch_time_ms/Δsearch_total → Low<50 / Med<200 / High",
-        "% hours = day-share proxy (qps≥p75 peak; idle only if a ~0-search day exists)",
+        "% hours = day-share proxy (idle: day ≤1 QPS and ≤p10; peak: other days ≥p75; rest non-peak; the three sum to 100)",
         "Ingest docs/sec = median daily Δdocs_count; active_hours/mo = active_day_frac×730",
     ]
 
@@ -423,11 +503,7 @@ def fetch_workload(base: str, key: str, org_id: str | list[str], avg_doc_bytes: 
     peak = max(clean, key=lambda r: r["qps"])
     non_q = median(qps)
     nonpeak = min(clean, key=lambda r: abs(r["qps"] - non_q))
-    p75 = _pctile(qps, 75) or non_q
-    peak_n = sum(1 for q in qps if q >= p75)
-    idle_n = 0 if min(qps) > 1.0 else sum(1 for q in qps if q <= (_pctile(qps, 10) or 0))
-    non_n = len(qps) - peak_n - idle_n
-    n = len(qps)
+    peak_pct, nonpeak_pct, idle_pct = hour_shares(qps)
     day_n = max(len(days) - 1, 1)
 
     return {
@@ -436,15 +512,15 @@ def fetch_workload(base: str, key: str, org_id: str | list[str], avg_doc_bytes: 
                 "qps": round(peak["qps"], 2),
                 "complexity": _complexity(peak["ms"]),
                 "complexity_ms": round(peak["ms"], 2),
-                "pct_hours_mo": round(100.0 * peak_n / n, 1),
+                "pct_hours_mo": peak_pct,
             },
             "nonpeak": {
                 "qps": round(nonpeak["qps"], 2),
                 "complexity": _complexity(nonpeak["ms"]),
                 "complexity_ms": round(nonpeak["ms"], 2),
-                "pct_hours_mo": round(100.0 * non_n / n, 1),
+                "pct_hours_mo": nonpeak_pct,
             },
-            "idle_pct_hours_mo": round(100.0 * idle_n / n, 1),
+            "idle_pct_hours_mo": idle_pct,
         },
         "ingest": {
             "docs_per_sec": round(median(ingest_dps), 2) if ingest_dps else None,
@@ -471,16 +547,49 @@ _SEC_NAME_HINTS = ("security", "cyberark", "infoblox", "siem", "endpoint")
 
 
 def classify_dep_kind(name: str, families: dict | None) -> str:
-    """Bucket a deployment for serverless offload analysis."""
+    """Bucket a deployment for serverless offload analysis.
+
+    Security is tested first. A deployment whose use case is security carries
+    its ECU in `families.security`, and most deployments bill some
+    Observability type (the integrations server), so testing Observability
+    first sent every security deployment to Observability.
+    """
     n = (name or "").lower()
     fam = families or {}
-    if float(fam.get("observability") or 0) > 0 or any(h in n for h in _O11Y_NAME_HINTS):
-        return "o11y"
     if float(fam.get("security") or 0) > 0 or any(h in n for h in _SEC_NAME_HINTS):
         return "security"
+    if float(fam.get("observability") or 0) > 0 or any(h in n for h in _O11Y_NAME_HINTS):
+        return "o11y"
     if any(h in n for h in _LOG_NAME_HINTS):
         return "logs"
     return "search"
+
+
+FAMILY_KEYS = ("search", "observability", "security", "genai", "other")
+
+
+def split_families(types: dict[str, float], ecu: float, use_case: str | None) -> dict[str, float]:
+    """One deployment's ECU split across the solution families. The parts sum to `ecu`.
+
+    Billing `type` decides search, observability, genai and other. Billing has
+    no security type, so a deployment whose use case is security moves its
+    search, observability and other ECU to security. Inference stays in genai.
+    ECU that no listed type explains goes to other.
+    """
+    fam = {k: 0.0 for k in FAMILY_KEYS}
+    for t, c in (types or {}).items():
+        fam[family(t)] += float(c or 0)
+    fam["other"] += float(ecu or 0) - sum(fam.values())
+    if abs(fam["other"]) < 0.005:
+        fam["other"] = 0.0
+    if str(use_case or "").strip().lower() == "security":
+        fam["security"] = fam["search"] + fam["observability"] + fam["other"]
+        fam["search"] = fam["observability"] = fam["other"] = 0.0
+    return fam
+
+
+# Billing windows whose exact deployment roster is saved on the chart.
+BILLED_WINDOW_DAYS = (30, 90)
 
 
 def _tiered_cost(gb: float, edges: tuple, prices: tuple) -> float:
@@ -530,6 +639,35 @@ def price_o11y_serverless(
     }
 
 
+def search_hour_mix(workload: dict | None) -> dict:
+    """Peak / non-peak / idle percent of a 730 h month, for the Python price and the sheet alike.
+
+    Measured shares are normalised to 100. With no measured share (workload
+    skipped, or no index telemetry) the mix is ASSUMED_HOUR_MIX and `assumed`
+    is true.
+    """
+    search = (workload or {}).get("search") or {}
+
+    def _pct(v) -> float:
+        try:
+            return max(float(v or 0), 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    peak = _pct((search.get("peak") or {}).get("pct_hours_mo"))
+    non = _pct((search.get("nonpeak") or {}).get("pct_hours_mo"))
+    idle = _pct(search.get("idle_pct_hours_mo"))
+    mix = peak + non + idle
+    assumed = mix <= 0
+    if assumed:
+        peak, non, idle = ASSUMED_HOUR_MIX
+    else:
+        peak, idle = round(100.0 * peak / mix, 1), round(100.0 * idle / mix, 1)
+        idle = min(idle, round(100.0 - peak, 1))
+        non = max(0.0, round(100.0 - peak - idle, 1))
+    return {"peak_pct": peak, "nonpeak_pct": non, "idle_pct": idle, "assumed": assumed}
+
+
 def price_es3_search(
     storage_gb: float,
     workload: dict | None,
@@ -552,16 +690,10 @@ def price_es3_search(
     idle_vcu = max(28.0, ref_idle_vcu * scale)
 
     wl = workload or {}
-    search = wl.get("search") or {}
-    peak_pct = float((search.get("peak") or {}).get("pct_hours_mo") or 0) / 100.0
-    non_pct = float((search.get("nonpeak") or {}).get("pct_hours_mo") or 0) / 100.0
-    idle_pct = float(search.get("idle_pct_hours_mo") or 0) / 100.0
-    mix = peak_pct + non_pct + idle_pct
-    if mix <= 0:
-        peak_pct, non_pct, idle_pct = 0.26, 0.74, 0.0
-    else:
-        # normalize
-        peak_pct, non_pct, idle_pct = peak_pct / mix, non_pct / mix, idle_pct / mix
+    hour_mix = search_hour_mix(wl)
+    peak_pct = hour_mix["peak_pct"] / 100.0
+    non_pct = hour_mix["nonpeak_pct"] / 100.0
+    idle_pct = hour_mix["idle_pct"] / 100.0
 
     peak_h = hours_mo * peak_pct
     non_h = hours_mo * non_pct
@@ -579,7 +711,7 @@ def price_es3_search(
     ingest_mb_s = (dps * avg_b) / (1024 * 1024) if dps and avg_b else 0.0
     ingest_vcu = max(4.0, ingest_mb_s * 4.0) if ingest_mb_s else 4.0
     if active_h <= 0:
-        active_h = hours_mo
+        active_h = float(ASSUMED_ACTIVE_HOURS)
     ingest_mo = ingest_vcu * active_h * ingest_vcu_hr
 
     sub = search_mo + retain_mo + ingest_mo
@@ -590,11 +722,7 @@ def price_es3_search(
         "storage_gb": round(gb, 3),
         "peak_vcu": round(peak_vcu, 1),
         "idle_vcu": round(idle_vcu, 1),
-        "hour_mix": {
-            "peak_pct": round(peak_pct * 100, 1),
-            "nonpeak_pct": round(non_pct * 100, 1),
-            "idle_pct": round(idle_pct * 100, 1),
-        },
+        "hour_mix": hour_mix,
         "search_mo": round(search_mo, 2),
         "retention_mo": round(retain_mo, 2),
         "ingest_mo": round(ingest_mo, 2),
@@ -604,32 +732,69 @@ def price_es3_search(
     }
 
 
+NOT_PRICED_SERVERLESS = "already serverless"
+NOT_PRICED_NO_GB = "no stored GB in telemetry"
+
+
 def build_serverless_offload(
     deployments: list[dict],
     storage_by_dep: list[dict],
     org_total_ecu: float,
     workload: dict | None = None,
+    *,
+    lookback_days: float = 365,
+    org_stored_gb: float | None = None,
+    not_billing: list[dict] | None = None,
 ) -> dict:
-    """ECH → multi-project serverless savings (Search + Observability + Security)."""
+    """ECH → multi-project serverless savings (Search + Observability + Security).
+
+    Only a deployment that can be priced is compared: it runs on ECH and has
+    stored GB. Any other deployment is left off both sides and listed in
+    `full_split.not_priced`. ECU a month is lookback ECU ÷ (lookback_days ÷
+    30.416). `org_stored_gb` is the one denominator for the Search share of
+    stored GB; it defaults to the stored GB of the priced deployments.
+    `not_billing` is `storage.not_billing`: a deployment listed there has a
+    snapshot that was left out of storage, and its reason is carried over.
+    """
+    months_n = lookback_months(lookback_days)
     stor = {s["name"]: s for s in storage_by_dep}
+    left_out = {x["name"]: x.get("reason") for x in (not_billing or [])}
     by_kind: dict[str, dict] = {
         k: {"n": 0, "ecu": 0.0, "gb": 0.0, "deps": []}
         for k in ("o11y", "logs", "security", "search")
     }
+    not_priced: list[dict] = []
     for d in deployments:
-        kind = classify_dep_kind(d["name"], d.get("families"))
         gb = float((stor.get(d["name"]) or {}).get("data_stored_gb") or 0)
         ecu = float(d.get("ecu") or 0)
+        reason = None
+        if str(d.get("platform") or "ech").lower() == "serverless":
+            reason = NOT_PRICED_SERVERLESS
+        elif gb <= 0:
+            reason = left_out.get(d["name"]) or NOT_PRICED_NO_GB
+        if reason:
+            not_priced.append({
+                "name": d["name"],
+                "ecu": round(ecu, 2),
+                "ecu_mo": round(ecu / months_n, 2),
+                "reason": reason,
+            })
+            continue
+        kind = classify_dep_kind(d["name"], d.get("families"))
         bucket = by_kind[kind]
         bucket["n"] += 1
         bucket["ecu"] += ecu
         bucket["gb"] += gb
         bucket["deps"].append({"name": d["name"], "ecu": round(ecu, 2), "gb": round(gb, 3)})
+    not_priced.sort(key=lambda x: -x["ecu"])
+    priced_n = sum(b["n"] for b in by_kind.values())
+    priced_ecu = sum(b["ecu"] for b in by_kind.values())
+    not_priced_ecu = sum(x["ecu"] for x in not_priced)
 
     for bucket in by_kind.values():
         bucket["ecu"] = round(bucket["ecu"], 2)
         bucket["gb"] = round(bucket["gb"], 3)
-        bucket["ecu_mo"] = round(bucket["ecu"] / 12.0, 2)
+        bucket["ecu_mo"] = round(bucket["ecu"] / months_n, 2)
         bucket["deps"].sort(key=lambda x: -x["gb"])
 
     def slice_kinds(*kinds: str) -> dict:
@@ -640,7 +805,7 @@ def build_serverless_offload(
             "kinds": list(kinds),
             "n": n,
             "ecu": round(ecu, 2),
-            "ecu_mo": round(ecu / 12.0, 2),
+            "ecu_mo": round(ecu / months_n, 2),
             "gb": round(gb, 3),
         }
 
@@ -655,8 +820,11 @@ def build_serverless_offload(
     }
 
     months_default = 3.0
-    org_mo = round(org_total_ecu / 12.0, 2)
+    # The ECH side of the comparison is the priced deployments only.
+    org_mo = round(priced_ecu / months_n, 2)
+    org_all_mo = round(float(org_total_ecu or 0) / months_n, 2)
     org_gb = sum(by_kind[k]["gb"] for k in by_kind)
+    share_gb = float(org_stored_gb) if org_stored_gb else org_gb
 
     # --- product-line serverless prices ---
     o11y_slice = slices["o11y_logs"]
@@ -673,10 +841,16 @@ def build_serverless_offload(
         else None
     )
 
-    # Scale ingest workload to search-slice storage share for ES3
+    # Scale ingest workload to search-slice storage share for ES3. The estimator
+    # payload uses this same share for docs and docs/sec.
     wl = dict(workload or {})
-    if org_gb > 0 and search_slice["gb"] > 0 and wl.get("ingest"):
-        share = search_slice["gb"] / org_gb
+    share = min(search_slice["gb"] / share_gb, 1.0) if share_gb > 0 else 0.0
+    search_share = {
+        "search_gb": search_slice["gb"],
+        "org_stored_gb": round(share_gb, 3),
+        "share": round(share, 6),
+    }
+    if share > 0 and wl.get("ingest"):
         ing = dict(wl["ingest"])
         if ing.get("docs_per_sec") is not None:
             ing["docs_per_sec"] = round(float(ing["docs_per_sec"]) * share, 2)
@@ -687,12 +861,15 @@ def build_serverless_offload(
     # All-in ES3 (anti-pattern): entire org on Search serverless
     all_es3 = price_es3_search(org_gb, workload) if org_gb > 0 else None
 
-    def line(name: str, project: str, ech_mo: float, svls: dict | None, method: str) -> dict:
+    def line(name: str, project: str, sl: dict, svls: dict | None, method: str) -> dict:
+        ech_mo = float(sl["ecu_mo"])
         tot = float((svls or {}).get("total_mo") or 0)
         return {
             "name": name,
             "project": project,
             "method": method,
+            "n": sl["n"],
+            "gb": sl["gb"],
             "ech_mo": round(ech_mo, 2),
             "serverless_mo": round(tot, 2),
             "serverless_yr": round(tot * 12, 2),
@@ -705,32 +882,46 @@ def build_serverless_offload(
         line(
             "Observability + logging",
             "Observability (Complete)",
-            o11y_slice["ecu_mo"],
+            o11y_slice,
             o11y_svls,
             "ingest+retention @ 3mo implied",
         ),
         line(
             "Security",
             "Security (Complete proxy)",
-            sec_slice["ecu_mo"],
+            sec_slice,
             security_svls,
             "same ladders as o11y until Security estimator linked",
         ),
         line(
             "Search",
             "Elasticsearch ES3 On-demand",
-            search_slice["ecu_mo"],
+            search_slice,
             search_svls,
             "storage-floored VCU × hour mix + $0.047/GB retain",
         ),
     ]
 
     split_mo = round(sum(x["serverless_mo"] for x in lines), 2)
+    reasons: dict[str, dict] = {}
+    for x in not_priced:
+        r = reasons.setdefault(x["reason"], {"n": 0, "ecu_mo": 0.0})
+        r["n"] += 1
+        r["ecu_mo"] = round(r["ecu_mo"] + x["ecu_mo"], 2)
     full_split = {
         "retention_months_assumed": months_default,
+        "lookback_days": lookback_days,
+        "lookback_months": round(months_n, 4),
         "lines": lines,
+        "priced_n": priced_n,
+        "not_priced": not_priced,
+        "not_priced_n": len(not_priced),
+        "not_priced_ecu_mo": round(not_priced_ecu / months_n, 2),
+        "not_priced_by_reason": reasons,
+        "org_ech_mo": org_all_mo,
         "serverless_total_mo": split_mo,
         "serverless_total_yr": round(split_mo * 12, 2),
+        # ECH bill of the priced deployments. Deployments in not_priced are on neither side.
         "full_ech_mo": org_mo,
         "full_ech_yr": round(org_mo * 12, 2),
         "save_vs_ech_mo": round(org_mo - split_mo, 2),
@@ -812,6 +1003,7 @@ def build_serverless_offload(
         "primary": primary,
         "hybrid": hybrid,
         "full_split": full_split,
+        "search_share": search_share,
         "all_es3": all_es3,
         "estimator": {
             "sheets_api": True,
@@ -824,12 +1016,293 @@ def build_serverless_offload(
         },
         "notes": [
             "full_split = Observability SVLS (o11y+logs) + Security SVLS (proxy) + ES3 Search (search-only GB)",
+            "Only ECH deployments with stored GB are compared; full_split.not_priced names the rest and they are on neither side",
+            f"ECH $/mo = lookback ECU ÷ {round(months_n, 4)} months ({lookback_days} days ÷ {DAYS_PER_MONTH}); ECU is the billed cost field, 1 ECU = $1",
             "Do NOT put all  fleets on ES3 Search — storage-floored VCU makes that ~all-ES3 anti-pattern",
             "Daily ingest = stored_gb / (retention_months × 30.416); confirm retention with customer",
             "Push sheets via push_estimator.py (OAuth); prefer sheet read-back totals when quoting",
             "Security uses Observability Complete ladders as proxy until a Security estimator is linked",
         ],
     }
+
+
+def bare_region(region: str | None) -> str | None:
+    """`azure-eastus2` → `eastus2`. A region with no provider prefix is returned as is."""
+    r = str(region or "").strip().lower()
+    return re.sub(r"^(aws|gcp|azure)-", "", r) or None
+
+
+def build_storage(
+    telem_buckets: list[dict],
+    last_bill: dict[str, str],
+    range_end,
+    *,
+    stale_days: int = STORAGE_STALE_DAYS,
+    billing_days: int = STORAGE_BILLING_DAYS,
+) -> tuple[dict, float, float]:
+    """Org storage from the newest telemetry snapshot of each deployment.
+
+    `last_bill` is each deployment's last day with a bill in the range. A
+    deployment with no bill in the last `billing_days` days of the range is
+    listed in `not_billing` and is not in org stored GB, docs, or
+    `by_deployment`. A kept snapshot more than `stale_days` days older than
+    the range end is listed in `stale`; it still counts.
+    Returns (storage, bytes, docs) for the kept deployments.
+    """
+    cutoff = (range_end - timedelta(days=billing_days - 1)).isoformat()
+    rows: list[dict] = []
+    not_billing: list[dict] = []
+    stale: list[dict] = []
+    sum_bytes = sum_docs = 0.0
+    as_of_dates: list[str] = []
+    for b in telem_buckets or []:
+        hits = b["latest"]["hits"]["hits"]
+        if not hits:
+            continue
+        src = hits[0]["_source"]
+        tot = (src.get("telemetry") or {}).get("totals") or {}
+        size_b = float(tot.get("dataset_size_bytes") or 0)
+        docs = float(tot.get("docs_count") or 0)
+        ts = str(src.get("@timestamp") or "")[:10]
+        try:
+            age = (range_end - date.fromisoformat(ts)).days if ts else None
+        except ValueError:
+            age = None
+        gb = round(size_b / (1024**3), 3)
+        last = last_bill.get(b["key"])
+        if last is None or last < cutoff:
+            not_billing.append({
+                "name": b["key"],
+                "as_of": ts or None,
+                "data_stored_gb": gb,
+                "last_billed": last,
+                "reason": "no bill in the range" if last is None else f"no bill in the last {billing_days} days of the range",
+            })
+            continue
+        if ts:
+            as_of_dates.append(ts)
+        sum_bytes += size_b
+        sum_docs += docs
+        avg_kb = (size_b / docs / 1024.0) if docs > 0 else 0.0
+        rows.append(
+            {
+                "name": b["key"],
+                "as_of": ts or None,
+                "age_days": age,
+                "data_stored_gb": gb,
+                "docs_count": int(docs) if docs == int(docs) else docs,
+                "avg_doc_kb": round(avg_kb, 4),
+                "calculated_data_stored_gb": round((docs * avg_kb) / (1024**2), 3) if docs else 0.0,
+            }
+        )
+        if age is None or age > stale_days:
+            stale.append({"name": b["key"], "as_of": ts or None, "age_days": age, "data_stored_gb": gb})
+    rows.sort(key=lambda x: -x["data_stored_gb"])
+    stale.sort(key=lambda x: -x["data_stored_gb"])
+    not_billing.sort(key=lambda x: -x["data_stored_gb"])
+    org_avg_kb = (sum_bytes / sum_docs / 1024.0) if sum_docs > 0 else 0.0
+    notes = [
+        "From cloud-tracker-telemetry latest snapshot per deployment (telemetry.totals)",
+        "avg_doc_kb = dataset_size_bytes / docs_count / 1024",
+        "calculated_data_stored_gb = docs_count × avg_doc_kb / 1024² (should match data_stored_gb)",
+        "Each row's as_of is that deployment's own snapshot day; storage.as_of is the newest of them",
+    ]
+    if stale:
+        ages = [x["age_days"] for x in stale if x["age_days"] is not None]
+        notes.insert(0, (
+            f"{len(stale)} of {len(rows)} storage snapshots are more than {stale_days} days older than the range end"
+            + (f" (oldest {max(ages)} days)" if ages else "")
+        ))
+    if not_billing:
+        notes.append(
+            f"{len(not_billing)} deployments with a snapshot have no bill in the last {billing_days} days of the range "
+            f"and are left out of org stored GB ({round(sum(x['data_stored_gb'] for x in not_billing), 3)} GB)"
+        )
+    storage = {
+        "as_of": max(as_of_dates) if as_of_dates else None,
+        "as_of_oldest": min(as_of_dates) if as_of_dates else None,
+        "deployments_with_telemetry": len(rows),
+        "data_stored_gb": round(sum_bytes / (1024**3), 3),
+        "docs_count": int(sum_docs) if sum_docs == int(sum_docs) else sum_docs,
+        "avg_doc_kb": round(org_avg_kb, 4),
+        "calculated_data_stored_gb": round((sum_docs * org_avg_kb) / (1024**2), 3) if sum_docs else 0.0,
+        "by_deployment": rows,
+        "stale_after_days": stale_days,
+        "stale": stale,
+        "stale_gb": round(sum(x["data_stored_gb"] for x in stale), 3),
+        "billing_window_days": billing_days,
+        "not_billing": not_billing,
+        "not_billing_gb": round(sum(x["data_stored_gb"] for x in not_billing), 3),
+        "notes": notes,
+    }
+    return storage, sum_bytes, sum_docs
+
+
+def _cplx(label: str | None) -> str:
+    if label == "Low":
+        return "simple"
+    if label == "High":
+        return "complex"
+    return "medium"
+
+
+def estimator_payload(
+    org_name: str,
+    generated_at: str,
+    infra_summary: dict,
+    storage: dict,
+    workload: dict,
+    offload: dict,
+) -> dict:
+    """Estimator inputs for push_estimator.py and the Apps Script importer. No network.
+
+    Every cell in `cells` has a value, so no template sample is left behind. A
+    value that was not measured is 0 and its cell is in `unmeasured_cells`. A
+    value that is this skill's own assumption is in `assumed_cells`. The cloud
+    region is not a cell here: `cloud` carries the org's provider and region,
+    and the fill matches them to the sheet's own options.
+    """
+    cloud = {
+        "provider": str(infra_summary.get("provider") or "").upper() or None,
+        "region": bare_region(infra_summary.get("region")),
+    }
+    primary = offload.get("primary") or {}
+    si = primary.get("sheet_inputs") or {}
+    share = offload.get("search_share") or {}
+    search_gb = float(share.get("search_gb") or 0)
+    share_gb = float(share.get("org_stored_gb") or 0)
+    search_share = min(search_gb / share_gb, 1.0) if share_gb > 0 else 0.0
+    search_docs = int(float(storage.get("docs_count") or 0) * search_share)
+    search = workload.get("search") or {}
+    peak = search.get("peak") or {}
+    nonpeak = search.get("nonpeak") or {}
+    ingest = workload.get("ingest") or {}
+    mix = search_hour_mix(workload)
+    assumed: list[str] = []
+    unmeasured: list[str] = []
+
+    def measured(cell: str, value):
+        if value is None:
+            unmeasured.append(cell)
+            return 0
+        return value
+
+    if mix["assumed"]:
+        assumed += ["C21", "C25", "C27"]
+    for cell, band in (("C20", peak), ("C24", nonpeak)):
+        if band.get("complexity") is None:
+            assumed.append(cell)
+    active_h = ingest.get("active_hours_mo")
+    if not active_h or float(active_h) <= 0:
+        active_h = ASSUMED_ACTIVE_HOURS
+        assumed.append("C32")
+    dps = ingest.get("docs_per_sec")
+    es3_cells = {
+        "C12": round(search_gb, 3),
+        "C13": search_docs,
+        "C14": storage.get("avg_doc_kb") or 0,
+        "C19": measured("C19", peak.get("qps")),
+        "C20": _cplx(peak.get("complexity")),
+        "C21": f"{mix['peak_pct']:g}%",
+        "C23": measured("C23", nonpeak.get("qps")),
+        "C24": _cplx(nonpeak.get("complexity")),
+        "C25": f"{mix['nonpeak_pct']:g}%",
+        "C27": f"{mix['idle_pct']:g}%",
+        "C30": round(float(measured("C30", dps)) * search_share, 2),
+        "C31": measured("C31", ingest.get("avg_doc_bytes")),
+        "C32": active_h,
+    }
+    o11y_unmeasured = [c for c, k in (("G23", "logs_gb_day"), ("G25", "metrics_gb_day")) if si.get(k) is None]
+    return {
+        "org": org_name,
+        "generated_at": generated_at,
+        "methodology": "full_split: ES3=search-only storage; O11y=o11y+logs @3mo",
+        "cloud": cloud,
+        "es3": {
+            "sheet_tab": "Estimator",
+            # No ES3 layout is recorded in estimator_layout.py, so push_estimator.py does not fill this block.
+            "layout": None,
+            # The provider and region cells are not written: the sheet's option strings are not known here.
+            "cloud": {**cloud, "provider_cell": "C5", "region_cell": "C6"},
+            "search_share": share,
+            "hour_mix": mix,
+            "assumed": bool(assumed),
+            "assumed_cells": assumed,
+            "unmeasured_cells": unmeasured,
+            "cells": es3_cells,
+        },
+        "o11y": {
+            "sheet_tab": "Observability Estimator",
+            # Cell addresses for Observability estimator v1.22 (estimator_layout.py).
+            "layout": "1.22",
+            # G8 is matched at fill time to an option on the sheet (estimator_layout.match_region).
+            "cloud": {**cloud, "cell": "G8"},
+            "unmeasured_cells": o11y_unmeasured,
+            "cells": {
+                "G4": si.get("feature_tier", "Complete"),
+                "G5": si.get("support", "Premium"),
+                "G11": si.get("retention_months", 3),
+                "G12": si.get("retention_months", 3),   # TSDS metrics keep the same month
+                "G15": si.get("synthetics", "No"),
+                "G19": 0,                                # Option 1 is not used
+                "G20": 0,
+                "G23": si.get("logs_gb_day") or 0,
+                "G24": si.get("k8s_logs_pct", "0%"),
+                "G25": si.get("metrics_gb_day") or 0,
+                "G26": si.get("traces_per_min", 0),
+                "G27": "100%",
+                "G33": "No",                             # cross-project search add-on
+            },
+        },
+    }
+
+
+def org_name_query(name: str) -> dict:
+    """Organizations whose name starts with `name`, any case. `*`, `?` and `\\` in the name are literal."""
+    escaped = "".join("\\" + c if c in "*?\\" else c for c in name)
+    return {"wildcard": {"organization.name": {"value": f"{escaped}*", "case_insensitive": True}}}
+
+
+def choose_pivots(pivots: list[dict], wanted: str) -> list[dict]:
+    """The pivots that are the organization asked for.
+
+    An exact name, any case, wins. With none, the one organization whose name
+    starts with `wanted` is taken. A hit that is neither stops the run, and so
+    do several different organizations that start with it.
+    """
+    want = " ".join(str(wanted or "").split()).casefold()
+
+    def _name(p: dict) -> str:
+        return " ".join(str((p.get("organization") or {}).get("name") or "").split())
+
+    exact = [p for p in pivots if _name(p).casefold() == want]
+    if exact:
+        return exact
+    prefix = [p for p in pivots if want and _name(p).casefold().startswith(want)]
+    names = sorted({_name(p) for p in prefix})
+    if len(names) == 1:
+        print(f"org → {names[0]}", file=sys.stderr)
+        return prefix
+    shown = ", ".join(
+        f"{(p.get('organization') or {}).get('id')} {_name(p)}" for p in (prefix or pivots)[:10]
+    )
+    if names:
+        raise SystemExit(
+            f"Several organizations start with {wanted!r}. Pass the exact name or --org-id. Matches: {shown}"
+        )
+    raise SystemExit(
+        f"No organization is named {wanted!r} or starts with it. Pass the exact name or --org-id. Closest hits: {shown}"
+    )
+
+
+def write_private(path: Path, text: str) -> None:
+    """Write a customer file readable by this user only."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
 
 
 def slim_org(org: dict | None) -> dict:
@@ -884,12 +1357,12 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    if args.days < 1:
+        raise SystemExit("--days must be 1 or more")
     env = load_env(Path(args.env))
-    kibana = env.get("KIBANA_URL") or env.get("ELASTIC_KIBANA_URL")
-    key = env.get("ELASTIC_API_KEY") or env.get("ES_API_KEY")
-    if not kibana or not key:
-        raise SystemExit("Need KIBANA_URL and ELASTIC_API_KEY in .env")
-    base = kibana.rstrip("/").replace(".kb.", ".es.")
+    base, key = es_base_and_key(env)
+    lb_months = lookback_months(args.days)
+    truncated: list[str] = []
 
     end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=args.days - 1)
@@ -927,29 +1400,19 @@ def main() -> None:
             ]["hits"]
         ]
         if not pivots:
+            # The name is not sent through query_string: "Foo Corp" parsed there as name:Foo OR Corp*.
             pivots = [
                 h["_source"]
                 for h in es_post(
                     base,
                     key,
                     "cloud-tracker-organization_pivot/_search",
-                    {
-                        "size": 10,
-                        "query": {
-                            "query_string": {
-                                "query": f'organization.name:"{args.org}" OR organization.name:{args.org}*'
-                            }
-                        },
-                    },
+                    {"size": 20, "query": org_name_query(args.org.strip())},
                 )["hits"]["hits"]
             ]
         if not pivots:
             raise SystemExit(f"No organization_pivot for {args.org!r}")
-        named = [
-            p for p in pivots
-            if (p.get("organization") or {}).get("name", "").lower() == args.org.lower()
-        ]
-        chosen = named or pivots
+        chosen = choose_pivots(pivots, args.org)
         if len({str((p.get("organization") or {}).get("id")) for p in chosen}) > 1:
             shown = ", ".join(
                 f"{(p.get('organization') or {}).get('id')} {(p.get('organization') or {}).get('name')}"
@@ -986,7 +1449,7 @@ def main() -> None:
             "query": {"bool": {"filter": filt}},
             "aggs": {
                 "by_dep": {
-                    "terms": {"field": "deployment.name", "size": 100, "order": {"ecu": "desc"}},
+                    "terms": {"field": "deployment.name", "size": DEP_TERMS_SIZE, "order": {"ecu": "desc"}},
                     "aggs": {
                         "ecu": {"sum": {"field": "cost"}},
                         "types": {"terms": {"field": "type", "size": 50}, "aggs": {"ecu": {"sum": {"field": "cost"}}}},
@@ -1012,8 +1475,9 @@ def main() -> None:
                     },
                     "aggs": {
                         "by_dep": {
-                            # size 200 so dep-count-over-time is accurate for large orgs
-                            "terms": {"field": "deployment.name", "size": 200},
+                            # Same size and order as the top-level roster, so a big spender with
+                            # few billing lines is not dropped from a day.
+                            "terms": {"field": "deployment.name", "size": DEP_TERMS_SIZE, "order": {"ecu": "desc"}},
                             "aggs": {"ecu": {"sum": {"field": "cost"}}},
                         },
                         "ecu": {"sum": {"field": "cost"}},
@@ -1053,7 +1517,7 @@ def main() -> None:
             "aggs": {
                 "use_case": {"terms": {"field": "use_case", "size": 10}},
                 "by_dep": {
-                    "terms": {"field": "deployment.name", "size": 100},
+                    "terms": {"field": "deployment.name", "size": DEP_TERMS_SIZE},
                     "aggs": {
                         "latest": {
                             "top_hits": {
@@ -1078,7 +1542,7 @@ def main() -> None:
             "query": {"bool": {"filter": [org_clause(org_ids or [org_id])]}},
             "aggs": {
                 "by_dep": {
-                    "terms": {"field": "deployment.name", "size": 200},
+                    "terms": {"field": "deployment.name", "size": DEP_TERMS_SIZE},
                     "aggs": {
                         "latest": {
                             "top_hits": {
@@ -1098,20 +1562,40 @@ def main() -> None:
         },
     )
 
-    inv = {
-        h["_source"]["name"]: h["_source"]
-        for h in es_post(
-            base,
-            key,
-            "cloud-tracker-deployments/_search",
-            {
-                "size": 200,
-                "query": org_clause(org_ids or [org_id]),
-                "_source": ["name", "stack_version", "template", "provider", "hot_instance_type"],
-            },
-        )["hits"]["hits"]
-        if h["_source"].get("name")
-    }
+    inv_res = es_post(
+        base,
+        key,
+        "cloud-tracker-deployments/_search",
+        {
+            "size": DEP_TERMS_SIZE,
+            "query": org_clause(org_ids or [org_id]),
+            "_source": ["name", "stack_version", "template", "provider", "hot_instance_type"],
+        },
+    )["hits"]
+    inv = {h["_source"]["name"]: h["_source"] for h in inv_res["hits"] if h["_source"].get("name")}
+
+    # A terms aggregation that left deployments out says so in sum_other_doc_count.
+    def _other(agg: dict | None) -> int:
+        return int((agg or {}).get("sum_other_doc_count") or 0)
+
+    if _other(bill["aggregations"]["by_dep"]) > 0:
+        truncated.append("billing.by_dep")
+    if any(_other(b.get("by_dep")) > 0 for b in bill["aggregations"]["by_day"]["buckets"]):
+        truncated.append("billing.by_day.by_dep")
+    if _other(feats.get("aggregations", {}).get("by_dep")) > 0:
+        truncated.append("features.by_dep")
+    if _other(telem.get("aggregations", {}).get("by_dep")) > 0:
+        truncated.append("telemetry.by_dep")
+    inv_total = inv_res.get("total")
+    inv_total = inv_total.get("value") if isinstance(inv_total, dict) else inv_total
+    if inv_total and int(inv_total) > len(inv_res["hits"]):
+        truncated.append("deployments.inventory")
+    for name in truncated:
+        print(
+            f"WARN: {name} holds more than {DEP_TERMS_SIZE} deployments. Some are left out of this report; "
+            "the output's `truncated` list names the aggregation.",
+            file=sys.stderr,
+        )
 
     feat_by = {}
     for b in feats.get("aggregations", {}).get("by_dep", {}).get("buckets", []):
@@ -1119,7 +1603,7 @@ def main() -> None:
         if hits:
             feat_by[b["key"]] = hits[0]["_source"]
 
-    deployments, fam_tot = [], {k: 0.0 for k in ("search", "observability", "security", "genai", "other")}
+    deployments, fam_tot = [], {k: 0.0 for k in FAMILY_KEYS}
     pc, pe = {"ech": 0, "serverless": 0}, {"ech": 0.0, "serverless": 0.0}
     # name -> {sku: {ecu, qty}} collected after we have per-dep sku terms with inference include
     dep_meta: dict[str, dict] = {}
@@ -1143,14 +1627,10 @@ def main() -> None:
         ecu = float(b["ecu"]["value"])
         pc[plat] += 1
         pe[plat] += ecu
-        families = {k: 0.0 for k in fam_tot}
-        for t, c in types.items():
-            families[family(t)] += c
-        families["security"] = ecu if use_case == "security" else 0.0
+        # The families partition the deployment's ECU, so the org families sum to the org total.
+        families = split_families(types, ecu, use_case)
         for k, v in families.items():
-            if k != "security":
-                fam_tot[k] += v
-        fam_tot["security"] += families["security"]
+            fam_tot[k] += v
         ff = feat.get("feature") or {}
         ml_skus = []
         for sb in b.get("ml_skus", {}).get("buckets", []):
@@ -1169,13 +1649,14 @@ def main() -> None:
         region = None
         for s, c in skus.items():
             parsed = parse_cloud_sku(s)
-            if not parsed:
+            where = parsed or cloud_sku_region(s)
+            if not where:
                 continue
             if not provider:
-                provider = parsed["provider"]
+                provider = where["provider"]
             if not region:
-                region = parsed["region"]
-            if not hot_instance and parsed["tier"] == "datahot":
+                region = where["region"]
+            if parsed and not hot_instance and parsed["tier"] == "datahot":
                 hot_instance = f"{parsed['provider'].lower()}.{parsed['instance']}"
         ai_sku_agg = b.get("ai_skus") or {}
         infer_skus = []
@@ -1203,7 +1684,9 @@ def main() -> None:
             "platform": plat,
             "use_case": use_case,
             "ecu": round(ecu, 2),
-            "ecu_monthly_avg": 0.0,  # filled after month rollup
+            # Lookback ECU ÷ (days ÷ 30.416): the ECU / mo figure the report prints.
+            "ecu_mo": round(ecu / lb_months, 2),
+            "ecu_monthly_avg": 0.0,  # filled after month rollup (mean of calendar-month totals)
             "months_active": 0,
             "families": {k: round(v, 2) for k, v in families.items()},
             "ml_ecu": ml_ecu,
@@ -1235,6 +1718,8 @@ def main() -> None:
     month_dep: dict[str, dict[str, float]] = {}
     # day -> set of named deps with spend (for deployments-over-time)
     day_active_deps: list[set[str]] = []
+    # deployment -> last day in the range with a bill (hex ids included)
+    last_bill: dict[str, str] = {}
     for bucket in bill["aggregations"]["by_day"]["buckets"]:
         day = bucket["key_as_string"][:10]
         days.append(day)
@@ -1242,6 +1727,9 @@ def main() -> None:
         dep_map = {x["key"]: x["ecu"]["value"] for x in bucket["by_dep"]["buckets"]}
         active = {k for k, v in dep_map.items() if not hex_id(k) and v > 0}
         day_active_deps.append(active)
+        for k, v in dep_map.items():
+            if v > 0:
+                last_bill[k] = day
         ym = day[:7]
         md = month_dep.setdefault(ym, {})
         for k, v in dep_map.items():
@@ -1300,22 +1788,32 @@ def main() -> None:
         },
     }
 
-    billed_rows = list(zip(days, total_daily, day_active_deps))
-    while billed_rows and billed_rows[-1][1] <= 0:
-        billed_rows.pop()
-    billed_rows = billed_rows[-30:]
-    billed_names: set[str] = set()
-    for _day, _ecu, active in billed_rows:
-        billed_names |= active
-    billed_window = {
-        "start": billed_rows[0][0] if billed_rows else None,
-        "end": billed_rows[-1][0] if billed_rows else None,
-        "days": len(billed_rows),
-        "names": sorted(billed_names),
-    }
+    billed_all = list(zip(days, total_daily, day_active_deps))
+    while billed_all and billed_all[-1][1] <= 0:
+        billed_all.pop()
+    # Days before the org's first bill are not billed days.
+    first_billed = next((i for i, row in enumerate(billed_all) if row[1] > 0), 0)
+    billed_all = billed_all[first_billed:]
+
+    def _billed(n: int) -> dict:
+        """Who billed on the last `n` days that end on the last day with a positive total."""
+        rows = billed_all[-n:]
+        names_n: set[str] = set()
+        for _day, _ecu, active in rows:
+            names_n |= active
+        return {
+            "start": rows[0][0] if rows else None,
+            "end": rows[-1][0] if rows else None,
+            "days": len(rows),
+            "names": sorted(names_n),
+        }
+
+    # The quote window is 90 days by default. 30 stays for a run that asks for it and for older readers.
+    billed_windows = {str(n): _billed(n) for n in BILLED_WINDOW_DAYS}
+    billed_window = billed_windows["30"]
     if args.chart == "week":
         c_days, c_series, c_total = rollup_weekly(days, series_list, total_daily)
-        chart = {"grain": "week", "days": c_days, "series_names": names, "ecu_series": c_series, "total": c_total, "billed_window": billed_window}
+        chart = {"grain": "week", "days": c_days, "series_names": names, "ecu_series": c_series, "total": c_total, "billed_window": billed_window, "billed_windows": billed_windows}
     else:
         chart = {
             "grain": "day",
@@ -1324,6 +1822,7 @@ def main() -> None:
             "ecu_series": series_list,
             "total": total_daily,
             "billed_window": billed_window,
+            "billed_windows": billed_windows,
         }
 
     # Distinct named deployments with billing spend > 0 per week / month
@@ -1489,50 +1988,18 @@ def main() -> None:
         },
     }
 
-    storage_by_dep = []
-    sum_bytes = 0.0
-    sum_docs = 0.0
-    as_of_dates: list[str] = []
-    for b in telem.get("aggregations", {}).get("by_dep", {}).get("buckets", []):
-        hits = b["latest"]["hits"]["hits"]
-        if not hits:
-            continue
-        src = hits[0]["_source"]
-        tot = (src.get("telemetry") or {}).get("totals") or {}
-        size_b = float(tot.get("dataset_size_bytes") or 0)
-        docs = float(tot.get("docs_count") or 0)
-        ts = str(src.get("@timestamp") or "")[:10]
-        if ts:
-            as_of_dates.append(ts)
-        sum_bytes += size_b
-        sum_docs += docs
-        avg_kb = (size_b / docs / 1024.0) if docs > 0 else 0.0
-        storage_by_dep.append(
-            {
-                "name": b["key"],
-                "as_of": ts or None,
-                "data_stored_gb": round(size_b / (1024**3), 3),
-                "docs_count": int(docs) if docs == int(docs) else docs,
-                "avg_doc_kb": round(avg_kb, 4),
-                "calculated_data_stored_gb": round((docs * avg_kb) / (1024**2), 3) if docs else 0.0,
-            }
+    storage, sum_bytes, sum_docs = build_storage(
+        telem.get("aggregations", {}).get("by_dep", {}).get("buckets", []), last_bill, end
+    )
+    storage_by_dep = storage["by_deployment"]
+    if storage["stale"]:
+        print(f"WARN: {storage['notes'][0]}", file=sys.stderr)
+    if storage["not_billing"]:
+        print(
+            f"WARN: {len(storage['not_billing'])} deployments have a storage snapshot and no bill in the last "
+            f"{STORAGE_BILLING_DAYS} days of the range; they are left out of org stored GB.",
+            file=sys.stderr,
         )
-    storage_by_dep.sort(key=lambda x: -x["data_stored_gb"])
-    org_avg_kb = (sum_bytes / sum_docs / 1024.0) if sum_docs > 0 else 0.0
-    storage = {
-        "as_of": max(as_of_dates) if as_of_dates else None,
-        "deployments_with_telemetry": len(storage_by_dep),
-        "data_stored_gb": round(sum_bytes / (1024**3), 3),
-        "docs_count": int(sum_docs) if sum_docs == int(sum_docs) else sum_docs,
-        "avg_doc_kb": round(org_avg_kb, 4),
-        "calculated_data_stored_gb": round((sum_docs * org_avg_kb) / (1024**2), 3) if sum_docs else 0.0,
-        "by_deployment": storage_by_dep,
-        "notes": [
-            "From cloud-tracker-telemetry latest snapshot per deployment (telemetry.totals)",
-            "avg_doc_kb = dataset_size_bytes / docs_count / 1024",
-            "calculated_data_stored_gb = docs_count × avg_doc_kb / 1024² (should match data_stored_gb)",
-        ],
-    }
 
     avg_doc_bytes = (sum_bytes / sum_docs) if sum_docs > 0 else None
     if args.skip_workload:
@@ -1558,87 +2025,30 @@ def main() -> None:
             )
 
     offload = build_serverless_offload(
-        deployments, storage_by_dep, org_total_ecu, workload=workload
+        deployments,
+        storage_by_dep,
+        org_total_ecu,
+        workload=workload,
+        lookback_days=args.days,
+        org_stored_gb=float(storage.get("data_stored_gb") or 0),
+        not_billing=storage.get("not_billing"),
     )
+    fs_np = offload["full_split"]
+    if fs_np["not_priced_n"]:
+        print(
+            f"WARN: {fs_np['not_priced_n']} of {len(deployments)} deployments ({fs_np['not_priced_ecu_mo']} ECU/mo) "
+            "are not in the ECH-vs-Serverless comparison; full_split.not_priced names them.",
+            file=sys.stderr,
+        )
     # Sheets API / Apps Script payload — ES3 = search-only GB (full_split); O11y = primary
-    infra_sum = infrastructure.get("summary") or {}
-    region = infra_sum.get("region") or ""
-    azure_region = region.replace("azure-", "") if region else "eastus2"
-    o11y_sheet_region = (
-        f"AZURE: {azure_region} (Virginia)"
-        if "east" in azure_region
-        else f"AZURE: {azure_region}"
+    offload["apps_script_payload"] = estimator_payload(
+        (pivot.get("organization") or {}).get("name") or args.org,
+        datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ"),
+        infrastructure.get("summary") or {},
+        storage,
+        workload,
+        offload,
     )
-    primary = offload.get("primary") or {}
-    si = (primary.get("sheet_inputs") or {}) if primary else {}
-    search_gb = float((offload.get("slices") or {}).get("search", {}).get("gb") or 0)
-    # docs/avg proportional to search share of org storage for ES3 inputs
-    org_gb = float(storage.get("data_stored_gb") or 0) or 1.0
-    search_share = search_gb / org_gb
-    search_docs = int(float(storage.get("docs_count") or 0) * search_share)
-    peak = (workload.get("search") or {}).get("peak") or {}
-    nonpeak = (workload.get("search") or {}).get("nonpeak") or {}
-    ingest = workload.get("ingest") or {}
-
-    def _cplx(label: str | None) -> str:
-        if label == "Low":
-            return "simple"
-        if label == "High":
-            return "complex"
-        return "medium"
-
-    offload["apps_script_payload"] = {
-        "org": (pivot.get("organization") or {}).get("name") or args.org,
-        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ"),
-        "methodology": "full_split: ES3=search-only storage; O11y=o11y+logs @3mo",
-        "es3": {
-            "sheet_tab": "Estimator",
-            "cells": {
-                "C5": "Azure"
-                if str(infra_sum.get("provider") or "").upper() == "AZURE"
-                else (infra_sum.get("provider") or "Azure"),
-                "C6": f"{azure_region} (Virginia)"
-                if "eastus" in azure_region
-                else azure_region,
-                "C12": round(search_gb, 3),
-                "C13": search_docs,
-                "C14": storage.get("avg_doc_kb"),
-                "C19": peak.get("qps"),
-                "C20": _cplx(peak.get("complexity")),
-                "C21": f"{peak.get('pct_hours_mo') or 0}%",
-                "C23": nonpeak.get("qps"),
-                "C24": _cplx(nonpeak.get("complexity")),
-                "C25": f"{nonpeak.get('pct_hours_mo') or 0}%",
-                "C27": f"{(workload.get('search') or {}).get('idle_pct_hours_mo') or 0}%",
-                "C30": round(float(ingest.get("docs_per_sec") or 0) * search_share, 2)
-                if ingest.get("docs_per_sec") is not None
-                else None,
-                "C31": ingest.get("avg_doc_bytes"),
-                "C32": ingest.get("active_hours_mo"),
-            },
-        },
-        "o11y": {
-            "sheet_tab": "Observability Estimator",
-            # Cell addresses for Observability estimator v1.22 (estimator_layout.py).
-            "layout": "1.22",
-            "cells": {
-                "G4": si.get("feature_tier", "Complete"),
-                "G5": si.get("support", "Premium"),
-                "G8": o11y_sheet_region,
-                "G11": si.get("retention_months", 3),
-                "G12": si.get("retention_months", 3),   # TSDS metrics keep the same month
-                "G15": si.get("synthetics", "No"),
-                "G19": 0,                                # Option 1 is not used
-                "G20": 0,
-                "G23": si.get("logs_gb_day"),
-                "G24": si.get("k8s_logs_pct", "0%"),
-                "G25": si.get("metrics_gb_day"),
-                "G26": si.get("traces_per_min", 0),
-                "G27": "100%",
-                "G33": "No",                             # cross-project search add-on
-            },
-        },
-    }
 
     # Vector + model inventory for ML canvas section
     vector_inventory = []
@@ -1756,17 +2166,24 @@ def main() -> None:
         "monthly": month_series,
         "totals": {
             "ecu": org_total_ecu,
+            # The report's ECU / mo: lookback ECU ÷ (days ÷ 30.416), the divisor §10 uses.
+            "ecu_mo": round(org_total_ecu / lb_months, 2),
+            "lookback_days": args.days,
+            "lookback_months": round(lb_months, 4),
+            # Mean of calendar-month totals. `months` counts the calendar months the range touches (13 for 365 days).
             "ecu_monthly_avg": round(org_total_ecu / n_months, 2),
             "months": n_months,
             "ml_ecu": ml_total,
         },
+        # Aggregations that left deployments out (more than DEP_TERMS_SIZE names). Empty when none did.
+        "truncated": truncated,
     }
 
     text = json.dumps(out, indent=2 if args.pretty else None, separators=(",", ":"))
     if args.out == "-":
         sys.stdout.write(text)
     else:
-        Path(args.out).write_text(text)
+        write_private(Path(args.out), text)
         n = len(text)
         print(
             f"wrote {args.out} ({len(deployments)} deps, {out['totals']['ecu']} ECU, "

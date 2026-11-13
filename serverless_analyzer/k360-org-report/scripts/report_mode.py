@@ -2,6 +2,8 @@
 """Shared exec|full report mode helpers for the org-report skill."""
 from __future__ import annotations
 
+from pathlib import Path
+
 REPORT_CHOICES = ("exec", "full")
 DEFAULT_REPORT = "exec"
 
@@ -60,3 +62,36 @@ def add_report_arg(parser) -> None:
         default=DEFAULT_REPORT,
         help="exec = shortened exec report; full = expanded §1–10 report (default: exec)",
     )
+
+
+def seal_dir(path: Path) -> Path:
+    """Create a customer folder and keep it private to this user."""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError:
+        pass
+    return path
+
+
+def seal_file(path: Path) -> Path:
+    """Make a customer file that was just written readable by this user only."""
+    path = Path(path)
+    try:
+        if path.is_file():
+            path.chmod(0o600)
+    except OSError:
+        pass
+    return path
+
+
+def write_private(path: Path, data) -> Path:
+    """Write text or bytes to a customer file, mode 0600."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(data, (bytes, bytearray)):
+        path.write_bytes(bytes(data))
+    else:
+        path.write_text(str(data))
+    return seal_file(path)
