@@ -2,7 +2,7 @@
 """Serverless consolidation-savings analysis (runs under the same ECH > 50 % trigger).
 
 Explains *why* moving the ECH footprint onto a few serverless projects saves money.
-Every serverless dollar is an estimator read-back (es3-estimator on-demand for
+Every serverless dollar is an estimator read-back (es3-estimator performant for
 Search, the sheet for Observability and Security). ECH list is $1 per ECU.
 The contract rate is recorded on the ECH bill only. Deployments, the tail, and
 retention / fleet scenarios are ECU, GB, and overhead share — not a second price.
@@ -19,7 +19,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from quote_checks import e73_blocks_quote, g28_gate, integrity_score, money as _money
+from quote_checks import e73_blocks_quote, echo_gate, ingest_echo, integrity_score, money as _money
 from skill_paths import find_skill
 
 DAYS_PER_MONTH = 30.416
@@ -180,10 +180,11 @@ except Exception:  # fallback mirror of Estimator_Reference v1.19 ladders
 O11Y_METER_FACTOR = 1.595
 
 
-def observability_metered_rates(rows: list[dict]) -> list[dict]:
+def observability_metered_rates(rows: list[dict], factor: float = O11Y_METER_FACTOR) -> list[dict]:
     """Blended Observability ingest rate when each deployment is priced alone.
 
-    Metered GB/day is raw bulk times 1.595. Logs are 90% of that and metrics
+    Metered GB/day is the row's GB/day times `factor`: 1.0 for diagnostic bulk,
+    which is already metered, and 1.595 for a raw rate. Logs are 90% of that and metrics
     are 10%. Each stream walks the ingest bands. The rate is ingest dollars
     per metered GB. A row with no bulk has no rate. This is not a D38 quote.
     """
@@ -193,8 +194,8 @@ def observability_metered_rates(rows: list[dict]) -> list[dict]:
             raw = float(row.get("daily_raw_gb") if row.get("daily_raw_gb") is not None else row.get("bulk_gb_day") or 0)
         except (TypeError, ValueError):
             raw = 0.0
-        logs = raw * 0.90 * O11Y_METER_FACTOR
-        metrics = raw * 0.10 * O11Y_METER_FACTOR
+        logs = raw * 0.90 * factor
+        metrics = raw * 0.10 * factor
         metered = logs + metrics
         rate = None
         if metered > 0:
@@ -218,6 +219,7 @@ def projected_region_monthly(
     retention_months: float | None,
     solution_stored_gb: float,
     workload: dict | None,
+    metered: bool = False,
 ) -> float:
     """Monthly sizing before an Observability or Search regional sheet is written.
 
@@ -237,6 +239,9 @@ def projected_region_monthly(
     daily = daily_raw_gb
     if daily is None:
         daily = gb / (months * DAYS_PER_MONTH) if months else 0.0
+    # Diagnostic bulk is already metered. The ladder's own expansion is for a raw rate.
+    if metered:
+        return float(price_o11y_serverless(float(daily or 0), months, meter_factor=1.0).get("total_mo") or 0)
     return float(price_o11y_serverless(float(daily or 0), months).get("total_mo") or 0)
 
 
@@ -290,7 +295,7 @@ def _clear_components(blk: dict) -> None:
 
 
 def _apply_search_estimator(by_solution: dict, sz: dict) -> bool:
-    """Replace the consolidated Search total with the es3-estimator on-demand read-back."""
+    """Replace the consolidated Search total with the es3-estimator performant read-back."""
     est = ((sz.get("estimators") or {}).get("search") or {})
     rb = est.get("readback") or {}
     monthly = _money(rb.get("monthly_steady_state"))
@@ -306,8 +311,8 @@ def _apply_search_estimator(by_solution: dict, sz: dict) -> bool:
     search["total_yr"] = round(monthly * 12, 2)
     search["peak_vcu"] = rb.get("provisioned_search_vcu")
     search["idle_vcu"] = rb.get("idle_search_vcu")
-    search["pricing"] = "es3-estimator on-demand (quotable)"
-    search["estimator_profile"] = rb.get("profile") or "on-demand"
+    search["pricing"] = "es3-estimator performant (quotable)"
+    search["estimator_profile"] = rb.get("profile") or "performant"
     return True
 
 
@@ -447,6 +452,8 @@ def per_cluster_plan(sz: dict, acc: dict, infra: dict | None) -> dict | None:
             # column still adds up to its bar.
             def _status(n: str) -> str:
                 src = (by_name.get(n) or {}).get("ingest_source")
+                if src == "decommissioned":
+                    return "decommissioned"
                 if src == "active_no_bundle":
                     return "missing_diag"
                 return "no_bulk" if bulk[n] < 0.0005 and src == "diagnostics" else "sized"
@@ -489,6 +496,7 @@ def _deployment_groups(acc: dict, infra: dict | None, months: float) -> list[dic
         if d.get("region")
     }
     grouped: dict[tuple[str, str], dict] = {}
+    by_name = {d.get("name"): d for d in (acc.get("solutions") or {}).get("by_deployment") or [] if d.get("platform") != "serverless"}
     for d in (acc.get("solutions") or {}).get("by_deployment") or []:
         if d.get("platform") == "serverless":
             continue
@@ -517,6 +525,9 @@ def _deployment_groups(acc: dict, infra: dict | None, months: float) -> list[dic
         }
         if g["has_daily"]:
             row["daily_raw_gb"] = round(g["daily_raw_gb"], 3)
+            if g["solution"] == "observability":
+                from diag_account import observability_mix
+                row["mix"] = observability_mix([by_name[n] for n in g["deployments"] if n in by_name])
             if g["retention_bulk"] > 0:
                 # Keep the fraction. Rounding to 2 decimals first turns 12.004 months into 12, and the fleet sheet writes 13.
                 row["retention_months"] = round((g["retention_weighted"] / g["retention_bulk"]) / DAYS_PER_MONTH, 6)
@@ -630,7 +641,7 @@ def regional_quote(
         }
     total_gb = sum(float(row.get("stored_gb") or 0) for row in classified)
     consolidated = float(consolidated_monthly or 0)
-    how = "on-demand read-back split by stored GB" if solution == "search" else "sheet read-back split by stored GB"
+    how = "performant read-back split by stored GB" if solution == "search" else "sheet read-back split by stored GB"
     priced = []
     for row in classified:
         gb = float(row.get("stored_gb") or 0)
@@ -707,6 +718,7 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                     retention_months=source_months,
                     solution_stored_gb=total_gb,
                     workload=workload if sol == "search" else None,
+                    metered=(acc.get("sizing") or {}).get("ingest_source") == "diagnostics",
                 )
                 if projected <= REGION_ESTIMATE_MIN_USD:
                     omitted_small.append({
@@ -734,7 +746,7 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                     "region": g["region"], "stored_gb": g["stored_gb"],
                     "retention_months": source_months,
                     "kind": "own" if monthly is not None else "missing",
-                    "own_monthly": monthly, "own_pricing": "re-estimated on-demand",
+                    "own_monthly": monthly, "own_pricing": "re-estimated performant",
                     "own_annual": _money(rb.get("annual_year1")),
                     "own_steady": _money(rb.get("annual_steady_state")),
                     "search_mo": _money(rb.get("search_monthly")),
@@ -746,17 +758,17 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                     "url": saved_hit.get("url"),
                 })
                 continue
-            gate = (saved_hit.get("g28_gate") or saved_hit.get("g26_gate") or {}) if sol == "observability" else {}
-            g28_rejected = sol == "observability" and (
+            gate = (saved_hit.get("echo_gate") or saved_hit.get("g28_gate") or saved_hit.get("g26_gate") or {}) if sol == "observability" else {}
+            echo_rejected = sol == "observability" and (
                 bool(saved_hit.get("readback_rejected")) or (bool(gate) and not gate.get("accepted"))
             )
             sheet_read = _security_sheet_was_read(saved_hit)
             e73_rejected = sol == "security" and sheet_read and e73_blocks_quote(saved_rb.get("cps_addon_monthly"))
-            if g28_rejected:
-                notes.append(f"Observability {g['region']} G28 differed from the written bulk, so that region was not quoted.")
+            if echo_rejected:
+                notes.append(f"Observability {g['region']} the sheet echo differed from the written bulk, so that region was not quoted.")
                 classified.append({
                     "region": g["region"], "stored_gb": g["stored_gb"], "kind": "rejected",
-                    "own_pricing": "rejected — G28 differs from the written bulk",
+                    "own_pricing": "rejected — the sheet echo differs from the written bulk",
                     "region_match": saved_hit.get("region_match"), "url": saved_hit.get("url"),
                 })
                 continue
@@ -819,7 +831,7 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
             blk["total_yr"] = quote["total_yr"]
             if "quotable" not in str(blk.get("pricing") or ""):
                 blk["pricing"] = (
-                    "es3-estimator on-demand (quotable)" if sol == "search"
+                    "es3-estimator performant (quotable)" if sol == "search"
                     else f"{sol.title()} sheet read-back (quotable)"
                 )
             regional_quoted = True
@@ -1092,16 +1104,18 @@ def _integrity(acc: dict, sz: dict, by_solution: dict, quotes: list[dict], headl
             "has_workload": _has_workload(o11y_blk),
             "sheet_read": bool(o11y.get("readback")),
             "written_bulk": float(o11y_blk.get("daily_raw_gb") or 0),
-            "sheet_raw": (o11y.get("readback") or {}).get("total_raw_gb_day"),
+            "sheet_raw": ingest_echo(o11y.get("readback") or {}),
         },
         "security": {
             "has_workload": _has_workload(sec_blk),
             "sheet_read": bool(security.get("readback")),
+            "written_bulk": float(sec_blk.get("daily_raw_gb") or 0),
+            "sheet_raw": ingest_echo(security.get("readback") or {}),
             "e73": (security.get("readback") or {}).get("cps_addon_monthly"),
         },
         "coverage": None if not coverage else {
             "matched": coverage.get("matched"),
-            "active": coverage.get("active_deployments"),
+            "active": None if coverage.get("active_deployments") is None else coverage.get("active_deployments") - int(coverage.get("decommissioned") or 0),
             "fallback": coverage.get("k360_fallback"),
             "fallback_names": coverage.get("fallback_names") or [],
             "bulk_gb_day": coverage.get("bulk_gb_day"),
@@ -1189,11 +1203,11 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         blk = by_solution[sol]
         readback = est.get("readback") or {}
         if sol == "observability" and readback and not est.get("readback_rejected"):
-            gate = est.get("g28_gate") or est.get("g26_gate") or g28_gate(float(blk.get("daily_raw_gb") or 0), readback.get("total_raw_gb_day"))
+            gate = est.get("echo_gate") or est.get("g28_gate") or est.get("g26_gate") or echo_gate(float(blk.get("daily_raw_gb") or 0), ingest_echo(readback))
             if not gate.get("accepted"):
-                blk["pricing"] = "rejected — G28 differs from the written bulk"
+                blk["pricing"] = "rejected — the sheet echo differs from the written bulk"
                 notes.append(
-                    f"Observability sheet G28 is {gate.get('sheet_raw_gb_day')} GB/day against {gate.get('written_bulk')} GB/day written. D38 was not quoted."
+                    f"Observability sheet echo is {gate.get('sheet_gb_day')} GB/day against {gate.get('written_bulk')} GB/day written. D38 was not quoted."
                 )
                 continue
         if sol == "security" and readback and e73_blocks_quote(readback.get("cps_addon_monthly")):
@@ -1204,6 +1218,8 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
             else:
                 blk["pricing"] = "rejected — E73 add-on is not zero"
                 notes.append(
+                    str(readback.get("addon_note")) + " E74 was not quoted."
+                    if readback.get("addon_note") else
                     f"Security month-12 total includes {addon} from template cross-project search (sheet E73). E74 was not quoted."
                 )
             continue
@@ -1224,7 +1240,7 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
     svls_total_mo = sum(float(p.get("total_mo") or 0) for p in by_solution.values())
     if quoted:
         notes.append(
-            "Every serverless dollar comes from a named estimator: Search Serverless on-demand, or the Observability or Security Serverless estimator. "
+            "Every serverless dollar comes from a named estimator: Search Serverless performant, or the Observability or Security Serverless estimator. "
             "EIS on a Search project is the billed token usage plus the ML-node ECU on deployments that billed jina, both at list. "
             "ECH dollars, when ARR and commit exist, are ARR ÷ (commit ECU/day × 365), applied to ECH only. Serverless is not discounted."
         )
@@ -1468,7 +1484,7 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
             continue
         est = (sz.get("estimators") or {}).get(sol) or {}
         rb = est.get("readback") or {}
-        label = "Search Serverless, on-demand" if sol == "search" else f"{sol.title()} Serverless"
+        label = "Search Serverless, performant" if sol == "search" else f"{sol.title()} Serverless"
         regions = blk.get("by_region") or []
         if regions:
             for r in regions:
@@ -1575,7 +1591,8 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         "contract_rate": contract_rate,
         "savings": savings,
         "ladder": [] if quoted else (_ladder_walk(metered) if metered else []),
-        "metered_rates": observability_metered_rates(((acc.get("solutions") or {}).get("by_deployment") or [])) if (sz.get("ingest_source") == "diagnostics") else [],
+        "metered_expansion": 1.0 if sz.get("ingest_source") == "diagnostics" else O11Y_METER_FACTOR,
+        "metered_rates": observability_metered_rates(((acc.get("solutions") or {}).get("by_deployment") or []), 1.0 if sz.get("ingest_source") == "diagnostics" else O11Y_METER_FACTOR) if (sz.get("ingest_source") == "diagnostics") else [],
         "deployment_plan": _deployment_bars(sz, by_solution, notes),
         "deployment_plan_floor": int((sz.get("deployment_plan") or {}).get("floor") or 1),
         "per_cluster_plan": per_cluster_plan(sz, acc, infra) if sz.get("deployment_plan") and not (sz.get("deployment_plan") or {}).get("error") else None,

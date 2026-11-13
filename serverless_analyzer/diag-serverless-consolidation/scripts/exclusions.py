@@ -31,6 +31,34 @@ def parse_ids(values) -> list[str]:
     return out
 
 
+# A stack-monitoring deployment holds other clusters' monitoring data. It is not a workload
+# that moves to serverless, so a consolidation run leaves it out unless told to keep it.
+# Match "monitoring" as a name part: "monitoring", "prod-monitoring", "es_monitoring_01".
+# "monitor" alone, or "monitoringx", does not match.
+MONITORING_RE = re.compile(r"(?<![a-z0-9])monitoring(?![a-z0-9])", re.IGNORECASE)
+
+
+def is_monitoring_name(name) -> bool:
+    return bool(name) and bool(MONITORING_RE.search(str(name)))
+
+
+def monitoring_names(names) -> list[str]:
+    """Deployment names that read as monitoring clusters, in first-seen order."""
+    out: list[str] = []
+    for name in names or []:
+        if is_monitoring_name(name) and name not in out:
+            out.append(name)
+    return out
+
+
+def ids_for_names(names: list[str], id_to_name: dict[str, str]) -> tuple[list[str], list[str]]:
+    """(ids, names with no id). A name shared by several deployments gives every id."""
+    wanted = set(names)
+    ids = [str(i).lower() for i, n in id_to_name.items() if n in wanted]
+    found = {n for n in id_to_name.values() if n in wanted}
+    return sorted(set(ids)), [n for n in names if n not in found]
+
+
 def resolve_names(ids: list[str], id_to_name: dict[str, str]) -> list[dict]:
     """[{id, name}] for every id. An id with no name is an error, never skipped."""
     known = {str(k).lower(): v for k, v in id_to_name.items() if k and v}

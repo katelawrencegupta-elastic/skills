@@ -2,8 +2,20 @@
 from __future__ import annotations
 
 import re
+import sys
+from pathlib import Path
 
-G28_TOLERANCE_GB_DAY = 0.51
+from skill_paths import find_skill
+
+# The estimator layout lives in k360-org-report, which also writes those sheets.
+_ORG_SCRIPTS = str(find_skill("k360-org-report", Path(__file__).resolve().parent) / "scripts")
+if _ORG_SCRIPTS not in sys.path:
+    sys.path.insert(0, _ORG_SCRIPTS)
+from estimator_layout import (  # noqa: E402,F401
+    TEMPLATE_ANCHORS, cell_range, check_value_ranges, layout_ranges, template_check, template_version,
+)
+
+ECHO_TOLERANCE_GB_DAY = 0.51
 
 
 def money(value) -> float | None:
@@ -28,111 +40,53 @@ def money(value) -> float | None:
     return number
 
 
-def g28_gate(written_bulk: float, sheet_raw) -> dict:
-    """Accept Observability only when G28 is within 0.51 GB/day of the bulk written."""
+def ingest_echo(readback: dict):
+    """GB/day the sheet says it is pricing, to compare with what was written.
+
+    A diagnostic fill writes metered volume, so the echo is the sheet's metered
+    GB/day (`echo_gb_day`). A read-back saved before that, and the K360 backup's
+    raw fill, echo through the sheet's total raw GB/day.
+    """
+    readback = readback or {}
+    if readback.get("echo_gb_day") is not None:
+        return readback.get("echo_gb_day")
+    return readback.get("total_raw_gb_day")
+
+
+def observability_readback(readback: dict, basis: str) -> dict:
+    """Observability read-back with the echo for the basis that was written.
+
+    Metered basis (Option 1): the sheet prices `Estimator_Reference!C2` plus
+    `Estimator_Reference-Metrics!C2`, the GB/day it derived from G19 and G20, so
+    their sum is the echo and the metered GB/day. Raw basis (Option 2): the echo
+    is G28, the total raw GB/day.
+    """
+    out = dict(readback or {})
+    if basis == "metered":
+        parts = [money(out.get("metered_ex_metrics_gb_day")), money(out.get("metered_metrics_gb_day"))]
+        echo = None if any(part is None for part in parts) else sum(parts)
+        out["echo_gb_day"] = echo
+        out["metered_gb_day"] = echo
+        out["total_raw_gb_day"] = None
+    else:
+        out["echo_gb_day"] = out.get("total_raw_gb_day")
+    out["ingest_basis"] = basis
+    return out
+
+
+def echo_gate(written_bulk: float, sheet_raw) -> dict:
+    """Accept a sheet only when its echo is within 0.51 GB/day of the GB/day written."""
     sheet = money(sheet_raw)
     try:
         written = float(written_bulk)
     except (TypeError, ValueError):
         written = 0.0
-    accepted = sheet is not None and abs(sheet - written) <= G28_TOLERANCE_GB_DAY
+    accepted = sheet is not None and abs(sheet - written) <= ECHO_TOLERANCE_GB_DAY
     return {
         "written_bulk": round(written, 3),
-        "sheet_raw_gb_day": None if sheet is None else round(sheet, 3),
+        "sheet_gb_day": None if sheet is None else round(sheet, 3),
         "accepted": accepted,
     }
-
-
-# Layout this skill writes and reads, by estimator. Each anchor is the text that
-# sits beside a cell the skill uses, so a moved row is caught before any write.
-# `min_version` is the oldest layout these addresses are known to fit. A sheet
-# reports 1.20 as "1.2", so versions compare as numbers.
-TEMPLATE_ANCHORS = {
-    "observability": {
-        "min_version": 1.22,
-        "labels": {
-            "D4": "feature tier",
-            "D5": "technical support tier",
-            "D8": "cloud provider and region",
-            "D11": "everything except tsds metrics",
-            "D12": "ingested tsds metrics",
-            "D15": "synthetic monitoring",
-            "D19": "estimated monthly (bytes)",
-            "D20": "estimated monthly (bytes)",
-            "D23": "daily logs raw data ingest",
-            "D24": "kubernetes",
-            "D25": "daily metrics raw data ingest",
-            "D26": "traces per minute",
-            "D27": "sampling rate",
-            "D28": "total raw ingest in gb/day",
-            "D29": "metered ingest in gb/day",
-            "D33": "cross-project search",
-            "D37": "monthly estimate (steady state)",
-            "E37": "annual estimate (first year)",
-            "F37": "annual estimate (steady state)",
-        },
-    },
-    "security": {
-        "min_version": 2.6,
-        "labels": {
-            "D4": "daily siem raw data ingest",
-            "E5": "actual metered ingest",
-            "D6": "retention period",
-            "D7": "cloud provider region",
-            "D8": "feature tier",
-            "D9": "elastic defend",
-            "D21": "technical support",
-            "D35": "annual estimate (year 1)",
-            "E35": "annual estimate (year 2)",
-            "F35": "annual estimate (year 3)",
-            "D73": "cps add-on charges",
-            "D74": "total monthly charges",
-        },
-    },
-}
-
-
-def template_version(column) -> str | None:
-    """Last filled cell of the Version Control tab's first column, the sheet's own version."""
-    last = None
-    for value in column or []:
-        text = str(value if value is not None else "").strip()
-        if text:
-            last = text
-    return last
-
-
-def _version_number(text) -> float | None:
-    match = re.fullmatch(r"v?(\d+(?:\.\d+)?)", str(text or "").strip(), re.IGNORECASE)
-    return float(match.group(1)) if match else None
-
-
-def template_check(kind: str, labels: dict, version) -> dict:
-    """Does this estimator copy have the layout the skill writes? No network.
-
-    `problems` is empty when every anchor label is where it is expected and the
-    version is readable and not older than `min_version`. A newer version with
-    every label in place is accepted and marked `newer`, because estimator
-    releases that only add regions keep the layout.
-    """
-    spec = TEMPLATE_ANCHORS.get(kind)
-    if spec is None:
-        return {"kind": kind, "version": None, "newer": False, "problems": [f"no layout is recorded for {kind!r}"]}
-    problems: list[str] = []
-    for cell, want in spec["labels"].items():
-        have = " ".join(str((labels or {}).get(cell) or "").lower().split())
-        if want not in have:
-            shown = have[:60] or "blank"
-            problems.append(f"{cell} should read '{want}' and is '{shown}'")
-    number = _version_number(version)
-    newer = False
-    if number is None:
-        problems.append(f"the Version Control tab gave no readable version ({version!r})")
-    elif number < spec["min_version"] - 1e-9:
-        problems.append(f"version {version} is older than {spec['min_version']:g}, the layout these cells fit")
-    else:
-        newer = number > spec["min_version"] + 1e-9
-    return {"kind": kind, "version": None if version is None else str(version), "newer": newer, "problems": problems}
 
 
 def _integrity_row(name: str, score, passed, detail: str) -> dict:
@@ -145,7 +99,7 @@ def _integrity_row(name: str, score, passed, detail: str) -> dict:
 
 
 def _sheet_echo(observability: dict, security: dict) -> dict:
-    """G28 distance and a parsed E73 of 0. A missing sheet is left out of this check."""
+    """Echo distance and a parsed E73 of 0. A missing sheet is left out of this check."""
     parts: list[float] = []
     passes: list[bool] = []
     bits: list[str] = []
@@ -155,13 +109,25 @@ def _sheet_echo(observability: dict, security: dict) -> dict:
         if sheet is None:
             parts.append(0.0)
             passes.append(False)
-            bits.append("G28 was blank or unreadable")
+            bits.append("The sheet echo was blank or unreadable")
         else:
             gap = abs(sheet - written)
-            parts.append(1.0 - min(gap / G28_TOLERANCE_GB_DAY, 1.0))
-            passes.append(gap <= G28_TOLERANCE_GB_DAY)
-            bits.append(f"G28 is {gap:.3f} GB/day from the written bulk")
+            parts.append(1.0 - min(gap / ECHO_TOLERANCE_GB_DAY, 1.0))
+            passes.append(gap <= ECHO_TOLERANCE_GB_DAY)
+            bits.append(f"The sheet echo is {gap:.3f} GB/day from the written bulk")
     if security.get("has_workload") and security.get("sheet_read"):
+        if "sheet_raw" in security:
+            written = float(security.get("written_bulk") or 0)
+            sheet = money(security.get("sheet_raw"))
+            if sheet is None:
+                parts.append(0.0)
+                passes.append(False)
+                bits.append("The Security sheet echo (G5) was blank or unreadable")
+            else:
+                gap = abs(sheet - written)
+                parts.append(1.0 - min(gap / ECHO_TOLERANCE_GB_DAY, 1.0))
+                passes.append(gap <= ECHO_TOLERANCE_GB_DAY)
+                bits.append(f"The Security sheet echo (G5) is {gap:.3f} GB/day from the written bulk")
         amount = money(security.get("e73"))
         if amount is None:
             parts.append(0.0)
@@ -353,7 +319,7 @@ def integrity_score(facts: dict) -> dict:
     """Quote integrity, 0 to 1. The mean skips a check that does not apply.
 
     A score of 0.90 or higher passes. A check that misses its own bar stays
-    flagged. A quote whose every scored check passes also passes. A G28 gap of
+    flagged. A quote whose every scored check passes also passes. An echo gap of
     0.51 scores 0 on that component and still passes that component. This is
     not a serverless bill.
     """
@@ -391,6 +357,56 @@ def e73_blocks_quote(value) -> bool:
     if amount is None:
         return True
     return abs(amount) > 0.005
+
+
+# Above this many months, month 12 on the Security sheet has not finished filling retention.
+SECURITY_MONTH12_STEADY_MAX = 12
+
+
+def security_readback(readback: dict, retention_months) -> dict:
+    """Security read-back with the steady month and the add-on lines made explicit.
+
+    E74 is the sheet's month-12 statement. Retained GB on the sheet starts at
+    zero in month 1 and fills for `retention` months, so month 12 is the steady
+    state only up to 12 months. Above that the steady month is the reference
+    tab's month 36 (`steady_total`), and the steady annual is 12 × that month.
+    If month 36 cannot be read above 12 months, the monthly is cleared so the
+    solution is not quoted on an unfinished ramp.
+
+    E74 also sums the endpoint, cloud, workflow, LLM, and SOAR lines. Whatever
+    E74 holds beyond ingest, retention, support, and E73 is `other_addons_monthly`.
+    A non-zero amount is folded into `cps_addon_monthly`, the value every Security
+    gate already refuses, and the sheet's own E73 stays in `cps_addon_e73`.
+    """
+    out = dict(readback or {})
+    month12 = money(out.get("monthly_steady_state"))
+    out["month12_monthly"] = month12
+    cps = money(out.get("cps_addon_monthly"))
+    parts = [money(out.get(key)) for key in ("ingest_monthly", "retention_monthly", "support_monthly")]
+    if month12 is not None and cps is not None and all(part is not None for part in parts):
+        other = round(month12 - cps - sum(parts), 2)
+        out["other_addons_monthly"] = other
+        if abs(other) > 0.005:
+            out["cps_addon_e73"] = out.get("cps_addon_monthly")
+            out["cps_addon_monthly"] = round(cps + other, 2)
+            out["addon_note"] = f"Security add-on lines E63 to E72 total ${other:,.2f}/mo on the sheet."
+    try:
+        months = float(retention_months)
+    except (TypeError, ValueError):
+        months = None
+    out["steady_basis"] = "month 12 (E74)"
+    if months is not None and months > SECURITY_MONTH12_STEADY_MAX:
+        steady = money(out.get("steady_total"))
+        if steady is None:
+            out["monthly_steady_state"] = None
+            out["steady_basis"] = "unread — month 36 was blank above 12 months of retention"
+        else:
+            # Row 254 leaves E73 out. E73 has to be 0 for a quote, so adding it keeps E74's meaning.
+            steady = steady + (money(out.get("cps_addon_monthly")) or 0.0)
+            out["monthly_steady_state"] = steady
+            out["annual_steady_state"] = steady * 12
+            out["steady_basis"] = "month 36 (Estimator_Reference CB254)"
+    return out
 
 
 def addon_off_value(validation: dict | None, formatted) -> object | None:

@@ -104,6 +104,67 @@ def _compression_fields(group: list[dict]) -> dict:
     }
 
 
+MIX_KEYS = ("logs_gb_day", "k8s_logs_gb_day", "metrics_gb_day", "traces_gb_day")
+
+
+def observability_mix(rows: list[dict], bulk_key: str = "daily_raw_gb") -> dict:
+    """Logs, Kubernetes logs, metrics, and traces GB/day for a group of deployments.
+
+    A row that carries the measured split (`logs_gb_day` and the other MIX_KEYS,
+    from the bundle's data stream names) keeps its proportions, scaled to that
+    row's bulk, so a compression-applied or paced row stays in proportion. A row
+    with no measured split is taken as 90% logs and 10% metrics. `basis` says
+    which was used. `metrics_retention_days` is the metrics-weighted delete age
+    of the metrics indices, for the TSDS retention row.
+    """
+    logs = k8s = metrics = traces = 0.0
+    measured = assumed = 0.0
+    weight = weighted = 0.0
+    for row in rows or []:
+        try:
+            bulk = float(row.get(bulk_key) or 0)
+        except (TypeError, ValueError):
+            bulk = 0.0
+        if bulk <= 0:
+            continue
+        parts = None
+        if row.get("logs_gb_day") is not None:
+            raw = [float(row.get(key) or 0) for key in MIX_KEYS]
+            total = raw[0] + raw[2] + raw[3]
+            if total > 0:
+                parts = [value * bulk / total for value in raw]
+        if parts is None:
+            parts = [bulk * 0.90, 0.0, bulk * 0.10, 0.0]
+            assumed += bulk
+        else:
+            measured += bulk
+        logs += parts[0]
+        k8s += parts[1]
+        metrics += parts[2]
+        traces += parts[3]
+        days = _measured_days(row.get("retention_days_metrics"))
+        if days is not None and parts[2] > 0:
+            weight += parts[2]
+            weighted += parts[2] * days
+    if measured and not assumed:
+        basis = "measured"
+    elif assumed and not measured:
+        basis = "assumed 90/10"
+    elif measured:
+        basis = "mixed"
+    else:
+        basis = None
+    return {
+        "logs_gb_day": round(logs, 3),
+        "k8s_logs_gb_day": round(k8s, 3),
+        "metrics_gb_day": round(metrics, 3),
+        "traces_gb_day": round(traces, 3),
+        "k8s_logs_share": round(k8s / logs, 4) if logs > 0 else 0.0,
+        "metrics_retention_days": round(weighted / weight, 3) if weight > 0 else None,
+        "basis": basis,
+    }
+
+
 def _rollup_solutions(out: dict, clamped_notes: list[str]) -> None:
     """Rewrite each solution block from the deployment rows currently on the account."""
     sz = out.setdefault("sizing", {})
@@ -147,8 +208,26 @@ def _rollup_solutions(out: dict, clamped_notes: list[str]) -> None:
         blk["ingest_source"] = "diagnostics"
         blk.update(_compression_fields(group))
         if sol == "observability":
-            blk["logs_gb_day"] = round(daily * 0.90, 2)
-            blk["metrics_gb_day"] = round(daily * 0.10, 2)
+            mix = observability_mix(group)
+            blk["logs_gb_day"] = round(mix["logs_gb_day"], 2)
+            blk["metrics_gb_day"] = round(mix["metrics_gb_day"], 2)
+            blk["traces_gb_day"] = round(mix["traces_gb_day"], 2)
+            blk["k8s_logs_gb_day"] = round(mix["k8s_logs_gb_day"], 2)
+            blk["k8s_logs_share"] = mix["k8s_logs_share"]
+            blk["mix_basis"] = mix["basis"]
+            blk.pop("retention_months_metrics", None)
+            if written is not None:
+                days = mix["metrics_retention_days"]
+                blk["retention_months_metrics"] = _sheet_months(days / DAYS_PER_MONTH) if days else written
+            if mix["basis"] and daily > 0:
+                if mix["basis"] == "assumed 90/10":
+                    clamped_notes.append("Observability bulk is split 90% logs and 10% metrics. The bundles were parsed without the measured split.")
+                else:
+                    clamped_notes.append(
+                        f"Observability bulk is split as the bundles measured it ({mix['basis']}): "
+                        f"{mix['logs_gb_day'] / daily * 100:.1f}% logs ({mix['k8s_logs_share'] * 100:.1f}% of them Kubernetes), "
+                        f"{mix['metrics_gb_day'] / daily * 100:.1f}% metrics, {mix['traces_gb_day'] / daily * 100:.1f}% traces."
+                    )
         elif sol == "security":
             blk["siem_gb_day"] = round(daily, 2)
         if totals.get(sol) is not None:
@@ -194,8 +273,14 @@ def compressioncalc_account(acc: dict) -> dict:
     return out
 
 
-def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
-    """Return a deep copy whose sizing inputs are the diagnostic measurements."""
+def apply_diagnostics(acc: dict, rows: list[dict], admin_names: set[str] | None = None) -> dict:
+    """Return a deep copy whose sizing inputs are the diagnostic measurements.
+
+    `admin_names` is the set of deployment names the admin console lists today. When it is
+    given, a billed deployment with no bundle whose name is not in that list is labelled
+    decommissioned, not missing a diagnostic: there is nothing left to capture.
+    """
+    admin_norm = None if admin_names is None else {_norm(n) for n in admin_names}
     out = copy.deepcopy(acc)
     by_exact = {r["name"]: r for r in rows if r.get("name")}
     by_norm = {_norm(r["name"]): r for r in rows if r.get("name")}
@@ -212,6 +297,7 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
     matched = 0
     fallback = 0
     fallback_names: list[str] = []
+    decommissioned_names: list[str] = []
     inactive = 0
     inactive_bundles: list[str] = []
     dropped_gb = 0.0
@@ -246,6 +332,17 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
             dep["compression_ratio"] = ratio
             dep[COMPRESSIONCALC] = accounted
             snapshot_gb += float(hit.get("snapshot_gb") or 0)
+            split = hit.get("bulk_mix")
+            for key in MIX_KEYS:
+                dep.pop(key, None)
+            if isinstance(split, dict):
+                dep["logs_gb_day"] = float(split.get("logs") or 0)
+                dep["k8s_logs_gb_day"] = float(split.get("k8s_logs") or 0)
+                dep["metrics_gb_day"] = float(split.get("metrics") or 0)
+                dep["traces_gb_day"] = float(split.get("traces") or 0)
+            dep["retention_days_metrics"] = _measured_days(hit.get("retention_days_metrics"))
+            dep["bulk_short_window_gb_day"] = hit.get("bulk_short_window_gb_day")
+            dep["bulk_fallback_gb_day"] = hit.get("bulk_fallback_gb_day")
             # A row parsed before this field existed says nothing either way.
             if hit.get("unrated_indices") is not None:
                 unrated_known = True
@@ -280,6 +377,11 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
             dep["uptime_days_min"] = up
             if up is not None and float(up) < 2:
                 short.append({"name": dep["name"], "uptime_days": up})
+        elif admin_norm is not None and _norm(name) not in admin_norm:
+            if name:
+                decommissioned_names.append(name)
+            dep["daily_raw_gb"] = 0.0
+            dep["ingest_source"] = "decommissioned"
         else:
             fallback += 1
             if name:
@@ -334,6 +436,8 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
         "matched": matched,
         "k360_fallback": fallback,
         "fallback_names": fallback_names[:12],
+        "decommissioned": len(decommissioned_names),
+        "decommissioned_names": decommissioned_names[:12],
         "unmatched_diagnostics": unmatched_diags[:12],
         "short_uptime": short,
         "bulk_gb_day": round(bulk_sum, 2),
@@ -343,6 +447,8 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
         "snapshot_gb": round(snapshot_gb, 2),
         "retention_unmeasured": unmeasured,
         "unrated": unrated,
+        "bulk_short_window_gb_day": round(sum(float(r.get("bulk_short_window_gb_day") or 0) for r in active_rows), 3),
+        "bulk_fallback_gb_day": round(sum(float(r.get("bulk_fallback_gb_day") or 0) for r in active_rows), 3),
         "retention_clamped": clamped_notes,
         "active_month": active_info.get("month"),
         "active_month_partial": bool(active_info.get("partial")),
@@ -386,6 +492,12 @@ def apply_diagnostics(acc: dict, rows: list[dict]) -> dict:
             notes.append(f"ECU/mo on the sizing row is {active_info['ecu_month']} billing for those deployments, the last complete month.")
     if inactive_bundles:
         notes.append(f"{len(inactive_bundles)} diagnostic bundles belong to deployments with no bill in {active_info.get('month')} and are not priced.")
+    if decommissioned_names:
+        n = len(decommissioned_names)
+        notes.append(
+            f"{n} billed {'deployment is' if n == 1 else 'deployments are'} decommissioned: not in the admin console, so no diagnostic can be captured "
+            f"({', '.join(decommissioned_names[:8])}). They add no ingest."
+        )
     if fallback:
         noun = "deployment" if fallback == 1 else "deployments"
         verb = "has" if fallback == 1 else "have"

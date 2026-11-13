@@ -34,7 +34,7 @@ from diag_inputs import summarize, whole_months  # noqa: E402
 from k360_infra import es_base_and_key  # noqa: E402
 from privacy import seal_dir, seal_text, unignored_secret_warnings  # noqa: E402
 from quote_checks import (  # noqa: E402
-    TEMPLATE_ANCHORS, addon_off_value, e73_blocks_quote, g28_gate, integrity_score, money,
+    TEMPLATE_ANCHORS, addon_off_value, e73_blocks_quote, echo_gate, integrity_score, money,
     template_check, template_version,
 )
 from run_consolidation import _compression_totals, _estimator_flags, consolidation_brief, quote_pdf_jobs  # noqa: E402
@@ -87,12 +87,13 @@ def _quote_account(*, g28: float, e73, observability_monthly: float = 100) -> di
                     "readback": {
                         "monthly_steady_state": 80,
                         "cps_addon_monthly": e73,
+                        "echo_gb_day": 4,
                         "annual_year1": 960,
                     },
                 },
                 "search": {
                     "profiles": [
-                        {"Search Power Setting": "on-demand", "Total $/month": 999},
+                        {"Search Power Setting": "performant", "Total $/month": 999},
                         {"Search Power Setting": "performant", "Total $/month": 1200},
                     ],
                 },
@@ -235,8 +236,8 @@ class RetentionTests(unittest.TestCase):
 
 class GateTests(unittest.TestCase):
     def test_g28_accepts_half_a_gigabyte_and_refuses_past_it(self):
-        self.assertTrue(g28_gate(10, 10.51)["accepted"])
-        self.assertFalse(g28_gate(10, 10.52)["accepted"])
+        self.assertTrue(echo_gate(10, 10.51)["accepted"])
+        self.assertFalse(echo_gate(10, 10.52)["accepted"])
         self.assertEqual(money("($1,234)"), -1234.0)
         self.assertTrue(e73_blocks_quote("($1,234)"))
         self.assertTrue(e73_blocks_quote(None))
@@ -285,12 +286,12 @@ class GateTests(unittest.TestCase):
         self.assertEqual(quoted["savings"]["serverless_mo"], 180)
         integrity = quoted["integrity"]
         sheet = next(row for row in integrity["checks"] if row["check"] == "Sheet echo")
-        self.assertEqual(sheet["score"], 0.5)
+        self.assertEqual(sheet["score"], 0.667)
         self.assertTrue(sheet["passed"])
-        self.assertEqual(integrity["score"], 0.875)
+        self.assertEqual(integrity["score"], 0.917)
         self.assertTrue(integrity["passed"])
         page = search_power_section({"consolidation": quoted})
-        self.assertIn("Quote integrity 0.875", page)
+        self.assertIn("Quote integrity 0.917", page)
         self.assertIn(">Pass<", page)
         bare = _quote_account(g28=10, e73=0)
         bare["sizing"]["estimators"]["search"] = {"status": "skipped"}
@@ -304,13 +305,27 @@ class GateTests(unittest.TestCase):
         skipped["storage"]["data_stored_gb"] = 100
         skipped["workload"] = {"search": {"peak": {"qps": 50}}}
         skipped["sizing"]["search_power"] = {
-            "profiles": [{"Search Power Setting": "on-demand", "Total $/month": 4734}],
+            "profiles": [{"Search Power Setting": "performant", "Total $/month": 4734}],
             "inputs": {"stored_gb": 100},
         }
         no_search = build_consolidation(skipped, None)
         self.assertIsNone(no_search["search_power"])
         page = search_power_section({"consolidation": {**no_search, "search_power": skipped["sizing"]["search_power"]}, "sizing": skipped["sizing"]})
         self.assertNotIn("Monthly search-power estimate", page)
+
+    def test_security_echo_counts_in_sheet_echo_check(self):
+        from quote_checks import integrity_score
+        facts = {
+            "observability": {"has_workload": False},
+            "security": {"has_workload": True, "sheet_read": True, "written_bulk": 10, "sheet_raw": 11, "e73": 0},
+        }
+        row = next(r for r in integrity_score(facts)["checks"] if r["check"] == "Sheet echo")
+        self.assertEqual(row["score"], 0.5)
+        self.assertFalse(row["passed"])
+        facts["security"]["sheet_raw"] = None
+        row = next(r for r in integrity_score(facts)["checks"] if r["check"] == "Sheet echo")
+        self.assertEqual(row["score"], 0.5)
+        self.assertFalse(row["passed"])
 
     def test_g28_miss_and_nonzero_e73_leave_the_solution_unquoted(self):
         missed = build_consolidation(_quote_account(g28=10.52, e73=0), None)
@@ -516,7 +531,7 @@ class DeploymentCountTests(unittest.TestCase):
         notes = []
         by_solution = {
             "search": {
-                "pricing": "es3-estimator on-demand (quotable)",
+                "pricing": "es3-estimator performant (quotable)",
                 "stored_gb": 1001,
                 "total_mo": 100,
                 "total_yr": 1200,
@@ -975,8 +990,8 @@ class RegionalQuoteTests(unittest.TestCase):
     def test_every_region_sums_its_own_readback(self):
         quote = regional_quote(
             [
-                {"region": "east", "stored_gb": 10, "kind": "own", "own_monthly": 180, "own_annual": 2160, "own_pricing": "re-estimated on-demand"},
-                {"region": "west", "stored_gb": 10, "kind": "own", "own_monthly": 90, "own_annual": 1080, "own_pricing": "re-estimated on-demand"},
+                {"region": "east", "stored_gb": 10, "kind": "own", "own_monthly": 180, "own_annual": 2160, "own_pricing": "re-estimated performant"},
+                {"region": "west", "stored_gb": 10, "kind": "own", "own_monthly": 90, "own_annual": 1080, "own_pricing": "re-estimated performant"},
             ],
             300,
             solution="search",
@@ -990,7 +1005,7 @@ class RegionalQuoteTests(unittest.TestCase):
         quote = regional_quote(
             [
                 {"region": "east", "stored_gb": 10, "kind": "own", "own_monthly": 180},
-                {"region": "west", "stored_gb": 10, "kind": "rejected", "own_pricing": "rejected — G28 differs from the written bulk"},
+                {"region": "west", "stored_gb": 10, "kind": "rejected", "own_pricing": "rejected — the sheet echo differs from the written bulk"},
             ],
             300,
             solution="observability",
@@ -1007,7 +1022,7 @@ class RegionalQuoteTests(unittest.TestCase):
                 {
                     "solution": "observability", "region": "east", "status": "filled",
                     "readback": {"monthly_steady_state": 180, "total_raw_gb_day": 10, "annual_year1": 2160, "annual_steady_state": 2160},
-                    "g28_gate": {"accepted": True},
+                    "echo_gate": {"accepted": True},
                 },
             ]}},
             "workload": {},
@@ -1104,8 +1119,8 @@ class EfficiencyTests(unittest.TestCase):
         acc["analysis"] = {"burndown": {"level": "ok", "series": {"months": []}}}
         acc["platform"] = {"label": "ECH"}
         acc["sizing"]["diagnostics"] = {"inactive_excluded": 2, "snapshot_gb": 0, "k360_fallback": 1}
-        acc["sizing"]["estimators"]["observability"]["g28_gate"] = {
-            "accepted": True, "written_bulk": 10, "sheet_raw_gb_day": 10.1,
+        acc["sizing"]["estimators"]["observability"]["echo_gate"] = {
+            "accepted": True, "written_bulk": 10, "sheet_gb_day": 10.1,
         }
         acc["sizing"]["estimators"]["observability"]["cells"] = {"G11": 1, "G21": 9, "G23": 1}
         acc["compressioncalc_accounted_for"] = {"gb_day": 6, "compression_ratio": 0.6, "bulk_gb_day": 10, "monthly": 40}
@@ -1116,7 +1131,7 @@ class EfficiencyTests(unittest.TestCase):
         ]
         cons["thirty_day"] = {"monthly": 50, "annual_year1": 600}
         cons["metered_rates"] = [{"name": "alpha", "raw_gb_day": 1, "metered_gb_day": 1.595, "usd_per_gb": 0.5}]
-        cons["search_power"] = {"profiles": [{"Search Power Setting": "on-demand", "Total $/month": 12}]}
+        cons["search_power"] = {"profiles": [{"Search Power Setting": "performant", "Total $/month": 12}]}
         acc["consolidation"] = cons
         brief = consolidation_brief(acc)
         self.assertNotIn("burndown", brief)
@@ -1127,7 +1142,7 @@ class EfficiencyTests(unittest.TestCase):
             {"label": "100%", "monthly": 100, "projects": 1},
         ])
         self.assertEqual(brief["thirty_day"]["monthly"], 50)
-        self.assertTrue(brief["estimators"]["observability"]["g28_gate"]["accepted"])
+        self.assertTrue(brief["estimators"]["observability"]["echo_gate"]["accepted"])
         self.assertEqual(brief["estimators"]["observability"]["cells"]["G21"], 9)
         self.assertNotIn("url", brief["deployment_plan"][0])
         self.assertTrue(brief["metered_rates"][0]["at_half_dollar"])
@@ -2082,6 +2097,352 @@ class UnratedIngestTests(unittest.TestCase):
         self.assertIsNone(out["sizing"]["diagnostics"]["unrated"])
         row = next(r for r in integrity_score({"coverage": {"unrated": None}})["checks"] if r["check"] == "Rated ingest")
         self.assertIsNone(row["score"])
+
+
+class SeriesRateTests(unittest.TestCase):
+    NOW = 1_800_000_000_000
+    HOUR = 3_600_000
+
+    @staticmethod
+    def _ix(bulk: int, store: int = 1_000) -> dict:
+        return {"primaries": {"bulk": {"total_size_in_bytes": bulk}, "store": {"size_in_bytes": store}}}
+
+    def _rates(self, stats, streams=(), alias=None, explain=None, created=None, mode=None):
+        from admin_diags import series_rates
+        return series_rates(stats, list(streams), alias or {}, explain or {}, created or {}, mode or {}, self.NOW)
+
+    def test_window_rate_keeps_esdiag_for_a_full_day_and_extends_a_short_one(self):
+        from admin_diags import _window_rate
+        day = 86_400
+        # A write phase of a day or more is esdiag's own figure. Older generations are not read.
+        self.assertEqual(_window_rate([(1_000, day, True), (9_000, day, True)]), (1_000, day, 1))
+        # Two hours at a burst, then the 22 hours before it: the rate is the whole day's bytes.
+        self.assertEqual(_window_rate([(600, 7_200, True), (1_800, 79_200, True)]), (2_400, day, 2))
+        # It stops at the first generation that lost its counter, even if a later one is fine.
+        self.assertEqual(_window_rate([(600, 7_200, True), (0, 79_200, False), (5_000, day, True)])[2], 1)
+        self.assertEqual(_window_rate([(600, 0, True)]), (0, 0, 0))
+        self.assertEqual(_window_rate([]), (0, 0, 0))
+
+    def test_short_write_phase_takes_the_generation_before_it(self):
+        h = self.HOUR
+        streams = [{"name": "logs-app-default", "indices": [{"index_name": ".ds-logs-app-000001"}, {"index_name": ".ds-logs-app-000002"}]}]
+        stats = {".ds-logs-app-000002": self._ix(600, 200), ".ds-logs-app-000001": self._ix(1_800, 600)}
+        explain = {
+            ".ds-logs-app-000002": {"index_creation_date_millis": self.NOW - 2 * h, "lifecycle_date_millis": self.NOW - 2 * h, "action": "rollover", "phase": "hot"},
+            ".ds-logs-app-000001": {"index_creation_date_millis": self.NOW - 24 * h, "lifecycle_date_millis": self.NOW - 2 * h, "phase": "hot"},
+        }
+        out = self._rates(stats, streams, explain=explain)
+        self.assertEqual(out["bytes_per_day"], 2_400)          # not 600 × 12
+        self.assertEqual(out["short_window_bytes"], 0)
+        self.assertEqual(out["mix"], {"logs": 2_400, "k8s_logs": 0, "metrics": 0, "traces": 0})
+        # The older generation moved to warm, or its counter no longer matches its store: write index alone.
+        for change in ({"phase": "warm"}, None):
+            ex = json.loads(json.dumps(explain))
+            st = json.loads(json.dumps(stats))
+            if change:
+                ex[".ds-logs-app-000001"].update(change)
+            else:
+                st[".ds-logs-app-000001"] = self._ix(100, 600)
+            alone = self._rates(st, streams, explain=ex)
+            self.assertEqual(alone["bytes_per_day"], 7_200)
+            self.assertEqual(alone["short_window_bytes"], 7_200)
+
+    def test_data_stream_lifecycle_and_dated_indices_are_rated_as_fallbacks(self):
+        h = self.HOUR
+        streams = [{"name": "metrics-system.cpu-default", "indices": [{"index_name": ".ds-metrics-system.cpu-000003"}]}]
+        stats = {
+            ".ds-metrics-system.cpu-000003": self._ix(4_800),
+            "app-2026.11.12": self._ix(1_000, 500),
+            "app-2026.11.11": self._ix(2_000, 1_000),
+            "orders": self._ix(9_999),               # not dated: stays unrated
+            "old-2020.01.01": self._ix(9_999),       # dated, but its newest index is years old
+        }
+        created = {
+            ".ds-metrics-system.cpu-000003": self.NOW - 48 * h,
+            "app-2026.11.12": self.NOW - 12 * h,
+            "app-2026.11.11": self.NOW - 36 * h,
+            "orders": self.NOW - 900 * 24 * h,
+            "old-2020.01.01": self.NOW - 900 * 24 * h,
+        }
+        out = self._rates(stats, streams, created=created)
+        # Data stream lifecycle: 4,800 bytes over the write index's 48 hours.
+        self.assertEqual(out["rated"][".ds-metrics-system.cpu-000003"], 2_400)
+        # Dated family: 12 h is short, so yesterday's index joins: 3,000 bytes over 36 h.
+        self.assertEqual(out["rated"]["app-2026.11.12"], 2_000)
+        self.assertEqual(out["bytes_per_day"], 4_400)
+        self.assertEqual(out["fallback_bytes"], 4_400)
+        self.assertEqual(out["mix"]["metrics"], 2_400)
+        self.assertEqual(out["mix"]["logs"], 2_000)
+        self.assertEqual(out["covered"], {"app-2026.11.12", "app-2026.11.11"})
+        from admin_diags import unrated_ingest
+        left = unrated_ingest(stats, streams, {}, {}, out["rated"], out["covered"])
+        self.assertEqual(sorted(row["index"] for row in left["unrated_top"]), ["old-2020.01.01", "orders"])
+
+    def test_kind_comes_from_the_series_name_or_the_index_mode(self):
+        from admin_diags import ingest_kind
+        self.assertEqual(ingest_kind("logs-nginx.access-default"), "logs")
+        self.assertEqual(ingest_kind("logs-kubernetes.container_logs-default"), "k8s_logs")
+        self.assertEqual(ingest_kind("metrics-system.cpu-default"), "metrics")
+        self.assertEqual(ingest_kind(".ds-metrics-system.cpu-default-2026.11.01-000004"), "metrics")
+        self.assertEqual(ingest_kind("custom-tsdb", "time_series"), "metrics")
+        self.assertEqual(ingest_kind("traces-apm-default"), "traces")
+        self.assertEqual(ingest_kind("orders-000007"), "logs")
+
+
+class MeasuredMixTests(unittest.TestCase):
+    def test_mix_keeps_measured_proportions_and_assumes_90_10_without_them(self):
+        from diag_account import observability_mix
+        measured = {"daily_raw_gb": 60.0, "logs_gb_day": 80.0, "k8s_logs_gb_day": 20.0, "metrics_gb_day": 15.0, "traces_gb_day": 5.0, "retention_days_metrics": 90}
+        mix = observability_mix([measured])
+        # The row's bulk was scaled to 60 (compression-applied). The proportions hold.
+        self.assertEqual((mix["logs_gb_day"], mix["metrics_gb_day"], mix["traces_gb_day"], mix["k8s_logs_gb_day"]), (48.0, 9.0, 3.0, 12.0))
+        self.assertEqual((mix["k8s_logs_share"], mix["metrics_retention_days"], mix["basis"]), (0.25, 90.0, "measured"))
+        assumed = observability_mix([{"daily_raw_gb": 100.0}])
+        self.assertEqual((assumed["logs_gb_day"], assumed["metrics_gb_day"], assumed["basis"]), (90.0, 10.0, "assumed 90/10"))
+        both = observability_mix([measured, {"daily_raw_gb": 100.0}])
+        self.assertEqual((both["logs_gb_day"], both["metrics_gb_day"], both["basis"]), (138.0, 19.0, "mixed"))
+        self.assertIsNone(observability_mix([{"daily_raw_gb": 0}])["basis"])
+
+    def test_rollup_writes_the_measured_split_and_the_metrics_month(self):
+        acc = {
+            "solutions": {"by_deployment": [{"name": "a", "solution": "observability", "platform": "ech", "gb": 1}], "totals": {}},
+            "sizing": {"consolidated": {}},
+        }
+        row = {"name": "a", "bulk_gb_day": 100.0, "store_gb": 50, "retention_days": 30, "retention_days_metrics": 95,
+               "bulk_mix": {"logs": 70.0, "k8s_logs": 7.0, "metrics": 25.0, "traces": 5.0}}
+        blk = apply_diagnostics(acc, [row])["sizing"]["consolidated"]["observability"]
+        self.assertEqual((blk["logs_gb_day"], blk["metrics_gb_day"], blk["traces_gb_day"]), (70.0, 25.0, 5.0))
+        self.assertEqual((blk["k8s_logs_share"], blk["mix_basis"]), (0.1, "measured"))
+        self.assertEqual((blk["retention_months"], blk["retention_months_metrics"]), (1, 4))   # 95 days rounds up to 4
+        old = apply_diagnostics(acc, [{"name": "a", "bulk_gb_day": 100.0, "store_gb": 50, "retention_days": 30}])
+        blk = old["sizing"]["consolidated"]["observability"]
+        self.assertEqual((blk["logs_gb_day"], blk["metrics_gb_day"], blk["mix_basis"], blk["retention_months_metrics"]), (90.0, 10.0, "assumed 90/10", 1))
+
+    def test_metered_basis_writes_option_1_and_leaves_option_2_at_zero(self):
+        from size_serverless import observability_input_cells
+        mix = {"basis": "measured", "logs_gb_day": 900.0, "metrics_gb_day": 60.0, "traces_gb_day": 40.0, "k8s_logs_share": 0.05}
+        cells = observability_input_cells({}, "Premium", "r", 2, 1000.0, mix=mix, retention_metrics=4, basis="metered")
+        # The sheet turns each back into GB/day with ÷ 730 × 24: logs and traces on G19, TSDS metrics on G20.
+        self.assertAlmostEqual(cells["G19"] / 730 * 24, 940.0, places=3)
+        self.assertAlmostEqual(cells["G20"] / 730 * 24, 60.0, places=3)
+        self.assertEqual((cells["G23"], cells["G24"], cells["G25"], cells["G26"]), (0, "0%", 0, 0))
+        self.assertEqual((cells["G11"], cells["G12"]), (2, 4))
+        assumed = observability_input_cells({}, "Premium", "r", 2, 1000.0, basis="metered")
+        self.assertAlmostEqual(assumed["G19"] / 730 * 24, 900.0, places=3)
+        self.assertAlmostEqual(assumed["G20"] / 730 * 24, 100.0, places=3)
+
+    def test_raw_basis_keeps_option_2_and_folds_traces_into_logs(self):
+        from size_serverless import observability_input_cells
+        mix = {"basis": "measured", "logs_gb_day": 900.0, "metrics_gb_day": 60.0, "traces_gb_day": 40.0, "k8s_logs_share": 0.05}
+        folded = observability_input_cells({}, "Premium", "r", 2, 1000.0, mix=mix)
+        self.assertEqual((folded["G19"], folded["G20"], folded["G23"], folded["G25"], folded["G26"], folded["G12"]), (0, 0, 940.0, 60.0, 0, 2))
+        self.assertAlmostEqual(folded["G24"], round(45 / 940, 4))    # the same Kubernetes GB over a larger logs row
+        plain = observability_input_cells({}, "Premium", "r", 2, 1000.0)
+        self.assertEqual((plain["G23"], plain["G25"], plain["G24"], plain["G26"]), (900.0, 100.0, "0%", 0))
+
+    def test_basis_follows_the_ingest_source(self):
+        from size_serverless import ingest_basis
+        self.assertEqual(ingest_basis({"sizing": {"ingest_source": "diagnostics"}}), "metered")
+        self.assertEqual(ingest_basis({"sizing": {"ingest_source": "k360"}}), "raw")
+        self.assertEqual(ingest_basis({}), "raw")
+
+    def test_metered_echo_is_the_two_ladder_inputs_and_raw_echo_is_g28(self):
+        from quote_checks import echo_gate, ingest_echo, observability_readback
+        rb = {"total_raw_gb_day": 0, "metered_gb_day": 0, "metered_ex_metrics_gb_day": 940.0, "metered_metrics_gb_day": 60.0}
+        metered = observability_readback(rb, "metered")
+        self.assertEqual((metered["echo_gb_day"], metered["metered_gb_day"], metered["total_raw_gb_day"]), (1000.0, 1000.0, None))
+        self.assertTrue(echo_gate(1000.0, ingest_echo(metered))["accepted"])
+        self.assertFalse(echo_gate(1000.0, ingest_echo(observability_readback({**rb, "metered_metrics_gb_day": None}, "metered")))["accepted"])
+        raw = observability_readback({"total_raw_gb_day": 10.2, "metered_gb_day": 16.3}, "raw")
+        self.assertEqual((raw["echo_gb_day"], raw["metered_gb_day"]), (10.2, 16.3))
+        # A read-back saved before the echo field existed still gates on the raw total.
+        self.assertEqual(ingest_echo({"total_raw_gb_day": 7}), 7)
+
+    def test_security_g4_is_measured_gb_over_the_sheet_expansion(self):
+        import size_serverless as ss
+        cells = ss.security_input_cells({}, "Premium", "r", 12, 166.0, expansion=1.66)
+        self.assertEqual(cells["G4"], 100.0)
+        self.assertEqual(ss.security_input_cells({}, "Premium", "r", 12, 166.0)["G4"], 166.0)
+        reads = iter([
+            {"raw": 100, "metered": 166, "reference": 1.66},     # expansion: G5 ÷ G4
+            {"monthly_steady_state": 115.0, "cps_addon_monthly": 0, "ingest_monthly": 70.0, "retention_monthly": 30.0,
+             "support_monthly": 15.0, "steady_total": 115.0, "metered_gb_day": 250.0},
+        ])
+        with mock.patch.object(ss, "read_cells", side_effect=lambda *_a, **_k: next(reads)), \
+             mock.patch.object(ss, "clear_security_addons", return_value={}), \
+             mock.patch.object(ss, "push_cells", return_value=6) as pushed:
+            cells, n, rb, gate = ss.fill_security(None, "copy", {}, "Premium", "r", 12, 250.0, [], "metered")
+        self.assertAlmostEqual(cells["G4"], round(250.0 / 1.66, 4))
+        self.assertEqual(pushed.call_args.args[3]["G4"], cells["G4"])
+        self.assertTrue(gate["accepted"])
+        self.assertEqual((rb["expansion"], rb["echo_gb_day"], rb["monthly_steady_state"]), (1.66, 250.0, 115.0))
+        # G5 does not come back as the GB/day measured: the monthly is cleared.
+        reads = iter([
+            {"raw": 0, "metered": 0, "reference": 1.66},         # G4 was 0 on the copy: the reference cell is used
+            {"monthly_steady_state": 115.0, "cps_addon_monthly": 0, "metered_gb_day": 400.0},
+        ])
+        with mock.patch.object(ss, "read_cells", side_effect=lambda *_a, **_k: next(reads)), \
+             mock.patch.object(ss, "clear_security_addons", return_value={}), \
+             mock.patch.object(ss, "push_cells", return_value=6):
+            _cells, _n, rb, gate = ss.fill_security(None, "copy", {}, "Premium", "r", 12, 250.0, [], "metered")
+        self.assertFalse(gate["accepted"])
+        self.assertIsNone(rb["monthly_steady_state"])
+        with mock.patch.object(ss, "read_cells", return_value={"raw": 0, "metered": 0, "reference": None}):
+            with self.assertRaises(RuntimeError):
+                ss.security_expansion(None, "copy")
+
+    def test_ladder_gate_and_band_walk_apply_no_expansion_to_metered_bulk(self):
+        from consolidation import observability_metered_rates, projected_region_monthly
+        raw = observability_metered_rates([{"name": "a", "daily_raw_gb": 10.0}])[0]
+        metered = observability_metered_rates([{"name": "a", "daily_raw_gb": 10.0}], 1.0)[0]
+        self.assertEqual((raw["metered_gb_day"], metered["metered_gb_day"]), (15.95, 10.0))
+        kw = dict(stored_gb=1, daily_raw_gb=10.0, retention_months=1, solution_stored_gb=1, workload=None)
+        self.assertLess(projected_region_monthly("observability", metered=True, **kw), projected_region_monthly("observability", **kw))
+
+
+class SecuritySteadyStateTests(unittest.TestCase):
+    RB = {"monthly_steady_state": 1150.0, "cps_addon_monthly": 0, "ingest_monthly": 700.0, "retention_monthly": 300.0,
+          "support_monthly": 150.0, "steady_total": 1495.0, "annual_steady_state": 13800.0}
+
+    def test_month_12_is_the_quote_up_to_twelve_months(self):
+        from quote_checks import security_readback
+        rb = security_readback(self.RB, 12)
+        self.assertEqual((rb["monthly_steady_state"], rb["annual_steady_state"], rb["other_addons_monthly"]), (1150.0, 13800.0, 0.0))
+        self.assertEqual(rb["steady_basis"], "month 12 (E74)")
+        self.assertFalse(e73_blocks_quote(rb["cps_addon_monthly"]))
+
+    def test_month_36_is_the_quote_above_twelve_months(self):
+        from quote_checks import security_readback
+        rb = security_readback(self.RB, 24)
+        self.assertEqual((rb["monthly_steady_state"], rb["month12_monthly"], rb["annual_steady_state"]), (1495.0, 1150.0, 17940.0))
+        unread = security_readback({**self.RB, "steady_total": None}, 24)
+        self.assertIsNone(unread["monthly_steady_state"])
+
+    def test_any_other_line_in_e74_blocks_the_quote(self):
+        from quote_checks import security_readback
+        rb = security_readback({**self.RB, "monthly_steady_state": 1650.0}, 12)   # an LLM or SOAR line of 500
+        self.assertEqual((rb["other_addons_monthly"], rb["cps_addon_monthly"], rb["cps_addon_e73"]), (500.0, 500.0, 0))
+        self.assertTrue(e73_blocks_quote(rb["cps_addon_monthly"]))
+        self.assertIn("E63 to E72", rb["addon_note"])
+        # A read-back saved before the lines were read still gates on E73 alone.
+        old = security_readback({"monthly_steady_state": 1150.0, "cps_addon_monthly": 0}, 12)
+        self.assertNotIn("other_addons_monthly", old)
+        self.assertFalse(e73_blocks_quote(old["cps_addon_monthly"]))
+
+
+class SearchPlanSeriesTests(unittest.TestCase):
+    """The 30-day Search plan must not change a cluster's disk when it is merged into a pack."""
+
+    ROWS = [
+        # name, store GB, bulk GB/day, retention days
+        ("monitoring", 4034, 282.0, 15), ("big-a", 18986, 0, 2086), ("big-b", 9007, 0.1, 2073),
+        ("small-1", 493, 0.1, 2102), ("small-2", 104, 0.07, 2519), ("small-3", 65, 0.08, 2152),
+        ("small-4", 7, 0.1, 1434), ("small-5", 1, 0.0, 1918), ("small-6", 0.1, 0.0, 1707),
+    ]
+
+    def _rows(self):
+        return [{"name": n, "solution": "search", "region": "us-east-1", "provider": "aws", "store_gb": st,
+                 "bulk_gb_day": b, "retention_days": d} for n, st, b, d in self.ROWS]
+
+    def _bars(self, force):
+        import size_serverless as ss
+        seen = []
+
+        def fake_es3(payload):
+            seen.append(payload["stored_gb"])
+            # Linear in disk plus a fixed per-project ingest floor, like the es3 model at this size.
+            return {"readback": {"monthly_steady_state": 620 + 2.3 * payload["stored_gb"]}}
+
+        with mock.patch.object(ss, "run_es3", side_effect=fake_es3):
+            specs, _jobs, err, _floor = plan_sheet_jobs(
+                self._rows(), run_key="Acme", name_suffix="_30d", force_months=force, o11y_id="o", security_id="s",
+                parent_id="p", reuse=True, provider="aws", region_name="us-east-1", support="Premium",
+                feature_tier="Complete", workload={"search": {"peak": {"qps": 5, "complexity_ms": 10, "pct_hours_mo": 50}}},
+                org_gb=sum(r[1] for r in self.ROWS),
+            )
+        self.assertIsNone(err)
+        return assemble_plan_bars(specs, [])["bars"]
+
+    def test_fleet_month_fixes_the_scale_for_every_project(self):
+        long_lived = [{"name": "a", "bulk_gb_day": 0, "store_gb": 3600, "retention_days": 1095}]
+        own, own_scale, own_written = search_plan_disk(long_lived, 1)
+        self.assertEqual((own_written, round(own_scale, 4), own), (36, round(1 / 36, 4), 100))
+        stored, scale, written = search_plan_disk(long_lived, 1, fleet_months=1)
+        self.assertEqual((stored, scale, written), (3600, 1.0, 1))
+
+    def test_30d_series_does_not_step_up_when_clusters_merge(self):
+        bars = self._bars(1)
+        floor = bars[-1]["monthly"]
+        headline = 620 + 2.3 * sum(r[1] for r in self.ROWS)
+        self.assertAlmostEqual(floor, headline, delta=1)
+        monthly = [b["monthly"] for b in bars]
+        # Fixed ingest per project makes the ceiling dearer; every merge makes the total smaller or equal.
+        for later, earlier in zip(monthly[1:], monthly):
+            self.assertLessEqual(later, earlier * 1.01)
+        for value in monthly:
+            self.assertLessEqual(value, headline * 1.15)
+            self.assertGreaterEqual(value, headline * 0.95)
+
+    def test_full_retention_series_matches_the_30d_series(self):
+        self.assertEqual([b["monthly"] for b in self._bars(None)], [b["monthly"] for b in self._bars(1)])
+
+
+class BulkCellTests(unittest.TestCase):
+    def test_bulk_shows_up_to_two_decimals(self):
+        from render_pdf import bulk_cell
+        self.assertEqual([bulk_cell(v) for v in (19455.7, 282, 12.5, 0.1, 0.008, 0.001, 0.0049, 0, None)],
+                         ["19,455.7", "282", "12.5", "0.1", "0.01", "<0.01", "<0.01", "0", "0"])
+        self.assertEqual(bulk_cell(1.234), "1.23")
+
+
+class MonitoringExclusionTests(unittest.TestCase):
+    def test_monitoring_is_a_name_part(self):
+        from exclusions import is_monitoring_name, monitoring_names
+        for name in ("monitoring", "prod-monitoring", "ES_Monitoring_01", "stack monitoring"):
+            self.assertTrue(is_monitoring_name(name), name)
+        for name in ("monitor", "monitoringx", "demonitoring", "search-prod", "", None):
+            self.assertFalse(is_monitoring_name(name), name)
+        self.assertEqual(monitoring_names(["a", "monitoring", "monitoring", "b-monitoring"]), ["monitoring", "b-monitoring"])
+
+    def test_ids_follow_names_and_report_the_unresolved(self):
+        from exclusions import ids_for_names
+        ids, missing = ids_for_names(["m1", "m2", "gone"], {"A" * 32: "m1", "b" * 32: "m1", "c" * 32: "m2", "d" * 32: "other"})
+        self.assertEqual(ids, ["a" * 32, "b" * 32, "c" * 32])
+        self.assertEqual(missing, ["gone"])
+
+    def test_auto_exclusion_is_consolidation_only_and_can_be_kept(self):
+        import run_account_analysis as ra
+        acc = {"solutions": {"by_deployment": [{"name": "monitoring", "platform": "ech"}, {"name": "prod", "platform": "ech"}]}}
+        args = type("A", (), {"diags_dir": None, "org_id": None, "exclude_ids": None})()
+        with mock.patch.object(ra, "load_id_to_name", return_value={"a" * 32: "monitoring"}):
+            self.assertEqual(ra.auto_exclude_monitoring(args, {}, {}, acc), [])           # account summary: off
+            args.auto_exclude_monitoring = True
+            self.assertEqual(ra.auto_exclude_monitoring(args, {}, {}, acc), ["monitoring"])
+            self.assertEqual(args.exclude_ids, ["a" * 32])
+        keep = ra.parse_args(["--org", "X", "--keep-monitoring"])
+        self.assertTrue(keep.keep_monitoring)
+
+
+class OrgReportLayoutTests(unittest.TestCase):
+    def test_v119_cells_move_to_the_v122_addresses(self):
+        from estimator_layout import OBSERVABILITY_INPUT_CELLS, cell_range, upgrade_observability_cells
+        old = {"sheet_tab": "Observability Estimator", "cells": {
+            "G4": "Complete", "G5": "Premium", "G8": "r", "G11": 3, "G14": "No", "G18": 0,
+            "G21": 90, "G22": "0%", "G23": 10, "G24": 7, "G25": "100%",
+        }}
+        new = upgrade_observability_cells(old)
+        cells = new["cells"]
+        self.assertEqual((cells["G23"], cells["G24"], cells["G25"], cells["G26"], cells["G27"]), (90, "0%", 10, 7, "100%"))
+        self.assertEqual((cells["G12"], cells["G15"], cells["G19"], cells["G20"], cells["G33"]), (3, "No", 0, 0, "No"))
+        self.assertLessEqual(set(cells), OBSERVABILITY_INPUT_CELLS)
+        self.assertEqual((new["layout"], new["upgraded_from"]), ("1.22", "1.19"))
+        self.assertEqual(upgrade_observability_cells(new), new)       # a tagged block is left alone
+        with self.assertRaises(ValueError):
+            upgrade_observability_cells({"cells": {"G99": 1}})
+        with self.assertRaises(ValueError):
+            upgrade_observability_cells({"layout": "1.22", "cells": {"G21": 1}})
+        self.assertEqual(cell_range("Security Estimator", "E74"), "'Security Estimator'!E74")
+        self.assertEqual(cell_range("Security Estimator", "Estimator_Reference!CB254"), "'Estimator_Reference'!CB254")
 
 
 if __name__ == "__main__":

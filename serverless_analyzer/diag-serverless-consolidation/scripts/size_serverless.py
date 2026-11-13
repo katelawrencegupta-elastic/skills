@@ -53,8 +53,8 @@ sys.path.insert(0, str(K360_SCRIPTS))
 sys.path.insert(0, str(ORG_SKILL / "scripts"))
 from privacy import seal_dir, seal_file, seal_text  # noqa: E402
 from quote_checks import (  # noqa: E402
-    TEMPLATE_ANCHORS, addon_off_value, e73_blocks_quote, g28_gate, money as sheet_money,
-    template_check, template_version,
+    addon_off_value, cell_range, check_value_ranges, e73_blocks_quote, echo_gate, layout_ranges,
+    money as sheet_money, observability_readback, security_readback,
 )
 try:
     from sheets_auth import get_creds  # noqa: E402
@@ -145,6 +145,9 @@ REF_TAB = "Estimator_Reference"
 O11Y_READBACK = {
     "total_raw_gb_day": "G28",
     "metered_gb_day": "G29",
+    # GB/day the two ingest ladders price. On the metered basis these are G19 and G20 turned back into GB/day.
+    "metered_ex_metrics_gb_day": "Estimator_Reference!C2",
+    "metered_metrics_gb_day": "Estimator_Reference-Metrics!C2",
     "monthly_steady_state": "D38",
     "annual_year1": "E38",
     "annual_steady_state": "F38",
@@ -157,6 +160,12 @@ SEC_READBACK = {
     "annual_year3": "F36",
     "annual_steady_state": "E36",
     "cps_addon_monthly": "E73",
+    # The three lines a SIEM quote is made of, so any other line in E74 shows up.
+    "ingest_monthly": "E61",
+    "retention_monthly": "E62",
+    "support_monthly": "E69",
+    # Month 36, the steady state when retention is above 12 months.
+    "steady_total": "Estimator_Reference!CB254",
 }
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -314,7 +323,6 @@ def copy_template(drive, template_id: str, title: str, parent_id: str, *, reuse:
     return _sheet_record(meta), False
 
 
-VERSION_TAB = "Version Control"
 # Exit status when an estimator copy does not have the layout this skill writes.
 TEMPLATE_MISMATCH_EXIT = 3
 
@@ -331,23 +339,17 @@ def verify_template(sheets, sid: str, kind: str, tab: str) -> dict:
     reads the copy, never the golden template.
     """
     assert_not_template(sid)
-    cells = list(TEMPLATE_ANCHORS[kind]["labels"])
-    ranges = [f"'{tab}'!{a1}" for a1 in cells] + [f"'{VERSION_TAB}'!A1:A300"]
+    cells, ranges = layout_ranges(kind, tab)
     res = _execute(lambda: sheets.spreadsheets().values().batchGet(
         spreadsheetId=sid, ranges=ranges, valueRenderOption="FORMATTED_VALUE",
     ))
-    got = res.get("valueRanges") or []
-    labels = {}
-    for a1, vr in zip(cells, got):
-        labels[a1] = ((vr.get("values") or [[None]])[0] or [None])[0]
-    column = [(row or [None])[0] for row in ((got[len(cells)].get("values") if len(got) > len(cells) else None) or [])]
-    check = template_check(kind, labels, template_version(column))
+    check = check_value_ranges(kind, cells, res.get("valueRanges") or [])
     if check["problems"]:
         raise TemplateMismatch(
             f"{kind.title()} estimator copy {sid} does not match the layout this skill writes. "
             + "; ".join(check["problems"][:6])
             + ". Nothing was written and no read-back was taken. "
-            "Point the template id at the current estimator, or update TEMPLATE_ANCHORS and the cell map together."
+            "Point the template id at the current estimator, or update estimator_layout.py and the cell map together."
         )
     return {"version": check["version"], "newer_than_validated": check["newer"]}
 
@@ -471,7 +473,7 @@ def push_cells(sheets, sid: str, tab: str, cells: dict, *, allowed_text: set[str
 
 def read_cells(sheets, sid: str, tab: str, cells: dict[str, str]) -> dict:
     assert_not_template(sid)
-    ranges = [f"'{tab}'!{a1}" for a1 in cells.values()]
+    ranges = [cell_range(tab, a1) for a1 in cells.values()]
     res = _execute(lambda: sheets.spreadsheets().values().batchGet(
         spreadsheetId=sid, ranges=ranges, valueRenderOption="UNFORMATTED_VALUE",
     ))
@@ -516,34 +518,139 @@ def clear_security_addons(sheets, sid: str, tab: str) -> dict:
     return cells
 
 
-def observability_input_cells(acc: dict, support: str, region, retention: int, daily: float, logs=None, metrics=None) -> dict:
-    return {
+HOURS_PER_MONTH = 730
+
+
+def ingest_basis(acc: dict) -> str:
+    """`metered` for diagnostic bulk, `raw` for the K360 backup.
+
+    Diagnostic bulk is the bulk request size on the primary shards, after ingest
+    pipelines have run and before compression. That is what the estimators call
+    metered ingest, so it goes into the cells that take metered volume. The K360
+    backup has no such measurement and keeps the raw-data cells.
+    """
+    return "metered" if (acc.get("sizing") or {}).get("ingest_source") == "diagnostics" else "raw"
+
+
+def observability_input_cells(acc: dict, support: str, region, retention: int, daily: float, logs=None, metrics=None, *, mix: dict | None = None, retention_metrics: int | None = None, basis: str = "raw") -> dict:
+    """Cells for one Observability sheet.
+
+    `metered` writes Option 1: G19 is the monthly metered GB for everything except
+    TSDS metrics (logs and traces), G20 is the monthly metered GB of TSDS metrics,
+    each GB/day × 730 ÷ 24, which is how the sheet turns them back into GB/day.
+    The Option 2 rows are set to 0, so the sheet applies no expansion factor.
+
+    `raw` writes Option 2: logs on G23 and metrics on G25, and the sheet expands
+    them itself. Trace GB/day stays in the logs row there.
+
+    With a `mix` the split is the measured one. With none, GB/day is 90% logs and
+    10% metrics.
+    """
+    k8s_share = 0.0
+    traces = 0.0
+    if mix and mix.get("basis"):
+        logs = float(mix.get("logs_gb_day") or 0)
+        metrics = float(mix.get("metrics_gb_day") or 0)
+        traces = float(mix.get("traces_gb_day") or 0)
+        k8s_share = float(mix.get("k8s_logs_share") or 0)
+    logs = float(daily) * 0.90 if logs is None else float(logs)
+    metrics = float(daily) * 0.10 if metrics is None else float(metrics)
+    cells = {
         "G4": (acc.get("sizing") or {}).get("feature_tier") or "Complete",
         "G5": support,
         "G8": region,
         "G11": retention,
-        "G12": retention,
+        "G12": retention if retention_metrics is None else retention_metrics,
         "G15": "No",
-        "G19": 0,
-        "G20": 0,
-        "G23": round(float(daily) * 0.90, 2) if logs is None else logs,
-        "G24": "0%",
-        "G25": round(float(daily) * 0.10, 2) if metrics is None else metrics,
-        "G26": 0,
         "G27": "100%",
         "G33": "No",
     }
+    if basis == "metered":
+        cells.update({
+            "G19": round((logs + traces) * HOURS_PER_MONTH / 24, 3),
+            "G20": round(metrics * HOURS_PER_MONTH / 24, 3),
+            "G23": 0, "G24": "0%", "G25": 0, "G26": 0,
+        })
+    else:
+        if traces > 0:
+            k8s_share = k8s_share * logs / (logs + traces) if (logs + traces) > 0 else 0.0
+            logs += traces
+        cells.update({
+            "G19": 0, "G20": 0,
+            "G23": round(logs, 2),
+            "G24": round(k8s_share, 4) if k8s_share > 0 else "0%",
+            "G25": round(metrics, 2),
+            "G26": 0,
+        })
+    return cells
 
 
-def security_input_cells(acc: dict, support: str, region, retention: int, daily: float) -> dict:
+def observability_fill(acc: dict, support: str, region, retention: int, daily: float, mix: dict | None, forced: bool, basis: str) -> dict:
+    """Observability cells from a measured mix.
+
+    A forced month (the 30-day read) is written to both retention rows. Otherwise
+    TSDS metrics keep their own measured month, rounded up like the other row.
+    """
+    retention_metrics = None
+    if mix and not forced and mix.get("metrics_retention_days"):
+        retention_metrics = _sheet_retention(float(mix["metrics_retention_days"]) / DAYS_PER_MONTH)
+    return observability_input_cells(acc, support, region, retention, daily, mix=mix, retention_metrics=retention_metrics, basis=basis)
+
+
+def security_input_cells(acc: dict, support: str, region, retention: int, daily: float, *, expansion: float | None = None) -> dict:
+    """Cells for one Security sheet.
+
+    G4 is raw GB/day, and the sheet multiplies it by its expansion factor to get
+    metered GB/day (G5). With an `expansion`, `daily` is metered and G4 is
+    daily ÷ expansion, so G5 comes back as the GB/day that was measured.
+    """
+    raw = float(daily) / expansion if expansion else float(daily)
     return {
-        "G4": round(float(daily), 2),
+        "G4": round(raw, 4 if expansion else 2),
         "G6": retention,
         "G7": region,
         "G8": (acc.get("sizing") or {}).get("feature_tier") or "Complete",
         "G9": 0,
         "G21": support,
     }
+
+
+def security_expansion(sheets, sid: str) -> float:
+    """The Security sheet's raw-to-metered factor, read from the copy.
+
+    G5 is G4 × that factor, so G5 ÷ G4 is the factor whatever cell holds it. A
+    copy whose G4 is 0 falls back to the reference cell. A factor that cannot be
+    read stops the fill.
+    """
+    rb = read_cells(sheets, sid, SEC_TAB, {"raw": "G4", "metered": "G5", "reference": "Estimator_Reference!C326"})
+    raw, metered, reference = sheet_money(rb.get("raw")), sheet_money(rb.get("metered")), sheet_money(rb.get("reference"))
+    factor = metered / raw if raw and metered and raw > 0 else reference
+    if not factor or not 1.0 <= factor <= 10.0:
+        raise RuntimeError(f"Security expansion factor could not be read from the sheet (G4 {rb.get('raw')!r}, G5 {rb.get('metered')!r})")
+    return float(factor)
+
+
+def fill_security(sheets, sid: str, account: dict, support: str, region, retention: int, daily: float, opts, basis: str) -> tuple[dict, int, dict, dict | None]:
+    """Turn the add-ons off, write the cells, and read the dollars back.
+
+    Returns the cells, how many were written, the read-back, and the echo gate.
+    On the metered basis the gate compares G5, the sheet's metered GB/day, with
+    the GB/day measured. A miss clears the monthly so the sheet is not quoted.
+    """
+    expansion = security_expansion(sheets, sid) if basis == "metered" else None
+    clear_security_addons(sheets, sid, SEC_TAB)
+    cells = security_input_cells(account, support, region, retention, daily, expansion=expansion)
+    written = push_cells(sheets, sid, SEC_TAB, cells, allowed_text=set(opts))
+    rb = security_readback(read_cells(sheets, sid, SEC_TAB, SEC_READBACK), retention)
+    rb["ingest_basis"] = basis
+    gate = None
+    if basis == "metered":
+        rb["expansion"] = expansion
+        rb["echo_gb_day"] = rb.get("metered_gb_day")
+        gate = echo_gate(daily, rb.get("metered_gb_day"))
+        if not gate["accepted"]:
+            rb["monthly_steady_state"] = None
+    return cells, written, rb, gate
 
 
 def region_options(sheets, sid: str) -> list[str]:
@@ -604,7 +711,7 @@ def search_markdown(customer: str, when: str, se: dict, provider, region, result
         f"# {customer} — Search Serverless estimate — {when}",
         "",
         "Priced with the es3-estimator library (`estimate_serverless_pricing`), the same function the Jupyter notebook runs.",
-        "On-demand is the quotable profile. Performant and high availability sit beside it; the notebook's own notes say those two can be distorted by training data.",
+        "Performant is the profile this skill quotes. The es3-estimator README says more than 98% of customers run Performant, so it is the setting the model has the most data for. On-demand and high availability are shown beside it; the README says on-demand can come out too high and high availability too low because of the training data.",
         "",
         "## Consolidated Search slice (from K360)",
         f"- Deployments: {se.get('deployments')}",
@@ -1120,20 +1227,16 @@ def _fill_regional_job(job: dict, creds) -> dict:
     )
     opts = region_options(sheets, copied["id"])
     reg, how = match_region(job["provider"], job["region"], opts)
-    if sol == "security":
-        clear_security_addons(sheets, copied["id"], job["tab"])
+    basis = job.get("basis") or "raw"
+    account = {"sizing": {"feature_tier": job.get("feature_tier")}}
+    gate = None
     if sol == "observability":
-        cells = observability_input_cells(
-            {"sizing": {"feature_tier": job.get("feature_tier")}},
-            job["support"], reg, int(job["retention"]), job["daily"],
-        )
+        cells = observability_fill(account, job["support"], reg, int(job["retention"]), job["daily"], job.get("mix"), bool(job.get("forced")), basis)
+        n = push_cells(sheets, copied["id"], job["tab"], cells, allowed_text=set(opts))
+        rb = observability_readback(read_cells(sheets, copied["id"], job["tab"], job["readback"]), basis)
+        gate = echo_gate(job["daily"], rb.get("echo_gb_day"))
     else:
-        cells = security_input_cells(
-            {"sizing": {"feature_tier": job.get("feature_tier")}},
-            job["support"], reg, int(job["retention"]), job["daily"],
-        )
-    n = push_cells(sheets, copied["id"], job["tab"], cells, allowed_text=set(opts))
-    rb = read_cells(sheets, copied["id"], job["tab"], job["readback"])
+        cells, n, rb, gate = fill_security(sheets, copied["id"], account, job["support"], reg, int(job["retention"]), job["daily"], opts, basis)
     entry = {
         "solution": sol, "region": job["region"], "title": copied["name"], "stored_gb": job["stored_gb"],
         "spreadsheet_id": copied["id"], "url": copied["url"], "reused_existing_copy": reused,
@@ -1141,10 +1244,11 @@ def _fill_regional_job(job: dict, creds) -> dict:
         "readback": rb, "status": "filled", "daily_raw_gb": round(job["daily"], 2),
         "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"],
     }
-    if sol == "observability":
-        entry["g28_gate"] = g28_gate(job["daily"], rb.get("total_raw_gb_day"))
-        if not entry["g28_gate"]["accepted"]:
-            entry["readback_rejected"] = "G28 differs from the written bulk by more than 0.51 GB/day"
+    entry["ingest_basis"] = basis
+    if gate is not None:
+        entry["echo_gate"] = gate
+        if not gate["accepted"]:
+            entry["readback_rejected"] = "the sheet echo differs from the written bulk by more than 0.51 GB/day"
     if not job["skip_xlsx"]:
         try:
             entry["local_xlsx"] = str(export_xlsx(drive, copied["id"], Path(job["local_dir"]) / f"{job['title']}.xlsx"))
@@ -1202,6 +1306,7 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
                     retention_months=source_months,
                     solution_stored_gb=total_gb,
                     workload=workload if sol == "search" else None,
+                    metered=ingest_basis(acc) == "metered",
                 )
                 if projected <= REGION_ESTIMATE_MIN_USD:
                     continue
@@ -1225,6 +1330,7 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
                 "feature_tier": feature_tier,
                 "skip_xlsx": skip_xlsx,
                 "reuse": not fresh,
+                "basis": ingest_basis(acc),
             }
             if sol == "search":
                 share = gb / total_gb if total_gb else 0.0
@@ -1237,6 +1343,7 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
                 job.update({
                     "template_id": o11y_id, "tab": O11Y_TAB, "readback": O11Y_READBACK,
                     "retention": int(retention), "daily": daily,
+                    "mix": g.get("mix"), "forced": force_months is not None,
                 })
             elif sol == "security":
                 job.update({
@@ -1250,6 +1357,11 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
         return []
     creds = load_sheet_creds()
     return map_in_order(lambda job: _fill_regional_job(job, creds), jobs)
+
+
+def _observability_mix(rows: list[dict], bulk_key: str) -> dict:
+    from diag_account import observability_mix
+    return observability_mix(rows, bulk_key)
 
 
 def _diag_inputs():
@@ -1336,23 +1448,30 @@ def _plan_written_months(group: list[dict]) -> int | None:
     return diag.whole_months(weighted_days / weight / diag.DAYS_PER_MONTH)
 
 
-def search_plan_disk(group: list[dict], force_months: int | None) -> tuple[float, float, int | None]:
+def search_plan_disk(group: list[dict], force_months: int | None, fleet_months: int | None = None) -> tuple[float, float, int | None]:
     """Search disk for one bar. A forced month shrinks store by measured months.
 
     Returns scaled store, the scale, and the measured whole month. The force
     month is not written back into the measured month before the division.
+
+    `fleet_months` is the written month of the whole Search fleet in the region.
+    Every project on every bar divides by that one month, so a project's disk does
+    not change when it is merged into another one. Without it, a pack takes its own
+    bulk-weighted month, and a long-retention cluster that merges with a short-
+    retention, high-bulk one stops being shrunk: the price steps up on the merge
+    and the series no longer meets the headline at the floor.
     """
     store = sum(float(row.get("store_gb") or 0) for row in group)
-    written = _plan_written_months(group)
+    written = fleet_months or _plan_written_months(group)
     scale = 1.0
     if force_months and written:
         scale = float(int(min(36, max(1, force_months)))) / float(written)
     return store * scale, scale, written
 
 
-def _search_group_price(group: list[dict], *, workload: dict, org_gb: float, support: str, force_months: int | None, cache: dict) -> tuple[float | None, str | None]:
-    """On-demand Search price for one project. A missing notebook total is an error."""
-    stored, _scale, _written = search_plan_disk(group, force_months)
+def _search_group_price(group: list[dict], *, workload: dict, org_gb: float, support: str, force_months: int | None, cache: dict, fleet_months: int | None = None) -> tuple[float | None, str | None]:
+    """Performant Search price for one project. A missing notebook total is an error."""
+    stored, _scale, _written = search_plan_disk(group, force_months, fleet_months)
     store = sum(float(row.get("store_gb") or 0) for row in group)
     org = float(org_gb or 0) * (_scale if store else 1.0)
     share = (store / float(org_gb)) if org_gb else 0.0
@@ -1375,16 +1494,16 @@ def _search_group_price(group: list[dict], *, workload: dict, org_gb: float, sup
     money = ((result.get("readback") or {}).get("monthly_steady_state"))
     if money is None:
         where = region or "the project"
-        return None, f"Deployment-count plan was not priced: Search in {where} returned no on-demand total."
+        return None, f"Deployment-count plan was not priced: Search in {where} returned no performant total."
     cache[key] = round(float(money), 2)
     return cache[key], None
 
 
-def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_months: int | None, o11y_id: str, security_id: str, parent_id: str, reuse: bool, provider, region_name, support: str, feature_tier, workload: dict | None = None, org_gb: float = 0) -> tuple[list[dict], list[dict], str | None, int]:
+def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_months: int | None, o11y_id: str, security_id: str, parent_id: str, reuse: bool, provider, region_name, support: str, feature_tier, workload: dict | None = None, org_gb: float = 0, basis: str = "raw") -> tuple[list[dict], list[dict], str | None, int]:
     """Bar specs plus the sheet jobs they point at.
 
     Observability projects read D38. Security projects read E74. Search projects
-    are the on-demand notebook. A missing month or a missing Search total fails
+    are the performant notebook. A missing month or a missing Search total fails
     before the remaining copies are treated as a quote.
     """
     diag = _diag_inputs()
@@ -1393,6 +1512,10 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
     shared: dict[int, list] = {}
     search_cache: dict = {}
     floor = diag.plan_floor_for_rows(rows)
+    # One written month per region for all Search projects, the same one the headline sheet uses.
+    search_months: dict[str, int | None] = {}
+    for region_key in {str(r.get("region") or "") for r in rows if r.get("solution") == "search"}:
+        search_months[region_key] = _plan_written_months([r for r in rows if r.get("solution") == "search" and str(r.get("region") or "") == region_key])
     for plan in diag.region_feature_plans(rows):
         pct = plan["cut_pct"]
         if pct <= 0 and plan["projects"] <= 1:
@@ -1420,6 +1543,7 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
                     support=support,
                     force_months=force_months,
                     cache=search_cache,
+                    fleet_months=search_months.get(str((group[0] if group else {}).get("region") or "")),
                 )
                 if err:
                     return [], [], err, floor
@@ -1467,6 +1591,9 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
                 "feature_tier": feature_tier,
                 "months_written": int(written),
                 "bulk": bulk,
+                "mix": _observability_mix(group, "bulk_gb_day") if solution == "observability" else None,
+                "forced": force_months is not None,
+                "basis": basis,
             })
         shared[plan["projects"]] = groups
         specs.append({
@@ -1482,7 +1609,7 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
 def fill_plan_sheet(job: dict, creds) -> dict:
     """Copy one plan workbook and read its quote cell. A 429 or 503 is retried inside the request.
 
-    Observability reads D38 after the G28 gate. Security reads E74 after E73 is 0.
+    Observability reads D38 after the echo gate. Security reads E74 after E73 is 0.
     """
     sheets, drive = services_from(creds)
     solution = job.get("solution") or "observability"
@@ -1495,27 +1622,33 @@ def fill_plan_sheet(job: dict, creds) -> dict:
         opts = region_options(sheets, copied["id"])
         reg, _how = match_region(job["provider"], job["region_name"], opts)
         account = {"sizing": {"feature_tier": job.get("feature_tier")}}
+        basis = job.get("basis") or "raw"
         if solution == "security":
-            clear_security_addons(sheets, copied["id"], SEC_TAB)
-            cells = security_input_cells(account, job["support"], reg, int(job["months_written"]), float(job["bulk"]))
-            push_cells(sheets, copied["id"], SEC_TAB, cells, allowed_text=set(opts))
-            rb = read_cells(sheets, copied["id"], SEC_TAB, SEC_READBACK)
+            _cells, _n, rb, gate = fill_security(sheets, copied["id"], account, job["support"], reg, int(job["months_written"]), float(job["bulk"]), opts, basis)
+            if gate is not None and not gate["accepted"]:
+                return {"error": (
+                    "Security deployment-count plan was not priced: "
+                    f"{job['title']} echoes {gate['sheet_gb_day']} GB/day against {gate['written_bulk']} written."
+                )}
             if e73_blocks_quote(rb.get("cps_addon_monthly")):
                 addon = sheet_money(rb.get("cps_addon_monthly"))
-                reason = "E73 was blank" if addon is None else f"E73 is {addon:g}"
+                reason = "E73 was blank" if addon is None else (rb.get("addon_note") or f"E73 is {addon:g}")
                 return {"error": f"Security deployment-count plan was not priced: {job['title']} {reason}."}
             price = sheet_money(rb.get("monthly_steady_state"))
             if price is None:
                 return {"error": f"Security deployment-count plan was not priced: {job['title']} has no E74 read-back."}
             return {"monthly": round(price, 2), "url": copied.get("url")}
-        cells = observability_input_cells(account, job["support"], reg, int(job["months_written"]), float(job["bulk"]))
+        cells = observability_fill(
+            account, job["support"], reg, int(job["months_written"]), float(job["bulk"]),
+            job.get("mix"), bool(job.get("forced")), basis,
+        )
         push_cells(sheets, copied["id"], O11Y_TAB, cells, allowed_text=set(opts))
-        rb = read_cells(sheets, copied["id"], O11Y_TAB, O11Y_READBACK)
-        gate = g28_gate(float(job["bulk"]), rb.get("total_raw_gb_day"))
+        rb = observability_readback(read_cells(sheets, copied["id"], O11Y_TAB, O11Y_READBACK), basis)
+        gate = echo_gate(float(job["bulk"]), rb.get("echo_gb_day"))
         if not gate["accepted"]:
             return {"error": (
                 "Observability deployment-count plan was not priced: "
-                f"{job['title']} G28 is {gate['sheet_raw_gb_day']} GB/day against {gate['written_bulk']} written."
+                f"{job['title']} echoes {gate['sheet_gb_day']} GB/day against {gate['written_bulk']} written."
             )}
         price = sheet_money(rb.get("monthly_steady_state"))
         if price is None:
@@ -1570,7 +1703,7 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
     """Price the cuts from the cover count down to one project per region and feature.
 
     Observability projects are D38 read-backs. Security projects are E74 read-backs.
-    Search projects are the on-demand estimator. A 30-day force scales Search disk
+    Search projects are the performant estimator. A 30-day force scales Search disk
     by the measured month.
     """
     del sheets, drive
@@ -1590,6 +1723,8 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
             "bulk_gb_day": rec.get("daily_raw_gb") or 0,
             "store_gb": rec.get("gb") if rec.get("gb") is not None else dep.get("gb") or 0,
             "retention_days": rec.get("retention_days"),
+            "retention_days_metrics": rec.get("retention_days_metrics"),
+            **{key: rec.get(key) for key in ("logs_gb_day", "k8s_logs_gb_day", "metrics_gb_day", "traces_gb_day") if rec.get(key) is not None},
         })
     if not rows:
         return {"bars": [], "error": "Deployment-count plan was not priced: no ECH deployments."}
@@ -1607,6 +1742,7 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
         region_name=(acc.get("sizing") or {}).get("region"),
         support=support,
         feature_tier=(acc.get("sizing") or {}).get("feature_tier"),
+        basis=ingest_basis(acc),
         workload=acc.get("workload") or {},
         org_gb=org_gb,
     )
@@ -1666,6 +1802,7 @@ def main() -> None:
     sizing_name = args.sizing_json or "sizing.json"
     support = args.support or sz.get("support_tier") or "Premium"
     provider, region = sz.get("provider"), sz.get("region")
+    basis = ingest_basis(acc)
 
     sheets, drive = services()
     root = ensure_drive_folder(drive, key)
@@ -1742,7 +1879,7 @@ def main() -> None:
                 entry["error"] = published["error"]
             estimators["search"] = entry
             rb = result.get("readback") or {}
-            lines.append(f"Search → {entry.get('url') or entry.get('error')}  (on-demand {rb.get('monthly_steady_state')})")
+            lines.append(f"Search → {entry.get('url') or entry.get('error')}  (performant {rb.get('monthly_steady_state')})")
         fresh = size_regional_projects(
             acc, sheets, drive, folder, o11y_id=args.o11y_id, security_id=args.security_id,
             support=support, provider=provider, skip_xlsx=args.skip_xlsx, fresh=args.fresh,
@@ -1809,15 +1946,26 @@ def main() -> None:
         opts = region_options(sheets, copied["id"])
         reg, how = match_region(provider, o_scope or region, opts)
         daily = float(o.get("daily_raw_gb") or 0)
-        cells = observability_input_cells(
-            acc, support, reg, o_months, daily, logs=o.get("logs_gb_day"), metrics=o.get("metrics_gb_day"),
-        )
+        o_mix = None
+        if o.get("mix_basis"):
+            o_mix = {
+                "basis": o.get("mix_basis"),
+                "logs_gb_day": o.get("logs_gb_day"), "metrics_gb_day": o.get("metrics_gb_day"),
+                "traces_gb_day": o.get("traces_gb_day"), "k8s_logs_share": o.get("k8s_logs_share"),
+                "metrics_retention_days": float(o["retention_months_metrics"]) * DAYS_PER_MONTH if o.get("retention_months_metrics") else None,
+            }
+            cells = observability_fill(acc, support, reg, o_months, daily, o_mix, args.force_months is not None, basis)
+        else:
+            cells = observability_input_cells(
+                acc, support, reg, o_months, daily, logs=o.get("logs_gb_day"), metrics=o.get("metrics_gb_day"), basis=basis,
+            )
         n = push_cells(sheets, copied["id"], O11Y_TAB, cells, allowed_text=set(opts))
-        rb = read_cells(sheets, copied["id"], O11Y_TAB, O11Y_READBACK)
+        rb = observability_readback(read_cells(sheets, copied["id"], O11Y_TAB, O11Y_READBACK), basis)
         entry = {"kind": "observability", "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.o11y_id, "reused_existing_copy": reused, "tab": O11Y_TAB, "cells": cells, "cells_written": n, "region_match": f"{reg} ({how})", "readback": rb, "status": "filled", "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"]}
-        entry["g28_gate"] = g28_gate(daily, rb.get("total_raw_gb_day"))
-        if not entry["g28_gate"]["accepted"]:
-            entry["readback_rejected"] = "G28 differs from the written bulk by more than 0.51 GB/day"
+        entry["ingest_basis"] = basis
+        entry["echo_gate"] = echo_gate(daily, rb.get("echo_gb_day"))
+        if not entry["echo_gate"]["accepted"]:
+            entry["readback_rejected"] = "the sheet echo differs from the written bulk by more than 0.51 GB/day"
         if not args.skip_xlsx:
             try:
                 x = export_xlsx(drive, copied["id"], estimate_dir / f"{title_o}.xlsx")
@@ -1847,11 +1995,14 @@ def main() -> None:
         copied, reused, layout = copy_verified(drive, sheets, args.security_id, title_s, folder["id"], reuse=not args.fresh, kind="security", tab=SEC_TAB)
         opts = region_options(sheets, copied["id"])
         reg, how = match_region(provider, s_scope or region, opts)
-        clear_security_addons(sheets, copied["id"], SEC_TAB)
-        cells = security_input_cells(acc, support, reg, s_months, float(s.get("siem_gb_day") if s.get("siem_gb_day") is not None else s.get("daily_raw_gb") or 0))
-        n = push_cells(sheets, copied["id"], SEC_TAB, cells, allowed_text=set(opts))
-        rb = read_cells(sheets, copied["id"], SEC_TAB, SEC_READBACK)
+        s_daily = float(s.get("siem_gb_day") if s.get("siem_gb_day") is not None else s.get("daily_raw_gb") or 0)
+        cells, n, rb, s_gate = fill_security(sheets, copied["id"], acc, support, reg, s_months, s_daily, opts, basis)
         entry = {"kind": "security", "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.security_id, "reused_existing_copy": reused, "tab": SEC_TAB, "cells": cells, "cells_written": n, "region_match": f"{reg} ({how})", "readback": rb, "status": "filled", "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"]}
+        entry["ingest_basis"] = basis
+        if s_gate is not None:
+            entry["echo_gate"] = s_gate
+            if not s_gate["accepted"]:
+                entry["readback_rejected"] = "the sheet echo differs from the written bulk by more than 0.51 GB/day"
         if not args.skip_xlsx:
             try:
                 x = export_xlsx(drive, copied["id"], estimate_dir / f"{title_s}.xlsx")
@@ -1910,7 +2061,7 @@ def main() -> None:
             "source": result.get("source"),
             "url": published.get("url"),
             "spreadsheet_id": published.get("spreadsheet_id"),
-            "note": "on-demand is the quotable profile" if result.get("readback") else (result.get("error") or result.get("status")),
+            "note": "performant is the quotable profile" if result.get("readback") else (result.get("error") or result.get("status")),
         }
         if result.get("error"):
             entry["error"] = result["error"]
@@ -1918,7 +2069,7 @@ def main() -> None:
             entry["error"] = published["error"]
             entry["note"] = f"{entry.get('note')}; Drive upload failed: {published['error']}"
         rb = result.get("readback") or {}
-        lines.append(f"Search → {entry.get('url') or entry.get('local')}  (on-demand {rb.get('monthly_steady_state') or entry['status']}; region {result.get('region_match')})")
+        lines.append(f"Search → {entry.get('url') or entry.get('local')}  (performant {rb.get('monthly_steady_state') or entry['status']}; region {result.get('region_match')})")
         estimators["search"] = entry
     project_only = {"observability", "security"} if args.skip_search else None
     fresh_projects = size_regional_projects(

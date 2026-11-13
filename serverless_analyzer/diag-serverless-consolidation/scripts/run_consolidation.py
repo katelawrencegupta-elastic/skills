@@ -46,6 +46,12 @@ from run_account_analysis import (  # noqa: E402
 )
 
 
+# The compression-applied set wrote bulk × 0.60 into the raw-data cells, where the
+# sheets multiply by 1.66. Since 0.60 × 1.66 is 0.996, that set was the metered quote
+# under another name. Bulk now goes into the metered cells directly, so the set
+# is not produced. Its code stays until it is removed.
+RUN_COMPRESSION_SET = False
+
 # size_serverless.py exits with this status when an estimator copy does not have
 # the layout its cell addresses were written for.
 TEMPLATE_MISMATCH_EXIT = 3
@@ -92,7 +98,7 @@ def _half_dollar(rate) -> bool:
 
 
 def _estimator_quote(entry: dict) -> dict:
-    keep = ("title", "url", "status", "readback", "region_match", "g28_gate", "readback_rejected", "cells")
+    keep = ("title", "url", "status", "readback", "region_match", "echo_gate", "readback_rejected", "cells")
     return {k: entry[k] for k in keep if k in entry}
 
 
@@ -512,7 +518,18 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
     if not rows:
         sz["diagnostics_status"] = "no diagnostic rows"
         return None
-    diag = apply_diagnostics(acc, rows)
+    admin_names = None
+    try:
+        from admin_diags import admin_base, list_deployments
+        base = admin_base(env)
+        key = env.get("FOUND_ADMIN_API_KEY")
+        names: set[str] = set()
+        for oid in org_ids:
+            names.update(str(x.get("name")) for x in list_deployments(base, key, oid) if x.get("name"))
+        admin_names = names or None
+    except Exception as ex:
+        print(f"WARN: admin deployment list unavailable ({ex!r}); unmatched deployments stay 'missing diagnostic'", file=sys.stderr)
+    diag = apply_diagnostics(acc, rows, admin_names)
     if download_failed:
         diag["sizing"].setdefault("diagnostics", {})["download_failed"] = download_failed
     apply_quote_lookback(diag, args.lookback_days)
@@ -626,16 +643,17 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
                 print(f"WARN: 30-day quote failed ({ex!r})", file=sys.stderr)
                 diag.setdefault("consolidation", {}).setdefault("notes", []).append(f"The 30-day PDF was not priced ({ex!r}).")
         seal_text(diag_path, json.dumps(diag, indent=2))
-    try:
-        _run_compressioncalc(
-            diag, diag_path, infra, py, args,
-            size_sheets=sizing_ran and not (diag.get("consolidation") or {}).get("error"),
-        )
-    except Exception as ex:
-        print(f"WARN: compressioncalc_accounted_for failed ({ex!r})", file=sys.stderr)
-        diag.setdefault("consolidation", {}).setdefault("notes", []).append(
-            f"compressioncalc_accounted_for was not priced ({ex!r})."
-        )
+    if RUN_COMPRESSION_SET:
+        try:
+            _run_compressioncalc(
+                diag, diag_path, infra, py, args,
+                size_sheets=sizing_ran and not (diag.get("consolidation") or {}).get("error"),
+            )
+        except Exception as ex:
+            print(f"WARN: compressioncalc_accounted_for failed ({ex!r})", file=sys.stderr)
+            diag.setdefault("consolidation", {}).setdefault("notes", []).append(
+                f"compressioncalc_accounted_for was not priced ({ex!r})."
+            )
     seal_text(diag_path, json.dumps(diag, indent=2))
     sz["diagnostics_status"] = "ok"
     sz["diagnostics_dir"] = str(out_dir)
@@ -647,6 +665,8 @@ def main() -> None:
     args = parse_args(description=__doc__)
     if not 1 <= int(args.lookback_days) <= 365:
         raise SystemExit("--lookback-days must be from 1 to 365")
+    # A consolidation run leaves stack-monitoring clusters out. The account summary does not.
+    args.auto_exclude_monitoring = not getattr(args, "keep_monitoring", False)
     acc, infra, folder, env, acc_path = prepare_account(args)
     if args.skip_diags and args.skip_sizing:
         finish_account(acc, folder, acc_path, args)

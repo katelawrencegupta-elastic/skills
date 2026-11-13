@@ -385,19 +385,74 @@ def _est_bytes_per_day(bulk_bytes: int, creation: int | None, lifecycle: int | N
     The write phase is creation until rollover, or the index age while ILM's
     current action is rollover. A missing write phase is 0.
     """
-    if not bulk_bytes or not creation or creation <= 0 or collection < creation or not lifecycle or lifecycle > collection:
+    seconds = _write_phase_sec(creation, lifecycle, action, collection)
+    if not bulk_bytes or seconds <= 0:
+        return 0
+    return int(int(bulk_bytes) * (86400.0 / seconds))
+
+
+def _write_phase_sec(creation: int | None, lifecycle: int | None, action: str | None, collection: int) -> int:
+    """index.write_phase_sec from esdiag: creation until rollover, or the age while ILM waits to roll over."""
+    if not creation or creation <= 0 or collection < creation or not lifecycle or lifecycle > collection:
         return 0
     age = collection - int(creation)
     since = collection - int(lifecycle)
     if age > since:
-        seconds = (age - since) // 1000
-    elif action == "rollover":
-        seconds = age // 1000
-    else:
-        seconds = 0
-    if seconds <= 0:
-        return 0
-    return int(int(bulk_bytes) * (86400.0 / seconds))
+        return (age - since) // 1000
+    if action == "rollover":
+        return age // 1000
+    return 0
+
+
+# A series is rated over at least this long when earlier generations allow it.
+MIN_RATE_WINDOW_SEC = 86_400
+# A dated index family is rated only while its newest index is this young.
+DATED_FAMILY_MAX_AGE_SEC = 32 * 86_400
+_DATED_NAME = re.compile(r"^(?P<base>.+?)[-_.](?P<date>20\d{2}[.\-_]?\d{2}(?:[.\-_]?\d{2})?)$")
+
+
+def _window_rate(generations: list[tuple[int, int, bool]], minimum: int = MIN_RATE_WINDOW_SEC) -> tuple[int, int, int]:
+    """Bytes per day over the newest generations of one series.
+
+    `generations` is newest first: (bulk bytes, write-phase seconds, usable).
+    The first entry is the current write index and is rated by esdiag's own
+    formula. While the window is under `minimum`, the next older generation is
+    added, bytes and seconds both, as long as it is usable: it still holds its
+    bulk counter and has a write phase. Returns the rate, the window in seconds,
+    and how many generations were used. A write index with no write phase is 0.
+    """
+    if not generations:
+        return 0, 0, 0
+    bulk, seconds, _usable = generations[0]
+    if bulk <= 0 or seconds <= 0:
+        return 0, 0, 0
+    used = 1
+    for more_bulk, more_seconds, usable in generations[1:]:
+        if seconds >= minimum or not usable or more_bulk <= 0 or more_seconds <= 0:
+            break
+        bulk += more_bulk
+        seconds += more_seconds
+        used += 1
+    return int(int(bulk) * (86400.0 / seconds)), int(seconds), used
+
+
+def ingest_kind(series: str, index_mode: str | None = None) -> str:
+    """logs, k8s_logs, metrics, or traces, from the data stream or index name.
+
+    The Observability estimator prices TSDS metrics on their own ladder, meters
+    Kubernetes logs at a higher expansion, and takes traces separately. Anything
+    that is not named as metrics or traces is logs.
+    """
+    name = (series or "").lower()
+    if name.startswith(".ds-"):
+        name = name[4:]
+    if (index_mode or "").lower() == "time_series" or name.startswith(("metrics-", "metricbeat-")):
+        return "metrics"
+    if name.startswith("traces-"):
+        return "traces"
+    if name.startswith("logs-kubernetes."):
+        return "k8s_logs"
+    return "logs"
 
 
 # The second estimate keeps 60% of write-index bulk.
@@ -437,7 +492,7 @@ def _rolled_over(info: dict) -> bool:
     return bool(created and lifecycle and int(lifecycle) > int(created))
 
 
-def unrated_ingest(stats: dict, streams: list, alias: dict, explain: dict, rated: dict[str, int]) -> dict:
+def unrated_ingest(stats: dict, streams: list, alias: dict, explain: dict, rated: dict[str, int], covered: set[str] | None = None) -> dict:
     """User indices that took bulk writes and contribute nothing to bulk GB/day.
 
     The rate is summed over write indices that have a write phase. Two kinds of
@@ -462,7 +517,7 @@ def unrated_ingest(stats: dict, streams: list, alias: dict, explain: dict, rated
             continue
         primaries = (body or {}).get("primaries") or {}
         bulk_bytes = int(((primaries.get("bulk") or {}).get("total_size_in_bytes")) or 0)
-        if bulk_bytes <= 0 or rated.get(name, 0) > 0:
+        if bulk_bytes <= 0 or rated.get(name, 0) > 0 or name in (covered or ()):
             continue
         if name in write:
             reason = "write index with no write phase"
@@ -490,6 +545,158 @@ def unrated_ingest(stats: dict, streams: list, alias: dict, explain: dict, rated
     }
 
 
+def _bulk_bytes(stats: dict, name: str) -> int:
+    return int((((stats.get(name) or {}).get("primaries") or {}).get("bulk") or {}).get("total_size_in_bytes") or 0)
+
+
+def _store_bytes(stats: dict, name: str) -> int:
+    return int((((stats.get(name) or {}).get("primaries") or {}).get("store") or {}).get("size_in_bytes") or 0)
+
+
+# An older generation whose bulk-to-store ratio is under this share of the write
+# index's ratio has probably lost part of its bulk counter to a shard move.
+COUNTER_INTACT_MIN = 0.5
+
+
+def _counter_intact(stats: dict, older: str, write_name: str) -> bool:
+    """Does the older generation still hold bulk bytes in proportion to what it stores?"""
+    write_bulk, write_store = _bulk_bytes(stats, write_name), _store_bytes(stats, write_name)
+    old_bulk, old_store = _bulk_bytes(stats, older), _store_bytes(stats, older)
+    if min(write_bulk, write_store, old_store) <= 0:
+        return old_bulk > 0
+    return (old_bulk / old_store) >= COUNTER_INTACT_MIN * (write_bulk / write_store)
+
+
+def series_rates(stats: dict, streams: list, alias: dict, explain: dict, created: dict, index_mode: dict, collection: int) -> dict:
+    """Bulk bytes per day for every series in a bundle, with the logs, metrics, and traces split.
+
+    A series is a data stream, the indices under one write alias, or a family of
+    dated indices written by name. Each is rated on its current write index by
+    esdiag's formula, bulk bytes × 86,400 ÷ write-phase seconds. Three things go
+    beyond the single write index:
+
+    - A write index in its first day is extended with the generations before
+      it until the window reaches a day (`_window_rate`). An older generation is
+      used only while ILM still has it in the hot phase and its bulk-to-store
+      ratio is at least half the write index's, because a shard that moved has
+      lost its bulk counter.
+    - A data stream with no ILM dates (a data stream lifecycle) takes the write
+      index age as its write phase, the same quantity ILM reports while it waits
+      to roll over.
+    - A dated family with no data stream or write alias is rated on its newest
+      index over that index's age, when that index is at most 32 days old.
+
+    `fallback_bytes` is the rate from the last two. `short_window_bytes` is the
+    rate still measured over less than a day.
+    """
+    members_of: dict[str, list[str]] = {}
+    for ds in streams or []:
+        names = [(ix or {}).get("index_name") or "" for ix in (ds.get("indices") or [])]
+        names = [n for n in names if n]
+        if names:
+            members_of[names[-1]] = names
+    stream_write = set(members_of)
+    alias_members: dict[str, list[str]] = defaultdict(list)
+    alias_write: dict[str, str] = {}
+    for name, body in (alias or {}).items():
+        for alias_name, st in (((body or {}).get("aliases")) or {}).items():
+            alias_members[alias_name].append(name)
+            if (st or {}).get("is_write_index"):
+                alias_write[name] = alias_name
+    for name, alias_name in alias_write.items():
+        if name not in members_of:
+            family = sorted(alias_members[alias_name], key=lambda n: (created.get(n) or (explain.get(n) or {}).get("index_creation_date_millis") or 0, n))
+            if name in family:
+                family = family[: family.index(name) + 1]
+            else:
+                family = [name]
+            members_of[name] = family
+
+    def born(name: str) -> int | None:
+        return (explain.get(name) or {}).get("index_creation_date_millis") or created.get(name)
+
+    rated: dict[str, int] = {}
+    mix = {"logs": 0, "k8s_logs": 0, "metrics": 0, "traces": 0}
+    total = short = fallback = 0
+    covered: set[str] = set()
+
+    def add(series: str, write_name: str, rate: int, window: int, by_fallback: bool) -> None:
+        nonlocal total, short, fallback
+        rated[write_name] = rate
+        if rate <= 0:
+            return
+        total += rate
+        kind = ingest_kind(series, index_mode.get(write_name))
+        if kind == "k8s_logs":
+            mix["k8s_logs"] += rate
+            kind = "logs"
+        mix[kind] += rate
+        if window < MIN_RATE_WINDOW_SEC:
+            short += rate
+        if by_fallback:
+            fallback += rate
+
+    stream_name = {names[-1]: ds.get("name") or names[-1] for ds in streams or [] for names in [[(ix or {}).get("index_name") or "" for ix in (ds.get("indices") or [])]] if names and names[-1]}
+    for write_name, family in members_of.items():
+        info = explain.get(write_name) or {}
+        seconds = _write_phase_sec(info.get("index_creation_date_millis"), info.get("lifecycle_date_millis"), info.get("action"), collection)
+        by_fallback = False
+        if seconds <= 0 and write_name in stream_write and not info.get("lifecycle_date_millis"):
+            # Data stream lifecycle: no ILM dates, and the write index is by definition still being written.
+            start = born(write_name)
+            if start and collection > start:
+                seconds = (collection - int(start)) // 1000
+                by_fallback = True
+        generations = [(_bulk_bytes(stats, write_name), int(seconds), True)]
+        later = write_name
+        for older in reversed(family[:-1]):
+            older_info = explain.get(older) or {}
+            start, end = born(older), None
+            if older_info.get("lifecycle_date_millis") and start and int(older_info["lifecycle_date_millis"]) > int(start):
+                end = int(older_info["lifecycle_date_millis"])
+            elif born(later):
+                end = int(born(later))
+            phase = (end - int(start)) // 1000 if start and end and end > int(start) else 0
+            usable = (older_info.get("phase") in (None, "hot")) and phase > 0 and _counter_intact(stats, older, write_name)
+            generations.append((_bulk_bytes(stats, older), int(phase), usable))
+            later = older
+        rate, window, _used = _window_rate(generations)
+        add(stream_name.get(write_name) or write_name, write_name, rate, window, by_fallback)
+
+    # Dated indices written by name: no data stream, no write alias, never rolled over.
+    in_stream = {n for names in members_of.values() for n in names}
+    write_aliases = set(alias_write.values())
+    families: dict[str, list[str]] = defaultdict(list)
+    for name in stats or {}:
+        if name in in_stream or not _user_index(name) or _bulk_bytes(stats, name) <= 0:
+            continue
+        if set((((alias or {}).get(name) or {}).get("aliases")) or {}) & write_aliases or _rolled_over(explain.get(name) or {}):
+            continue
+        match = _DATED_NAME.match(name)
+        if match and born(name):
+            families[match.group("base")].append(name)
+    for base, names in families.items():
+        names.sort(key=lambda n: (int(born(n)), n))
+        newest = names[-1]
+        age = (collection - int(born(newest))) // 1000
+        if age <= 0 or age > DATED_FAMILY_MAX_AGE_SEC // 1:
+            continue
+        generations = [(_bulk_bytes(stats, newest), int(age), True)]
+        later = newest
+        for older in reversed(names[:-1]):
+            phase = (int(born(later)) - int(born(older))) // 1000
+            generations.append((_bulk_bytes(stats, older), int(phase), phase > 0 and _counter_intact(stats, older, newest)))
+            later = older
+        rate, window, _used = _window_rate(generations)
+        if rate > 0:
+            add(base, newest, rate, window, True)
+            covered.update(names)
+    return {
+        "rated": rated, "bytes_per_day": total, "mix": mix,
+        "short_window_bytes": short, "fallback_bytes": fallback, "covered": covered,
+    }
+
+
 def analyze_bundle(path: Path, *, captured: datetime) -> dict:
     """Bulk GB/day, retention, and primary store size from one diagnostic zip."""
     with zipfile.ZipFile(path) as archive:
@@ -513,18 +720,22 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         ts = node.get("timestamp") or 0
         if ts > collection:
             collection = ts
-    est_bytes = 0
-    rated: dict[str, int] = {}
-    for name in _write_indices(streams, alias):
-        body = stats.get(name) or {}
-        primaries = body.get("primaries") or {}
-        bulk_bytes = ((primaries.get("bulk") or {}).get("total_size_in_bytes") or 0)
-        info = explain.get(name) or {}
-        created_ms = info.get("index_creation_date_millis")
-        lifecycle_ms = info.get("lifecycle_date_millis")
-        action = info.get("action")
-        rated[name] = _est_bytes_per_day(int(bulk_bytes), created_ms, lifecycle_ms, action, collection)
-        est_bytes += rated[name]
+    created: dict[str, int] = {}
+    index_mode: dict[str, str] = {}
+    for name, meta in ((state.get("metadata") or {}).get("indices") or {}).items():
+        settings = ((meta.get("settings") or {}).get("index") or {})
+        if settings.get("mode"):
+            index_mode[name] = str(settings.get("mode"))
+        raw = settings.get("creation_date")
+        if raw:
+            try:
+                created[name] = int(raw)
+            except (TypeError, ValueError):
+                pass
+
+    rates = series_rates(stats, streams, alias, explain, created, index_mode, collection)
+    rated = rates["rated"]
+    est_bytes = rates["bytes_per_day"]
     gb_day = est_bytes / 1e9
     # compressioncalc_accounted_for = bulk GB/day × 0.60.
     # On-disk bytes do not change it.
@@ -550,16 +761,13 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         for ix in ds.get("indices") or []:
             ds_age[ix.get("index_name") or ""] = age
 
-    created: dict[str, int] = {}
-    for name, meta in ((state.get("metadata") or {}).get("indices") or {}).items():
-        raw = ((meta.get("settings") or {}).get("index") or {}).get("creation_date")
-        if raw:
-            try:
-                created[name] = int(raw)
-            except (TypeError, ValueError):
-                pass
-
+    series_of = {
+        (ix or {}).get("index_name"): ds.get("name") or ""
+        for ds in streams for ix in (ds.get("indices") or [])
+    }
     by_age: dict[float, float] = defaultdict(float)
+    metrics_age_bytes = 0.0
+    metrics_bytes = 0.0
     unknown = 0.0
     local = 0.0
     dataset = 0.0
@@ -585,6 +793,9 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
             unknown += nbytes
         else:
             by_age[round(age, 3)] += nbytes
+            if ingest_kind(series_of.get(ix) or ix, index_mode.get(ix)) == "metrics":
+                metrics_age_bytes += age * nbytes
+                metrics_bytes += nbytes
         ms = created.get(ix) or info.get("index_creation_date_millis")
         if ms:
             observed.append((captured_ms - int(ms)) / 86_400_000)
@@ -614,12 +825,19 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         "compressioncalc_accounted_for": round(accounted_gb, 3),
         "uptime_days_min": round(min(hot_up), 1) if hot_up else None,
         "retention_days": round(days, 3) if days else None,
+        # Size-weighted delete age of the metrics indices alone, for the TSDS retention row.
+        "retention_days_metrics": round(metrics_age_bytes / metrics_bytes, 3) if metrics_bytes > 0 else None,
         "retention_basis": basis,
         "retention_label": _retention_label(parts, basis),
         "store_gb": round(local / 1e9, 2),
         "dataset_gb": round((dataset + snapshot) / 1e9, 2),
         "snapshot_gb": round(((dataset - local) + snapshot) / 1e9, 2),
-        **unrated_ingest(stats, streams, alias, explain, rated),
+        # logs + metrics + traces is bulk_gb_day. k8s_logs is the part of logs from Kubernetes.
+        "bulk_mix": {kind: round(nbytes / 1e9, 3) for kind, nbytes in rates["mix"].items()},
+        # Part of bulk_gb_day rated over less than a day, and the part rated without an ILM write phase.
+        "bulk_short_window_gb_day": round(rates["short_window_bytes"] / 1e9, 3),
+        "bulk_fallback_gb_day": round(rates["fallback_bytes"] / 1e9, 3),
+        **unrated_ingest(stats, streams, alias, explain, rated, rates["covered"]),
     }
 
 

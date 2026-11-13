@@ -22,6 +22,10 @@ from io import StringIO
 from pathlib import Path
 
 MONTHLY_HOURS = 730
+# The search-power setting whose total is the Search quote. The estimator's README
+# says more than 98% of customers run performant, so its model has the most data
+# for it. The other settings are reported beside it and are never the quote.
+QUOTED_SEARCH_PROFILE = "performant"
 QTT_BY_COMPLEXITY = {"Low": 25.0, "Medium": 100.0, "High": 300.0}
 SUPPORT_BY_TIER = {
     "premium": "Enterprise",
@@ -203,7 +207,7 @@ def build_user_info(payload: dict, pricing: dict, support_matrix: dict) -> tuple
     assumptions: list[str] = [
         "Workload type is text. Vector and time-series profiles are not inferred from K360.",
         "QPS and query time are day averages from index telemetry, not peak-second load.",
-        "On-demand is the quotable profile. Performant and high availability are shown beside it.",
+        "Performant is the quoted profile. On-demand and high availability are shown beside it.",
     ]
     stored = max(float(payload.get("stored_gb") or 0), 0.0)
     org_gb = max(float(payload.get("org_stored_gb") or 0), 0.0)
@@ -250,9 +254,8 @@ def _num(value):
 
 
 def readback_from(profiles: list[dict]) -> dict | None:
-    chosen = next((row for row in profiles if row.get("Search Power Setting") == "on-demand"), None)
-    if chosen is None and profiles:
-        chosen = profiles[0]
+    # No fallback to another setting: a quote labelled performant is the performant total or nothing.
+    chosen = next((row for row in profiles if row.get("Search Power Setting") == QUOTED_SEARCH_PROFILE), None)
     if not chosen:
         return None
     monthly = _num(chosen.get("Total $/month"))
@@ -302,7 +305,7 @@ def run(payload: dict) -> dict:
     for item in caught:
         assumptions.append(str(item.message))
     rb = readback_from(profiles)
-    status = "estimated" if rb else "estimated — on-demand total was not numeric"
+    status = "estimated" if rb else f"estimated — {QUOTED_SEARCH_PROFILE} total was not numeric"
     return {
         "status": status,
         "source": "es3-estimator estimate_serverless_pricing",
