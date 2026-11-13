@@ -50,13 +50,11 @@ THIRTY_DAY_FOLDER = "30d"
 def pdf_folder_name(kind: str) -> str | None:
     """Subfolder for a consolidation PDF, or None for the run folder.
 
-    The account PDF, the appendix, and the bulk consolidation PDFs (full retention
-    and 30-day) stay in the run folder root. Compression-applied and K360 backup
-    PDFs go in their retention folder.
+    The account PDF and the appendix stay in the run folder root. Every
+    consolidation PDF goes in its retention folder: `full_retention` for the
+    rounded month, `30d` for the 30-day read.
     """
     if not kind or kind in ("account", "appendix"):
-        return None
-    if "compression" not in kind and "k360" not in kind:
         return None
     if kind.endswith("_30d"):
         return THIRTY_DAY_FOLDER

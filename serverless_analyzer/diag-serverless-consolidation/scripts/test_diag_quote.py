@@ -756,10 +756,10 @@ class EstimateFolderTests(unittest.TestCase):
         self.assertNotIn("readback", estimators["search"])
 
     def test_pdfs_split_by_retention(self):
-        self.assertIsNone(pdf_folder_name("consolidation"))
+        self.assertEqual(pdf_folder_name("consolidation"), "full_retention")
         self.assertEqual(pdf_folder_name("consolidation_compressioncalc"), "full_retention")
         self.assertEqual(pdf_folder_name("consolidation_k360"), "full_retention")
-        self.assertIsNone(pdf_folder_name("consolidation_30d"))
+        self.assertEqual(pdf_folder_name("consolidation_30d"), "30d")
         self.assertEqual(pdf_folder_name("consolidation_compressioncalc_30d"), "30d")
         self.assertIsNone(pdf_folder_name("account"))
         self.assertIsNone(pdf_folder_name("appendix"))
