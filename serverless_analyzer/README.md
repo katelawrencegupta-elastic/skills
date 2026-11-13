@@ -82,13 +82,19 @@ Prices Observability and Security from Elasticsearch diagnostic bundles. Daily G
 Run options worth knowing:
 
 - `--exclude-deployment <id>` (repeat or comma list) removes a deployment from the whole run. The run key gains `_excluding_<n>`, and page 1 names what was left out.
+- `--ech-scope priced|all` (default `priced`) sets the ECH side of the comparison: only deployments that got a serverless price, or the whole billing window. Page 1 names what was not compared.
+- `--unmeasured exclude|k360|fail` (default `exclude`) says what an active deployment with no bundle does: on neither side, priced from K360 stored GB and labelled, or a stop.
+- `--min-priced-ecu-pct N` (default 90) fails integrity when priced deployments carry less than that share of the ECH deployments' billed cost.
+- `--keep-serverless-spend` leaves existing serverless projects' cost in the ECH figure under `--ech-scope all`.
 - `--allow-missing-diags` continues when a diagnostic download still fails after its retries. Page 1 then lists the deployments that were not measured.
-- When serverless at list costs more than ECH at the contract rate, page 1 reads "increase" with an up arrow instead of "reduction".
-- The bulk PDFs carry a per-cluster page after the deployment-count page: each cluster's serverless $/mo as its own project, then at every step down to the floor.
-- A 30-day pass writes `sizing_30d.json`, not `sizing.json`.
+- When serverless at list costs more than the ECH billed cost, page 1 reads "increase" with an up arrow instead of "reduction".
+- The consolidation PDF carries a per-cluster page after the deployment-count page: each cluster's serverless $/mo as its own project, then at every step down to the floor.
+- `--lookback-days` (default 90) is the billing window: the ECH month and the roster of active deployments. ECH dollars are the K360 billing `cost` field as billed. No ARR ÷ commit rate is applied.
+- Every run is stamped with the commit and rules that produced it (`meta.method`, `method` in the brief, and the last line of the PDF). Compare two runs of one customer only when the stamp matches.
+- Quote integrity passes only when every check passes. One failed check fails the quote.
 
 References: `calculations.md` is the arithmetic. `sizing-cells.md` is the estimator cell map.
 
 ## How a quote is assembled
 
-`k360-org-report` writes `<customer>_<date>_org_report.json`. `k360-account-analysis` can reuse that file for the summary. `diag-serverless-consolidation` reuses it again, then replaces ingest and retention with the diagnostic measurements. Observability monthly is D38. Security monthly is E74, or the sheet's month 36 when retention is above 12 months. Search is the es3 performant profile. The account PDF stays in the customer folder. Measured-retention consolidation PDFs go in `full_retention/`. 30-day PDFs go in `30d/`.
+`k360-org-report` writes `<customer>_<date>_org_report.json`. `k360-account-analysis` can reuse that file for the summary. `diag-serverless-consolidation` reuses it again, then replaces ingest and retention with the diagnostic measurements. Observability monthly is D38. Security monthly is E74, or the sheet's month 36 when retention is above 12 months. Search is the es3 performant profile. Every PDF is in the customer folder root: the account PDF, the appendix, and the consolidation PDF. Estimate sheets are directly in `generated_estimates/`, and plan sheets in `generated_estimates/plan_sheets/`. There are no `full_retention` or `30d` folders, and no 30-day read.

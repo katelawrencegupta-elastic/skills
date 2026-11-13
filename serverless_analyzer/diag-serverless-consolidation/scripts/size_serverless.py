@@ -6,23 +6,17 @@ Run with the Sheets venv python (google-api-python-client installed):
   ~/.config/serverless-analyzer/venv/bin/python size_serverless.py \
       --account-json serverless_analyzer/diag_artifacts/Acme_2026-11-02/Acme_2026-11-02_account.json
 
-Produces a Drive folder <customer>_<date>. The account PDF stays in that folder.
-Measured-retention consolidation PDFs go in full_retention/. 30-day PDFs go in 30d/.
-Estimate sheets go in generated_estimates/full_retention or generated_estimates/30d.
-Compression-applied sheets go in generated_estimates/compression_applied/full_retention or .../30d.
+Produces a Drive folder <customer>_<date>. Every PDF stays in that folder: the account
+PDF, the appendix, and the consolidation PDF.
+Estimate sheets go directly in generated_estimates. There is no full_retention or 30d folder.
 Deployment-plan sheets stay in generated_estimates/plan_sheets.
-Each solution with a workload gets four sheets. A solution with no workload is skipped.
+Each solution with a workload gets one sheet per region. A solution with no workload is skipped.
   <solution>_full retention_bulk
-  <solution>_30d_bulk
-  <solution>_full retention_compression-applied
-  <solution>_30d_compression-applied
-Observability and Security write GB/day, and the 30-day sheet writes 1 month.
-Search disk on the 30-day sheet is measured store × (1 / written months).
-Search disk on a compression-applied sheet is measured store × 0.60, and the
-30-day compression sheet applies both. Ingest share stays put. Query rate does not scale.
+Observability and Security write GB/day at the measured month, rounded up.
+Search disk is the measured local store. It is not scaled by a retention month.
 Sheet titles are
-  <customer>_<date>_<search|observability|security>_<full retention|30d>_<bulk|compression-applied>_serverless_estimate
-Local .xlsx export is off unless `--xlsx` is passed. Search CSV reports still use that title. An estimate already in generated_estimates is moved into the retention folder its name calls for, on disk and on Drive.
+  <customer>_<date>_<search|observability|security>_full retention_<bulk|k360>_<region>_serverless_estimate
+Local .xlsx export is off unless `--xlsx` is passed. Search CSV reports still use that title. An estimate that an earlier run filed under generated_estimates/full_retention or generated_estimates/30d is moved up into generated_estimates, on disk and on Drive, and the empty folder is removed.
   sizing.json ; account JSON `sizing.estimators` updated
 
 Never mutates the golden templates.
@@ -588,7 +582,7 @@ def observability_input_cells(acc: dict, support: str, region, retention: int, d
 def observability_fill(acc: dict, support: str, region, retention: int, daily: float, mix: dict | None, forced: bool, basis: str) -> dict:
     """Observability cells from a measured mix.
 
-    A forced month (the 30-day read) is written to both retention rows. Otherwise
+    A forced month (--force-months) is written to both retention rows. Otherwise
     TSDS metrics keep their own measured month, rounded up like the other row.
     """
     retention_metrics = None
@@ -817,9 +811,12 @@ ESTIMATE_FOLDER_NAME = "generated_estimates"
 PLAN_FOLDER_NAME = "plan_sheets"
 COMPRESSION_FOLDER_NAME = "compression_applied"
 COMPRESSION_NAME_MARK = "compression-applied"
-FULL_RETENTION_FOLDER = "full_retention"
-THIRTY_DAY_FOLDER = "30d"
 ESTIMATE_NAME_MARK = "serverless_estimate"
+# Earlier runs split estimates into these folders. They are emptied and removed, never written.
+LEGACY_RETENTION_FOLDERS = ("full_retention", "30d")
+LEGACY_ESTIMATE_DIRS = tuple(
+    prefix + (name,) for prefix in ((), (COMPRESSION_FOLDER_NAME,)) for name in LEGACY_RETENTION_FOLDERS
+)
 
 
 def _estimate_parts(name_suffix: str | None) -> tuple[str, str]:
@@ -841,7 +838,7 @@ def _estimate_parts(name_suffix: str | None) -> tuple[str, str]:
 
 
 def estimate_folder_name(name_suffix: str | None) -> str:
-    """Parent directory for estimate sheets. Retention, compression, and plan sheets are children of it."""
+    """Directory that holds the estimate sheets. Plan sheets are in a folder under it."""
     _estimate_parts(name_suffix)
     return ESTIMATE_FOLDER_NAME
 
@@ -849,14 +846,13 @@ def estimate_folder_name(name_suffix: str | None) -> str:
 def estimate_dir_parts(name_suffix: str | None) -> tuple[str, ...]:
     """Path under generated_estimates for this sizing.
 
-    Bulk and k360 sheets go in full_retention or 30d.
-    Compression-applied sheets go in compression_applied/full_retention or compression_applied/30d.
+    Bulk and k360 sheets sit directly in generated_estimates. Sheets from the
+    retired compression-applied set stay in compression_applied.
     """
-    retention, basis = _estimate_parts(name_suffix)
-    retention_dir = THIRTY_DAY_FOLDER if retention == "30d" else FULL_RETENTION_FOLDER
+    _retention, basis = _estimate_parts(name_suffix)
     if basis == "compression-applied":
-        return (COMPRESSION_FOLDER_NAME, retention_dir)
-    return (retention_dir,)
+        return (COMPRESSION_FOLDER_NAME,)
+    return ()
 
 
 def estimate_subfolder(name_suffix: str | None) -> str:
@@ -872,25 +868,21 @@ def is_estimate_artifact_name(name: str) -> bool:
     return ESTIMATE_NAME_MARK in (name or "")
 
 
-def retention_dir_for_filename(name: str) -> str:
-    """30d when the sheet title carries that token. Otherwise full retention."""
-    if "_30d_" in (name or "") or (name or "").endswith("_30d"):
-        return THIRTY_DAY_FOLDER
-    return FULL_RETENTION_FOLDER
-
-
 def estimate_dest_parts_for_filename(name: str) -> tuple[str, ...] | None:
     """Where an existing estimate file belongs. Plan sheets and other files stay put."""
     if not is_estimate_artifact_name(name):
         return None
-    retention = retention_dir_for_filename(name)
     if is_compression_estimate_name(name):
-        return (COMPRESSION_FOLDER_NAME, retention)
-    return (retention,)
+        return (COMPRESSION_FOLDER_NAME,)
+    return ()
 
 
 def relocate_local_estimates(parent: Path) -> list[str]:
-    """Move estimate files under generated_estimates into their retention folders."""
+    """Move estimate files out of the old retention folders, up into generated_estimates.
+
+    When the same file name is already there, the newer copy is kept. A retention
+    folder is removed once it is empty; one that still holds anything else stays.
+    """
     moved: list[str] = []
     files = [
         item for item in parent.rglob("*")
@@ -905,17 +897,30 @@ def relocate_local_estimates(parent: Path) -> list[str]:
             continue
         seal_dir(dest_dir)
         target = dest_dir / item.name
-        if target.exists():
-            target.unlink()
-        item.rename(target)
+        if target.is_file() and target.stat().st_mtime > item.stat().st_mtime:
+            item.unlink()
+            continue
+        item.replace(target)
         seal_file(target)
         moved.append(item.name)
+    for parts in LEGACY_ESTIMATE_DIRS:
+        legacy = parent.joinpath(*parts)
+        if not legacy.is_dir() or legacy.is_symlink():
+            continue
+        if any(child.name != ".DS_Store" for child in legacy.iterdir()):
+            continue
+        (legacy / ".DS_Store").unlink(missing_ok=True)
+        try:
+            legacy.rmdir()
+        except OSError:
+            pass
     return moved
 
 
-def _drive_child_files(drive, parent_id: str) -> list[dict]:
+def drive_children(drive, parent_id: str) -> list[dict]:
+    """Every live child of a Drive folder, files and folders."""
     parent_id = require_customer_parent(parent_id)
-    files: list[dict] = []
+    found: list[dict] = []
     token = None
     while True:
         def _list(page=token):
@@ -928,14 +933,15 @@ def _drive_child_files(drive, parent_id: str) -> list[dict]:
             if page:
                 kwargs["pageToken"] = page
             return drive.files().list(**kwargs)
-        found = _execute(_list)
-        for item in found.get("files") or []:
-            if item.get("mimeType") == FOLDER_MIME:
-                continue
-            files.append(item)
-        token = found.get("nextPageToken")
+        page = _execute(_list)
+        found.extend(page.get("files") or [])
+        token = page.get("nextPageToken")
         if not token:
-            return files
+            return found
+
+
+def _drive_child_files(drive, parent_id: str) -> list[dict]:
+    return [item for item in drive_children(drive, parent_id) if item.get("mimeType") != FOLDER_MIME]
 
 
 def _drive_folder_id(drive, estimates_id: str, parts: tuple[str, ...]) -> str | None:
@@ -949,16 +955,14 @@ def _drive_folder_id(drive, estimates_id: str, parts: tuple[str, ...]) -> str | 
 
 
 def relocate_drive_estimates(drive, estimates_id: str) -> list[str]:
-    """Move estimate files under generated_estimates into their retention folders."""
+    """Move estimate files out of the old retention folders, up into generated_estimates.
+
+    A retention folder is trashed once it is empty; one that still holds anything
+    else stays. Two sheets that end up with one title are settled by the
+    one-estimate-per-title rule when that title is next written, and by the dedupe pass.
+    """
     estimates_id = require_customer_parent(estimates_id)
-    candidates = [
-        (),
-        (COMPRESSION_FOLDER_NAME,),
-        (FULL_RETENTION_FOLDER,),
-        (THIRTY_DAY_FOLDER,),
-        (COMPRESSION_FOLDER_NAME, FULL_RETENTION_FOLDER),
-        (COMPRESSION_FOLDER_NAME, THIRTY_DAY_FOLDER),
-    ]
+    candidates = [(), (COMPRESSION_FOLDER_NAME,), *LEGACY_ESTIMATE_DIRS]
     planned: list[tuple[dict, str, tuple[str, ...]]] = []
     for parts in candidates:
         source_id = estimates_id if not parts else _drive_folder_id(drive, estimates_id, parts)
@@ -987,14 +991,19 @@ def relocate_drive_estimates(drive, estimates_id: str) -> list[str]:
             fields="id,parents",
         ))
         moved.append(item.get("name") or file_id)
+    # Deepest first, so compression_applied/30d goes before a check of its parent would matter.
+    for parts in sorted(LEGACY_ESTIMATE_DIRS, key=len, reverse=True):
+        legacy_id = _drive_folder_id(drive, estimates_id, parts)
+        if legacy_id and not drive_children(drive, legacy_id):
+            trash_file(drive, legacy_id)
     return moved
 
 
 def open_estimate_place(drive, root_id: str, local_dir: Path, name_suffix: str | None) -> tuple[dict, Path, dict, list[str]]:
     """Drive folder and local directory for this sizing, plus the generated_estimates Drive folder.
 
-    Sheets land in full_retention or 30d. Compression-applied sheets use that split
-    under compression_applied. Files already in generated_estimates are moved to match.
+    Sheets land directly in generated_estimates. Files an earlier run left in
+    full_retention or 30d are moved up to match, and those folders are removed.
     """
     parent = ensure_drive_folder(drive, ESTIMATE_FOLDER_NAME, root_id)
     local_parent = local_dir / ESTIMATE_FOLDER_NAME
@@ -1125,24 +1134,18 @@ def _months_for_sheet(block: dict, force: int | None) -> int | None:
     return measured
 
 
-def _search_volume_scale(block: dict, force_months: int | None, name_suffix: str | None) -> float:
-    """Scale Search disk for a 30-day read and for a compression-applied read.
+def _search_volume_scale(name_suffix: str | None) -> float:
+    """Scale on Search disk. 1.0: Search is priced on the measured local store.
 
-    Full-retention bulk is 1. A forced month shrinks disk by that month divided
-    by the written month, so 30 days is 1 / written months. Compression-applied
-    multiplies by 0.60. Callers scale org store by the same factor so the
-    ingest share stays put. Query rate is not scaled here.
+    Search disk is never scaled by a retention month. An index's age is not a
+    retention window for search content, and dividing store by it moved the
+    Search price many times over on one cluster's write rate. Only a title from
+    the retired compression-applied set still multiplies by 0.60.
     """
     from admin_diags import COMPRESSION_RATIO
 
-    scale = 1.0
-    written = _sheet_retention((block or {}).get("retention_months"))
-    if force_months is not None and written:
-        scale *= float(int(min(36, max(1, force_months)))) / float(written)
     _retention, basis = _estimate_parts(name_suffix)
-    if basis == "compression-applied":
-        scale *= COMPRESSION_RATIO
-    return scale
+    return COMPRESSION_RATIO if basis == "compression-applied" else 1.0
 
 
 def estimator_skip(block: dict, force: int | None, *, always_copy: bool = False) -> str | None:
@@ -1172,6 +1175,16 @@ def _fill_missing_doc_bytes(acc_path: Path, acc: dict) -> None:
         fill_ingest_doc_bytes(base, key, acc)
     except SystemExit:
         return
+
+
+def org_store_gb(acc: dict) -> float:
+    """Org store behind the Search ingest share: search store ÷ this is Search's part of the org docs/s.
+
+    It includes deployments left unsized (no bundle, decommissioned), because the K360 org rate
+    includes their ingest. An account written before that figure existed uses the sized store.
+    """
+    st = acc.get("storage") or {}
+    return float(st.get("ingest_share_store_gb") or st.get("data_stored_gb") or 0)
 
 
 def _scale_qps(workload: dict, share: float) -> dict:
@@ -1244,7 +1257,7 @@ def _fill_regional_job(job: dict, creds) -> dict:
     if gate is not None:
         entry["echo_gate"] = gate
         if not gate["accepted"]:
-            entry["readback_rejected"] = "the sheet echo differs from the written bulk by more than 0.51 GB/day"
+            entry["readback_rejected"] = "the sheet echo differs from the written bulk by more than the tolerance (0.1% of it, at least 0.02 GB/day)"
     if not job["skip_xlsx"]:
         try:
             entry["local_xlsx"] = str(export_xlsx(drive, copied["id"], Path(job["local_dir"]) / f"{job['title']}.xlsx"))
@@ -1267,7 +1280,7 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
     for g in groups:
         by_sol.setdefault(g["solution"], []).append(g)
     con = (acc.get("sizing") or {}).get("consolidated") or {}
-    org_gb = float((acc.get("storage") or {}).get("data_stored_gb") or 0)
+    org_gb = org_store_gb(acc)
     search_slice = con.get("search") or {}
     workload = search_slice.get("workload") or acc.get("workload") or {}
     key = acc["meta"]["run_key"]
@@ -1330,7 +1343,7 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
             }
             if sol == "search":
                 share = gb / total_gb if total_gb else 0.0
-                scale = _search_volume_scale({"retention_months": source_months}, force_months, name_suffix)
+                scale = _search_volume_scale(name_suffix)
                 job["stored_gb"] = gb * scale
                 job["org_gb"] = org_gb * scale
                 job["store_scale"] = scale
@@ -1418,59 +1431,10 @@ def assemble_plan_bars(specs: list[dict], fills: list[dict]) -> dict:
     return {"bars": bars}
 
 
-def _plan_written_months(group: list[dict]) -> int | None:
-    """Whole retention month for one deployment-count project, before a 30-day force.
-
-    Bulk weights the month when any row has bulk. A Search project with store and
-    a measured age but no write-index bulk uses store as the weight.
-    """
-    diag = _diag_inputs()
-    written = diag.summarize(group).get("months_written")
-    if written:
-        return int(written)
-    weight = 0.0
-    weighted_days = 0.0
-    for row in group:
-        try:
-            store = float(row.get("store_gb") or 0)
-            days = float(row.get("retention_days"))
-        except (TypeError, ValueError):
-            continue
-        if store > 0 and days > 0:
-            weight += store
-            weighted_days += store * days
-    if weight <= 0:
-        return None
-    return diag.whole_months(weighted_days / weight / diag.DAYS_PER_MONTH)
-
-
-def search_plan_disk(group: list[dict], force_months: int | None, fleet_months: int | None = None) -> tuple[float, float, int | None]:
-    """Search disk for one bar. A forced month shrinks store by measured months.
-
-    Returns scaled store, the scale, and the measured whole month. The force
-    month is not written back into the measured month before the division.
-
-    `fleet_months` is the written month of the whole Search fleet in the region.
-    Every project on every bar divides by that one month, so a project's disk does
-    not change when it is merged into another one. Without it, a pack takes its own
-    bulk-weighted month, and a long-retention cluster that merges with a short-
-    retention, high-bulk one stops being shrunk: the price steps up on the merge
-    and the series no longer meets the headline at the floor.
-    """
-    store = sum(float(row.get("store_gb") or 0) for row in group)
-    written = fleet_months or _plan_written_months(group)
-    scale = 1.0
-    if force_months and written:
-        scale = float(int(min(36, max(1, force_months)))) / float(written)
-    return store * scale, scale, written
-
-
-def _search_group_price(group: list[dict], *, workload: dict, org_gb: float, support: str, force_months: int | None, cache: dict, fleet_months: int | None = None) -> tuple[float | None, str | None]:
-    """Performant Search price for one project. A missing notebook total is an error."""
-    stored, _scale, _written = search_plan_disk(group, force_months, fleet_months)
-    store = sum(float(row.get("store_gb") or 0) for row in group)
-    org = float(org_gb or 0) * (_scale if store else 1.0)
-    share = (store / float(org_gb)) if org_gb else 0.0
+def _search_group_price(group: list[dict], *, workload: dict, org_gb: float, support: str, cache: dict) -> tuple[float | None, str | None]:
+    """Performant Search price for one project, on its measured store. A missing notebook total is an error."""
+    stored = sum(float(row.get("store_gb") or 0) for row in group)
+    share = (stored / float(org_gb)) if org_gb else 0.0
     region = str(group[0].get("region") or "")
     provider = str(group[0].get("provider") or "")
     if stored <= 0:
@@ -1481,7 +1445,7 @@ def _search_group_price(group: list[dict], *, workload: dict, org_gb: float, sup
     wl = _scale_qps(workload, share) if org_gb else (workload or {})
     result = run_es3({
         "stored_gb": stored,
-        "org_stored_gb": org or stored,
+        "org_stored_gb": float(org_gb or 0) or stored,
         "provider": provider,
         "region": region,
         "support_tier": support,
@@ -1508,10 +1472,6 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
     shared: dict[int, list] = {}
     search_cache: dict = {}
     floor = diag.plan_floor_for_rows(rows)
-    # One written month per region for all Search projects, the same one the headline sheet uses.
-    search_months: dict[str, int | None] = {}
-    for region_key in {str(r.get("region") or "") for r in rows if r.get("solution") == "search"}:
-        search_months[region_key] = _plan_written_months([r for r in rows if r.get("solution") == "search" and str(r.get("region") or "") == region_key])
     for plan in diag.region_feature_plans(rows):
         pct = plan["cut_pct"]
         if pct <= 0 and plan["projects"] <= 1:
@@ -1537,9 +1497,7 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
                     workload=workload or {},
                     org_gb=float(org_gb or 0),
                     support=support,
-                    force_months=force_months,
                     cache=search_cache,
-                    fleet_months=search_months.get(str((group[0] if group else {}).get("region") or "")),
                 )
                 if err:
                     return [], [], err, floor
@@ -1673,8 +1631,8 @@ def _plan_solution(cloud_row: dict, measured: dict) -> str:
 def plan_roster(acc: dict) -> list[dict]:
     """Deployments on the cover. The ceiling is one project for each of them.
 
-    That list is the last 30 days of complete billing. A deployment with no
-    bill in that window stays off the ceiling.
+    That list is the quote window, the last 90 billed days unless --lookback-days
+    says otherwise. A deployment with no bill in that window stays off the ceiling.
     """
     measured = [
         dep for dep in (acc.get("solutions") or {}).get("by_deployment") or []
@@ -1699,8 +1657,7 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
     """Price the cuts from the cover count down to one project per region and feature.
 
     Observability projects are D38 read-backs. Security projects are E74 read-backs.
-    Search projects are the performant estimator. A 30-day force scales Search disk
-    by the measured month.
+    Search projects are the performant estimator on their measured store.
     """
     del sheets, drive
     measured = {
@@ -1775,7 +1732,7 @@ def main() -> None:
     ap.add_argument("--search-sheets", action="store_true", help="Republish Search estimator output as Google Sheets and leave the other copies in place")
     ap.add_argument("--name-suffix", default="", help="Appended to estimator titles so a second sizing does not overwrite the first")
     ap.add_argument("--sizing-json", default=None, help="Filename for the sizing sidecar (default sizing.json)")
-    ap.add_argument("--force-months", type=int, default=None, help="Write this whole month when a measured month already exists")
+    ap.add_argument("--force-months", type=int, default=None, help="Write this whole month on the Observability and Security sheets when a measured month already exists. Search disk is never scaled by a month")
     ap.add_argument("--skip-search", action="store_true", help="Keep the Search estimator already on the account JSON")
     ap.add_argument("--dedupe", action="store_true", help="Trash all but the newest sheet for each estimate title under this run's Drive folder, then exit")
     ap.add_argument("--dedupe-dry-run", action="store_true", help="With --dedupe: list the duplicates and trash nothing")
@@ -1850,10 +1807,10 @@ def main() -> None:
             lines.append(f"Search → one sheet per region ({', '.join(search_regions)})")
         else:
             title_se = estimate_title(key, "search", suffix, search_scope)
-            store_scale = _search_volume_scale(se, args.force_months, suffix)
+            store_scale = _search_volume_scale(suffix)
             result = run_es3({
                 "stored_gb": float(se.get("stored_gb") or 0) * store_scale,
-                "org_stored_gb": float((acc.get("storage") or {}).get("data_stored_gb") or 0) * store_scale,
+                "org_stored_gb": org_store_gb(acc) * store_scale,
                 "provider": provider,
                 "region": search_scope or region,
                 "support_tier": support,
@@ -1961,7 +1918,7 @@ def main() -> None:
         entry["ingest_basis"] = basis
         entry["echo_gate"] = echo_gate(daily, rb.get("echo_gb_day"))
         if not entry["echo_gate"]["accepted"]:
-            entry["readback_rejected"] = "the sheet echo differs from the written bulk by more than 0.51 GB/day"
+            entry["readback_rejected"] = "the sheet echo differs from the written bulk by more than the tolerance (0.1% of it, at least 0.02 GB/day)"
         if not args.skip_xlsx:
             try:
                 x = export_xlsx(drive, copied["id"], estimate_dir / f"{title_o}.xlsx")
@@ -1998,7 +1955,7 @@ def main() -> None:
         if s_gate is not None:
             entry["echo_gate"] = s_gate
             if not s_gate["accepted"]:
-                entry["readback_rejected"] = "the sheet echo differs from the written bulk by more than 0.51 GB/day"
+                entry["readback_rejected"] = "the sheet echo differs from the written bulk by more than the tolerance (0.1% of it, at least 0.02 GB/day)"
         if not args.skip_xlsx:
             try:
                 x = export_xlsx(drive, copied["id"], estimate_dir / f"{title_s}.xlsx")
@@ -2022,11 +1979,11 @@ def main() -> None:
         title_se = estimate_title(key, "search", suffix, search_scope)
         has_search = bool(se.get("has_workload") or (se.get("stored_gb") or 0) > 0 or args.always_copy)
         result: dict = {}
-        store_scale = _search_volume_scale(se, args.force_months, suffix)
+        store_scale = _search_volume_scale(suffix)
         if has_search and (se.get("stored_gb") or 0) > 0:
             result = run_es3({
                 "stored_gb": float(se.get("stored_gb") or 0) * store_scale,
-                "org_stored_gb": float((acc.get("storage") or {}).get("data_stored_gb") or 0) * store_scale,
+                "org_stored_gb": org_store_gb(acc) * store_scale,
                 "provider": provider,
                 "region": search_scope or region,
                 "support_tier": support,

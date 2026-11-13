@@ -8,7 +8,9 @@ is a separate document.
   python run_consolidation.py --org "Acme Corp" --reuse serverless_analyzer/diag_artifacts/<key>/<key>_org_report.json
   python run_consolidation.py --org "Acme Corp" --diags-dir serverless_analyzer/diag_artifacts/<org_id>_diags_<date>
 
-The quote window is the last 30 days (--lookback-days, maximum 365). The account fetch stays a year.
+The quote window is the last 90 billed days (--lookback-days, maximum 365). The account fetch stays a year.
+ECH dollars are the K360 billing cost field for that window, as a month. One consolidation PDF is
+written, at the measured retention month.
 
 Run from the project root that holds `.env` (KIBANA_URL, ELASTIC_API_KEY, FOUND_ADMIN_API_KEY).
 The account summary stays on run_account_analysis.py --skip-diags --skip-sizing.
@@ -70,12 +72,43 @@ def _run(cmd: list[str]) -> None:
         raise
 
 
-def _sidecar(extra: list[str], name: str) -> list[str]:
-    """The sizing flags with --sizing-json pointed at another file, so a 30-day pass cannot overwrite sizing.json."""
-    out = list(extra)
-    if "--sizing-json" in out:
-        out[out.index("--sizing-json") + 1] = name
-    return out
+def method_stamp(lookback_days: int, *, diagnostic: bool = True) -> dict:
+    """Which code and which rules produced this run.
+
+    Two runs of one customer can only be compared when they carry the same stamp.
+    `commit` is the checkout the scripts ran from. `uncommitted_changes` is true
+    when that checkout had edits under serverless_analyzer that no commit records.
+    Both are None when the scripts are not in a git checkout.
+    """
+    root = HERE.parent.parent
+
+    def git(*argv: str) -> str | None:
+        try:
+            out = subprocess.run(["git", "-C", str(root), *argv], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return out.stdout.strip() if out.returncode == 0 else None
+
+    status = git("status", "--porcelain", "--", ".")
+    return {
+        "commit": git("rev-parse", "--short", "HEAD") or None,
+        "uncommitted_changes": None if status is None else bool(status),
+        "ingest_basis": "metered diagnostic bulk" if diagnostic else "K360 stored GB ÷ assumed retention",
+        "ech_dollars": "k360_cost",
+        "quote_window_days": int(lookback_days),
+        "retention": "measured month, rounded up" if diagnostic else "assumed month",
+        "integrity_pass": "every check",
+    }
+
+
+def quote_options_from(args) -> dict:
+    """The comparison flags, stored on the account so the consolidation is a pure function of it."""
+    return {
+        "ech_scope": getattr(args, "ech_scope", "priced") or "priced",
+        "unmeasured": getattr(args, "unmeasured", "exclude") or "exclude",
+        "min_priced_ecu_pct": float(getattr(args, "min_priced_ecu_pct", 90.0)),
+        "keep_serverless_spend": bool(getattr(args, "keep_serverless_spend", False)),
+    }
 
 
 def _estimator_flags(args) -> list[str]:
@@ -182,24 +215,21 @@ def consolidation_brief(acc: dict) -> dict:
         "run_key": m.get("run_key"),
         "date": m.get("date"),
         "ingest_source": cons.get("source") or sz.get("ingest_source") or "k360",
-        "savings": {k: (cons.get("savings") or {}).get(k) for k in ("ech_contract_mo", "serverless_mo", "cost_mo", "cost_yr", "cost_pct") if (cons.get("savings") or {}).get(k) is not None},
+        "savings": {k: (cons.get("savings") or {}).get(k) for k in ("ech_basis", "ech_list_mo", "serverless_mo", "list_mo", "list_yr", "list_pct") if (cons.get("savings") or {}).get(k) is not None},
         "quotes": ((cons.get("reconciliation") or {}).get("quotes")) or [],
         "fleet": ((cons.get("sensitivity") or {}).get("fleet")) or [],
         "contract_rate": cons.get("contract_rate"),
+        "ech_scope": cons.get("ech_scope"),
         "notes": list((cons.get("notes") or [])[:12]),
         "diagnostics_coverage": sz.get("diagnostics") if (cons.get("source") == "diagnostics" or sz.get("ingest_source") == "diagnostics") else None,
         "excluded_deployments": m.get("excluded_deployments"),
-        "compressioncalc_accounted_for": acc.get("compressioncalc_accounted_for"),
-        "thirty_day": cons.get("thirty_day"),
+        "method": m.get("method"),
         "deployment_plan": _plan_brief(cons.get("deployment_plan")),
         "metered_rates": rates,
         "estimators": estimators,
         "links": {
             "folder": sz.get("folder"),
             "drive": (sz.get("drive_folder") or {}).get("url"),
-            "drive_30d": (sz.get("drive_folder_30d") or {}).get("url"),
-            "drive_compressioncalc": (sz.get("drive_folder_compressioncalc") or {}).get("url"),
-            "drive_compressioncalc_30d": (sz.get("drive_folder_compressioncalc_30d") or {}).get("url"),
             "pdfs": {
                 k: {field: v.get(field) for field in ("pdf", "html", "drive_url") if v.get(field)}
                 for k, v in exports.items() if isinstance(v, dict)
@@ -257,7 +287,7 @@ def _quote_block(acc: dict) -> dict:
     cons = acc.get("consolidation") or {}
     return {
         "source": cons.get("source") or "k360",
-        "savings": {k: (cons.get("savings") or {}).get(k) for k in ("ech_contract_mo", "ech_list_mo", "serverless_mo", "cost_mo", "cost_yr", "cost_pct", "list_mo", "list_pct") if (cons.get("savings") or {}).get(k) is not None},
+        "savings": {k: (cons.get("savings") or {}).get(k) for k in ("ech_basis", "ech_list_mo", "serverless_mo", "list_mo", "list_yr", "list_pct") if (cons.get("savings") or {}).get(k) is not None},
         "quotes": ((cons.get("reconciliation") or {}).get("quotes")) or [],
         "notes": (cons.get("notes") or [])[:4],
         "contract_rate": cons.get("contract_rate"),
@@ -383,46 +413,6 @@ def _run_compressioncalc(diag: dict, diag_path: Path, infra: dict, py: Path, arg
     if (comp.get("consolidation") or {}).get("error"):
         block["status"] = "not priced — consolidation failed"
         return
-    path_30 = diag_path.with_name(diag_path.stem + "_compressioncalc_accounted_for_30d.json")
-    try:
-        comp_30 = copy.deepcopy(comp)
-        for sol in ("observability", "security"):
-            blk = ((comp_30.get("sizing") or {}).get("consolidated") or {}).get(sol) or {}
-            if blk.get("retention_months") is not None:
-                blk["retention_months"] = 1
-        (comp_30.get("sizing") or {}).pop("deployment_plan", None)
-        seal_text(path_30, json.dumps(comp_30, indent=2))
-        _run([
-            str(py), str(HERE / "size_serverless.py"),
-            "--account-json", str(path_30),
-            "--name-suffix", f"{COMPRESSIONCALC}_30d",
-            "--sizing-json", "sizing_compressioncalc_accounted_for_30d.json",
-            "--force-months", "1",
-            *flags,
-        ])
-        comp_30 = json.loads(path_30.read_text())
-        comp_30["consolidation"] = build_consolidation(comp_30, infra)
-        _stamp_compression(comp_30, scenario="30d")
-        comp_30["consolidation"]["retention_set_days"] = 30
-        seal_text(path_30, json.dumps(comp_30, indent=2))
-        monthly_30 = ((comp_30.get("consolidation") or {}).get("savings") or {}).get("serverless_mo")
-        comp["consolidation"]["thirty_day"] = {
-            "monthly": monthly_30,
-            "annual_year1": None if monthly_30 is None else round(float(monthly_30) * 12, 2),
-        }
-        seal_text(path, json.dumps(comp, indent=2))
-        block["thirty_day_monthly"] = monthly_30
-        block["thirty_day_account"] = str(path_30)
-        diag["compressioncalc_thirty_day_account"] = str(path_30)
-        folder_30 = (comp_30.get("sizing") or {}).get("drive_folder") or {}
-        if folder_30.get("id"):
-            diag.setdefault("sizing", {})["drive_folder_compressioncalc_30d"] = folder_30
-    except subprocess.CalledProcessError as e:
-        print(f"WARN: compressioncalc_accounted_for 30-day sizing failed ({e})", file=sys.stderr)
-        block["thirty_day_status"] = f"not priced ({e})"
-    except Exception as ex:
-        print(f"WARN: compressioncalc_accounted_for 30-day quote failed ({ex!r})", file=sys.stderr)
-        block["thirty_day_status"] = f"not priced ({ex!r})"
     monthly = ((comp.get("consolidation") or {}).get("savings") or {}).get("serverless_mo")
     block["monthly"] = monthly
     block["quotes"] = ((comp.get("consolidation") or {}).get("reconciliation") or {}).get("quotes") or []
@@ -529,7 +519,21 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
         admin_names = names or None
     except Exception as ex:
         print(f"WARN: admin deployment list unavailable ({ex!r}); unmatched deployments stay 'missing diagnostic'", file=sys.stderr)
-    diag = apply_diagnostics(acc, rows, admin_names)
+    options = quote_options_from(args)
+    diag = apply_diagnostics(
+        acc, rows, admin_names,
+        unmeasured=options["unmeasured"],
+        fallback_months=float(getattr(args, "retention_months", 3.0) or 3.0),
+        security_fallback_months=getattr(args, "security_retention_months", None),
+    )
+    missing = (diag["sizing"].get("diagnostics") or {}).get("fallback_names") or []
+    if options["unmeasured"] == "fail" and missing:
+        raise SystemExit(
+            f"ERROR: {len(missing)} active deployment(s) have no diagnostic bundle: {', '.join(str(n) for n in missing)}. "
+            "--unmeasured fail stops the run. Collect the bundles, or pass --unmeasured exclude or --unmeasured k360."
+        )
+    diag["sizing"]["quote_options"] = options
+    diag.setdefault("meta", {})["method"] = method_stamp(args.lookback_days)
     if download_failed:
         diag["sizing"].setdefault("diagnostics", {})["download_failed"] = download_failed
     apply_quote_lookback(diag, args.lookback_days)
@@ -595,53 +599,6 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
                 diag["consolidation"] = {"triggered": True, "source": "diagnostics", "error": repr(ex)}
         if not (diag.get("consolidation") or {}).get("error"):
             diag.setdefault("consolidation", {})["retention_scenario"] = "rounded"
-            try:
-                diag_30 = copy.deepcopy(diag)
-                for sol in ("observability", "security"):
-                    blk = ((diag_30.get("sizing") or {}).get("consolidated") or {}).get(sol) or {}
-                    if blk.get("retention_months") is not None:
-                        blk["retention_months"] = 1
-                if args.skip_deployment_plan:
-                    (diag_30.get("sizing") or {}).pop("deployment_plan", None)
-                path_30 = diag_path.with_name(diag_path.stem + "_30d.json")
-                seal_text(path_30, json.dumps(diag_30, indent=2))
-                month_cmd = [str(py), str(HERE / "size_serverless.py"), "--account-json", str(path_30), "--name-suffix", "_30d", "--force-months", "1", *_sidecar(extra, "sizing_30d.json")]
-                if args.xlsx:
-                    month_cmd.append("--xlsx")
-                _run(month_cmd)
-                if not args.skip_deployment_plan:
-                    plan_30 = [str(py), str(HERE / "size_serverless.py"), "--account-json", str(path_30), "--deployment-plan", "--name-suffix", "_30d", "--force-months", "1", *_sidecar(extra, "sizing_30d.json")]
-                    if args.xlsx:
-                        plan_30.append("--xlsx")
-                    try:
-                        _run(plan_30)
-                    except subprocess.CalledProcessError as e:
-                        diag_30 = json.loads(path_30.read_text())
-                        diag_30.setdefault("sizing", {})["deployment_plan"] = {
-                            "bars": [],
-                            "error": f"Observability deployment-count plan was not priced ({e}).",
-                        }
-                        seal_text(path_30, json.dumps(diag_30, indent=2))
-                diag_30 = json.loads(path_30.read_text())
-                diag_30["consolidation"] = build_consolidation(diag_30, infra)
-                diag_30["consolidation"]["retention_scenario"] = "30d"
-                diag_30["consolidation"]["retention_set_days"] = 30
-                seal_text(path_30, json.dumps(diag_30, indent=2))
-                monthly = ((diag_30.get("consolidation") or {}).get("savings") or {}).get("serverless_mo")
-                diag["consolidation"]["thirty_day"] = {
-                    "monthly": monthly,
-                    "annual_year1": None if monthly is None else round(float(monthly) * 12, 2),
-                }
-                diag["thirty_day_account"] = str(path_30)
-                folder_30 = ((diag_30.get("sizing") or {}).get("drive_folder") or {})
-                if folder_30.get("id"):
-                    diag.setdefault("sizing", {})["drive_folder_30d"] = folder_30
-            except subprocess.CalledProcessError as e:
-                print(f"WARN: 30-day sizing failed ({e})", file=sys.stderr)
-                diag.setdefault("consolidation", {}).setdefault("notes", []).append(f"The 30-day PDF was not priced ({e}).")
-            except Exception as ex:
-                print(f"WARN: 30-day quote failed ({ex!r})", file=sys.stderr)
-                diag.setdefault("consolidation", {}).setdefault("notes", []).append(f"The 30-day PDF was not priced ({ex!r}).")
         seal_text(diag_path, json.dumps(diag, indent=2))
     if RUN_COMPRESSION_SET:
         try:
@@ -665,12 +622,25 @@ def main() -> None:
     args = parse_args(description=__doc__)
     if not 1 <= int(args.lookback_days) <= 365:
         raise SystemExit("--lookback-days must be from 1 to 365")
+    if not 0 <= float(args.min_priced_ecu_pct) <= 100:
+        raise SystemExit("--min-priced-ecu-pct must be from 0 to 100")
+    if args.keep_serverless_spend and args.ech_scope == "priced":
+        print("NOTE: --keep-serverless-spend has no effect with --ech-scope priced; only priced deployments are compared.", file=sys.stderr)
     # A consolidation run leaves stack-monitoring clusters out. The account summary does not.
     args.auto_exclude_monitoring = not getattr(args, "keep_monitoring", False)
     acc, infra, folder, env, acc_path = prepare_account(args)
+    # Until a diagnostic quote replaces it, this account is the K360 backup.
+    acc.setdefault("meta", {})["method"] = method_stamp(args.lookback_days, diagnostic=False)
+    acc.setdefault("sizing", {})["quote_options"] = quote_options_from(args)
     if args.skip_diags and args.skip_sizing:
         finish_account(acc, folder, acc_path, args)
         return
+    if not (acc.get("ecu") or {}).get("daily_totals"):
+        raise SystemExit(
+            "ERROR: this org report has no daily billing series, so there is no quote window to price. "
+            "It was fetched at week grain (run_org_report.py writes that). Run without --reuse, or reuse an "
+            "org report written by run_account_analysis.py or run_consolidation.py."
+        )
     # 4. Diagnostics are the default ingest. K360 stored-GB ÷ retention is the backup.
     diag_acc = None
     if acc["sizing"]["triggered"] and not args.skip_diags:
@@ -685,6 +655,9 @@ def main() -> None:
     k360_for_pdf = None
     quote_k360 = acc["sizing"]["triggered"] and (diag_acc is None or args.k360_ingest)
     if quote_k360:
+        # The backup is priced on the same billing window as a diagnostic quote, so --lookback-days
+        # and --ech-scope mean the same thing on both. Its stored-GB ingest takes the window's pace.
+        apply_quote_lookback(acc, args.lookback_days)
         backup = diag_acc is not None
         extra = ["--name-suffix", "from_k360", "--sizing-json", "sizing_from_k360.json"] if backup else []
         sizing_ran = False
@@ -751,18 +724,21 @@ def main() -> None:
         sz = acc.setdefault("sizing", {})
         for key in (
             "estimators", "consolidated", "notes", "diagnostics", "drive_folder", "drive_root",
-            "drive_folder_30d", "drive_folder_compressioncalc", "drive_folder_compressioncalc_30d", "sized_at",
+            "drive_folder_compressioncalc", "sized_at",
         ):
             if dsz.get(key) not in (None, {}, []):
                 sz[key] = dsz[key]
         sz["ingest_source"] = "diagnostics"
         acc["consolidation"] = diag_acc.get("consolidation")
+        acc.setdefault("meta", {})["method"] = (diag_acc.get("meta") or {}).get("method")
+        # The account now carries the diagnostic quote, so it carries that quote's window figures too.
+        for key in ("quote_lookback_requested", "quote_lookback_days", "quote_daily_avg", "quote_monthly_ecu", "quote_usage_factor", "quote_ingest_factor"):
+            if key in (diag_acc.get("ecu") or {}):
+                acc.setdefault("ecu", {})[key] = diag_acc["ecu"][key]
         if diag_acc.get("compressioncalc_accounted_for"):
             acc["compressioncalc_accounted_for"] = diag_acc["compressioncalc_accounted_for"]
         if diag_acc.get("compressioncalc_account"):
             acc["compressioncalc_account"] = diag_acc["compressioncalc_account"]
-        if diag_acc.get("compressioncalc_thirty_day_account"):
-            acc["compressioncalc_thirty_day_account"] = diag_acc["compressioncalc_thirty_day_account"]
         cost = (diag_acc.get("analysis") or {}).get("cost")
         if cost:
             acc.setdefault("analysis", {})["cost"] = cost
@@ -791,9 +767,7 @@ def main() -> None:
             k360_doc = k360_for_pdf if k360_for_pdf and (k360_for_pdf.get("consolidation") or {}).get("source") == "k360" and not (k360_for_pdf.get("consolidation") or {}).get("error") else None
             if diag_acc is not None and not (diag_acc.get("consolidation") or {}).get("error"):
                 jobs = quote_pdf_jobs(acc, diag_acc, [
-                    (_load_quote(diag_acc.get("thirty_day_account")), "consolidation_30d"),
                     (_load_quote(diag_acc.get("compressioncalc_account")), "consolidation_compressioncalc"),
-                    (_load_quote(diag_acc.get("compressioncalc_thirty_day_account")), "consolidation_compressioncalc_30d"),
                     (k360_doc, "consolidation_k360"),
                 ])
             else:

@@ -6,8 +6,7 @@ Reads sizing_from_diags.json (a list of bundle rows). Each printed project is
 retention is left out of that average. Stored GB is used only to pack rows
 into N groups. --each keeps deployments at or above 50 GB/day alone and
 pools the rest into one project. The estimator month is a whole number,
-rounded up, and is omitted when nothing was measured. Every project also
-carries a 30-day read, written as 1 month.
+rounded up, and is omitted when nothing was measured.
 --retention-months replaces the headline month and leaves bulk measured.
 No K360 stored-GB backfill is added.
 """
@@ -19,9 +18,6 @@ import math
 from pathlib import Path
 
 DAYS_PER_MONTH = 30.416
-# 30 / 30.416 is under 1, and the estimator only prices whole months, so a
-# 30-day read is written as 1.
-THIRTY_DAY_MONTHS = 1
 # First Observability ingest tier. A deployment under this, priced alone, never
 # leaves the top $/GB band. Pool those rows into one project.
 POOL_UNDER_GB_DAY = 50.0
@@ -107,8 +103,6 @@ def summarize(rows: list[dict], retention_months: int | None = None) -> dict:
     if retention_months is not None and bulk:
         written = int(min(36, max(1, retention_months)))
     o11y, security = _cells(bulk, written)
-    thirty = THIRTY_DAY_MONTHS if bulk else 0
-    o11y_30, security_30 = _cells(bulk, thirty)
     short = [
         {"name": r["name"], "uptime_days": r.get("uptime_days_min")}
         for r in rows
@@ -126,12 +120,6 @@ def summarize(rows: list[dict], retention_months: int | None = None) -> dict:
         "store_gb": round(store, 1),
         "observability_cells": o11y,
         "security_cells": security,
-        "thirty_day": {
-            "retention_days": 30,
-            "months_written": thirty,
-            "observability_cells": o11y_30,
-            "security_cells": security_30,
-        },
         "search_disk_gb": round(store, 1),
         "short_uptime": short,
     }

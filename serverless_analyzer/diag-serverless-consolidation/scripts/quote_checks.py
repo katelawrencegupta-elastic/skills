@@ -15,7 +15,20 @@ from estimator_layout import (  # noqa: E402,F401
     TEMPLATE_ANCHORS, cell_range, check_value_ranges, layout_ranges, template_check, template_version,
 )
 
-ECHO_TOLERANCE_GB_DAY = 0.51
+# The sheet echo has to match the GB/day written. The sheet rounds a little, so there is a floor,
+# and a large rate gets a share of itself. It was a flat 0.51 GB/day, which no sheet under 0.51
+# GB/day could ever fail and which let a 5% error through at 10 GB/day.
+ECHO_TOLERANCE_FLOOR_GB_DAY = 0.02
+ECHO_TOLERANCE_SHARE = 0.001
+
+
+def echo_tolerance(written) -> float:
+    """GB/day the echo may differ from the written bulk: 0.1% of it, never less than 0.02."""
+    try:
+        base = abs(float(written))
+    except (TypeError, ValueError):
+        base = 0.0
+    return max(ECHO_TOLERANCE_FLOOR_GB_DAY, ECHO_TOLERANCE_SHARE * base)
 
 
 def money(value) -> float | None:
@@ -75,16 +88,18 @@ def observability_readback(readback: dict, basis: str) -> dict:
 
 
 def echo_gate(written_bulk: float, sheet_raw) -> dict:
-    """Accept a sheet only when its echo is within 0.51 GB/day of the GB/day written."""
+    """Accept a sheet only when its echo is within `echo_tolerance` of the GB/day written."""
     sheet = money(sheet_raw)
     try:
         written = float(written_bulk)
     except (TypeError, ValueError):
         written = 0.0
-    accepted = sheet is not None and abs(sheet - written) <= ECHO_TOLERANCE_GB_DAY
+    tolerance = echo_tolerance(written)
+    accepted = sheet is not None and abs(sheet - written) <= tolerance
     return {
         "written_bulk": round(written, 3),
         "sheet_gb_day": None if sheet is None else round(sheet, 3),
+        "tolerance": round(tolerance, 4),
         "accepted": accepted,
     }
 
@@ -98,49 +113,58 @@ def _integrity_row(name: str, score, passed, detail: str) -> dict:
     }
 
 
-def _sheet_echo(observability: dict, security: dict) -> dict:
-    """Echo distance and a parsed E73 of 0. A missing sheet is left out of this check."""
+def _echo_component(label: str, written, sheet_raw, parts: list, passes: list, bits: list) -> None:
+    """One echo comparison: score 1 − gap ÷ tolerance, pass when the gap is within the tolerance."""
+    written = float(written or 0)
+    sheet = money(sheet_raw)
+    if sheet is None:
+        parts.append(0.0)
+        passes.append(False)
+        bits.append(f"{label} echo was blank or unreadable")
+        return
+    tolerance = echo_tolerance(written)
+    gap = abs(sheet - written)
+    parts.append(1.0 - min(gap / tolerance, 1.0))
+    passes.append(gap <= tolerance)
+    bits.append(f"{label} echo is {gap:.3f} GB/day from the written bulk (tolerance {tolerance:.3f})")
+
+
+def _e73_component(label: str, e73, parts: list, passes: list, bits: list) -> None:
+    amount = money(e73)
+    if amount is None:
+        parts.append(0.0)
+        passes.append(False)
+        bits.append(f"{label}E73 was blank or unreadable")
+    elif abs(amount) > 0.005:
+        parts.append(0.0)
+        passes.append(False)
+        bits.append(f"{label}E73 is {amount:g}")
+    else:
+        parts.append(1.0)
+        passes.append(True)
+        bits.append(f"{label}E73 is 0")
+
+
+def _sheet_echo(observability: dict, security: dict, regional: list[dict] | None = None) -> dict:
+    """Echo distance and a parsed E73 of 0, on every sheet that was read. A missing sheet is left out.
+
+    The fleet sheets and each regional sheet count: a solution sized per region has no fleet
+    sheet, and its regional sheets carry the whole quote.
+    """
     parts: list[float] = []
     passes: list[bool] = []
     bits: list[str] = []
     if observability.get("has_workload") and observability.get("sheet_read"):
-        written = float(observability.get("written_bulk") or 0)
-        sheet = money(observability.get("sheet_raw"))
-        if sheet is None:
-            parts.append(0.0)
-            passes.append(False)
-            bits.append("The sheet echo was blank or unreadable")
-        else:
-            gap = abs(sheet - written)
-            parts.append(1.0 - min(gap / ECHO_TOLERANCE_GB_DAY, 1.0))
-            passes.append(gap <= ECHO_TOLERANCE_GB_DAY)
-            bits.append(f"The sheet echo is {gap:.3f} GB/day from the written bulk")
+        _echo_component("The sheet", observability.get("written_bulk"), observability.get("sheet_raw"), parts, passes, bits)
     if security.get("has_workload") and security.get("sheet_read"):
         if "sheet_raw" in security:
-            written = float(security.get("written_bulk") or 0)
-            sheet = money(security.get("sheet_raw"))
-            if sheet is None:
-                parts.append(0.0)
-                passes.append(False)
-                bits.append("The Security sheet echo (G5) was blank or unreadable")
-            else:
-                gap = abs(sheet - written)
-                parts.append(1.0 - min(gap / ECHO_TOLERANCE_GB_DAY, 1.0))
-                passes.append(gap <= ECHO_TOLERANCE_GB_DAY)
-                bits.append(f"The Security sheet echo (G5) is {gap:.3f} GB/day from the written bulk")
-        amount = money(security.get("e73"))
-        if amount is None:
-            parts.append(0.0)
-            passes.append(False)
-            bits.append("E73 was blank or unreadable")
-        elif abs(amount) > 0.005:
-            parts.append(0.0)
-            passes.append(False)
-            bits.append(f"E73 is {amount:g}")
-        else:
-            parts.append(1.0)
-            passes.append(True)
-            bits.append("E73 is 0")
+            _echo_component("The Security sheet (G5)", security.get("written_bulk"), security.get("sheet_raw"), parts, passes, bits)
+        _e73_component("", security.get("e73"), parts, passes, bits)
+    for sheet in regional or []:
+        where = f"{str(sheet.get('solution') or '').title()} {sheet.get('region') or ''}".strip()
+        _echo_component(f"{where}", sheet.get("written_bulk"), sheet.get("sheet_raw"), parts, passes, bits)
+        if sheet.get("solution") == "security":
+            _e73_component(f"{where} ", sheet.get("e73"), parts, passes, bits)
     if not parts:
         return _integrity_row("Sheet echo", None, None, "No Observability or Security sheet was read.")
     return _integrity_row("Sheet echo", sum(parts) / len(parts), all(passes), ". ".join(bits) + ".")
@@ -213,6 +237,52 @@ def _rated_row(coverage: dict | None) -> dict:
     if names:
         detail += " Largest: " + ", ".join(names) + "."
     return _integrity_row("Rated ingest", 1.0 - share, share <= UNRATED_STORE_PASS, detail)
+
+
+def _priced_row(priced: dict | None) -> dict:
+    """Share of the ECH deployments' billed cost that belongs to deployments with a serverless price."""
+    if not priced or priced.get("share_pct") is None:
+        return _integrity_row("Priced share", None, None, "This run has no per-deployment billing to split.")
+    share = min(max(float(priced["share_pct"]), 0.0), 100.0)
+    minimum = float(priced.get("min_pct") if priced.get("min_pct") is not None else 90.0)
+    unpriced = int(priced.get("unpriced") or 0)
+    detail = f"Deployments with a serverless price carry {share:.1f}% of the ECH deployments' billed cost. The bar is {minimum:g}%."
+    if unpriced:
+        detail += f" {unpriced} {'deployment has' if unpriced == 1 else 'deployments have'} no price, ${float(priced.get('unpriced_mo') or 0):,.0f}/mo"
+        names = [str(name) for name in (priced.get("names") or []) if name]
+        detail += (": " + ", ".join(names)) if names else ""
+        detail += "."
+    return _integrity_row("Priced share", share / 100.0, share >= minimum, detail)
+
+
+# Packing projects together can only save money or hold it level: it removes a project's fixed ingest
+# and minimum search power. A step that costs more than the step before it means an estimator
+# returned a total that does not fall as the fleet merges (the es3 model is not additive, and the
+# Observability sheet's ladders are). The read-back stays the dollar; the quote does not pass.
+PLAN_RISE_SHARE = 0.02
+PLAN_RISE_FLOOR_USD = 5.0
+
+
+def _plan_row(plan: list[dict] | None) -> dict:
+    """Deployment-count bars must not rise as projects merge."""
+    bars = [row for row in (plan or []) if isinstance(row.get("monthly"), (int, float)) and not isinstance(row.get("monthly"), bool)]
+    if len(bars) < 2:
+        return _integrity_row("Estimator monotone", None, None, "The deployment-count plan has fewer than two priced steps.")
+    rises = []
+    for earlier, later in zip(bars, bars[1:]):
+        before, after = float(earlier["monthly"]), float(later["monthly"])
+        if after > before * (1 + PLAN_RISE_SHARE) + PLAN_RISE_FLOOR_USD:
+            rises.append(
+                f"{later.get('label') or '?'} ({later.get('projects')} projects) ${after:,.0f} is above "
+                f"{earlier.get('label') or '?'} ({earlier.get('projects')} projects) ${before:,.0f}"
+            )
+    steps = len(bars) - 1
+    if not rises:
+        return _integrity_row("Estimator monotone", 1.0, True, f"{steps} merge steps, none costs more than the step before it.")
+    return _integrity_row(
+        "Estimator monotone", 1.0 - len(rises) / steps, False,
+        f"{len(rises)} of {steps} merge steps cost more than the step before: " + "; ".join(rises[:4]) + ".",
+    )
 
 
 def _direct_row(solutions: list[dict]) -> dict:
@@ -312,23 +382,23 @@ def _year_row(lines: list[dict]) -> dict:
     )
 
 
-PASS_SCORE = 0.90
-
-
 def integrity_score(facts: dict) -> dict:
     """Quote integrity, 0 to 1. The mean skips a check that does not apply.
 
-    A score of 0.90 or higher passes. A check that misses its own bar stays
-    flagged. A quote whose every scored check passes also passes. An echo gap of
-    0.51 scores 0 on that component and still passes that component. This is
-    not a serverless bill.
+    The quote passes only when every scored check passes its own bar: 100% of
+    the checks, whatever the mean is. One failed check fails the quote. The
+    score is the mean and is reported beside that verdict. It does not decide
+    it, because a check can pass its bar and score under 1 (an echo gap inside
+    the tolerance, or unrated store under 5%). This is not a serverless bill.
     """
     coverage = facts.get("coverage")
     checks = [
-        _sheet_echo(facts.get("observability") or {}, facts.get("security") or {}),
+        _sheet_echo(facts.get("observability") or {}, facts.get("security") or {}, list(facts.get("regional_sheets") or [])),
         _coverage_row(coverage),
         _retention_row(coverage),
         _rated_row(coverage),
+        _priced_row(facts.get("priced")),
+        _plan_row(facts.get("plan")),
         _direct_row(list(facts.get("solutions") or [])),
         _line_row(facts.get("headline_monthly"), list(facts.get("lines") or [])),
         _year_row(list(facts.get("lines") or [])),
@@ -339,7 +409,7 @@ def integrity_score(facts: dict) -> dict:
     if score is None:
         passed = None
     else:
-        passed = score >= PASS_SCORE or all(row["passed"] for row in scored_rows)
+        passed = all(row["passed"] is True for row in scored_rows)
     return {
         "score": score,
         "passed": passed,

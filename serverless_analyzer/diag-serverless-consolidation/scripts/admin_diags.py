@@ -374,8 +374,10 @@ def _retention_label(parts: list[dict], basis: str | None) -> str | None:
         return f"{round(days):,} days observed"
     if parts[0]["pct"] >= 75:
         n = round(parts[0]["days"])
-        return "1 day" if n == 1 else f"{n:,} days"
-    return " · ".join(f"{round(p['days'])}d ({p['pct']:.0f}%)" for p in parts[:3])
+        label = "1 day" if n == 1 else f"{n:,} days"
+    else:
+        label = " · ".join(f"{round(p['days'])}d ({p['pct']:.0f}%)" for p in parts[:3])
+    return label + (" (part observed)" if basis == "blended" else "")
 
 
 def _est_bytes_per_day(bulk_bytes: int, creation: int | None, lifecycle: int | None, action: str | None, collection: int) -> int:
@@ -567,7 +569,7 @@ def _counter_intact(stats: dict, older: str, write_name: str) -> bool:
     return (old_bulk / old_store) >= COUNTER_INTACT_MIN * (write_bulk / write_store)
 
 
-def series_rates(stats: dict, streams: list, alias: dict, explain: dict, created: dict, index_mode: dict, collection: int) -> dict:
+def series_rates(stats: dict, streams: list, alias: dict, explain: dict, created: dict, index_mode: dict, collection: int, counter_start: dict | None = None) -> dict:
     """Bulk bytes per day for every series in a bundle, with the logs, metrics, and traces split.
 
     A series is a data stream, the indices under one write alias, or a family of
@@ -588,6 +590,14 @@ def series_rates(stats: dict, streams: list, alias: dict, explain: dict, created
 
     `fallback_bytes` is the rate from the last two. `short_window_bytes` is the
     rate still measured over less than a day.
+
+    The bulk counter starts at zero whenever a primary shard starts on a node, so a
+    shard that restarted or moved has counted only since then, while the write phase
+    runs from the index's creation. `counter_start` is that start for each index
+    (the latest primary recovery in the bundle). Where the counter is younger than
+    the write phase, `restart_extra_bytes` is what the rate would add if the same
+    bytes were spread over the counter's own age. The quoted rate stays esdiag's
+    figure; this is the flag beside it.
     """
     members_of: dict[str, list[str]] = {}
     for ds in streams or []:
@@ -618,6 +628,7 @@ def series_rates(stats: dict, streams: list, alias: dict, explain: dict, created
     rated: dict[str, int] = {}
     mix = {"logs": 0, "k8s_logs": 0, "metrics": 0, "traces": 0}
     total = short = fallback = 0
+    restart_extra = restart_indices = 0
     covered: set[str] = set()
 
     def add(series: str, write_name: str, rate: int, window: int, by_fallback: bool) -> None:
@@ -662,6 +673,13 @@ def series_rates(stats: dict, streams: list, alias: dict, explain: dict, created
             later = older
         rate, window, _used = _window_rate(generations)
         add(stream_name.get(write_name) or write_name, write_name, rate, window, by_fallback)
+        write_bulk, write_seconds = generations[0][0], generations[0][1]
+        start = (counter_start or {}).get(write_name)
+        if rate > 0 and start and write_seconds > 0 and collection > start:
+            counted = (collection - int(start)) // 1000
+            if 0 < counted < 0.9 * write_seconds:
+                restart_extra += max(0, int(int(write_bulk) * (86400.0 / counted)) - int(int(write_bulk) * (86400.0 / write_seconds)))
+                restart_indices += 1
 
     # Dated indices written by name: no data stream, no write alias, never rolled over.
     in_stream = {n for names in members_of.values() for n in names}
@@ -694,6 +712,7 @@ def series_rates(stats: dict, streams: list, alias: dict, explain: dict, created
     return {
         "rated": rated, "bytes_per_day": total, "mix": mix,
         "short_window_bytes": short, "fallback_bytes": fallback, "covered": covered,
+        "restart_extra_bytes": restart_extra, "restart_indices": restart_indices,
     }
 
 
@@ -708,6 +727,15 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         stats = (_zip_json(archive, "/indices_stats.json") or {}).get("indices") or {}
         state = _zip_json(archive, "/cluster_state.json") or {}
         alias = _zip_json(archive, "/alias.json") or {}
+        recovery = _zip_json(archive, "/recovery.json") or {}
+
+    # When each index's primary shards last started on a node. The bulk counter restarts then.
+    counter_start: dict[str, int] = {}
+    for name, body in (recovery.items() if isinstance(recovery, dict) else []):
+        for shard in (body or {}).get("shards") or []:
+            ms = shard.get("start_time_in_millis")
+            if shard.get("primary") and ms:
+                counter_start[name] = max(counter_start.get(name, 0), int(ms))
 
     hot_up: list[float] = []
     collection = 0
@@ -733,7 +761,7 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
             except (TypeError, ValueError):
                 pass
 
-    rates = series_rates(stats, streams, alias, explain, created, index_mode, collection)
+    rates = series_rates(stats, streams, alias, explain, created, index_mode, collection, counter_start)
     rated = rates["rated"]
     est_bytes = rates["bytes_per_day"]
     gb_day = est_bytes / 1e9
@@ -773,6 +801,8 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
     dataset = 0.0
     snapshot = 0.0
     observed: list[float] = []
+    blended_bytes = 0.0       # store with no delete policy, taken at its own age
+    blended_age_bytes = 0.0
     captured_ms = captured.timestamp() * 1000
     for ix, body in stats.items():
         store = ((body.get("primaries") or {}).get("store") or {})
@@ -789,30 +819,45 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         age = delete_age.get(info.get("policy")) if info.get("managed") else None
         if age is None:
             age = ds_age.get(ix)
+        ms = created.get(ix) or info.get("index_creation_date_millis")
+        own_age = None
+        if ms:
+            own_age = (captured_ms - int(ms)) / 86_400_000
+        else:
+            own_age = _parse_age(info.get("time_since_index_creation"))
+        if own_age is not None and own_age > 0:
+            observed.append(own_age)
         if age is None:
+            # No delete policy covers this index. Its own age is the best evidence of how long
+            # that data is kept, so it joins the weighted age at that age, by its size.
             unknown += nbytes
+            if own_age is not None and own_age > 0:
+                blended_bytes += nbytes
+                blended_age_bytes += own_age * nbytes
+                by_age[round(own_age, 3)] += nbytes
+                age = own_age
         else:
             by_age[round(age, 3)] += nbytes
-            if ingest_kind(series_of.get(ix) or ix, index_mode.get(ix)) == "metrics":
-                metrics_age_bytes += age * nbytes
-                metrics_bytes += nbytes
-        ms = created.get(ix) or info.get("index_creation_date_millis")
-        if ms:
-            observed.append((captured_ms - int(ms)) / 86_400_000)
-        else:
-            since = _parse_age(info.get("time_since_index_creation"))
-            if since:
-                observed.append(since)
+        if age is not None and ingest_kind(series_of.get(ix) or ix, index_mode.get(ix)) == "metrics":
+            metrics_age_bytes += age * nbytes
+            metrics_bytes += nbytes
 
-    known = local - unknown
-    weighted = sum(age * nbytes for age, nbytes in by_age.items()) / known if known > 0 else None
+    known = local - unknown                   # store whose age a policy or data stream sets
+    covered = known + blended_bytes           # store that has an age at all
+    weighted = sum(age * nbytes for age, nbytes in by_age.items()) / covered if covered > 0 else None
+    known_share = (known / local) if local > 0 else None
     parts: list[dict] = []
-    if known > 0:
+    if covered > 0:
         for age, nbytes in sorted(by_age.items(), key=lambda kv: -kv[1]):
-            parts.append({"days": age, "pct": round(100 * nbytes / known, 1)})
+            parts.append({"days": age, "pct": round(100 * nbytes / covered, 1)})
     observed_days = max(observed) if observed else None
-    if weighted:
+    if weighted and known > 0 and blended_bytes > 0:
+        basis, days = "blended", weighted
+    elif weighted and known > 0:
         basis, days = "policy", weighted
+    elif weighted:
+        basis, days = "observed", weighted
+        parts = [{"days": round(weighted, 1), "pct": 100.0, "basis": "observed"}]
     elif observed_days and observed_days > 0:
         basis, days = "observed", observed_days
         parts = [{"days": round(observed_days, 1), "pct": 100.0, "basis": "observed"}]
@@ -828,6 +873,9 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         # Size-weighted delete age of the metrics indices alone, for the TSDS retention row.
         "retention_days_metrics": round(metrics_age_bytes / metrics_bytes, 3) if metrics_bytes > 0 else None,
         "retention_basis": basis,
+        # Share of local store whose age a delete policy or data stream sets. The rest is taken at
+        # its own age (blended) and is what the age would be if nothing were ever deleted.
+        "retention_known_share": None if known_share is None else round(known_share, 4),
         "retention_label": _retention_label(parts, basis),
         "store_gb": round(local / 1e9, 2),
         "dataset_gb": round((dataset + snapshot) / 1e9, 2),
@@ -837,6 +885,10 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         # Part of bulk_gb_day rated over less than a day, and the part rated without an ILM write phase.
         "bulk_short_window_gb_day": round(rates["short_window_bytes"] / 1e9, 3),
         "bulk_fallback_gb_day": round(rates["fallback_bytes"] / 1e9, 3),
+        # Extra GB/day if each write index's bytes were spread over the age of its shards' bulk
+        # counter. A flag only: the quoted bulk_gb_day is esdiag's figure.
+        "bulk_restart_gb_day": round(rates["restart_extra_bytes"] / 1e9, 3),
+        "bulk_restart_indices": rates["restart_indices"],
         **unrated_ingest(stats, streams, alias, explain, rated, rates["covered"]),
     }
 

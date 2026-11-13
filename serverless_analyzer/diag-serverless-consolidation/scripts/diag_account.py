@@ -12,9 +12,9 @@ The copy is what the default sizing run reads. It does not replace the K360
 account JSON. The K360 stored-GB back-calculation is the backup (--k360-ingest),
 because K360 does not provide a raw ingest total.
 
-Only deployments with a bill in the latest lookback month are sized. A
-deployment with no bill that month is left out, and its last telemetry
-snapshot is not added to stored GB.
+Only deployments with a bill in the quote window (the last 90 billed days by
+default) are sized. A deployment with no bill in that window is left out, and
+its last telemetry snapshot is not added to stored GB.
 """
 from __future__ import annotations
 
@@ -180,6 +180,8 @@ def _rollup_solutions(out: dict, clamped_notes: list[str]) -> None:
         if written is not None and abs(float(written) - measured) > 0.05:
             clamped_notes.append(f"{sol} retention measures {measured:.1f} months and is written to the estimator as {written}")
         blk["deployments"] = len(group)
+        # Deployments that were actually sized: a matched bundle, or priced from K360 on request.
+        blk["sized_deployments"] = sum(1 for d in group if d.get("ingest_source") in ("diagnostics", "k360_fallback"))
         ecu_map = active_info.get("ecu_complete_month") or {}
         if use_active and ecu_map:
             blk["ecu_monthly_avg"] = round(sum(float(ecu_map.get(d["name"]) or 0) for d in group), 2)
@@ -263,13 +265,33 @@ def compressioncalc_account(acc: dict) -> dict:
     return out
 
 
-def apply_diagnostics(acc: dict, rows: list[dict], admin_names: set[str] | None = None) -> dict:
+UNMEASURED_MODES = ("exclude", "k360", "fail")
+# Stored GB ÷ assumed retention is a raw rate. The estimators expand a raw rate to a metered one,
+# and bulk is written as metered, so a K360 fallback rate takes that expansion before it joins bulk.
+K360_FALLBACK_EXPANSION = {"observability": 1.595, "security": 1.66}
+
+
+def apply_diagnostics(
+    acc: dict, rows: list[dict], admin_names: set[str] | None = None, *,
+    unmeasured: str = "exclude", fallback_months: float = 3.0, security_fallback_months: float | None = None,
+) -> dict:
     """Return a deep copy whose sizing inputs are the diagnostic measurements.
 
     `admin_names` is the set of deployment names the admin console lists today. When it is
     given, a billed deployment with no bundle whose name is not in that list is labelled
-    decommissioned, not missing a diagnostic: there is nothing left to capture.
+    decommissioned, not missing a diagnostic: there is nothing left to capture. It is not
+    sized: no ingest, and its last stored GB is kept only as `k360_gb`.
+
+    `unmeasured` says what an active deployment with no bundle does:
+
+      exclude  not sized: no ingest and no stored GB. Its K360 size is kept as `k360_gb`.
+      k360     priced from K360 stored GB and labelled `k360_fallback`. Observability and
+               Security take stored GB ÷ (`fallback_months` × 30.416) × the estimator's
+               expansion, at that assumed retention. Search keeps its K360 stored GB.
+      fail     sized as `exclude`; the run stops on those names after this returns.
     """
+    if unmeasured not in UNMEASURED_MODES:
+        raise ValueError(f"unmeasured must be one of {', '.join(UNMEASURED_MODES)}")
     admin_norm = None if admin_names is None else {_norm(n) for n in admin_names}
     out = copy.deepcopy(acc)
     by_exact = {r["name"]: r for r in rows if r.get("name")}
@@ -287,12 +309,13 @@ def apply_diagnostics(acc: dict, rows: list[dict], admin_names: set[str] | None 
     matched = 0
     fallback = 0
     fallback_names: list[str] = []
+    k360_priced: list[dict] = []
     decommissioned_names: list[str] = []
     inactive = 0
     inactive_bundles: list[str] = []
     dropped_gb = 0.0
     snapshot_gb = 0.0
-    unmeasured: list[dict] = []
+    no_age: list[dict] = []  # bulk with no measured retention
     unrated_rows: list[dict] = []
     unrated_known = False
     active_info = (out.get("deployments") or {}).get("active") or {}
@@ -333,6 +356,9 @@ def apply_diagnostics(acc: dict, rows: list[dict], admin_names: set[str] | None 
             dep["retention_days_metrics"] = _measured_days(hit.get("retention_days_metrics"))
             dep["bulk_short_window_gb_day"] = hit.get("bulk_short_window_gb_day")
             dep["bulk_fallback_gb_day"] = hit.get("bulk_fallback_gb_day")
+            dep["bulk_restart_gb_day"] = hit.get("bulk_restart_gb_day")
+            dep["bulk_restart_indices"] = hit.get("bulk_restart_indices")
+            dep["retention_known_share"] = hit.get("retention_known_share")
             # A row parsed before this field existed says nothing either way.
             if hit.get("unrated_indices") is not None:
                 unrated_known = True
@@ -352,7 +378,7 @@ def apply_diagnostics(acc: dict, rows: list[dict], admin_names: set[str] | None 
                 dep["retention_unmeasured"] = True
                 dep["retention_days"] = None
                 if float(hit.get("bulk_gb_day") or 0) > 0:
-                    unmeasured.append({
+                    no_age.append({
                         "name": dep.get("name"),
                         "bulk_gb_day": round(float(hit.get("bulk_gb_day") or 0), 3),
                     })
@@ -370,14 +396,31 @@ def apply_diagnostics(acc: dict, rows: list[dict], admin_names: set[str] | None 
         elif admin_norm is not None and _norm(name) not in admin_norm:
             if name:
                 decommissioned_names.append(name)
+            dep["k360_gb"] = dep.get("gb")
+            dep["gb"] = 0.0
             dep["daily_raw_gb"] = 0.0
             dep["ingest_source"] = "decommissioned"
         else:
             fallback += 1
             if name:
                 fallback_names.append(name)
-            dep["daily_raw_gb"] = 0.0
-            dep["ingest_source"] = "active_no_bundle"
+            stored = float(dep.get("gb") or 0)
+            sol = dep.get("solution") or "search"
+            if unmeasured == "k360" and stored > 0:
+                dep["ingest_source"] = "k360_fallback"
+                dep["daily_raw_gb"] = 0.0
+                if sol in K360_FALLBACK_EXPANSION:
+                    months = float(security_fallback_months or fallback_months) if sol == "security" else float(fallback_months)
+                    dep["daily_raw_gb"] = round(stored / (months * DAYS_PER_MONTH) * K360_FALLBACK_EXPANSION[sol], 3)
+                    dep["retention_days"] = round(months * DAYS_PER_MONTH, 3)
+                    dep["retention_basis"] = "assumed"
+                    dep["retention_label"] = f"{months:g} months assumed"
+                k360_priced.append({"name": name, "solution": sol, "stored_gb": round(stored, 2), "gb_day": dep["daily_raw_gb"]})
+            else:
+                dep["k360_gb"] = dep.get("gb")
+                dep["gb"] = 0.0
+                dep["daily_raw_gb"] = 0.0
+                dep["ingest_source"] = "active_no_bundle"
 
     ech = _ech_rows(out)
     clamped_notes: list[str] = []
@@ -400,12 +443,20 @@ def apply_diagnostics(acc: dict, rows: list[dict], admin_names: set[str] | None 
         ]
     st["data_stored_gb"] = stored_total
     st["data_stored_tb"] = round(stored_total / 1024, 2)
+    # Search ingest is the org's docs/s × search store ÷ org store. The org rate covers every
+    # deployment that billed, so the denominator keeps the K360 size of the ones left unsized.
+    st["ingest_share_store_gb"] = round(sum(float(d.get("gb") or 0) + float(d.get("k360_gb") or 0) for d in ech), 2)
     by_name = {d["name"]: d for d in ech}
     for row in st.get("by_deployment") or []:
         src = by_name.get(row.get("name"))
         if src and src.get("ingest_source") == "diagnostics":
             row["data_stored_gb"] = src.get("gb")
     unmatched_diags = [r.get("name") for r in rows if r.get("name") not in used]
+    _known = [(float(r.get("store_gb") or 0), r.get("retention_known_share")) for r in rows if r.get("name") in used and r.get("name") not in inactive_bundles]
+    _store = sum(gb for gb, _share in _known)
+    blended_share = None
+    if _store > 0 and all(share is not None for _gb, share in _known):
+        blended_share = round(sum(gb * (1.0 - float(share)) for gb, share in _known) / _store, 4)
     active_rows = [r for r in rows if r.get("name") in used and r.get("name") not in inactive_bundles]
     bulk_sum = sum(float(r.get("bulk_gb_day") or 0) for r in active_rows)
     accounted_sum, share = _accounted_from_bulk(bulk_sum)
@@ -426,6 +477,9 @@ def apply_diagnostics(acc: dict, rows: list[dict], admin_names: set[str] | None 
         "matched": matched,
         "k360_fallback": fallback,
         "fallback_names": fallback_names[:12],
+        "unmeasured_mode": unmeasured,
+        "k360_priced": k360_priced[:12],
+        "k360_priced_gb_day": round(sum(float(row["gb_day"] or 0) for row in k360_priced), 3),
         "decommissioned": len(decommissioned_names),
         "decommissioned_names": decommissioned_names[:12],
         "unmatched_diagnostics": unmatched_diags[:12],
@@ -435,17 +489,27 @@ def apply_diagnostics(acc: dict, rows: list[dict], admin_names: set[str] | None 
         "compression_ratio": None if share is None else round(share, 3),
         "store_gb": round(sum(float(r.get("store_gb") or 0) for r in rows if r.get("name") in used and r.get("name") not in inactive_bundles), 2),
         "snapshot_gb": round(snapshot_gb, 2),
-        "retention_unmeasured": unmeasured,
+        "retention_unmeasured": no_age,
         "unrated": unrated,
         "bulk_short_window_gb_day": round(sum(float(r.get("bulk_short_window_gb_day") or 0) for r in active_rows), 3),
         "bulk_fallback_gb_day": round(sum(float(r.get("bulk_fallback_gb_day") or 0) for r in active_rows), 3),
+        "bulk_restart_gb_day": round(sum(float(r.get("bulk_restart_gb_day") or 0) for r in active_rows), 3),
+        "bulk_restart_indices": sum(int(r.get("bulk_restart_indices") or 0) for r in active_rows),
+        "bulk_restart_deployments": [
+            {"name": r.get("name"), "gb_day": round(float(r.get("bulk_restart_gb_day") or 0), 3)}
+            for r in sorted(active_rows, key=lambda r: -float(r.get("bulk_restart_gb_day") or 0))
+            if float(r.get("bulk_restart_gb_day") or 0) > 0
+        ][:8],
+        # Share of local store whose retention is set by a delete policy. The rest is blended in at its own age.
+        "retention_blended_share": blended_share,
         "retention_clamped": clamped_notes,
         "active_month": active_info.get("month"),
         "active_month_partial": bool(active_info.get("partial")),
         "window_start": active_info.get("window_start"),
         "window_end": active_info.get("window_end"),
         "window_days": active_info.get("window_days"),
-        "active_deployments": len(active_names) if use_active else None,
+        # ECH deployments on the roster. A serverless project on the roster has no bundle to match.
+        "active_deployments": (matched + fallback + len(decommissioned_names)) if use_active else None,
         "ecu_month": active_info.get("ecu_month"),
         "inactive_excluded": inactive,
         "inactive_snapshot_gb": round(dropped_gb, 2),
@@ -465,7 +529,7 @@ def apply_diagnostics(acc: dict, rows: list[dict], admin_names: set[str] | None 
     if use_active:
         if active_info.get("window_start") and active_info.get("window_end"):
             notes.insert(0, (
-                f"Sized {len(active_names)} deployments with a bill from {active_info['window_start']} through {active_info['window_end']} "
+                f"Sized {matched + fallback + len(decommissioned_names)} ECH deployments with a bill from {active_info['window_start']} through {active_info['window_end']} "
                 f"({active_info.get('window_days')} days). "
                 f"{inactive} deployments had no bill in that window. Their last stored snapshot, {dropped_gb:,.0f} GB, is not carried into the sizing."
             ))
@@ -481,12 +545,12 @@ def apply_diagnostics(acc: dict, rows: list[dict], admin_names: set[str] | None 
         elif active_info.get("partial") and active_info.get("ecu_month"):
             notes.append(f"ECU/mo on the sizing row is {active_info['ecu_month']} billing for those deployments, the last complete month.")
     if inactive_bundles:
-        notes.append(f"{len(inactive_bundles)} diagnostic bundles belong to deployments with no bill in {active_info.get('month')} and are not priced.")
+        notes.append(f"{len(inactive_bundles)} diagnostic bundles belong to deployments with no bill in the quote window and are not priced.")
     if decommissioned_names:
         n = len(decommissioned_names)
         notes.append(
             f"{n} billed {'deployment is' if n == 1 else 'deployments are'} decommissioned: not in the admin console, so no diagnostic can be captured "
-            f"({', '.join(decommissioned_names[:8])}). They add no ingest."
+            f"({', '.join(decommissioned_names[:8])}). They add no ingest and no stored GB."
         )
     if fallback:
         noun = "deployment" if fallback == 1 else "deployments"
@@ -494,18 +558,38 @@ def apply_diagnostics(acc: dict, rows: list[dict], admin_names: set[str] | None 
         adds = "It adds" if fallback == 1 else "They add"
         shown = ", ".join(fallback_names[:8])
         named = f" ({shown})" if shown else ""
+        if k360_priced:
+            gb_day = sum(float(row["gb_day"] or 0) for row in k360_priced)
+            notes.append(
+                f"{fallback} active {noun} {verb} no diagnostic bundle{named}. {len(k360_priced)} of them are priced from K360 stored GB "
+                f"(--unmeasured k360): stored GB ÷ assumed retention × the estimator's expansion, {gb_day:,.1f} GB/day in all. "
+                "That is not a measured rate, and it is why Bundle coverage is flagged."
+            )
+        else:
+            notes.append(
+                f"{fallback} active {noun} {verb} no diagnostic bundle{named}. {adds} no ingest and no stored GB to the estimate. "
+                "Pass --unmeasured k360 to price them from K360 stored GB, or --unmeasured fail to stop the run."
+            )
+    if blended_share is not None and blended_share > 0.10:
         notes.append(
-            f"{fallback} active {noun} {verb} no diagnostic bundle{named}. {adds} no ingest. "
-            "Current stored GB stays; a decommissioned snapshot is not added."
+            f"{blended_share * 100:.0f}% of local store has no delete policy or data stream retention. It is taken at its own age, "
+            "which is how long that data has been kept so far, so the written month is a floor for it."
+        )
+    restart_gb = sum(float(r.get("bulk_restart_gb_day") or 0) for r in rows if r.get("name") in used and r.get("name") not in inactive_bundles)
+    if restart_gb > 0 and bulk_sum > 0 and restart_gb / bulk_sum > 0.05:
+        notes.append(
+            f"Primary shards of write indices restarted or moved after those indices were created, so their bulk counter is younger than the "
+            f"write phase. Spread over the counter's own age, the bulk rate would be up to {restart_gb:,.1f} GB/day higher "
+            f"({restart_gb / bulk_sum * 100:.0f}% of the quoted {bulk_sum:,.1f}). The quote keeps esdiag's figure."
         )
     if snapshot_gb > 0:
         notes.append(
             f"Searchable snapshots, {snapshot_gb:,.0f} GB, are left out of store and retention. The quote uses local primary store."
         )
-    if unmeasured:
-        names = ", ".join(row["name"] for row in unmeasured[:8])
+    if no_age:
+        names = ", ".join(row["name"] for row in no_age[:8])
         notes.append(
-            f"{len(unmeasured)} deployments have bulk and no measured retention ({names}). They stay out of the weighted month."
+            f"{len(no_age)} deployments have bulk and no measured retention ({names}). They stay out of the weighted month."
         )
     if unrated and unrated["indices"]:
         names = ", ".join(f"{row['name']} ({row['store_gb']:,.0f} GB)" for row in unrated_rows[:6])

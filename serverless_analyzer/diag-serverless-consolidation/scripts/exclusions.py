@@ -115,16 +115,24 @@ def apply_exclusions(acc: dict, org: dict, excluded: list[dict]) -> dict:
         ecu["monthly_avg_complete_months"] = round(_mean(complete_new), 2)
     if new_totals and ecu.get("monthly_avg_all") is not None:
         ecu["monthly_avg_all"] = round(_mean(new_totals), 2)
+    # An excluded deployment is an ECH deployment, so the same ECU leaves the whole-org total and the
+    # ECH-named total. The two were different figures before, and they stay different.
     for key in ("total_lookback", "total_lookback_ech_named"):
         if ecu.get(key) is not None:
-            ecu[key] = round(sum(new_totals), 2)
+            ecu[key] = round(max(0.0, float(ecu[key]) - removed_ecu), 2)
     if new_totals:
-        top = max(range(len(new_totals)), key=lambda i: new_totals[i])
-        low = min(range(len(new_totals)), key=lambda i: new_totals[i])
+        # Peak and quietest month are complete months with a bill, as the analysis picks them.
+        # The open month and a part first month are never the quietest.
+        complete = [i for i, m in enumerate(months) if m not in partial and new_totals[i] > 0]
         if ecu.get("monthly_peak"):
+            top = max(complete or range(len(new_totals)), key=lambda i: new_totals[i])
             ecu["monthly_peak"] = {"month": months[top], "ecu": new_totals[top]}
         if ecu.get("monthly_low"):
-            ecu["monthly_low"] = {"month": months[low], "ecu": new_totals[low]}
+            if complete:
+                low = min(complete, key=lambda i: new_totals[i])
+                ecu["monthly_low"] = {"month": months[low], "ecu": new_totals[low]}
+            else:
+                ecu["monthly_low"] = None
 
     days = list(ecu.get("daily_days") or [])
     daily = [float(v or 0) for v in ecu.get("daily_totals") or []]
@@ -143,6 +151,8 @@ def apply_exclusions(acc: dict, org: dict, excluded: list[dict]) -> dict:
             ecu["daily_peak"] = {"day": days[peak], "ecu": daily[peak]}
     for key in ("quote_ingest_scaled", "quote_lookback_days", "quote_daily_avg", "quote_monthly_ecu", "quote_usage_factor", "quote_ingest_factor"):
         ecu.pop(key, None)
+    if isinstance(ecu.get("monthly_by_deployment"), dict):
+        ecu["monthly_by_deployment"] = {n: v for n, v in ecu["monthly_by_deployment"].items() if n not in names}
 
     dep = acc.setdefault("deployments", {})
     present = [d for d in (acc.get("solutions") or {}).get("by_deployment") or [] if d.get("name") in names]
