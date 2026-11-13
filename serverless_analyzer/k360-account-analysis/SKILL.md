@@ -31,7 +31,7 @@ cd <project with .env>          # KIBANA_URL, ELASTIC_API_KEY
 
 python <skill>/scripts/run_account_analysis.py --org "ORG NAME" --skip-diags --skip-sizing
 python <skill>/scripts/run_account_analysis.py --org "ORG NAME" --skip-diags --skip-sizing \
-  --reuse /tmp/account_org_report.json
+  --reuse serverless_analyzer/diag_artifacts/<customer>_<date>/<customer>_<date>_org_report.json
 ```
 Every run uses the trailing year (`--days` defaults to 365). Do not shorten the window. The 3- and 6-month projections use that year's complete-month ECU average (partial months excluded), not the last 30 days. Contract dollars on the projection are included only when ARR and a commit pace exist: ARR ÷ (commit ECU/day × 365).
 

@@ -238,9 +238,12 @@ def consolidation_section(acc: dict) -> list[str]:
         L.append("")
         L.append("_Contract rate_ = ARR ÷ (commit ECU/day × 365), applied to ECH only. _Estimate_ = from the serverless estimators, not a quote or a bill. Serverless is not discounted.")
     else:
-        L.append(f"ECH today **{n0(sv.get('ech_list_mo'))} ECU/mo** at list ($1 per ECU) → {shape}, **{usd(sv.get('serverless_mo'))}/mo estimate** → **{usd(sv.get('list_mo'))}/mo ({s(sv.get('list_pct'))}%)** below list, {usd(sv.get('list_yr'))}/yr.")
+        _gap = sv.get("list_mo")
+        _side = "above" if isinstance(_gap, (int, float)) and _gap < 0 else "below"
+        _abs = (lambda v: abs(v) if isinstance(v, (int, float)) else v)
+        L.append(f"ECH billed cost **{usd(sv.get('ech_list_mo'))}/mo** → {shape}, **{usd(sv.get('serverless_mo'))}/mo estimate** → **{usd(_abs(_gap))}/mo ({s(_abs(sv.get('list_pct')))}%)** {_side} the ECH billed cost, {usd(_abs(sv.get('list_yr')))}/yr.")
         L.append("")
-        L.append("_List_ = $1 per ECU. _Estimate_ = from the serverless estimators, not a quote or a bill.")
+        L.append("_ECH billed cost_ = the K360 billing cost field as a month, with no ARR ÷ commit rate applied. _Estimate_ = from the serverless estimators, not a quote or a bill.")
     L.append("")
     L.append("Three mechanisms: (1) metered usage replaces 24×7 provisioned RAM; (2) per-deployment fixed overhead disappears; (3) one estimator read-back covers a solution instead of a price per deployment. Deployments are shown as ECU, GB, and overhead share.")
     L.append("")
@@ -256,13 +259,13 @@ def consolidation_section(acc: dict) -> list[str]:
     from_diags = c.get("source") == "diagnostics" or (acc.get("sizing") or {}).get("ingest_source") == "diagnostics"
     L.append(f"- **Lookback ECU** {n0(e.get('total_lookback'))} from {s(rng.get('start'))} → {s(rng.get('end'))} ({s(e.get('lookback_days'))} d), cloud-tracker-billing. Headline ECH/mo is the complete-month average, {n0(sv.get('ech_list_mo'))} ECU. Partial months excluded: {', '.join(partial) if partial else 'none'}.")
     if from_diags:
-        L.append(f"- **Stored size** {n1(b.get('stored_gb'))} GB on the quote. Matched deployments use the diagnostic primary store. A deployment with no bundle keeps its K360 size. GB/day is measured bulk, not stored GB ÷ retention.")
+        L.append(f"- **Stored size** {n1(b.get('stored_gb'))} GB on the quote. Matched deployments use the diagnostic primary store. A deployment with no bundle is not sized, unless --unmeasured k360 priced it from its K360 size. GB/day is measured bulk, not stored GB ÷ retention.")
         L.append(f"- **Retention** {s(b.get('retention_months'))} is the ingest-weighted diagnostic retention written to the estimator (1–36 months). K360 does not provide a raw ingest total. Stored GB ÷ assumed retention is the --k360-ingest backup and can sit far below this bulk rate.")
     else:
         L.append(f"- **Stored size** {n1(st.get('data_stored_gb'))} GB as of {s(st.get('as_of'))}, {s(st.get('deployments_with_telemetry'))} deployments with a row. {src} K360 does not provide a raw ingest total. This backup uses stored GB ÷ (retention months × 30.416), which can sit far below measured bulk.")
         L.append(f"- **Retention** {s(b.get('retention_months'))} is the run assumption, not a measured ILM policy. It changes implied GB/day. The estimator was not re-run, so the quoted dollars stay put.")
     L.append(f"- **Workload** {s(wl.get('window_days'))} d, {s(wl.get('indices'))} indices, index_telemetry day averages. Ingest {n1(ingest.get('docs_per_sec'))} docs/s, active {n0(ingest.get('active_hours_mo'))} h/mo, avg doc bytes {s(ingest.get('avg_doc_bytes')) or 'missing'}. Search QPS is not scaled to the search slice. Ingest docs/s is, by stored-GB share. Missing ingest inputs leave Search ingest at $0 in the es3-estimator.")
-    L.append(f"- **Contract** {s(cr.get('note'))} Shown rate ${s(cr.get('implied_usd_per_ecu'))}/ECU.")
+    L.append(f"- **Contract** {s(cr.get('note'))}" + (f" Shown rate ${s(cr.get('implied_usd_per_ecu'))}/ECU." if cr.get("implied_usd_per_ecu") is not None else ""))
     if fr.get("size_gaps"):
         L.append(f"- **Size coverage** {missing} of {s(fr.get('n_deployments'))} deployments have no size on {s(st.get('as_of'))}. {s(fr.get('n_size_moved'))} now report under a sibling name already in the stored-GB total. {missing - (fr.get('n_size_moved') or 0)} have no current size.")
     else:
@@ -271,7 +274,7 @@ def consolidation_section(acc: dict) -> list[str]:
     if sv.get("ech_contract_mo") is not None:
         L.append(f"ECH at the contract rate: {n0(sv.get('ech_list_mo'))} ECU × ARR ÷ (commit × 365) = **{usd(sv.get('ech_contract_mo'))}/mo**. The serverless estimate is {usd(sv.get('serverless_mo'))}/mo, **{usd(sv.get('cost_mo'))}/mo ({s(sv.get('cost_pct'))}%)** below that, {usd(sv.get('cost_yr'))}/yr. Serverless is not discounted.")
     else:
-        L.append(f"At list, $1 per ECU: {n0(sv.get('ech_list_mo'))} − {usd(sv.get('serverless_mo'))} = **{usd(sv.get('list_mo'))}/mo ({s(sv.get('list_pct'))}%)**, {usd(sv.get('list_yr'))}/yr.")
+        L.append(f"ECH billed cost {usd(sv.get('ech_list_mo'))} − serverless estimate {usd(sv.get('serverless_mo'))} = **{usd(sv.get('list_mo'))}/mo ({s(sv.get('list_pct'))}%)**, {usd(sv.get('list_yr'))}/yr. A negative figure is an increase.")
     L.append("")
     bs_early = svl.get("by_solution") or {}
     search = bs_early.get("search") or {}
@@ -355,9 +358,9 @@ def consolidation_section(acc: dict) -> list[str]:
     L.append(mermaid_xy("Largest deployments, ECH ECU/mo", [r["name"] for r in (c.get("by_deployment") or [])[:8]], [r.get("ech_ecu_mo") or 0 for r in (c.get("by_deployment") or [])[:8]], ylabel="ECU/mo"))
     L.append("")
     L.append("### 11.4 Where ECH spend sits")
-    L.append(table(["Deployment", "Solution", "Stored GB", "List $/mo", "Calculated $/mo", "Fixed ECU/mo", "Overhead %"],
-                   [[r["name"], r["solution"], n0(r["stored_gb"]) if r.get("gb_known") else (f"on {r['size_now_on']}" if r.get("size_now_on") else "no GB"), usd(r["ech_ecu_mo"]), usd(r.get("ech_cost_mo")), n0(r.get("fixed_overhead_ecu_mo")), s(r.get("overhead_pct"))] for r in c.get("by_deployment") or []]))
-    L.append("\nList $/mo is ECU at $1. Calculated $/mo is that ECU × ARR ÷ (commit × 365).\n")
+    L.append(table(["Deployment", "Solution", "Stored GB", "Billed $/mo", "Fixed ECU/mo", "Overhead %"],
+                   [[r["name"], r["solution"], n0(r["stored_gb"]) if r.get("gb_known") else (f"on {r['size_now_on']}" if r.get("size_now_on") else "no GB"), usd(r["ech_ecu_mo"]), n0(r.get("fixed_overhead_ecu_mo")), s(r.get("overhead_pct"))] for r in c.get("by_deployment") or []]))
+    L.append("\nBilled $/mo is the K360 billing cost field for that deployment: 1 ECU is $1, and no ARR ÷ commit rate is applied.\n")
     L.append("")
     for x in c.get("callouts") or []:
         L.append(f"- **{x['title']}** — {x['detail']}")
@@ -375,7 +378,7 @@ def consolidation_section(acc: dict) -> list[str]:
             L.append(table(["Usage", "ECH at contract rate", "Serverless, estimate", "Savings vs. contract rate"],
                            [[r["scenario"], usd(r.get("ech_cost_mo")), usd(r.get("serverless_mo")), usd(r.get("save_vs_contract_mo"))] for r in sens["fleet"]]))
         else:
-            L.append(table(["Usage", "ECH at list", "Serverless, estimate", "Savings vs. list"],
+            L.append(table(["Usage", "ECH billed cost", "Serverless, estimate", "Savings vs. ECH billed cost"],
                            [[r["scenario"], usd(r["ech_ecu_mo"]), usd(r.get("serverless_mo")), usd(r.get("save_vs_list_mo"))] for r in sens["fleet"]]))
         L.append("")
         eis_bit = next((r.get("eis_mo") for r in sens["fleet"] if r.get("eis_mo")), None)
@@ -408,7 +411,7 @@ def consolidation_section(acc: dict) -> list[str]:
         L.append("\n### Appendix\n")
         L.append(lead)
         L.append("")
-        L.append("The score is the mean of the checks that apply. A check that does not apply is n/a and stays out of the mean. A score of 0.90 or higher passes. A check that misses its own bar stays flagged. An echo gap of 0.51 scores 0 on that component and still passes that component. This is not a serverless bill.")
+        L.append("The score is the mean of the checks that apply. A check that does not apply is n/a and stays out of the mean. The quote passes only when every scored check passes its own bar. One failed check fails it. The score is the mean and does not decide the verdict. An echo gap equal to the tolerance (0.1% of the written bulk, at least 0.02 GB/day) scores 0 on that component and still passes it. This is not a serverless bill.")
         L.append("")
         L.append(table(
             ["Check", "Score", "Pass", "Measured"],

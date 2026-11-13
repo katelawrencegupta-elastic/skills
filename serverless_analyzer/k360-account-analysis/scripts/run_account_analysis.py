@@ -200,7 +200,7 @@ def agent_brief(acc: dict) -> dict:
             for kind in ("performance", "cost") for r in (an.get(kind) or [])[:5]
         ],
         "contract_rate": cons.get("contract_rate"),
-        "savings": {k: (cons.get("savings") or {}).get(k) for k in ("ech_contract_mo", "serverless_mo", "cost_mo", "cost_yr", "cost_pct") if (cons.get("savings") or {}).get(k) is not None},
+        "savings": {k: (cons.get("savings") or {}).get(k) for k in ("ech_basis", "ech_list_mo", "serverless_mo", "list_mo", "list_yr", "list_pct") if (cons.get("savings") or {}).get(k) is not None},
         "quotes": ((cons.get("reconciliation") or {}).get("quotes")) or [],
         "integrity": cons.get("integrity"),
         "fleet": ((cons.get("sensitivity") or {}).get("fleet")) or [],
@@ -209,9 +209,6 @@ def agent_brief(acc: dict) -> dict:
         "links": {
             "folder": sz.get("folder"),
             "drive": (sz.get("drive_folder") or {}).get("url"),
-            "drive_30d": (sz.get("drive_folder_30d") or {}).get("url"),
-            "drive_compressioncalc": (sz.get("drive_folder_compressioncalc") or {}).get("url"),
-            "drive_compressioncalc_30d": (sz.get("drive_folder_compressioncalc_30d") or {}).get("url"),
             "estimators": {k: v.get("url") for k, v in estimators.items() if v.get("url")},
             "pdfs": {
                 k: {field: v.get(field) for field in ("pdf", "html", "drive_url") if v.get(field)}
@@ -222,6 +219,8 @@ def agent_brief(acc: dict) -> dict:
         "canvas_file": f"{slug}-account-analysis.canvas.tsx",
         "ingest_source": cons.get("source") or sz.get("ingest_source") or "k360",
         "consolidation_canvas_file": f"{slug}-serverless-consolidation-savings.canvas.tsx" if cons else None,
+        "method": m.get("method"),
+        "ech_scope": cons.get("ech_scope") if cons else None,
         "k360_ingest": _k360_brief(acc),
         "k360_canvas_file": f"{slug}-serverless-consolidation-from-k360.canvas.tsx" if acc.get("k360_ingest") else None,
         "diagnostics_coverage": sz.get("diagnostics") if (cons.get("source") == "diagnostics" or sz.get("ingest_source") == "diagnostics") else None,
@@ -247,7 +246,11 @@ def parse_args(argv=None, description: str | None = None):
     ap.add_argument("--org-id", action="append", default=None, help="Cloud organization id. Repeat when one customer name covers several orgs")
     ap.add_argument("--env", default=".env")
     ap.add_argument("--days", type=int, default=365, help="Trailing fetch window in days. The account summary uses the past year (365)")
-    ap.add_argument("--lookback-days", type=int, default=30, help="Quote window in days. Default 30. Maximum 365. The account summary fetch still uses --days")
+    ap.add_argument("--lookback-days", type=int, default=90, help="Quote window in days: the ECH month and the active-deployment roster. Default 90 (3 months). Maximum 365. The account summary fetch still uses --days")
+    ap.add_argument("--ech-scope", choices=("priced", "all"), default="priced", help="Which billed cost is the ECH side of the comparison. priced (default): only deployments that got a serverless price. all: the whole billing window")
+    ap.add_argument("--unmeasured", choices=("exclude", "k360", "fail"), default="exclude", help="An active deployment with no diagnostic bundle. exclude (default): not sized, on neither side. k360: priced from K360 stored GB and labelled. fail: stop the run")
+    ap.add_argument("--min-priced-ecu-pct", type=float, default=90.0, help="Integrity fails when deployments with a serverless price carry less than this share of the ECH deployments' billed cost. Default 90")
+    ap.add_argument("--keep-serverless-spend", action="store_true", help="With --ech-scope all, leave existing serverless projects' cost in the ECH figure. Off by default")
     ap.add_argument("--reuse", default=None, help="Existing fetch_org.py JSON (skips the K360 fetch)")
     ap.add_argument("--artifacts-root", default=None, help="Parent of <customer>_<date>/ (default serverless_analyzer/diag_artifacts)")
     ap.add_argument("--date", default=None, help="YYYY-MM-DD for the run key (default today UTC)")
@@ -265,11 +268,16 @@ def parse_args(argv=None, description: str | None = None):
     ap.add_argument("--skip-diags", action="store_true", help="Do not pull diagnostics. The quote uses the K360 backup (stored GB ÷ assumed retention)")
     ap.add_argument("--diags-dir", default=None, help="Existing directory of admin-console diagnostic zips. Skips the admin API and parses this folder")
     ap.add_argument("--k360-ingest", action="store_true", help="Also price serverless from K360 stored GB ÷ assumed retention. K360 has no raw ingest total, so this backup can sit far below diagnostic bulk. Used automatically when bundles are unavailable")
+    ap.add_argument("--allow-missing-diags", action="store_true", help="Consolidation only: continue when a diagnostic download still fails after its retries. Page 1 names the deployments that were not measured")
     ap.add_argument("--skip-vpn-check", action="store_true", help="Pull diagnostics without checking that the Aviatrix VPN tunnel is up")
     ap.add_argument("--exclude-deployment", action="append", default=None, metavar="ID", help="Leave this deployment out of the whole run (billing, bundles, plan, estimates). Repeat, or pass a comma list. 32-character deployment id")
     ap.add_argument("--keep-monitoring", action="store_true", help="Consolidation only: keep stack-monitoring deployments (names containing 'monitoring'). They are left out by default")
     ap.add_argument("--skip-deployment-plan", action="store_true", help="Skip the Observability 0/25/50/75/100%% deployment-count sheets. The headline quote still runs")
     args = ap.parse_args(argv)
+    if not 1 <= int(args.lookback_days) <= 365:
+        ap.error("--lookback-days must be from 1 to 365")
+    if not 0 <= float(args.min_priced_ecu_pct) <= 100:
+        ap.error("--min-priced-ecu-pct must be from 0 to 100")
     if args.exclude_deployment:
         from exclusions import parse_ids
         args.exclude_ids = parse_ids(args.exclude_deployment)
@@ -342,6 +350,41 @@ def auto_exclude_monitoring(args, env: dict, org: dict, acc: dict) -> list[str]:
     return names
 
 
+def check_reused_org(org: dict, args) -> None:
+    """Stop when a reused org report is another customer's. Warn when it is old.
+
+    The name has to be the one asked for, or start with it. With --org-id, at
+    least one id has to be in the file. Nothing is fetched under --reuse, so
+    this is the only place a wrong file can be caught.
+    """
+    info = org.get("organization") or {}
+    have = str(info.get("name") or "").strip()
+    want = str(args.org or "").strip()
+    if not have or not (have.casefold() == want.casefold() or have.casefold().startswith(want.casefold())):
+        raise SystemExit(
+            f"ERROR: --reuse is the org report for {have or 'an unnamed organization'!r}, and --org is {want!r}. "
+            "Pass the org report for that customer, or drop --reuse to fetch it."
+        )
+    asked = {str(i) for i in (getattr(args, "org_id", None) or []) if i}
+    ids = {str(i) for i in ([info.get("id")] + list(info.get("ids") or [])) if i}
+    if asked and ids and not (asked & ids):
+        raise SystemExit(f"ERROR: --reuse covers organization ids {', '.join(sorted(ids))}, and --org-id is {', '.join(sorted(asked))}.")
+    if have != want:
+        print(f"org → {have}", flush=True)
+        args.org = have
+    try:
+        from analyze import report_day
+        age = (datetime.now(timezone.utc).date() - report_day(org)).days
+    except Exception:  # noqa: BLE001
+        age = 0
+    if age > 7:
+        print(
+            f"WARN: the reused org report was fetched {age} days ago ({(org.get('range') or {}).get('end')}). "
+            "Its billing window ends on that day, not today. Drop --reuse for current billing.",
+            file=sys.stderr, flush=True,
+        )
+
+
 def prepare_account(args):
     """Fetch the org, fill infra, and write the account folder. Returns acc, infra, folder, env, acc_path."""
     warn_unignored_secrets()
@@ -354,6 +397,7 @@ def prepare_account(args):
     env = load_env(env_path)
 
     # 1. fetch (daily chart grain so daily avg/peak are exact)
+    fetched_here = None
     if args.reuse:
         org_json = Path(args.reuse)
         if not org_json.is_file():
@@ -364,7 +408,12 @@ def prepare_account(args):
         if canonical != args.org:
             print(f"org → {canonical}", flush=True)
         args.org = canonical
-        org_json = Path("/tmp/account_org_report.json")
+        # A file of its own, readable only by this user. A fixed path in /tmp was shared by every
+        # run, so two runs could read each other's customer.
+        import tempfile
+        handle, tmp_name = tempfile.mkstemp(prefix="k360_org_", suffix=".json")
+        os.close(handle)
+        org_json = fetched_here = Path(tmp_name)
         cmd = [sys.executable, str(fetch_py), "--org", args.org, "--env", str(env_path), "--days", str(args.days), "--chart", "day", "--out", str(org_json)]
         for oid in args.org_id or []:
             cmd.extend(["--org-id", str(oid)])
@@ -372,6 +421,10 @@ def prepare_account(args):
             cmd.append("--skip-workload")
         _run(cmd)
     org = json.loads(org_json.read_text())
+    if fetched_here is not None:
+        fetched_here.unlink(missing_ok=True)
+    if args.reuse:
+        check_reused_org(org, args)
 
     # 2. infra (1 ES call)
     base, key = es_base_and_key(env)
@@ -382,7 +435,11 @@ def prepare_account(args):
 
     # 3. analyze
     when = date.fromisoformat(args.date) if args.date else datetime.now(timezone.utc).date()
-    acc = build_account(org, infra, when=when, retention_months=args.retention_months, security_retention_months=args.security_retention_months)
+    acc = build_account(
+        org, infra, when=when, retention_months=args.retention_months,
+        security_retention_months=args.security_retention_months,
+        quote_window_days=int(getattr(args, "lookback_days", 90) or 90),
+    )
     excluded = []
     auto_names = auto_exclude_monitoring(args, env, org, acc)
     exclude_ids = getattr(args, "exclude_ids", None)

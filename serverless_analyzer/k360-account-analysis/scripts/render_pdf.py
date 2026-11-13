@@ -6,11 +6,10 @@ sections, in the same order, from `<key>_account.json` into print-ready HTML (in
 charts, stdlib only) and prints them with headless Chrome:
 
   <key>_Account_analysis.{html,pdf}
-  <key>_full retention_bulk_serverless_consolidation_plan.{html,pdf}                 in full_retention/
-  <key>_30d_bulk_serverless_consolidation_plan.{html,pdf}                            in 30d/
-  <key>_full retention_compression-applied_serverless_consolidation_plan.{html,pdf} in full_retention/
-  <key>_30d_compression-applied_serverless_consolidation_plan.{html,pdf}            in 30d/
-  <key>_full retention_k360_serverless_consolidation_plan.{html,pdf}                in full_retention/ (--k360-ingest)
+  <key>_full retention_bulk_serverless_consolidation_plan.{html,pdf}
+  <key>_full retention_k360_serverless_consolidation_plan.{html,pdf}   (--k360-ingest)
+
+Every file is written to the run folder root. There is no per-retention PDF folder.
 
   python render_pdf.py --account-json serverless_analyzer/diag_artifacts/<key>/<key>_account.json [--skip-pdf] [--only account|consolidation]
 
@@ -43,22 +42,43 @@ APPENDIX_STEM = "serverless_consolidation_analysis_appendix"
 CONSOLIDATION_SUFFIX = "Serverless_consolidation_bulk_savings"
 DIAGNOSTICS_SUFFIX = "Serverless_consolidation_from_diagnostics"
 K360_BACKUP_SUFFIX = "Serverless_consolidation_from_k360"
-FULL_RETENTION_FOLDER = "full_retention"
-THIRTY_DAY_FOLDER = "30d"
+# Every PDF is written to the run folder root. Earlier runs filed consolidation PDFs
+# in these two folders under the run folder; a new export empties and removes them.
+LEGACY_PDF_FOLDERS = ("full_retention", "30d")
+CONSOLIDATION_PLAN_MARK = "_serverless_consolidation_plan."
 
 
-def pdf_folder_name(kind: str) -> str | None:
-    """Subfolder for a consolidation PDF, or None for the run folder.
+def retire_legacy_pdf_folders(folder: Path) -> list[str]:
+    """Move consolidation reports out of `full_retention/` and `30d/` into the run folder.
 
-    The account PDF and the appendix stay in the run folder root. Every
-    consolidation PDF goes in its retention folder: `full_retention` for the
-    rounded month, `30d` for the 30-day read.
+    Only the two folders directly under the run folder are touched. A report that
+    is already in the run folder and is at least as new wins, and the older copy is
+    removed. Otherwise the report is moved up. A folder is removed once it is empty;
+    one that still holds anything else is left alone. Returns the names moved.
     """
-    if not kind or kind in ("account", "appendix"):
-        return None
-    if kind.endswith("_30d"):
-        return THIRTY_DAY_FOLDER
-    return FULL_RETENTION_FOLDER
+    moved: list[str] = []
+    for name in LEGACY_PDF_FOLDERS:
+        legacy = folder / name
+        if not legacy.is_dir() or legacy.is_symlink():
+            continue
+        for item in sorted(legacy.iterdir()):
+            if not item.is_file() or CONSOLIDATION_PLAN_MARK not in item.name:
+                continue
+            target = folder / item.name
+            if target.is_file() and target.stat().st_mtime >= item.stat().st_mtime:
+                item.unlink()
+                continue
+            item.replace(target)
+            _seal_file(target)
+            moved.append(item.name)
+        leftovers = [child for child in legacy.iterdir() if child.name != ".DS_Store"]
+        if not leftovers:
+            (legacy / ".DS_Store").unlink(missing_ok=True)
+            try:
+                legacy.rmdir()
+            except OSError:
+                pass
+    return moved
 
 
 def consolidation_pdf_stem(run_key: str, kind: str) -> str:
@@ -141,7 +161,12 @@ def _missing_diag_notes(cov: dict) -> list[str]:
     noun = "deployment is" if count == 1 else "deployments are"
     why = "its diagnostic bundle could not be downloaded after retries" if failed and len(failed) >= count else "no diagnostic bundle was available"
     tail = f" ({shown})" if shown else ""
-    return [f"Missing diagnostics: {count} active {noun} not measured{tail} because {why}. Their ingest is not in this estimate, so the serverless cost is understated by that amount."]
+    if cov.get("unmeasured_mode") == "k360" and cov.get("k360_priced"):
+        return [
+            f"Missing diagnostics: {count} active {noun} not measured{tail} because {why}. "
+            f"{len(cov['k360_priced'])} of them are priced from K360 stored GB ÷ an assumed retention, which is not a measured rate."
+        ]
+    return [f"Missing diagnostics: {count} active {noun} not measured{tail} because {why}. They are on neither side of the comparison: no ingest or stored GB in the estimate, and with the default scope no bill in the ECH figure."]
 
 
 def _excluded_notes(record) -> list[str]:
@@ -174,6 +199,88 @@ def _delta_pct(value) -> str:
 
 def _delta_tone(cost) -> str:
     return "danger" if _increase(cost) else "success"
+
+
+def _method_bit(meta: dict) -> str:
+    """The commit that produced this report, so a PDF can be tied to its method."""
+    method = (meta or {}).get("method") or {}
+    commit = method.get("commit")
+    if not commit:
+        return ""
+    return f" · method {esc(commit)}" + (" + uncommitted changes" if method.get("uncommitted_changes") else "")
+
+
+def _window_bill(c: dict):
+    """The whole org's billed month for the quote window. The compared ECH figure can be a part of it."""
+    basis = (c or {}).get("basis") or {}
+    return basis.get("ech_window_ecu") if basis.get("ech_window_ecu") is not None else basis.get("ech_monthly_ecu")
+
+
+def _scope_is_partial(c: dict) -> bool:
+    """True when the compared ECH figure is less than the whole window's bill."""
+    scope = (c or {}).get("ech_scope") or {}
+    try:
+        return bool(scope) and abs(float(scope.get("in_comparison_mo") or 0) - float(scope.get("window_mo") or 0)) > 0.5
+    except (TypeError, ValueError):
+        return False
+
+
+def _scope_reminder(c: dict) -> str | None:
+    """One line for a page that shows every roster deployment beside the compared figure."""
+    scope = (c or {}).get("ech_scope") or {}
+    if not _scope_is_partial(c):
+        return None
+    return (
+        f"The figures on this page cover every deployment on the roster, {usd(scope.get('window_mo'))}/mo billed in the window. "
+        f"The cover compares {usd(scope.get('in_comparison_mo'))}/mo of it."
+    )
+
+
+def _scope_note(c: dict) -> str | None:
+    """Page 1: which billed cost is the ECH side, and what was left out of the comparison."""
+    scope = (c or {}).get("ech_scope") or {}
+    if not scope:
+        return None
+    unpriced = scope.get("unpriced") or []
+    shown = ", ".join(f"{esc(row.get('name'))} ({esc(row.get('reason'))}, {usd(row.get('ecu_mo'))}/mo)" for row in unpriced[:4])
+    more = "" if len(unpriced) <= 4 else f", and {len(unpriced) - 4} more"
+    if scope.get("scope") == "priced":
+        left = []
+        if unpriced:
+            left.append(f"{_count_label(len(unpriced), 'deployment')} with no serverless price, {usd(scope.get('unpriced_mo'))}/mo: {shown}{more}")
+        if float(scope.get("serverless_mo") or 0) > 0:
+            left.append(f"existing serverless projects, {usd(scope.get('serverless_mo'))}/mo")
+        if float(scope.get("other_mo") or 0) >= 0.5:
+            left.append(f"lines with no deployment on the roster, {usd(scope.get('other_mo'))}/mo")
+        note = (
+            f"ECH billed cost here is the {_count_label(scope.get('priced_deployments'), 'deployment')} that got a serverless price: "
+            f"{usd(scope.get('in_comparison_mo'))}/mo of the {usd(scope.get('window_mo'))}/mo billed in the window."
+        )
+        return note + (" Not compared: " + "; ".join(left) + "." if left else " Nothing was left out.")
+    note = f"ECH billed cost here is the whole billing window, {usd(scope.get('in_comparison_mo'))}/mo"
+    if not scope.get("keep_serverless_spend") and float(scope.get("serverless_mo") or 0) > 0:
+        note += f", less {usd(scope.get('serverless_mo'))}/mo of existing serverless projects"
+    note += "."
+    if unpriced:
+        note += (
+            f" It still includes {_count_label(len(unpriced), 'deployment')} with no serverless price, {usd(scope.get('unpriced_mo'))}/mo "
+            f"({shown}{more}). Nothing on the serverless side replaces that bill, so "
+            + ("the increase is understated by it." if _increase(((c or {}).get("savings") or {}).get("list_mo")) else "the reduction is overstated by it.")
+        )
+    return note
+
+
+def _roster_bit(c: dict) -> str:
+    """How long the billing window behind the deployment count is, as a sentence."""
+    days = ((c or {}).get("basis") or {}).get("quote_lookback_days")
+    if days:
+        return f"Each is {int(days)} days of complete billing."
+    return "Each billed in the quote window."
+
+
+def _roster_days(c: dict) -> str:
+    days = ((c or {}).get("basis") or {}).get("quote_lookback_days")
+    return f"the last {int(days)} days of complete billing" if days else "the quote window"
 
 
 def _reduction(x) -> bool:
@@ -1537,7 +1644,7 @@ def consolidation_inputs_html(acc: dict) -> str:
     avg_doc = ingest.get("avg_doc_bytes")
     from_diags = _from_diagnostics(acc)
     if from_diags:
-        size_src = "Elasticsearch diagnostic bundle, local primary store. Searchable snapshots are left out. A deployment with no bundle keeps its K360 size."
+        size_src = "Elasticsearch diagnostic bundle, local primary store. Searchable snapshots are left out. A deployment with no bundle is not sized, unless --unmeasured k360 priced it from its K360 size."
         size_math = "Observability and Security GB/day is measured bulk index bytes per day. K360 has no raw ingest total; stored GB ÷ assumed retention is the --k360-ingest backup and can sit far below this bulk rate. Search disk is the diagnostic store size."
         ret_src = "Size-weighted ILM delete age, else data-stream retention, else the oldest index. Ingest-weighted across the solution. The estimator accepts 1–36 months."
         if e.get("quote_lookback_days") and _ingest_factor(acc):
@@ -1555,27 +1662,29 @@ def consolidation_inputs_html(acc: dict) -> str:
         ret_math = "Changes the implied GB/day shown in the sensitivity table. The estimator was not re-run, so the quoted dollars stay put."
     if e.get("quote_lookback_days"):
         ecu_math = (
-            f"{int(e['quote_lookback_days'])}-day lookback is {n0(sv.get('ech_list_mo'))} ECU/mo. "
+            f"{int(e['quote_lookback_days'])}-day lookback is {n0(_window_bill(c))} ECU/mo for the whole org"
+            + (f", and {n0(sv.get('ech_list_mo'))} ECU/mo of it is in the comparison. " if _scope_is_partial(c) else ". ")
+            +
             f"Complete-month average is {n0(e.get('monthly_avg_complete_months'))} ECU/mo. "
             f"Partial months left out of that average: {', '.join(partial) if partial else 'none'}."
         )
     else:
         ecu_math = f"Complete-month average is {n0(sv.get('ech_list_mo'))} ECU/mo. Partial months left out: {', '.join(partial) if partial else 'none'}."
     if sv.get("ech_contract_mo") is None:
-        ecu_math += " List price is $1 per ECU."
+        ecu_math += " ECH dollars are the K360 billing cost field as billed: 1 ECU is $1, and no ARR ÷ commit rate is applied."
     rows = [
         ["Lookback ECU", f"{n0(e.get('total_lookback'))} ECU, {rng.get('start') or '—'} → {rng.get('end') or '—'} ({e.get('lookback_days')} d)", "cloud-tracker-billing", ecu_math],
         ["Stored size", f"{n1(st.get('data_stored_gb'))} GB · {n0(st.get('docs_count'))} docs · as of {st.get('as_of')} · {st.get('deployments_with_telemetry')} deployments with a row", size_src, size_math],
         ["Solution split", split, "use case, then features, billing family, and name; GB joined by deployment name", "One serverless project per solution. A solution with no bulk and no stored GB is not priced."],
         ["Retention", ret_txt, ret_src, ret_math],
         ["Workload", f"{wl.get('window_days')} d · {wl.get('indices')} indices · peak {n1((search_wl.get('peak') or {}).get('qps'))} QPS for {(search_wl.get('peak') or {}).get('pct_hours_mo')}% of hours · ingest {n1(ingest.get('docs_per_sec'))} docs/s · active {n0(ingest.get('active_hours_mo'))} h/mo · avg doc {n0(avg_doc) if avg_doc is not None else 'missing'} B", "cloud-tracker-index_telemetry, day averages. Average document size is dataset_size_bytes / docs_count.", "Hour mix is the Search Serverless estimator's active search hours. Ingest docs/s is scaled by the search share of stored GB. A missing document size leaves Search ingest at $0."],
-        ["Contract", f"ARR {usd(cr.get('arr'))} · commit {n0(cr.get('commit_ecu_per_day'))} ECU/day · shown rate ${cr.get('implied_usd_per_ecu')}/ECU", "organization pivot", cr.get("note") or "list view only"],
+        ["Contract", f"ARR {usd(cr.get('arr'))} · commit {n0(cr.get('commit_ecu_per_day'))} ECU/day" + (f" · shown rate ${cr.get('implied_usd_per_ecu')}/ECU" if cr.get("implied_usd_per_ecu") is not None else ""), "organization pivot", cr.get("note") or "For reference. Not applied to the ECH dollars."],
         (["Deployments without a size row",
           f"{missing} of {fr.get('n_deployments')} have no size on {st.get('as_of')}. {fr.get('n_size_moved')} now report under a sibling name. {missing - (fr.get('n_size_moved') or 0)} have no current size.",
           "cloud-tracker-data_pivot, each name's last size day and the names that started after it",
           f"The renamed clusters' data is already in the stored-GB total under the new name. All {fr.get('n_deployments')} stay in the ECU totals."]
          if fr.get("size_gaps") else
-         ["Deployments without a size row", f"{missing} of {fr.get('n_deployments')} have no stored-GB row", "same size snapshot as the stored-GB total", "They stay in the ECU totals and out of the stored-GB total. They are not given a serverless price."]),
+         ["Deployments without a size row", f"{missing} of {fr.get('n_deployments')} have no stored GB (not sized, or no storage row)", "same size snapshot as the stored-GB total", "They stay in the roster ECU totals and out of the stored-GB total. They are not given a serverless price."]),
     ]
     if sv.get("ech_contract_mo") is not None:
         lines = [
@@ -1583,7 +1692,7 @@ def consolidation_inputs_html(acc: dict) -> str:
             f"The serverless estimate is {usd(sv.get('serverless_mo'))}/mo. Against the contract rate that is {usd(sv.get('cost_mo'))}/mo lower ({sv.get('cost_pct')}%), or {usd(sv.get('cost_yr'))}/yr. Serverless is not discounted.",
         ]
     else:
-        lines = [f"At list, $1 per ECU: {n0(sv.get('ech_list_mo'))} billed − {usd(sv.get('serverless_mo'))} estimate = {usd(sv.get('list_mo'))}/mo ({sv.get('list_pct')}%) estimated savings, or {usd(sv.get('list_yr'))}/yr."]
+        lines = [f"ECH billed cost in K360 is {usd(sv.get('ech_list_mo'))}/mo. The serverless estimate is {usd(sv.get('serverless_mo'))}/mo. The estimated {_delta_word(sv.get('list_mo'))} is {_delta_usd(sv.get('list_mo'))}/mo ({_delta_pct(sv.get('list_pct'))}), or {_delta_usd(sv.get('list_yr'))}/yr."]
     body = table(["Input", "Value used", "Where it came from", "How it enters the math"], rows, ["left", "left", "left", "left"])
     body += bullets([
         "Every serverless dollar is an estimate from the serverless estimators. It is not a quote or a bill.",
@@ -1844,7 +1953,7 @@ def _integrity_block(acc: dict) -> str:
         + bullets([
             headline,
             "The score is the mean of the checks that apply. A check that does not apply is n/a and stays out of the mean.",
-            "A score of 0.90 or higher passes. A check that misses its own bar stays flagged. An echo gap of 0.51 scores 0 on that component and still passes that component. E73 must be 0.",
+            "The quote passes only when every scored check passes its own bar. One failed check fails it. The score is the mean and does not decide the verdict. An echo gap equal to the tolerance (0.1% of the written bulk, at least 0.02 GB/day) scores 0 on that component and still passes it. E73 must be 0.",
             "This scores whether the written inputs, the sheet echo, and the published totals agree. It is not a serverless bill.",
         ])
         + table(["Check", "Score", "Pass", "Measured"], rows, ["left", "right", "left", "left"], tones)
@@ -1969,10 +2078,12 @@ def search_power_section(acc: dict, *, new_page: bool = True) -> str:
 
 
 _INTEGRITY_FORMULA = {
-    "Sheet echo": "Mean of the echo component and the E73 component, for each solution that has a workload and a sheet. echo component = 1 − min(|echo − written bulk| / 0.51, 1). A blank G28 scores 0. E73 scores 1 when the parsed amount is 0, and 0 when it is blank or the amount is above 0.005.",
+    "Sheet echo": "Mean of the echo and E73 components over every sheet read, fleet or regional. echo component = 1 − min(|echo − written bulk| ÷ tolerance, 1), where the tolerance is 0.1% of the written bulk, at least 0.02 GB/day. A blank echo scores 0. E73 scores 1 when the parsed amount is 0, and 0 when it is blank or the amount is above 0.005.",
     "Bundle coverage": "Matched deployments ÷ active deployments. When the active count is absent, the denominator is matched bundles plus bundles that fell back.",
     "Measured retention": "1 − (bulk with no measured age ÷ Σ bulk).",
     "Rated ingest": "1 − (store in indices that took bulk writes and have no rate ÷ local store). Those indices are not a data stream, a write alias, or an ILM rollover, or their write index has no write phase. Passes at 5% or less.",
+    "Priced share": "Billed cost of the ECH deployments that got a serverless price ÷ billed cost of every ECH deployment on the roster, over the quote window. Passes at the --min-priced-ecu-pct bar, 90% unless set.",
+    "Estimator monotone": "1 − (merge steps in the deployment-count plan that cost more than the step before them ÷ merge steps). A step rising more than 2% and $5 fails. The read-back stays the dollar.",
     "Direct read-back": "Solutions on their own read-back ÷ solutions with a workload. One region counts. A store split does not.",
     "Line agreement": "1 − min(|sum of quote lines − headline| / headline, 1). Both $0 scores 1.",
     "Year agreement": "For each quote line, 1 − min(|steady annual − 12 × unrounded monthly| / |steady annual|, 1), then the mean. Both sides are rounded to cents first.",
@@ -2038,7 +2149,7 @@ def _quote_window_rows(acc: dict) -> list[list]:
     cr = c.get("contract_rate") or {}
     rows: list[list] = []
     days = e.get("quote_lookback_days")
-    ech = b.get("ech_monthly_ecu")
+    ech = _window_bill(c)
     if ech is None:
         ech = e.get("quote_monthly_ecu")
     if days and _formula_num(ech, 2):
@@ -2052,6 +2163,15 @@ def _quote_window_rows(acc: dict) -> list[list]:
             inputs,
             _formula_num(ech, 2),
         ])
+        scope = c.get("ech_scope") or {}
+        if scope:
+            if scope.get("scope") == "priced":
+                how = "The part of that window billed by deployments with a serverless price. A deployment's part of a day is its month's cost ÷ the org's daily total for that month."
+                used = f"{_count_label(scope.get('priced_deployments'), 'deployment')} priced, {_count_label(scope.get('unpriced_deployments'), 'deployment')} not"
+            else:
+                how = "The whole window" + ("." if scope.get("keep_serverless_spend") else ", less existing serverless projects.")
+                used = f"serverless projects {_formula_money(scope.get('serverless_mo'))}"
+            rows.append(["ECH in the comparison", how, used, _formula_num(scope.get("in_comparison_mo"), 2)])
     factor = e.get("quote_usage_factor")
     if factor is not None:
         complete = _formula_num(e.get("monthly_avg_complete_months"), 2)
@@ -2069,7 +2189,7 @@ def _quote_window_rows(acc: dict) -> list[list]:
         if "quotable" not in str((quote or {}).get("pricing") or ""):
             continue
         if name == "observability":
-            formula = "Observability monthly is the D38 read-back. Quoted only when the sheet echo is within 0.51 GB/day of the written bulk."
+            formula = "Observability monthly is the D38 read-back. Quoted only when the sheet echo is within 0.1% of the written GB/day, at least 0.02 of the written bulk."
         elif name == "security":
             formula = "Security monthly is the E74 read-back. Quoted only when parsed E73 is 0."
         elif name == "search":
@@ -2113,14 +2233,14 @@ def _quote_window_rows(acc: dict) -> list[list]:
     elif sv.get("serverless_mo") is not None and sv.get("list_mo") is not None:
         rows.append([
             "Savings $/month",
-            "ECH list ECU/month − the serverless read-back, at $1 per ECU.",
-            f"{_formula_num(sv.get('ech_list_mo'), 2)} ECU/month − {_formula_money(sv.get('serverless_mo'))}",
+            "ECH billed cost (the K360 cost field, as a month) − the serverless read-back. A negative result is an increase.",
+            f"{_formula_money(sv.get('ech_list_mo'))} − {_formula_money(sv.get('serverless_mo'))}",
             _formula_money(sv.get("list_mo")),
         ])
         rows.append([
             "Savings %",
-            "Savings $/month ÷ ECH list ECU/month.",
-            f"{_formula_money(sv.get('list_mo'))} ÷ {_formula_num(sv.get('ech_list_mo'), 2)} ECU/month",
+            "Savings $/month ÷ ECH billed cost.",
+            f"{_formula_money(sv.get('list_mo'))} ÷ {_formula_money(sv.get('ech_list_mo'))}",
             None if sv.get("list_pct") is None else f"{sv.get('list_pct')}%",
         ])
         rows.append([
@@ -2512,7 +2632,7 @@ def _plan_rows(acc: dict) -> list[list]:
     month = "Every project is written as 1 month." if thirty else "Retention on a project is that group's measured months, rounded up."
     n = _plan_n(plan)
     floor = _plan_floor(acc)
-    n_bit = f" The ceiling is {n}, the cover count. Each is 30 days of complete billing." if n is not None else ""
+    n_bit = f" The ceiling is {n}, the cover count. {_roster_bit(acc.get('consolidation') or {})}" if n is not None else ""
     floor_bit = f" The floor is {floor}, one project per feature per region."
     rows = [[
         "Deployment-count steps",
@@ -2583,7 +2703,7 @@ def _integrity_rows(acc: dict) -> list[list]:
                 result += " fail"
         rows.append([name, formula, row.get("detail") or "This check does not apply.", result])
     if block.get("score") is not None:
-        passed = "Pass is 0.90 or higher, and also when every scored check passes."
+        passed = "Pass is every scored check passing its own bar. One failed check fails the quote."
         rows.append([
             "Quote integrity",
             "The score is the mean of the checks that apply. A check with no inputs is n/a and stays out of the mean. " + passed,
@@ -2608,7 +2728,7 @@ def appendix_b_section(acc: dict, *, new_page: bool = True) -> str:
     groups = [
         _formula_group("Quote window", _quote_window_rows(acc)),
         _formula_group("Bulk and retention", _bulk_rows(acc)),
-        _formula_group("30-day and compression scales", _scale_rows(acc)),
+        _formula_group("Search disk scale", _scale_rows(acc)),
         _formula_group("Search workload", _workload_rows(acc)),
         _formula_group("Raw bulk ingest", _raw_ingest_rows(acc)),
         _formula_group("Metered ingest rate", _metered_rows(acc)),
@@ -2815,8 +2935,8 @@ def raw_ingest_section(acc: dict, *, new_page: bool = True) -> str:
         cells = [
             r["name"],
             (r["solution"] or "").title(),
-            "no bundle" if r["source"] == "active_no_bundle" else "decommissioned" if r["source"] == "decommissioned" else fmt(r["measured"]),
-            "no bundle" if r["source"] == "active_no_bundle" else "decommissioned" if r["source"] == "decommissioned" else fmt(r["quoted"]),
+            "no bundle" if r["source"] in ("active_no_bundle", "k360_fallback") else "decommissioned" if r["source"] == "decommissioned" else fmt(r["measured"]),
+            "no bundle" if r["source"] == "active_no_bundle" else "decommissioned" if r["source"] == "decommissioned" else (fmt(r["quoted"]) + " from K360" if r["source"] == "k360_fallback" else fmt(r["quoted"])),
         ]
         if accounted:
             cells.append(fmt(q))
@@ -2869,6 +2989,7 @@ def raw_ingest_section(acc: dict, *, new_page: bool = True) -> str:
             f"Quoted GB/day is bundle GB/day × the pace factor, and is what each estimator receives. Pace factor {factor:.6f} = {window} daily ECU average ÷ complete-month daily average."
             if factor else
             "Quoted GB/day is the bundle GB/day, as measured, and is what each estimator receives. The billing window does not scale it."
+            + (" A row marked “from K360” had no bundle: its GB/day is K360 stored GB ÷ an assumed retention × the estimator's expansion (--unmeasured k360), and it is in the totals on this page." if any(r["source"] == "k360_fallback" for r in rows) else "")
         ),
         f"The four largest deployments are {top4_share * 100:.0f}% of quoted bulk: " + ", ".join(r["name"] for r in top4) + ".",
         "Days in store is stored GB ÷ bundle GB/day. It is an indicative figure: stored GB is compressed and bundle GB/day is not, so it reads high against true days held. A value far below Retention means most retained data sits outside that store, for example in searchable snapshots, or the stored-GB snapshot is older than the bundle.",
@@ -3097,7 +3218,7 @@ def deployment_plan_body(c: dict, sv: dict, *, alongside: str = "", width: int =
     if sv.get("ech_contract_mo") is not None:
         ech = (float(sv["ech_contract_mo"]), "ECH at contract rate")
     elif sv.get("ech_list_mo") is not None:
-        ech = (float(sv["ech_list_mo"]), "ECH at list")
+        ech = (float(sv["ech_list_mo"]), "ECH billed cost")
     else:
         ech = None
     if c.get("retention_set_days") == 30:
@@ -3111,7 +3232,7 @@ def deployment_plan_body(c: dict, sv: dict, *, alongside: str = "", width: int =
         chart += caption(
             "Ceiling matches the cover count."
             + n_bit
-            + " Each is 30 days of complete billing. "
+            + f" {_roster_bit(c)} "
             + "Each later bar is round(previous × 0.75). "
             + f"Floor is one project per feature per region, {int(c.get('deployment_plan_floor') or 1)}. "
             + "Upper bar is serverless at list; lower is the ECH bill. "
@@ -3121,8 +3242,8 @@ def deployment_plan_body(c: dict, sv: dict, *, alongside: str = "", width: int =
         chart += caption(
             "The project count is on the right. The arrow beside it points down the column."
             + n_bit
-            + " The ceiling matches the cover count: one serverless project per deployment with a bill in the last 30 days of complete billing, aligned to that deployment's feature. "
-            + "The cover count and this ceiling are the same deployments. Each is 30 days of complete billing. "
+            + f" The ceiling matches the cover count: one serverless project per deployment with a bill in {_roster_days(c)}, aligned to that deployment's feature. "
+            + f"The cover count and this ceiling are the same deployments. {_roster_bit(c)} "
             + "Each later bar is round(previous × 0.75), half-to-even. "
             + f"The floor is one project per feature per region, {int(c.get('deployment_plan_floor') or 1)} projects, and the series stops there. "
             + "The upper bar is serverless at list. The lower bar is the ECH bill, the same on every step. "
@@ -3165,8 +3286,18 @@ def per_cluster_section(c: dict, *, new_page: bool = True) -> str:
     rows, tones = [], []
     shown = rows_in
     folded: list[dict] = []
+    unsized_folded: list[dict] = []
     if len(rows_in) > PER_CLUSTER_MAX_ROWS:
-        shown, folded = rows_in[:PER_CLUSTER_MAX_ROWS - 1], rows_in[PER_CLUSTER_MAX_ROWS - 1:]
+        # Only sized clusters fold into "smaller clusters". A cluster that was not sized is never
+        # shown as $0: the ones that do not fit are counted and named under the table.
+        sized_rows = [r for r in rows_in if r.get("status", "sized") == "sized"]
+        other_rows = [r for r in rows_in if r.get("status", "sized") != "sized"]
+        room = PER_CLUSTER_MAX_ROWS - 1
+        keep_other = other_rows[: max(0, min(len(other_rows), room // 3))]
+        unsized_folded = other_rows[len(keep_other):]
+        keep_sized = sized_rows[: max(0, room - len(keep_other) - (1 if unsized_folded else 0))]
+        folded = sized_rows[len(keep_sized):]
+        shown = keep_sized + keep_other
     for r in shown:
         cells = [r.get("name"), str(r.get("solution") or "").title(), r.get("region") or "—", bulk_cell(r.get("bulk_gb_day"))]
         status = r.get("status")
@@ -3192,6 +3323,9 @@ def per_cluster_section(c: dict, *, new_page: bool = True) -> str:
             rest.append(usd(sum(vals)))
         rows.append([f"{len(folded)} smaller clusters", "", "", bulk_cell(sum(float(r.get("bulk_gb_day") or 0) for r in folded))] + rest)
         tones.append("muted")
+    if unsized_folded:
+        rows.append([f"{len(unsized_folded)} more clusters not sized", "", "", ""] + ["not sized"] * len(steps))
+        tones.append("warning")
     un = plan.get("unallocated") or []
     if any(float(v or 0) > 0.5 for v in un):
         rows.append(["Priced in the plan for projects with no sized cluster", "", "", ""] + [usd(v) if float(v or 0) > 0.5 else "—" for v in un])
@@ -3202,7 +3336,7 @@ def per_cluster_section(c: dict, *, new_page: bool = True) -> str:
     body = f"<div class='pc'>{table(headers, rows, align, tones)}</div>"
     notes = [
         "Ceiling is every cluster as its own serverless project. Each later step packs clusters into fewer projects, cutting the project count 25% at a time down to the floor.",
-        "A cluster in a packed project shows its share of that project's price, by bulk GB/day. “(of N)” is the number of clusters sharing the project. Each column adds up to that step's bar on the previous page.",
+        "A cluster in a packed project shows its share of that project's price: by stored GB in a Search project, by bulk GB/day in an Observability or Security project. “(of N)” is the number of clusters sharing the project. Each column adds up to that step's bar on the previous page.",
     ]
     if any(r.get("status") == "no_bulk" for r in rows_in):
         notes.append("Grey “not sized” rows have a diagnostic bundle that measured no bulk. They are not sized and take no share of a packed project. When every cluster in a project is unsized, the project's plan price shows on its own line so each column still adds up to its bar.")
@@ -3212,6 +3346,11 @@ def per_cluster_section(c: dict, *, new_page: bool = True) -> str:
         notes.append("Shaded “missing diagnostic” rows are active deployments with no diagnostic bundle. Their ingest is not measured, so they are not sized.")
     if any(r.get("under_minimum") for r in rows_in):
         notes.append(f"Grey rows are clusters whose own project is ${float(plan.get('min_usd') or 10):,.0f}/mo or less at the ceiling.")
+    if unsized_folded:
+        label = {"missing_diag": "missing diagnostic", "decommissioned": "decommissioned", "no_bulk": "measured nothing to price"}
+        named = ", ".join(f"{esc(r.get('name'))} ({label.get(r.get('status'), 'not sized')})" for r in unsized_folded[:20])
+        more = "" if len(unsized_folded) <= 20 else f", and {len(unsized_folded) - 20} more"
+        notes.append(f"Not sized and not in the table: {named}{more}.")
     return section("Serverless cost per cluster, from one project each down to the floor", body + bullets(notes), new_page=new_page)
 
 
@@ -3224,7 +3363,13 @@ def deployment_plan_section(c: dict, sv: dict, *, alongside: str = "", new_page:
 
 
 def _contract_usd_per_ecu(cr: dict) -> float | None:
-    """ARR ÷ (commit ECU/day × 365). The stored rate is rounded; the dollars use this one."""
+    """The applied ARR ÷ (commit ECU/day × 365) rate on an account written before ECH dollars became K360 billed cost.
+
+    A current account has no applied rate (`implied_usd_per_ecu` is None, `basis` is
+    `k360_cost`), and this returns None: ARR and commit are kept for reference only.
+    """
+    if cr.get("basis") == "k360_cost" or cr.get("implied_usd_per_ecu") is None:
+        return None
     try:
         arr, commit = cr.get("arr"), cr.get("commit_ecu_per_day")
         if arr and commit:
@@ -3278,13 +3423,13 @@ def egress_section(acc: dict) -> str:
 
     out_mo = month_ecu("data-transfer-out")
     out_pct = (nc.get("data-transfer-out") or {}).get("pct")
-    money_hdr = "Contract $/mo" if rate is not None else "List $/mo"
+    money_hdr = "Contract $/mo" if rate is not None else "Billed $/mo"
     share = f", {pct(out_pct)} of the hosted bill" if out_pct is not None else ""
-    priced = f"{dollars(out_mo)} at the contract rate" if rate is not None else f"{dollars(out_mo)} at list"
+    priced = f"{dollars(out_mo)} at the contract rate" if rate is not None else f"{dollars(out_mo)} billed in K360"
     intro = (
         f"Data out is {n1(out_mo)} ECU/mo ({priced}){share}. "
         f"The {usd(sv.get('serverless_mo'))} estimate does not include it. "
-        f"The reduction on the cover counts this hosted charge as going away."
+        f"The comparison on the cover counts this hosted charge as going away."
     )
     rows = []
     for key, label in (
@@ -3333,7 +3478,7 @@ def egress_section(acc: dict) -> str:
     rate_note = (
         "Contract $ is that monthly ECU × ARR ÷ (commit ECU/day × 365)."
         if rate is not None
-        else "List $ is $1 per ECU."
+        else "Billed $ is the K360 cost field: 1 ECU is $1."
     )
     notes = bullets([
         f"ECU/mo is lookback ECU ÷ ({n0(days)} / 30.416). {rate_note}",
@@ -3353,7 +3498,8 @@ def render_consolidation_html(acc: dict) -> str:
     cloud = (acc.get("cloud") or {}).get("summary") or {}
     B: list[str] = []
     diag = _from_diagnostics(acc)
-    _outcome = "estimated cost increase from" if _increase(sv.get("cost_mo")) else "estimated savings from"
+    _change = sv.get("cost_mo") if sv.get("cost_mo") is not None else sv.get("list_mo")
+    _outcome = "estimated cost increase from" if _increase(_change) else "estimated savings from"
     headline = f"{esc(m.get('customer'))} — {_outcome} consolidating on {esc(dom_key.title())} Serverless"
     if diag:
         headline += ", measured from cluster diagnostics"
@@ -3378,7 +3524,7 @@ def render_consolidation_html(acc: dict) -> str:
     active_cov = ((acc.get("sizing") or {}).get("diagnostics") or {})
     quote_days = b0.get("quote_lookback_days")
     ecu_basis = f"{int(quote_days)}-day lookback" if quote_days else "complete-month avg"
-    ecu_src = b0.get("ech_monthly_ecu")
+    ecu_src = _window_bill(c)
     if active_cov.get("window_days"):
         dep_label = f"{dep_n} deployments in the last {int(active_cov['window_days'])} days"
         ecu_label = f"{n0(ecu_src)} ECU/mo account bill ({ecu_basis})"
@@ -3393,8 +3539,11 @@ def render_consolidation_html(acc: dict) -> str:
              f"<div class='sub'>{dep_label} · {ecu_label} · {n0(b0.get('stored_gb'))} GB stored · {esc(cloud.get('provider'))} {esc(cloud.get('region'))} · {esc(m.get('date'))}{source_bit}</div></header>")
     rc = c.get("reconciliation") or {}
     project_n = _priced_project_count(svl)
+    _scope = c.get("ech_scope") or {}
+    # The ECH bar is labelled with the deployments it bills for, not the whole roster.
+    compared_n = _scope.get("priced_deployments") if _scope.get("scope") == "priced" else b0.get("deployments")
     compare_subs = [
-        _count_label(b0.get("deployments"), "deployment"),
+        _count_label(compared_n, "deployment"),
         _count_label(project_n, "project"),
     ]
     if not any(compare_subs):
@@ -3407,7 +3556,7 @@ def render_consolidation_html(acc: dict) -> str:
     else:
         window = ""
         chart_title = "ECH cost today vs. the serverless estimate"
-        ech_cat = "ECH at contract rate" if sv.get("cost_mo") is not None else "ECH at list"
+        ech_cat = "ECH at contract rate" if sv.get("cost_mo") is not None else "ECH billed cost"
         svl_cat = "Serverless estimate"
     cover_rate = _contract_usd_per_ecu(cr) if sv.get("cost_mo") is not None else None
     if sv.get("cost_mo") is not None:
@@ -3432,11 +3581,11 @@ def render_consolidation_html(acc: dict) -> str:
         chart_colors = [PALETTE[0], PALETTE[2]]
         chart_subs = compare_subs
     else:
-        ech_stat = "Monthly ECH cost at list price" + (f", {window}" if window else "")
+        ech_stat = "Monthly ECH billed cost (K360)" + (f", {window}" if window else "")
         svl_stat = "Estimated monthly serverless cost" + (f", {window}" if window else "")
         word = _delta_word(sv.get("list_mo"))
-        save_stat = f"Estimated monthly {word} versus list price" + (f", {window}" if window else "")
-        pct_stat = f"Estimated {word} versus list price" + (f", {window}" if window else "")
+        save_stat = f"Estimated monthly {word} versus ECH billed cost" + (f", {window}" if window else "")
+        pct_stat = f"Estimated {word} versus ECH billed cost" + (f", {window}" if window else "")
         dtone = _delta_tone(sv.get("list_mo"))
         stats = [
             stat(usd(sv.get("ech_list_mo")), ech_stat, tag="billed"),
@@ -3473,17 +3622,21 @@ def render_consolidation_html(acc: dict) -> str:
         ]
     elif quote_days:
         cover_notes = [
-            f"Billed: the last {int(quote_days)} days of ECU at list, $1 per ECU, as a month (that total ÷ {int(quote_days)} × 30.416). Estimate: the serverless estimators filled at that same pace.",
+            f"Billed: the K360 billing cost field over the last {int(quote_days)} billed days, as a month (that total ÷ {int(quote_days)} × 30.416). No contract rate is applied to it. Estimate: the serverless estimators at list. The {_delta_word(sv.get('list_mo'))} is ECH billed cost minus that estimate.",
             ("The serverless estimate is " + " plus ".join(quote_bits) + ".") if quote_bits else "The serverless estimate is one project per solution.",
         ]
     else:
         cover_notes = [
-            "Billed: ECU from K360 billing at list, $1 per ECU. Estimate: from the serverless estimators, not a quote or a bill.",
+            "Billed: the K360 billing cost field, with no contract rate applied. Estimate: from the serverless estimators, not a quote or a bill.",
             ("The serverless estimate is " + " plus ".join(quote_bits) + ".") if quote_bits else "The serverless estimate is one project per solution.",
         ]
     cover_notes.append(
-        "The deployment count on this page and the ceiling on the deployment-count page are the same deployments. Each is 30 days of complete billing."
+        f"The roster count in the heading and the ceiling on the deployment-count page are the same deployments. {_roster_bit(c)}"
+        + (" The ECH bar bills for the priced ones only." if _scope_is_partial(c) and (c.get("ech_scope") or {}).get("scope") == "priced" else "")
     )
+    scope_note = _scope_note(c)
+    if scope_note:
+        cover_notes.insert(1, scope_note)
     if diag and c.get("ingest_basis") == "compressioncalc_accounted_for":
         ratio = c.get("compression_ratio")
         ratio_bit = "unset" if ratio is None else str(ratio)
@@ -3531,7 +3684,14 @@ def render_consolidation_html(acc: dict) -> str:
         metered_v = dom.get("sheet_metered_gb_day")
         if metered_v is None:
             metered_v = dom.get("daily_metered_gb")
-        volume = f"{n0(metered_v)} GB/d metered · {n0(dom.get('retained_gb'))} GB retained"
+        volume = f"{n0(metered_v)} GB/d metered"
+        _months = ((c.get("basis") or {}).get("retention_months") or {}).get(dom_key)
+        try:
+            # Retained GB is the metered rate kept for the month the sheet was written at.
+            if _months:
+                volume += f" · {n0(float(metered_v) * float(_months) * 30.416)} GB retained at {int(float(_months))} months"
+        except (TypeError, ValueError):
+            pass
         rate_bits = []
         if svl.get("eff_ingest_usd_per_gb") is not None:
             rate_bits.append(f"${svl.get('eff_ingest_usd_per_gb')}/GB ingest")
@@ -3592,6 +3752,14 @@ def render_consolidation_html(acc: dict) -> str:
     for _sol_name, sol_blk in by_sol_bars.items():
         if "sheet" in str((sol_blk or {}).get("pricing") or "") and (sol_blk.get("total_mo") or 0) > 0:
             pieces.append((estimator_label(sol_blk.get("pricing")), 0.0, float(sol_blk.get("total_mo") or 0)))
+    # The serverless bar has to stack to the estimate. When the parts do not, draw one segment per
+    # solution at its quoted total instead of parts that are not parts of that price.
+    svl_parts = sum(serverless for _name, _ech_v, serverless in pieces)
+    if sv.get("serverless_mo") is not None and svl_parts > float(sv.get("serverless_mo") or 0) + 1:
+        pieces = [(name, ech, 0.0) for name, ech, _serverless in pieces if ech]
+        for sol_name, sol_blk in by_sol_bars.items():
+            if float((sol_blk or {}).get("total_mo") or 0) > 0:
+                pieces.append((f"{str(sol_name).title()} Serverless", 0.0, float(sol_blk["total_mo"])))
     ser = [(name, _bars(ech, serverless)) for name, ech, serverless in pieces]
     other = (sv.get("serverless_mo") or 0) - sum(vals[list_i] for _name, vals in ser)
     if other > 1:
@@ -3612,7 +3780,13 @@ def render_consolidation_html(acc: dict) -> str:
     per_spend = c.get("by_deployment") or []
     callouts_html = "".join(callout(x["title"], esc(x["detail"]), x.get("tone") or "info") for x in c.get("callouts") or [])
     if quote_days:
-        spend_notes = [f"ECU/mo and Fixed ECU/mo are the last {int(quote_days)} billed days, the same pace as the cover."]
+        if c.get("by_deployment_basis") == "window":
+            spend_notes = [f"ECU/mo and Fixed ECU/mo are each deployment's own part of the last {int(quote_days)} billed days: its month's cost ÷ the org's daily total for that month, because K360 bills a deployment by month."]
+        else:
+            spend_notes = [f"ECU/mo and Fixed ECU/mo are each deployment's lookback average at the fleet's {int(quote_days)}-day pace. This account has no per-deployment months, so they are an approximation of the window."]
+        reminder = _scope_reminder(c)
+        if reminder:
+            spend_notes.append(reminder)
     else:
         spend_notes = ["ECU/mo is lookback ECU ÷ (lookback days / 30.416)."]
     spend_notes.append("Overhead % is fixed-role ECU ÷ that deployment’s ECU. Fixed roles are master, Kibana, coordinating, integrations server, enterprise search, and APM.")
@@ -3621,7 +3795,7 @@ def render_consolidation_html(acc: dict) -> str:
     if fr.get("size_gaps"):
         spend_notes.append("“on <name>” means this cluster’s size now reports under that name, and the GB is counted there. “no GB” means no current size.")
     elif per_spend:
-        spend_notes.append("“no GB” means the size snapshot had no row. That deployment is not given a serverless price.")
+        spend_notes.append("“no GB” means the deployment was not sized: it had no diagnostic bundle, it is decommissioned, or the size snapshot had no row. It is not given a serverless price.")
     spend_table = deployment_spend_block(c)
     spend_detail = callouts_html + bullets(spend_notes)
     spend_body = spend_table + spend_detail
@@ -3645,9 +3819,10 @@ def render_consolidation_html(acc: dict) -> str:
     elif lookback_total is not None:
         build_notes = [
             f"Full lookback: ECU over {n0(b0.get('lookback_days'))} days, divided into a month and split by tier.",
-            f"{int(quote_days)}-day lookback: {n0(lookback_total)} ECU/mo, the usage total on the cover. It is not split by tier.",
+            f"{int(quote_days)}-day lookback: {n0(lookback_total)} ECU/mo, the ECH figure on the cover. It is not split by tier."
+            + (" It is the deployments in the comparison only, so it is not the same fleet as the Full lookback bar." if _scope_is_partial(c) else ""),
             "Serverless: dollars per month from the estimator at that lookback.",
-            "The ECH bars are ECU and the serverless bar is dollars, because list price treats 1 ECU as $1.",
+            "The ECH bars are the K360 billed cost in ECU, and 1 ECU is $1. The serverless bar is dollars.",
         ]
     elif contract_rate:
         build_notes = [
@@ -3660,7 +3835,7 @@ def render_consolidation_html(acc: dict) -> str:
         build_notes = [
             f"Full lookback: Cloud-* tier ECU ÷ ({b0.get('lookback_days')} / 30.416). It includes partial months, so it will not equal the {n0(sv.get('ech_list_mo'))} complete-month average in the headline.",
             "Serverless: dollars per month from the serverless build-up.",
-            "Y axis mixes ECU and dollars because list price treats 1 ECU as $1.",
+            "The ECH bars are the K360 billed cost in ECU, and 1 ECU is $1.",
         ]
     B.append(section("What you pay for today, and what replaces it", grid(unit, "<h3>Monthly build-up</h3>" + chart, ratio="1.05fr 1fr") + "<h3>Projects</h3>" + projects + bullets(build_notes), new_page=True))
 
@@ -3733,7 +3908,7 @@ def render_consolidation_html(acc: dict) -> str:
         inactive_n = ((acc.get("sizing") or {}).get("diagnostics") or {}).get("inactive_excluded")
         year_bit = f" The full lookback is {n0(year_fixed)} ECU/mo, {pct(comp.get('fixed_overhead_pct'))} of that year"
         year_bit += (
-            f", including {int(inactive_n)} {'deployment' if int(inactive_n) == 1 else 'deployments'} with no bill in the latest month."
+            f", including {int(inactive_n)} {'deployment' if int(inactive_n) == 1 else 'deployments'} with no bill in the quote window."
             if inactive_n else "."
         )
     pace_bit = f" on the last {int(quote_days)} billed days" if quote_days else ""
@@ -3834,7 +4009,7 @@ def render_consolidation_html(acc: dict) -> str:
         fleet_series.append(("ECH at contract rate", [f.get("ech_cost_mo") or 0 for f in fleet]))
         colors5.append(PALETTE[0])
     else:
-        fleet_series.append(("ECH at list", [f["ech_ecu_mo"] for f in fleet]))
+        fleet_series.append(("ECH billed cost", [f["ech_ecu_mo"] for f in fleet]))
         colors5.append(PALETTE[6])
     if has_svl:
         fleet_series.append(("Serverless at list" if cover_rate is not None else "Serverless, estimate", [f.get("serverless_mo") or 0 for f in fleet]))
@@ -3854,7 +4029,7 @@ def render_consolidation_html(acc: dict) -> str:
         ft_rows = [[_fleet_row_label(f["scenario"]), usd(f.get("ech_cost_mo")), usd(f.get("serverless_mo")), usd(f.get("save_vs_contract_mo"))] for f in fleet]
         ft_align = ["left", "right", "right", "right"]
     else:
-        ft_headers = ["Usage", "ECH at list", "Serverless, estimate", "Savings vs. list"]
+        ft_headers = ["Usage", "ECH billed cost", "Serverless, estimate", "Savings vs. ECH billed cost"]
         ft_rows = [[_fleet_row_label(f["scenario"]), usd(f["ech_ecu_mo"]), usd(f.get("serverless_mo")), usd(f.get("save_vs_list_mo"))] for f in fleet]
         ft_align = ["left", "right", "right", "right"]
     def _cover_row(f: dict) -> bool:
@@ -3863,6 +4038,8 @@ def render_consolidation_html(acc: dict) -> str:
     ft = table(ft_headers, ft_rows, ft_align, tones=["info" if _cover_row(f) else None for f in fleet])
     others = [f for f in fleet if abs(float(f.get("scale") or 0) - 1) > 1e-9]
     fleet_notes = []
+    if _scope_is_partial(c):
+        fleet_notes.append("ECH billed cost in every row is the deployments in the comparison, scaled by how that month's whole-org bill compares with the window.")
     if has_svl:
         scales = " and ".join(f"×{float(f['scale']):.2f}" for f in others)
         if any(f.get("eis_mo") for f in fleet):
@@ -3952,7 +4129,7 @@ def render_consolidation_html(acc: dict) -> str:
     foot_src = "Elasticsearch diagnostics joined to K360 billing" if _from_diagnostics(acc) else "K360 cloud-tracker billing + telemetry"
     B.extend(cost_sizing_sections(acc, sizing=False, new_page=True, numbered=False))
     pricing_src = re.sub(r"\s*parent \S+ \([^)]*\)", "", str(svl.get("pricing_source") or "")).strip(" ·")
-    B.append(section("Reconciliation and what to confirm before quoting", recon + f"<div class='foot'>Source: {foot_src}{(' · ' + esc(pricing_src)) if pricing_src else ''} · generated {esc(m.get('generated_at'))} · only estimator read-backs are quotable $</div>", new_page=True))
+    B.append(section("Reconciliation and what to confirm before quoting", recon + f"<div class='foot'>Source: {foot_src}{(' · ' + esc(pricing_src)) if pricing_src else ''} · generated {esc(m.get('generated_at'))}{_method_bit(m)} · only estimator read-backs are quotable $</div>", new_page=True))
     return page(f"{m.get('customer')} — serverless consolidation savings", "".join(B), kind="consolidation")
 
 
@@ -4015,12 +4192,14 @@ def _seal_dir(path: Path) -> None:
 def export_documents(docs: list[tuple[dict, str]], folder: Path, *, skip_pdf: bool = False) -> dict:
     """Render every document, then print the PDFs on one Chrome pool.
 
-    Each item is (account, kind). kind is `account` or a consolidation kind such as
-    `consolidation`, `consolidation_30d`, `consolidation_compressioncalc`, or
-    `consolidation_compressioncalc_30d`.
+    Each item is (account, kind). kind is `account`, `appendix`, or a consolidation
+    kind: `consolidation`, or `consolidation_k360` for the K360 backup.
     """
     out: dict = {}
     pending: list[tuple[str, Path, Path]] = []
+    folder.mkdir(parents=True, exist_ok=True)
+    _seal_dir(folder)
+    retire_legacy_pdf_folders(folder)
     for acc, kind in docs:
         if kind != "account" and (not acc.get("consolidation") or (acc.get("consolidation") or {}).get("error")):
             continue
@@ -4031,18 +4210,14 @@ def export_documents(docs: list[tuple[dict, str]], folder: Path, *, skip_pdf: bo
             fn = render_appendix_html
         else:
             fn = render_consolidation_html
-        sub = pdf_folder_name(kind)
-        out_dir = folder / sub if sub else folder
-        out_dir.mkdir(parents=True, exist_ok=True)
-        _seal_dir(out_dir)
         if kind == "account":
             stem = f"{key}_{ACCOUNT_SUFFIX}"
         elif kind == "appendix":
             stem = APPENDIX_STEM
         else:
             stem = consolidation_pdf_stem(key, kind)
-        html_path = out_dir / f"{stem}.html"
-        pdf_path = out_dir / f"{stem}.pdf"
+        html_path = folder / f"{stem}.html"
+        pdf_path = folder / f"{stem}.pdf"
         try:
             html_path.write_text(fn(acc))
             _seal_file(html_path)

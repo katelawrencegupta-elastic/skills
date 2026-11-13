@@ -20,7 +20,7 @@ from pathlib import Path
 # Cloud-Standard_gcp.es.datafrozen.n2.68x10x95_gcp-europe-west1_61440_2
 # Cloud-Enterprise_azure.kibana.fsv2_azure-eastus2_1024_1
 _SKU = re.compile(
-    r"^Cloud-(?P<plan>[^_]+)_(?P<provider>aws|gcp|azure)\."
+    r"^Cloud-(?P<plan>[^_]+)_(?P<provider>aws|gcp|azure|ibm)\."
     r"(?P<product>[a-z]+)\."
     r"(?:(?P<tier>datahot|datawarm|datacold|datafrozen|master|coordinating|ml|ingest)\.)?"
     r"(?P<instance>[^_]+)_(?P<region>[^_]+)_(?P<ram_mb>\d+)_(?P<zones>\d+)$",
@@ -128,18 +128,45 @@ def es_post(base: str, key: str, path: str, body: dict) -> dict:
         raise SystemExit(f"ES HTTP {e.code} {path}: {e.read()[:600]!r}") from e
 
 
+# A SKU with no `es.<tier>` part names its role in the product slot. These are the products K360
+# bills (checked against a week of billing SKUs). Without this map they all fell into "other", so
+# integrations server, APM and enterprise search never counted as fixed overhead and legacy data
+# nodes never counted as data tiers.
+PRODUCT_TIER = {
+    "kibana": "kibana",
+    "integrationsserver": "integrations server",
+    "apm": "apm",
+    "enterprisesearch": "enterprise search",
+    "appsearch": "enterprise search",
+    "master": "master",
+    "coordinating": "coordinating",
+    "ccs": "coordinating",
+    "ml": "ml",
+}
+
+
+def _product_tier(product: str, instance: str) -> str:
+    """Tier for a SKU that names no `es.<tier>`. Legacy data nodes are `data.highio` and `data.highstorage`."""
+    product = (product or "").lower()
+    if product in PRODUCT_TIER:
+        return PRODUCT_TIER[product]
+    if product == "data":
+        return "datawarm" if (instance or "").lower().startswith("highstorage") else "datahot"
+    return "other"
+
+
 def parse_sku(sku: str) -> dict | None:
     m = _SKU.match(sku or "")
     if not m:
         return None
     d = m.groupdict()
     region = d["region"]
-    region = re.sub(r"^(aws|gcp|azure)-", "", region, flags=re.IGNORECASE)
+    region = re.sub(r"^(aws|gcp|azure|ibm)-", "", region, flags=re.IGNORECASE)
     return {
         "plan": d["plan"],
         "provider": d["provider"].upper(),
         "product": d["product"].lower(),
-        "tier": (d["tier"] or ("kibana" if d["product"].lower() == "kibana" else "other")).lower(),
+        "tier": (d["tier"] or _product_tier(d["product"], d["instance"])).lower(),
         "instance": f"{d['provider'].lower()}.{d['product'].lower()}."
         + (f"{d['tier'].lower()}." if d["tier"] else "")
         + d["instance"],
@@ -321,7 +348,8 @@ def fetch_infra(base: str, key: str, org: dict) -> dict:
             e = float(sb["ecu"]["value"])
             if not p:
                 continue
-            comp = p["tier"] if p["tier"] not in ("", "other") else p["product"]
+            # Component names stay keyed by product for everything that is not an `es.<tier>` node.
+            comp = p["tier"] if p["product"] == "es" and p["tier"] not in ("", "other") else p["product"]
             prev = shape.get(comp)
             if prev is None or e > prev[0]:
                 shape[comp] = (e, {"tier": comp, "ram_gb": round(p["ram_mb"] / 1024, 2), "nodes": p["zones"]})

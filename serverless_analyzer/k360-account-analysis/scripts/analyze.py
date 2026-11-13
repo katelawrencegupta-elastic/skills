@@ -421,12 +421,33 @@ def cloud_section(org: dict, infra: dict | None) -> dict:
     }
 
 
+def report_day(org: dict) -> date:
+    """The day the org report was fetched: the end of its range.
+
+    Everything that asks "which month is still open" or "how old is this" asks it
+    of that day, not of the clock. A report fetched on the 5th and reused on the
+    13th of the next month still has an open month, and it is the one it was
+    fetched in. Without a range end the report is taken as fetched today.
+    """
+    end = str((org.get("range") or {}).get("end") or "")[:10]
+    try:
+        return date.fromisoformat(end)
+    except ValueError:
+        return datetime.now(timezone.utc).date()
+
+
+def open_months(org: dict, months: list) -> set:
+    """Calendar months the fetch only partly covers: the one it ended in, and a first month it joined late."""
+    start = str((org.get("range") or {}).get("start") or "")
+    cur_ym = report_day(org).strftime("%Y-%m")
+    return {m for m in months if m == cur_ym or (start and m == start[:7] and not start.endswith("-01"))}
+
+
 def ecu_section(org: dict, infra: dict | None, platform: dict) -> dict:
     chart = org.get("chart") or {}
     monthly = org.get("monthly") or {}
     totals = org.get("totals") or {}
     bd = org.get("burndown") or {}
-    today = datetime.now(timezone.utc).date()
 
     # monthly totals = Σ named deployments per month + serverless projects (hex ids)
     months = list(monthly.get("months") or [])
@@ -442,11 +463,16 @@ def ecu_section(org: dict, infra: dict | None, platform: dict) -> dict:
         for i, m in enumerate(months):
             m_tot[i] += svl_month.get(m, 0.0)
     m_tot = [round(v, 2) for v in m_tot]
+    # Per-deployment and serverless-project cost by month. The quote uses them to say how much of
+    # a billing window belongs to deployments that got a serverless price.
+    dep_months = {
+        name: [round(float(v or 0), 2) for v in (d.get("ecu") or [])][: len(months)]
+        for name, d in by_dep.items() if isinstance(d, dict)
+    }
+    svl_series = [round(svl_month.get(m, 0.0), 2) if svl_extra > 0 else 0.0 for m in months]
     total_ecu = float(totals.get("ecu") or 0) + max(svl_extra, 0.0)
     rng = org.get("range") or {}
-    start = rng.get("start") or ""
-    cur_ym = today.strftime("%Y-%m")
-    partial = {m for m in months if m == cur_ym or (start and m == start[:7] and not start.endswith("-01"))}
+    partial = open_months(org, months)
     complete = [(m, v) for m, v in zip(months, m_tot) if m not in partial and v > 0]
     peak = max(complete, key=lambda x: x[1]) if complete else (max(zip(months, m_tot), key=lambda x: x[1]) if months else (None, 0))
     low = min(complete, key=lambda x: x[1]) if complete else (None, 0)
@@ -500,6 +526,8 @@ def ecu_section(org: dict, infra: dict | None, platform: dict) -> dict:
         "total_lookback_serverless": r2(platform.get("serverless_ecu")),
         "months_in_lookback": totals.get("months"),
         "monthly": {"months": months, "totals": m_tot, "partial_months": sorted(partial)},
+        "monthly_by_deployment": dep_months,
+        "monthly_serverless": svl_series,
         "monthly_peak": {"month": peak[0], "ecu": r2(peak[1])} if peak and peak[0] else None,
         "monthly_low": {"month": low[0], "ecu": r2(low[1])} if low and low[0] else None,
         "monthly_avg_all": r2(total_ecu / max(int(totals.get("months") or len(months) or 1), 1)),
@@ -690,7 +718,7 @@ def storage_section(org: dict, cloud: dict) -> dict:
     stale_days = None
     if st.get("as_of"):
         try:
-            stale_days = (datetime.now(timezone.utc).date() - date.fromisoformat(str(st["as_of"])[:10])).days
+            stale_days = (report_day(org) - date.fromisoformat(str(st["as_of"])[:10])).days
         except ValueError:
             stale_days = None
     notes = list(st.get("notes") or [])
@@ -1518,25 +1546,30 @@ def _complete_months(org: dict) -> tuple[list, list, str | None]:
     """Calendar months in the lookback, and the last one that is not still open."""
     monthly = org.get("monthly") or {}
     months = list(monthly.get("months") or [])
-    rng = org.get("range") or {}
-    start = str(rng.get("start") or "")
-    cur_ym = datetime.now(timezone.utc).date().strftime("%Y-%m")
-    partial = {m for m in months if m == cur_ym or (start and m == start[:7] and not start.endswith("-01"))}
+    partial = open_months(org, months)
     complete = [m for m in months if m not in partial]
     ecu_month = complete[-1] if complete else (months[-1] if months else None)
     return months, complete, ecu_month
 
 
-def quote_billing_window(org: dict, days_n: int = 30) -> dict:
+QUOTE_WINDOW_DAYS = 90
+
+
+def quote_billing_window(org: dict, days_n: int = QUOTE_WINDOW_DAYS) -> dict:
     """Who billed in the last `days_n` days with a positive org total.
 
     Trailing days with no bill are not part of the window. A partial calendar
-    month is not the window. Names saved on the chart are that exact set.
-    Without them, a named daily series is summed across the window, and any
-    other deployment counts when a month the window touches still has ECU.
+    month is not the window. Names saved on the chart for that same number of
+    days are the exact set. An org report fetched before 90-day rosters were
+    saved carries only the 30-day one, so any other window is rebuilt: a named
+    daily series is summed across the window, and any other deployment counts
+    when a month the window touches still has ECU.
     """
     chart = org.get("chart") or {}
-    stored = chart.get("billed_window") or {}
+    days_n = int(days_n)
+    stored = (chart.get("billed_windows") or {}).get(str(days_n)) or {}
+    if not stored and days_n == 30:
+        stored = chart.get("billed_window") or {}
     if stored.get("names") and stored.get("start") and stored.get("end"):
         return {
             "start": stored.get("start"),
@@ -1550,8 +1583,12 @@ def quote_billing_window(org: dict, days_n: int = 30) -> dict:
     rows = list(zip(days[:n], total[:n]))
     while rows and rows[-1][1] <= 0:
         rows.pop()
+    # Days before the org's first bill are not billed days. An org with fewer billed days than
+    # the window asks for is sized on the days it has.
+    lead = next((i for i, (_day, value) in enumerate(rows) if value > 0), 0)
+    rows = rows[lead:]
     window = rows[-days_n:] if chart.get("grain") in (None, "day") else []
-    if len(window) < days_n:
+    if not window:
         months, _complete, ecu_month = _complete_months(org)
         by_dep = (org.get("monthly") or {}).get("by_deployment") or {}
         names = []
@@ -1571,9 +1608,10 @@ def quote_billing_window(org: dict, days_n: int = 30) -> dict:
             if name == "Other" or not isinstance(vals, list):
                 continue
             daily_sum[name] = sum(float(vals[i] or 0) for i in idxs if i < len(vals))
-    overlap = {start[:7], end[:7]}
     monthly = org.get("monthly") or {}
     months = list(monthly.get("months") or [])
+    # Every calendar month the window touches, not only its first and last.
+    overlap = {m for m in months if start[:7] <= str(m)[:7] <= end[:7]} | {start[:7], end[:7]}
     names = []
     for name, series_row in (monthly.get("by_deployment") or {}).items():
         if not isinstance(series_row, dict):
@@ -1588,8 +1626,8 @@ def quote_billing_window(org: dict, days_n: int = 30) -> dict:
     return {"start": start, "end": end, "days": len(window), "names": names}
 
 
-def active_deployment_set(org: dict) -> dict:
-    """Deployments with a bill in the last 30 days.
+def active_deployment_set(org: dict, days_n: int = QUOTE_WINDOW_DAYS) -> dict:
+    """Deployments with a bill in the quote window, the last 90 billed days by default.
 
     Page 1 of the quote uses this set. A partial calendar month is not the
     filter. ECU on the sizing row is still the last complete month, so an
@@ -1597,7 +1635,7 @@ def active_deployment_set(org: dict) -> dict:
     """
     months, _complete, ecu_month = _complete_months(org)
     by_dep = (org.get("monthly") or {}).get("by_deployment") or {}
-    window = quote_billing_window(org)
+    window = quote_billing_window(org, days_n)
     names = list(window.get("names") or [])
     ecu_complete: dict[str, float] = {}
     if ecu_month:
@@ -1619,7 +1657,7 @@ def active_deployment_set(org: dict) -> dict:
     }
 
 
-def build_account(org: dict, infra: dict | None, *, when: date | None = None, retention_months: float = 3.0, security_retention_months: float | None = None) -> dict:
+def build_account(org: dict, infra: dict | None, *, when: date | None = None, retention_months: float = 3.0, security_retention_months: float | None = None, quote_window_days: int = QUOTE_WINDOW_DAYS) -> dict:
     when = when or datetime.now(timezone.utc).date()
     customer = (org.get("organization") or {}).get("name") or "Customer"
     key = run_key(customer, when)
@@ -1639,7 +1677,7 @@ def build_account(org: dict, infra: dict | None, *, when: date | None = None, re
     acc["cloud"] = cloud_section(org, infra)
     acc["ecu"] = ecu_section(org, infra, acc["platform"])
     acc["deployments"] = deployments_section(org, acc["ecu"], infra)
-    acc["deployments"]["active"] = active_deployment_set(org)
+    acc["deployments"]["active"] = active_deployment_set(org, quote_window_days)
     acc["storage"] = storage_section(org, acc["cloud"])
     acc["solutions"] = solutions_section(org, infra)
     acc["ai_ml"] = ai_ml_section(org)
@@ -1712,10 +1750,13 @@ def chat_bullets(acc: dict) -> list[str]:
                 parts.append(f"{k.title()} → {shown}")
         c = acc.get("consolidation") or {}
         cs_ = c.get("savings") or {}
-        if cs_.get("cost_mo") is not None:
-            parts.append(f"consolidation: ECH at the contract rate is ${cs_['ech_contract_mo']:,.0f}/mo, and serverless is ${cs_['cost_mo']:,.0f}/mo below that")
-        elif cs_.get("list_mo") is not None:
-            parts.append(f"consolidation is ${cs_['list_mo']:,.0f}/mo ({cs_.get('list_pct')}%) below list")
+        if cs_.get("list_mo") is not None:
+            _side = "above" if float(cs_["list_mo"]) < 0 else "below"
+            _part = (c.get("ech_scope") or {}).get("scope") == "priced"
+            parts.append(
+                f"consolidation: ECH billed cost {'for the priced deployments ' if _part else ''}is ${float(cs_.get('ech_list_mo') or 0):,.0f}/mo, and serverless is "
+                f"${abs(float(cs_['list_mo'])):,.0f}/mo ({abs(float(cs_.get('list_pct') or 0))}%) {_side} that"
+            )
         k360_sav = ((acc.get("k360_ingest") or {}).get("savings") or {})
         if k360_sav.get("serverless_mo") is not None:
             parts.append(f"K360 backup (stored GB ÷ assumed retention) ${float(k360_sav['serverless_mo']):,.0f}/mo")

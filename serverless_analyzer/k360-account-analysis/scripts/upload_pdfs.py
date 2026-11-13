@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Upload the canvas PDF exports into the customer's Drive folder (Sheets venv).
 
-The account PDF and the appendix stay in the customer root.
-Consolidation PDFs go in `full_retention` (rounded month) or `30d`. Same-named files are updated in place.
+Every PDF goes in the customer root: the account PDF, the appendix, and both consolidation
+PDFs. Same-named files are updated in place. A consolidation PDF that an earlier run filed
+under `full_retention` or `30d` in that root is moved up, and the folder is trashed once empty.
 Writes `exports.<kind>.drive_url` back to account.json.
 
   ~/.config/serverless-analyzer/venv/bin/python upload_pdfs.py --account-json <key>_account.json
@@ -25,11 +26,46 @@ def _diag_scripts() -> Path:
 
 
 sys.path.insert(0, str(_diag_scripts()))
-from render_pdf import pdf_folder_name  # noqa: E402
+from render_pdf import CONSOLIDATION_PLAN_MARK, LEGACY_PDF_FOLDERS  # noqa: E402
 from privacy import seal_text  # noqa: E402
-from size_serverless import assert_not_template, ensure_drive_folder, find_in_folder, require_customer_parent, services  # noqa: E402
+from size_serverless import (  # noqa: E402
+    FOLDER_MIME, _execute, assert_not_template, drive_children, find_in_folder, require_customer_parent, services, trash_file,
+)
 
 PDF_MIME = "application/pdf"
+
+
+def retire_legacy_pdf_folders(drive, root_id: str) -> list[str]:
+    """Move consolidation PDFs out of `full_retention` and `30d` in the customer root.
+
+    Only folders directly under the customer root are touched. A PDF with no
+    same-named file in the root is moved up, so its link keeps working and the
+    upload updates it in place. One the root already holds is trashed. A folder is
+    trashed once it is empty; one that still holds anything else is left alone.
+    Returns the names moved.
+    """
+    root_id = require_customer_parent(root_id)
+    moved: list[str] = []
+    for name in LEGACY_PDF_FOLDERS:
+        legacy = find_in_folder(drive, root_id, name)
+        if not legacy or legacy.get("mimeType") != FOLDER_MIME:
+            continue
+        legacy_id = legacy["id"]
+        for item in drive_children(drive, legacy_id):
+            title = item.get("name") or ""
+            if item.get("mimeType") == FOLDER_MIME or CONSOLIDATION_PLAN_MARK not in title:
+                continue
+            assert_not_template(item["id"])
+            if find_in_folder(drive, root_id, title):
+                trash_file(drive, item["id"])
+                continue
+            _execute(lambda fid=item["id"]: drive.files().update(
+                fileId=fid, addParents=root_id, removeParents=legacy_id, fields="id,parents",
+            ))
+            moved.append(title)
+        if not drive_children(drive, legacy_id):
+            trash_file(drive, legacy_id)
+    return moved
 
 
 def upload_pdf(drive, local: Path, parent_id: str, title: str) -> dict:
@@ -54,26 +90,25 @@ def main() -> None:
     acc = json.loads(src.read_text())
     sizing = acc.get("sizing") or {}
     rounded = sizing.get("drive_folder") or {}
-    day30 = sizing.get("drive_folder_30d") or {}
-    compressed = sizing.get("drive_folder_compressioncalc") or {}
-    compressed_30 = sizing.get("drive_folder_compressioncalc_30d") or {}
-    root = sizing.get("drive_root") or rounded
+    root = sizing.get("drive_root") or {}
     exports = acc.get("exports") or {}
-    if not any(folder.get("id") for folder in (rounded, day30, root, compressed, compressed_30)):
+    if not any(folder.get("id") for folder in (rounded, root)):
         print("no Drive folder (sizing not triggered) — PDFs kept local only")
         return
     _, drive = services()
-
-    def parent_for(kind: str) -> dict:
-        base = root if root.get("id") else (rounded or day30 or compressed or compressed_30)
-        name = pdf_folder_name(kind)
-        if not name or not base.get("id"):
-            return base
-        return ensure_drive_folder(drive, name, base["id"])
+    # Every PDF goes in the customer root. The estimate folders are the fallback when no root was recorded.
+    in_root = bool(root.get("id"))
+    folder = root if in_root else rounded
+    if in_root:
+        # Tidying the old folders must never stop the new PDFs from uploading.
+        try:
+            for name in retire_legacy_pdf_folders(drive, folder["id"]):
+                print(f"moved {name} into the customer folder")
+        except Exception as ex:  # noqa: BLE001
+            print(f"WARN: could not tidy the old full_retention/30d folders ({ex!r}); uploading the PDFs anyway", file=sys.stderr)
 
     for kind, e in exports.items():
         pdf = Path(e.get("pdf") or "")
-        folder = parent_for(kind)
         if not pdf.is_file() or not folder.get("id"):
             continue
         up = upload_pdf(drive, pdf, folder["id"], pdf.name)
