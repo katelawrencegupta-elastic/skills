@@ -1221,10 +1221,25 @@ def _priced_search_names(acc: dict, by_solution: dict, scope: dict | None) -> se
     search = by_solution.get("search") or {}
     if "quotable" not in str(search.get("pricing") or ""):
         return set()
+    regional_mode = search.get("regional_mode")
+    accepted_regions: set[str] | None = None
+    if regional_mode is not None:
+        if regional_mode not in ("per_region", "store_split"):
+            return set()
+        accepted_regions = {
+            str(row.get("region"))
+            for row in search.get("by_region") or []
+            if row.get("region") and row.get("monthly") is not None
+        }
     rows = (acc.get("solutions") or {}).get("by_deployment") or []
     active = (acc.get("deployments") or {}).get("active") or {}
     active_names = set(active.get("names") or [])
     unpriced_names = {str(row.get("name")) for row in (scope or {}).get("unpriced") or []}
+    region_by_name = {
+        str(row.get("name")): str(row.get("region"))
+        for row in ((acc.get("cloud") or {}).get("by_deployment") or [])
+        if row.get("name") and row.get("region")
+    }
     diagnostic = (acc.get("sizing") or {}).get("ingest_source") == "diagnostics"
     eligible = set()
     for dep in rows:
@@ -1232,6 +1247,8 @@ def _priced_search_names(acc: dict, by_solution: dict, scope: dict | None) -> se
         if not name or dep.get("platform") == "serverless" or (dep.get("solution") or "search") != "search":
             continue
         if active_names and name not in active_names:
+            continue
+        if accepted_regions is not None and region_by_name.get(name) not in accepted_regions:
             continue
         if scope is not None:
             if name in unpriced_names:

@@ -2837,6 +2837,26 @@ class ReviewRegressionTests(unittest.TestCase):
         scope = {"unpriced": [{"name": "no-bundle", "reason": "no diagnostic bundle"}]}
         self.assertEqual(_priced_search_names(acc, by_solution, scope), {"sized"})
 
+    def test_eis_eligibility_excludes_search_regions_omitted_from_regional_quote(self):
+        from consolidation import _priced_search_names
+        acc = {
+            "deployments": {"active": {"names": ["quoted-east", "omitted-west"]}},
+            "cloud": {"by_deployment": [
+                {"name": "quoted-east", "region": "us-east-1"},
+                {"name": "omitted-west", "region": "us-west-2"},
+            ]},
+            "solutions": {"by_deployment": [
+                {"name": "quoted-east", "solution": "search", "platform": "ech", "gb": 50},
+                {"name": "omitted-west", "solution": "search", "platform": "ech", "gb": 1},
+            ]},
+        }
+        by_solution = {"search": {
+            "pricing": "es3-estimator performant (quotable)",
+            "regional_mode": "per_region",
+            "by_region": [{"region": "us-east-1", "monthly": 50.0}],
+        }}
+        self.assertEqual(_priced_search_names(acc, by_solution, {"unpriced": []}), {"quoted-east"})
+
     def test_search_quote_scales_eis_and_excludes_existing_serverless_project(self):
         acc = _quote_account(g28=10, e73=0)
         acc["ecu"]["quote_usage_factor"] = 0.5
