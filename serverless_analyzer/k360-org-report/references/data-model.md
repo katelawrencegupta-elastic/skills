@@ -15,6 +15,8 @@ Org lookup: `match_phrase` on `organization.name` (no `.keyword`), then a case-i
 
 Every terms aggregation on `deployment.name` has size 300 (`DEP_TERMS_SIZE`). The two billing ones are ordered by ECU, so a big spender with few billing lines is not dropped. When `sum_other_doc_count` is above 0 the aggregation's name is added to `truncated` in the output (`billing.by_dep`, `billing.by_day.by_dep`, `features.by_dep`, `telemetry.by_dep`, `deployments.inventory`) and a WARN is printed. `truncated` is `[]` when nothing was cut.
 
+The daily billing aggregation also carries per-deployment EIS ECU, token quantity, inference SKU, and ML-node ECU. `ai.daily_usage_by_deployment` stores these series on the same day labels as the billing chart. `ai.daily_usage_complete` is false if a deployment or inference/ML SKU bucket was truncated in the daily or fetched-period aggregations; consumers must disclose a fallback instead of treating omitted values as zero.
+
 ## Family ← `type` (lowercased) → `families`, `deployments.items[].families`
 - **Search / default ECH:** see `taxonomy.json` → `search`
 - **Observability:** `taxonomy.json` → `observability` (note: `integrationsserver`)

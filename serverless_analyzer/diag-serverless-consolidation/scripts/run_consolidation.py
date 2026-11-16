@@ -295,6 +295,16 @@ def _quote_block(acc: dict) -> dict:
     }
 
 
+def _apply_diagnostic_report_view(acc: dict, diag_acc: dict) -> None:
+    """Overlay diagnostic sizing fields in the report artifact without replacing billing/workload data."""
+    for key in ("storage", "solutions"):
+        if isinstance(diag_acc.get(key), dict):
+            acc[key] = diag_acc[key]
+    source_map = (diag_acc.get("sizing") or {}).get("source_precedence")
+    if source_map:
+        acc.setdefault("sizing", {})["source_precedence"] = source_map
+
+
 def _money_note(diag_mo, k360_mo) -> str:
     return (
         f"Discrepancy: diagnostic bulk prices serverless at ${float(diag_mo):,.0f}/mo. "
@@ -724,11 +734,15 @@ def main() -> None:
         sz = acc.setdefault("sizing", {})
         for key in (
             "estimators", "consolidated", "notes", "diagnostics", "drive_folder", "drive_root",
-            "drive_folder_compressioncalc", "sized_at",
+            "drive_folder_compressioncalc", "sized_at", "source_precedence",
         ):
             if dsz.get(key) not in (None, {}, []):
                 sz[key] = dsz[key]
         sz["ingest_source"] = "diagnostics"
+        # Keep report-visible sizing measurements on the same diagnostic view as
+        # the quote. Billing, roster, workload rates, and infrastructure metadata
+        # remain from Cloud Tracker because diagnostics do not measure them.
+        _apply_diagnostic_report_view(acc, diag_acc)
         acc["consolidation"] = diag_acc.get("consolidation")
         acc.setdefault("meta", {})["method"] = (diag_acc.get("meta") or {}).get("method")
         # The account now carries the diagnostic quote, so it carries that quote's window figures too.

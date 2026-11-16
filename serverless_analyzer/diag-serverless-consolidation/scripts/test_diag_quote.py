@@ -37,7 +37,7 @@ from quote_checks import (  # noqa: E402
     TEMPLATE_ANCHORS, addon_off_value, e73_blocks_quote, echo_gate, integrity_score, money,
     template_check, template_version,
 )
-from run_consolidation import _compression_totals, _estimator_flags, consolidation_brief, method_stamp, quote_pdf_jobs  # noqa: E402
+from run_consolidation import _apply_diagnostic_report_view, _compression_totals, _estimator_flags, consolidation_brief, method_stamp, quote_pdf_jobs  # noqa: E402
 from render_pdf import consolidation_pdf_stem, deployment_plan_section, export_documents, render_appendix_html, render_consolidation_html, retire_legacy_pdf_folders, search_power_section, stat  # noqa: E402
 from size_serverless import (  # noqa: E402
     COMPRESSION_FOLDER_NAME, DEFAULT_O11Y, DEFAULT_SECURITY, PLAN_FOLDER_NAME, _sheet_retention,
@@ -2722,6 +2722,56 @@ class UnmeasuredDeploymentTests(unittest.TestCase):
 
 
 class ReviewRegressionTests(unittest.TestCase):
+    def test_diagnostic_fields_override_conflicting_tracker_measurements_and_record_sources(self):
+        acc = {
+            "solutions": {"by_deployment": [{
+                "name": "measured", "platform": "ech", "solution": "observability",
+                "gb": 999, "daily_raw_gb": 888, "retention_days": 777,
+                "logs_gb_day": 300, "metrics_gb_day": 400, "ecu": 120,
+            }], "totals": {"observability": {}, "security": {}, "search": {}}},
+            "sizing": {"consolidated": {"observability": {"stored_gb": 999, "daily_raw_gb": 888}}},
+            "storage": {"data_stored_gb": 999, "by_deployment": [{"name": "measured", "data_stored_gb": 999, "docs_count": 123}]},
+            "ecu": {"total_lookback": 456},
+            "workload": {"ingest": {"docs_per_sec": 7}},
+        }
+        row = {"name": "measured", "store_gb": 12, "bulk_gb_day": 2, "retention_days": 30,
+               "retention_days_metrics": 10, "bulk_mix": {"logs": 1.0, "k8s_logs": 0.2, "metrics": 0.5, "traces": 0.5}}
+        out = apply_diagnostics(acc, [row])
+        dep = out["solutions"]["by_deployment"][0]
+        self.assertEqual((dep["gb"], dep["daily_raw_gb"], dep["retention_days"]), (12, 2, 30))
+        self.assertEqual((dep["logs_gb_day"], dep["metrics_gb_day"], dep["retention_days_metrics"]), (1.0, 0.5, 10))
+        self.assertEqual(dep["field_sources"]["gb"], "diagnostics")
+        self.assertEqual(dep["field_sources"]["ecu"], "cloud_tracker_billing")
+        self.assertEqual(out["storage"]["data_stored_gb"], 12)
+        self.assertEqual(out["storage"]["by_deployment"][0]["data_stored_gb"], 12)
+        self.assertEqual(out["storage"]["by_deployment"][0]["docs_count"], 123)
+        self.assertEqual(out["ecu"]["total_lookback"], 456)
+        self.assertEqual(out["workload"]["ingest"]["docs_per_sec"], 7)
+        self.assertIn("diagnostic_authoritative", out["sizing"]["source_precedence"])
+        self.assertEqual(out["sizing"]["diagnostics"]["estimation_limits"], [])
+
+    def test_diagnostic_report_view_overrides_measurements_but_keeps_tracker_billing_and_workload(self):
+        account = {
+            "storage": {"data_stored_gb": 900},
+            "solutions": {"totals": {"search": {"gb": 900}}},
+            "ecu": {"total_lookback": 123},
+            "workload": {"search": {"peak": {"qps": 42}}},
+            "sizing": {},
+        }
+        diagnostic = {
+            "storage": {"data_stored_gb": 12},
+            "solutions": {"totals": {"search": {"gb": 12}}},
+            "sizing": {"source_precedence": {"diagnostic_authoritative": ["store"]}},
+            "ecu": {"total_lookback": 999},
+            "workload": {"search": {"peak": {"qps": 999}}},
+        }
+        _apply_diagnostic_report_view(account, diagnostic)
+        self.assertEqual(account["storage"]["data_stored_gb"], 12)
+        self.assertEqual(account["solutions"]["totals"]["search"]["gb"], 12)
+        self.assertEqual(account["ecu"]["total_lookback"], 123)
+        self.assertEqual(account["workload"]["search"]["peak"]["qps"], 42)
+        self.assertEqual(account["sizing"]["source_precedence"]["diagnostic_authoritative"], ["store"])
+
     """Defects a review found in the window, scope, and unmeasured-deployment changes."""
 
     def test_search_ingest_share_keeps_unsized_store_in_the_denominator(self):
@@ -2820,6 +2870,40 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(eis["monthly"], 15.0)
         self.assertAlmostEqual(eis["by_region"]["us-east-1"], 15.0)
         self.assertAlmostEqual(sum(row["monthly"] for row in eis["workloads"]), 15.0)
+
+    def test_search_eis_uses_exact_quote_window_daily_usage_when_complete(self):
+        from consolidation import _search_eis
+        acc = {
+            "ecu": {
+                "quote_lookback_days": 2,
+                "daily_days": ["2026-10-01", "2026-10-02", "2026-10-03"],
+                "daily_totals": [10, 10, 10],
+            },
+            "ai_ml": {
+                "daily_usage_complete": True,
+                "daily_usage_by_deployment": {"quoted": {
+                    "days": ["2026-10-01", "2026-10-02", "2026-10-03"],
+                    "eis_ecu": [100, 20, 40],
+                    "million_tokens": [10, 2, 4],
+                    "ml_node_ecu": [50, 20, 30],
+                    "jina_ml_node_ecu": [0, 20, 0],
+                    "models": [[], ["jina-embeddings-v3"], []],
+                }},
+                # Fetched-period totals reconcile with all three daily buckets;
+                # the quote window uses only the last two days.
+                "by_deployment": [{"name": "quoted", "eis_inference_ecu": 160,
+                                   "ml_node_ecu": 100, "million_tokens": 16,
+                                   "models": ["jina-embeddings-v3"], "model_labels": ["Jina"]}],
+            },
+            "cloud": {"by_deployment": [{"name": "quoted", "region": "us-east-1"}]},
+        }
+        eis = _search_eis(acc, 12, usage_factor=0.25, eligible_names={"quoted"})
+        self.assertEqual(eis["usage_basis"], "quote_window_daily")
+        self.assertEqual(eis["usage_days"], 2)
+        self.assertAlmostEqual(eis["monthly"], (60 + 20) * 30.416 / 2)
+        self.assertAlmostEqual(eis["jina_ml_ecu_mo"], 20 * 30.416 / 2)
+        self.assertAlmostEqual(eis["other_ml_ecu"], 30)
+        self.assertAlmostEqual(sum(row["monthly"] for row in eis["workloads"]), eis["monthly"])
 
     def test_eis_eligible_names_follow_quoteable_active_ech_search_scope(self):
         from consolidation import _priced_search_names

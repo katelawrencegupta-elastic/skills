@@ -144,12 +144,18 @@ class FakeES:
             by_day[d["day"]].append(d)
         buckets = []
         cur = date.fromisoformat(lo)
-        day_spec = aggs["by_day"]["aggs"]["by_dep"]["terms"]
+        day_dep = aggs["by_day"]["aggs"]["by_dep"]
+        day_spec = day_dep["terms"]
         while cur <= date.fromisoformat(hi):
             ds = by_day.get(cur.isoformat(), [])
+            def daily_dep_sub(dep_docs):
+                return {
+                    "eis_skus": self._terms(dep_docs, "sku", day_dep["aggs"]["eis_skus"]["terms"], include=".*inference.*"),
+                    "ml_skus": self._terms(dep_docs, "sku", day_dep["aggs"]["ml_skus"]["terms"], include=r".*(\.es\.ml\.|\.ml\.).*"),
+                }
             buckets.append({
                 "key_as_string": cur.isoformat() + "T00:00:00.000Z",
-                "by_dep": self._terms(ds, "dep", day_spec),
+                "by_dep": self._terms(ds, "dep", day_spec, sub=daily_dep_sub),
                 "ecu": {"value": sum(x["cost"] for x in ds)},
             })
             cur += timedelta(days=1)
@@ -1105,6 +1111,8 @@ class O13RosterTruncation(Workdir):
         self.assertEqual(size, 300)
         self.assertEqual(bill["by_dep"]["terms"], {"field": "deployment.name", "size": size, "order": {"ecu": "desc"}})
         self.assertEqual(bill["by_day"]["aggs"]["by_dep"]["terms"], {"field": "deployment.name", "size": size, "order": {"ecu": "desc"}})
+        self.assertEqual(bill["by_day"]["aggs"]["by_dep"]["aggs"]["eis_skus"]["terms"], {"field": "sku", "size": 40, "include": ".*inference.*"})
+        self.assertEqual(bill["by_day"]["aggs"]["by_dep"]["aggs"]["ml_skus"]["terms"], {"field": "sku", "size": 30, "include": r".*(\.es\.ml\.|\.ml\.).*"})
         self.assertEqual(bodies["cloud-tracker-features-*"]["aggs"]["by_dep"]["terms"], {"field": "deployment.name", "size": size})
         self.assertEqual(bodies["cloud-tracker-telemetry"]["aggs"]["by_dep"]["terms"], {"field": "deployment.name", "size": size})
         self.assertEqual(bodies["cloud-tracker-deployments"]["size"], size)
@@ -1135,6 +1143,23 @@ class O13RosterTruncation(Workdir):
         org, err = self.fetch(FakeES(year("a", 10.0) + year("b", 5.0), telem={"a": 10}))
         self.assertEqual(org["truncated"], [])
         self.assertNotIn("holds more than", err)
+
+    def test_daily_eis_and_jina_ml_usage_is_saved_by_deployment(self):
+        inference_sku = "global.inference.embed-text-dense_jina-embeddings-v3"
+        docs = [
+            {"day": "2026-11-11", "dep": "search-a", "sku": inference_sku, "type": "inference", "cost": 2.0, "qty": 10.0, "lines": 1},
+            {"day": "2026-11-11", "dep": "search-a", "sku": SKU_AWS_ML, "type": "elasticsearch", "cost": 4.0, "qty": 0.0, "lines": 1},
+            {"day": "2026-11-12", "dep": "search-a", "sku": inference_sku, "type": "inference", "cost": 3.0, "qty": 15.0, "lines": 1},
+        ]
+        org, _ = self.fetch(FakeES(docs), days=5, chart="day")
+        self.assertTrue(org["ai"]["daily_usage_complete"])
+        usage = org["ai"]["daily_usage_by_deployment"]["search-a"]
+        by_day = {day: i for i, day in enumerate(usage["days"])}
+        i = by_day["2026-11-11"]
+        self.assertEqual(usage["eis_ecu"][i], 2.0)
+        self.assertEqual(usage["million_tokens"][i], 10.0)
+        self.assertEqual(usage["jina_ml_node_ecu"][i], 4.0)
+        self.assertIn("jina-embeddings-v3", usage["models"][i][0])
 
     def test_billed_window_meaning_is_unchanged(self):
         docs = dep_docs("old", "2026-06-01", "2026-08-31", 10.0) + dep_docs("mid", "2026-09-01", "2026-10-20", 10.0) + dep_docs("new", "2026-10-01", "2026-11-10", 10.0)

@@ -1078,10 +1078,9 @@ def _search_eis(
 ) -> dict | None:
     """Search EIS for quoted ECH Search deployments at the quote-window pace.
 
-    The account data holds EIS and ML ECU over the fetched billing period. Scale
-    those monthly averages by the same quote-window usage factor used for other
-    K360-derived Search rates. `eligible_names` is the set of deployments that
-    are actually represented in the accepted Search estimate.
+    Prefer the exact daily SKU totals when the billing fetch has a complete daily
+    deployment aggregation. Older/truncated account data falls back to fetched
+    period monthly averages scaled by the account quote pace.
     """
     region = {
         d.get("name"): d.get("region")
@@ -1089,33 +1088,120 @@ def _search_eis(
         if d.get("region")
     }
     eligible_names = eligible_names or set()
-    scale = float(usage_factor or 1.0) / max(float(months or 0), 1.0)
+    ai_ml = acc.get("ai_ml") or {}
+    deployment_rows = {d.get("name"): d for d in ai_ml.get("by_deployment") or [] if d.get("name")}
+    exact_rows: dict[str, dict] = {}
+    exact_scale = None
+    daily_usage = ai_ml.get("daily_usage_by_deployment") or {}
+    e = acc.get("ecu") or {}
+    quote_days = int(e.get("quote_lookback_days") or 0)
+    daily_labels, _daily_totals = billed_series(e)
+    window_labels = daily_labels[-quote_days:] if quote_days and daily_labels else []
+    daily_coverage = set(next(iter(daily_usage.values()), {}).get("days") or []) if daily_usage else set()
+    arrays_cover_window = bool(window_labels) and set(window_labels).issubset(daily_coverage)
+    if ai_ml.get("daily_usage_complete") and arrays_cover_window:
+        for name in eligible_names:
+            data = daily_usage.get(name)
+            if not data:
+                info = deployment_rows.get(name) or {}
+                if float(info.get("eis_inference_ecu") or 0) > 0.02 or float(info.get("ml_node_ecu") or 0) > 0.02:
+                    arrays_cover_window = False
+                    break
+                continue  # no named EIS/ML charges anywhere in the fetched period
+            data_days = list(data.get("days") or [])
+            index_by_day = {day: i for i, day in enumerate(data_days)}
+            if not set(window_labels).issubset(index_by_day):
+                arrays_cover_window = False
+                break
+            for field in ("eis_ecu", "million_tokens", "ml_node_ecu", "jina_ml_node_ecu", "models"):
+                if len(data.get(field) or []) < len(data_days):
+                    arrays_cover_window = False
+                    break
+            if not arrays_cover_window:
+                break
+            for field, source_field in (("eis_ecu", "eis_inference_ecu"), ("million_tokens", "million_tokens"), ("ml_node_ecu", "ml_node_ecu")):
+                daily_total = sum(float(value or 0) for value in (data.get(field) or []))
+                source_total = float((deployment_rows.get(name) or {}).get(source_field) or 0)
+                tolerance = max(0.02, abs(source_total) * 0.001)
+                if abs(daily_total - source_total) > tolerance:
+                    arrays_cover_window = False
+                    break
+            if not arrays_cover_window:
+                break
+    if ai_ml.get("daily_usage_complete") and arrays_cover_window:
+        exact_scale = DAYS_PER_MONTH / len(window_labels)
+        for name in eligible_names:
+            data = daily_usage.get(name) or {}
+            data_days = list(data.get("days") or [])
+            indices = {day: i for i, day in enumerate(data_days)}
+
+            def sum_days(field: str) -> float:
+                values = data.get(field) or []
+                return sum(
+                    float(values[indices[day]] or 0)
+                    for day in window_labels
+                    if day in indices and indices[day] < len(values)
+                )
+
+            models_by_day = data.get("models") or []
+            models = sorted({
+                str(model)
+                for day in window_labels
+                if day in indices and indices[day] < len(models_by_day)
+                for model in (models_by_day[indices[day]] or [])
+                if model
+            })
+            info = deployment_rows.get(name) or {}
+            model_label_map = dict(zip(info.get("models") or [], info.get("model_labels") or []))
+            exact_rows[name] = {
+                "name": name,
+                "region": region.get(name) or "unknown region",
+                "ml": sum_days("ml_node_ecu"),
+                "jina_ml": sum_days("jina_ml_node_ecu"),
+                "eis": sum_days("eis_ecu"),
+                "million_tokens": sum_days("million_tokens"),
+                "models": models,
+                "model_labels": [model_label_map.get(model, model) for model in models],
+                "elser": any("elser" in model.lower() for model in models),
+                "jina": sum_days("jina_ml_node_ecu") > 0,
+            }
+    exact = exact_scale is not None
+    scale = exact_scale if exact else float(usage_factor or 1.0) / max(float(months or 0), 1.0)
     rows = []
-    for d in (acc.get("ai_ml") or {}).get("by_deployment") or []:
-        name = d.get("name")
+    for name in eligible_names:
+        d = deployment_rows.get(name) or {}
         if not name or name not in eligible_names:
             continue
-        ml = float(d.get("ml_node_ecu") or 0)
-        eis = float(d.get("eis_inference_ecu") or 0)
-        models = list(d.get("models") or [])
-        if ml <= 0 and eis <= 0 and not d.get("elser") and not models:
+        if exact:
+            row = exact_rows.get(name) or {
+                "name": name, "region": region.get(name) or "unknown region", "ml": 0.0,
+                "jina_ml": 0.0, "eis": 0.0, "million_tokens": 0.0,
+                "models": list(d.get("models") or []), "model_labels": list(d.get("model_labels") or []),
+                "elser": bool(d.get("elser")), "jina": False,
+            }
+        else:
+            models = list(d.get("models") or [])
+            ml = float(d.get("ml_node_ecu") or 0)
+            row = {
+                "name": name,
+                "region": region.get(name) or "unknown region",
+                "ml": ml,
+                "jina_ml": ml if any("jina" in str(m).lower() for m in models) else 0.0,
+                "eis": float(d.get("eis_inference_ecu") or 0),
+                "million_tokens": float(d.get("million_tokens") or 0),
+                "models": models,
+                "model_labels": list(d.get("model_labels") or []),
+                "elser": bool(d.get("elser")),
+                "jina": any("jina" in str(m).lower() for m in models),
+            }
+        if row["ml"] <= 0 and row["eis"] <= 0 and not row["elser"] and not row["models"]:
             continue
-        rows.append({
-            "name": name,
-            "region": region.get(name) or "unknown region",
-            "ml": ml,
-            "eis": eis,
-            "million_tokens": float(d.get("million_tokens") or 0),
-            "models": models,
-            "model_labels": list(d.get("model_labels") or []),
-            "elser": bool(d.get("elser")),
-            "jina": any("jina" in str(m).lower() for m in models),
-        })
+        rows.append(row)
     if not rows:
         return None
     by_region: dict[str, float] = {}
     for r in rows:
-        moved = r["ml"] if r["jina"] else 0.0
+        moved = r["jina_ml"]
         by_region[r["region"]] = by_region.get(r["region"], 0.0) + (r["eis"] + moved) * scale
     models = sorted({m for r in rows for m in r["models"] if m})
     if any(r["elser"] for r in rows) and "ELSER" not in models:
@@ -1133,7 +1219,7 @@ def _search_eis(
             "ecu": round(r["eis"], 2),
             "monthly": round(r["eis"] * scale, 2),
         })
-    moved_rows = [r for r in rows if r["jina"] and r["ml"] > 0]
+    moved_rows = [r for r in rows if r["jina_ml"] > 0]
     moved_rows.sort(key=lambda r: -r["ml"])
     for r in moved_rows:
         workloads.append({
@@ -1141,11 +1227,11 @@ def _search_eis(
             "kind": f"ML nodes · {r['region']}",
             "deployment": r["name"],
             "million_tokens": None,
-            "ecu": round(r["ml"], 2),
-            "monthly": round(r["ml"] * scale, 2),
+            "ecu": round(r["jina_ml"], 2),
+            "monthly": round(r["jina_ml"] * scale, 2),
         })
-    moved_ecu = sum(r["ml"] for r in moved_rows)
-    other_ml = sum(r["ml"] for r in rows if not r["jina"])
+    moved_ecu = sum(r["jina_ml"] for r in moved_rows)
+    other_ml = sum(max(0.0, r["ml"] - r["jina_ml"]) for r in rows)
     return {
         "monthly": round(sum(by_region.values()), 2),
         "by_region": {k: round(v, 2) for k, v in by_region.items()},
@@ -1157,6 +1243,8 @@ def _search_eis(
         "deployments": len(rows),
         "jina_deployments": len(moved_rows),
         "workloads": workloads,
+        "usage_basis": "quote_window_daily" if exact else "fetched_period_paced_proxy",
+        "usage_days": len(window_labels) if exact else None,
     }
 
 
@@ -1186,6 +1274,8 @@ def _apply_search_eis(
     blk["eis_workloads"] = eis["workloads"]
     blk["eis_deployments"] = eis["deployments"]
     blk["jina_deployments"] = eis.get("jina_deployments")
+    blk["eis_usage_basis"] = eis["usage_basis"]
+    blk["eis_usage_days"] = eis.get("usage_days")
     extra_support = round(usage * rate, 2)
     blk["eis_with_support_mo"] = round(usage * (1 + rate), 2)
     if blk.get("by_region"):
@@ -1207,12 +1297,18 @@ def _apply_search_eis(
             row["Total $/month"] = round(float(row["Total $/month"]) + usage * (1 + rate), 2)
         if isinstance(row.get("Support $/month"), (int, float)):
             row["Support $/month"] = round(float(row["Support $/month"]) + extra_support, 2)
+    if eis["usage_basis"] == "quote_window_daily":
+        pace_text = f"EIS token and Jina ML-node billing was summed over the {eis['usage_days']}-day quote window"
+        period_text = "quote window"
+    else:
+        pace_text = "Fetched-period EIS token and Jina ML-node averages were scaled by the account quote-usage factor"
+        period_text = "fetched billing period"
     notes.append(
         f"The Search EIS line includes activity found on {eis['deployments']} sized ECH Search deployment(s). "
-        f"Jina deployments ran {eis['jina_ml_ecu']:,.0f} ECU of ML nodes over the fetched billing period "
-        f"({eis['jina_ml_ecu_mo']:,.0f} ECU/mo at the quote-window pace). That capacity is in the EIS line at list, with the billed token usage. "
+        f"{pace_text}. Jina deployments ran {eis['jina_ml_ecu']:,.0f} ECU of ML nodes over the {period_text} "
+        f"({eis['jina_ml_ecu_mo']:,.2f} ECU/mo after monthly normalization). That capacity is in the EIS line at list, with the billed token usage. "
         f"EIS is ${usage:,.2f}/mo before support. "
-        f"Another {eis['other_ml_ecu']:,.0f} ECU of ML nodes sit on Search deployments with no jina SKU, and are not in this line."
+        f"Another {eis['other_ml_ecu']:,.0f} ECU of ML nodes sit on Search deployments with no Jina SKU in that period, and are not in this line."
     )
 
 
@@ -1356,6 +1452,7 @@ def _integrity(acc: dict, sz: dict, by_solution: dict, quotes: list[dict], headl
             "bulk_gb_day": coverage.get("bulk_gb_day"),
             "unmeasured_bulk": unmeasured,
             "unrated": coverage.get("unrated"),
+            "estimation_limits": coverage.get("estimation_limits") or [],
         },
         "solutions": [
             {
@@ -1501,6 +1598,16 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         usage_factor=usage,
         eligible_names=_priced_search_names(acc, by_solution, scope),
     )
+    search_eis = by_solution.get("search") or {}
+    coverage = sz.get("diagnostics") or {}
+    if search_eis.get("eis_usage_basis") == "fetched_period_paced_proxy":
+        limits = coverage.setdefault("estimation_limits", [])
+        if not any(row.get("code") == "eis_quote_pace_proxy" for row in limits):
+            limits.append({
+                "code": "eis_quote_pace_proxy",
+                "detail": "daily or fetched-period deployment/SKU aggregations were unavailable or incomplete; available fetched-period totals were scaled by the account quote-usage factor",
+                "severity": "medium",
+            })
     svls_total_mo = sum(float(p.get("total_mo") or 0) for p in by_solution.values())
     # The window month for the whole org, before the comparison scope narrows it.
     ech_window_mo = ech_mo
@@ -1876,6 +1983,7 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
             "deployments": len(per),
             "retention_months": {k: (v or {}).get("retention_months") for k, v in con.items()},
         },
+        "source_precedence": sz.get("source_precedence") or coverage.get("source_precedence"),
         "ech_composition": composition,
         "serverless": serverless,
         "contract_rate": contract_rate,

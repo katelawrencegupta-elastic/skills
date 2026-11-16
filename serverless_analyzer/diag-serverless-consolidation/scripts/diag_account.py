@@ -335,6 +335,14 @@ def apply_diagnostics(
             dep["daily_raw_gb"] = 0.0
             dep["retention_days"] = 0
             dep["ingest_source"] = "inactive"
+            dep["field_sources"] = {
+                "gb": "quote_window_policy",
+                "daily_raw_gb": "quote_window_policy",
+                "retention_days": "quote_window_policy",
+                "k360_gb": "cloud_tracker_telemetry",
+                "ecu": "cloud_tracker_billing",
+                "region": "cloud_tracker_infrastructure",
+            }
             continue
         hit = match(name)
         if hit:
@@ -388,6 +396,17 @@ def apply_diagnostics(
             dep["retention_basis"] = hit.get("retention_basis")
             dep["retention_label"] = hit.get("retention_label")
             dep["ingest_source"] = "diagnostics"
+            dep["field_sources"] = {
+                "gb": "diagnostics",
+                "daily_raw_gb": "diagnostics",
+                "retention_days": "diagnostics",
+                "retention_days_metrics": "diagnostics",
+                "retention_basis": "diagnostics",
+                "bulk_mix": "diagnostics" if isinstance(split, dict) else "derived_assumption",
+                "ecu": "cloud_tracker_billing",
+                "region": "cloud_tracker_infrastructure",
+                "solution": "cloud_tracker_classification",
+            }
             dep["diag_id"] = hit.get("id")
             up = hit.get("uptime_days_min")
             dep["uptime_days_min"] = up
@@ -400,6 +419,11 @@ def apply_diagnostics(
             dep["gb"] = 0.0
             dep["daily_raw_gb"] = 0.0
             dep["ingest_source"] = "decommissioned"
+            dep["field_sources"] = {
+                "gb": "unmeasured_policy", "k360_gb": "cloud_tracker_telemetry",
+                "daily_raw_gb": "unmeasured_policy", "ecu": "cloud_tracker_billing",
+                "region": "cloud_tracker_infrastructure",
+            }
         else:
             fallback += 1
             if name:
@@ -408,6 +432,11 @@ def apply_diagnostics(
             sol = dep.get("solution") or "search"
             if unmeasured == "k360" and stored > 0:
                 dep["ingest_source"] = "k360_fallback"
+                dep["field_sources"] = {
+                    "gb": "cloud_tracker_telemetry", "daily_raw_gb": "derived_k360_fallback",
+                    "retention_days": "assumed_fallback_policy", "ecu": "cloud_tracker_billing",
+                    "region": "cloud_tracker_infrastructure",
+                }
                 dep["daily_raw_gb"] = 0.0
                 if sol in K360_FALLBACK_EXPANSION:
                     months = float(security_fallback_months or fallback_months) if sol == "security" else float(fallback_months)
@@ -421,6 +450,11 @@ def apply_diagnostics(
                 dep["gb"] = 0.0
                 dep["daily_raw_gb"] = 0.0
                 dep["ingest_source"] = "active_no_bundle"
+                dep["field_sources"] = {
+                    "gb": "unmeasured_policy", "k360_gb": "cloud_tracker_telemetry",
+                    "daily_raw_gb": "unmeasured_policy", "ecu": "cloud_tracker_billing",
+                    "region": "cloud_tracker_infrastructure",
+                }
 
     ech = _ech_rows(out)
     clamped_notes: list[str] = []
@@ -448,9 +482,16 @@ def apply_diagnostics(
     st["ingest_share_store_gb"] = round(sum(float(d.get("gb") or 0) + float(d.get("k360_gb") or 0) for d in ech), 2)
     by_name = {d["name"]: d for d in ech}
     for row in st.get("by_deployment") or []:
+        row["field_sources"] = {
+            **(row.get("field_sources") or {}),
+            "data_stored_gb": "cloud_tracker_telemetry",
+            "docs_count": "cloud_tracker_telemetry",
+            "avg_doc_kb": "cloud_tracker_telemetry",
+        }
         src = by_name.get(row.get("name"))
         if src and src.get("ingest_source") == "diagnostics":
             row["data_stored_gb"] = src.get("gb")
+            row["field_sources"]["data_stored_gb"] = "diagnostics"
     unmatched_diags = [r.get("name") for r in rows if r.get("name") not in used]
     _known = [(float(r.get("store_gb") or 0), r.get("retention_known_share")) for r in rows if r.get("name") in used and r.get("name") not in inactive_bundles]
     _store = sum(gb for gb, _share in _known)
@@ -516,6 +557,40 @@ def apply_diagnostics(
         "inactive_bundle_count": len(inactive_bundles),
         "inactive_bundles": inactive_bundles[:12],
     }
+    source_precedence = {
+        "diagnostic_authoritative": [
+            "solutions.by_deployment.gb (matched local primary store)",
+            "solutions.by_deployment.daily_raw_gb (matched diagnostic bulk)",
+            "solutions.by_deployment.retention_days and retention_days_metrics",
+            "measured Observability bulk mix",
+            "storage.data_stored_gb and matched storage.by_deployment[].data_stored_gb",
+            "sizing.consolidated store, bulk, and retention aggregates",
+        ],
+        "cloud_tracker_authoritative": [
+            "billing ECU and cost",
+            "active billing-window roster",
+            "Search QPS, ingest docs/s, active hours, and average document size",
+            "cloud provider, region, tiers, and deployment metadata",
+        ],
+        "fallback_only": [
+            "Cloud Tracker stored GB for a missing bundle only when --unmeasured k360 is selected",
+        ],
+    }
+    limitations = []
+    if fallback:
+        limitations.append({"code": "missing_diagnostics", "count": fallback, "names": fallback_names[:12], "severity": "high"})
+    if no_age:
+        limitations.append({"code": "retention_unmeasured", "count": len(no_age), "names": [r["name"] for r in no_age[:12]], "severity": "medium"})
+    if short:
+        limitations.append({"code": "short_diagnostic_window", "count": len(short), "deployments": short[:12], "severity": "medium"})
+    if float(coverage.get("bulk_fallback_gb_day") or 0) > 0:
+        limitations.append({"code": "bulk_rate_fallback", "bulk_gb_day": coverage["bulk_fallback_gb_day"], "severity": "medium"})
+    if unrated and unrated.get("indices"):
+        limitations.append({"code": "unrated_ingest", "indices": unrated["indices"], "store_gb": unrated["store_gb"], "severity": "high"})
+    if (con.get("observability") or {}).get("mix_basis") == "assumed 90/10":
+        limitations.append({"code": "assumed_observability_mix", "basis": "assumed 90/10", "severity": "medium"})
+    coverage["source_precedence"] = source_precedence
+    coverage["estimation_limits"] = limitations
     notes = [
         "Ingest GB/day is the write-index sum of index.primaries.bulk.est_bytes_per_day from the Elasticsearch diagnostic bundle. "
         "Retention is the size-weighted ILM delete age on local primary store, or the oldest index age when no delete policy covers that store, rounded up to a whole month for the estimator. "
@@ -605,6 +680,7 @@ def apply_diagnostics(
     sz["consolidated"] = con
     sz["ingest_source"] = "diagnostics"
     sz["diagnostics"] = coverage
+    sz["source_precedence"] = source_precedence
     sz["estimators"] = {}
     sz["notes"] = notes
     out["sizing"] = sz

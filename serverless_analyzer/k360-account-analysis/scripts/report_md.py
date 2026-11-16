@@ -261,6 +261,24 @@ def consolidation_section(acc: dict) -> list[str]:
     if from_diags:
         L.append(f"- **Stored size** {n1(b.get('stored_gb'))} GB on the quote. Matched deployments use the diagnostic primary store. A deployment with no bundle is not sized, unless --unmeasured k360 priced it from its K360 size. GB/day is measured bulk, not stored GB ÷ retention.")
         L.append(f"- **Retention** {s(b.get('retention_months'))} is the ingest-weighted diagnostic retention written to the estimator (1–36 months). K360 does not provide a raw ingest total. Stored GB ÷ assumed retention is the --k360-ingest backup and can sit far below this bulk rate.")
+        source_map = (acc.get("sizing") or {}).get("source_precedence") or ((acc.get("sizing") or {}).get("diagnostics") or {}).get("source_precedence") or {}
+        diagnostic_fields = source_map.get("diagnostic_authoritative") or []
+        tracker_fields = source_map.get("cloud_tracker_authoritative") or []
+        if diagnostic_fields or tracker_fields:
+            L.append("- **Source precedence** Diagnostics supply: " + "; ".join(diagnostic_fields) + ". Cloud Tracker remains authoritative for: " + "; ".join(tracker_fields) + ".")
+        limit_labels = {
+            "missing_diagnostics": "some active deployments have no diagnostic bundle",
+            "retention_unmeasured": "retention is unmeasured for some bulk rows",
+            "short_diagnostic_window": "some bulk rates came from nodes up for under two days",
+            "bulk_rate_fallback": "some bulk rates lack a measured ILM write phase",
+            "unrated_ingest": "some indices have writes but no measured ingest rate",
+            "assumed_observability_mix": "the Observability logs/metrics split uses the 90/10 assumption",
+            "eis_quote_pace_proxy": "EIS uses fetched-period billing scaled by account pace because complete deployment/SKU billing data was unavailable",
+        }
+        diag_coverage = (acc.get("sizing") or {}).get("diagnostics") or {}
+        limits = [limit_labels[row.get("code")] for row in diag_coverage.get("estimation_limits") or [] if row.get("code") in limit_labels]
+        if limits:
+            L.append("- **Estimation limits** " + "; ".join(limits) + ".")
     else:
         L.append(f"- **Stored size** {n1(st.get('data_stored_gb'))} GB as of {s(st.get('as_of'))}, {s(st.get('deployments_with_telemetry'))} deployments with a row. {src} K360 does not provide a raw ingest total. This backup uses stored GB ÷ (retention months × 30.416), which can sit far below measured bulk.")
         L.append(f"- **Retention** {s(b.get('retention_months'))} is the run assumption, not a measured ILM policy. It changes implied GB/day. The estimator was not re-run, so the quoted dollars stay put.")
@@ -312,9 +330,17 @@ def consolidation_section(acc: dict) -> list[str]:
     eis_rows = search_blk_early.get("eis_workloads") or []
     if eis_rows:
         L.append("### Search machine learning, priced as EIS")
-        L.append(f"This EIS line covers the sized ECH Search deployments in the accepted Search estimate; existing Serverless projects are excluded. Token and jina ML-node charges use their fetched-period monthly average scaled by the quote-window pace. The selected deployments ran {n0(search_blk_early.get('jina_ml_ecu'))} ECU of jina-associated ML nodes over the fetched period ({n0(search_blk_early.get('jina_ml_ecu_mo'))} ECU/mo at quote pace). That capacity is in the EIS line with billed tokens: **{usd(search_blk_early.get('eis_mo'))}/mo** before support. The quote-window EIS amount is held constant in quieter and busier sensitivity rows. Another {n0(search_blk_early.get('other_ml_ecu'))} ECU of ML nodes on these Search deployments have no jina SKU and are not in the line.")
+        exact_eis = search_blk_early.get("eis_usage_basis") == "quote_window_daily"
+        if exact_eis:
+            period_desc = f"the exact {int(search_blk_early.get('eis_usage_days') or 0)}-day quote window, monthly-normalized"
+            period_label = "quote window"
+        else:
+            period_desc = "the fetched-period monthly average scaled by the account quote-usage factor"
+            period_label = "fetched period"
+        L.append(f"This EIS line covers the sized ECH Search deployments in the accepted Search estimate; existing Serverless projects are excluded. Token and Jina ML-node charges use {period_desc}. The selected deployments ran {n0(search_blk_early.get('jina_ml_ecu'))} ECU of Jina-associated ML nodes over the {period_label} ({n0(search_blk_early.get('jina_ml_ecu_mo'))} ECU/mo after monthly normalization). That capacity is in the EIS line with billed tokens: **{usd(search_blk_early.get('eis_mo'))}/mo** before support. The EIS amount is held constant in quieter and busier sensitivity rows. Another {n0(search_blk_early.get('other_ml_ecu'))} ECU of ML nodes on these Search deployments have no Jina SKU in that period and are not in the line.")
         L.append("")
-        L.append(table(["EIS workload", "What is billed", "Million tokens", "ECU, fetched period", "$ / mo"],
+        period_column = "quote window" if exact_eis else "fetched period"
+        L.append(table(["EIS workload", "What is billed", f"Million tokens, {period_column}", f"ECU, {period_column}", "$ / mo"],
                        [[w["model"], w["kind"], "—" if w.get("million_tokens") is None else f"{float(w.get('million_tokens') or 0):,.4f}", f"{float(w.get('ecu') or 0):,.2f}", f"${float(w.get('monthly') or 0):,.2f}"] for w in eis_rows]
                        + [["Total", "", "", f"{sum(float(w.get('ecu') or 0) for w in eis_rows):,.2f}", f"${float(search_blk_early.get('eis_mo') or 0):,.2f}"]]))
         L.append("")

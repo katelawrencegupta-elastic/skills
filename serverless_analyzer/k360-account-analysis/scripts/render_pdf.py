@@ -169,6 +169,19 @@ def _missing_diag_notes(cov: dict) -> list[str]:
     return [f"Missing diagnostics: {count} active {noun} not measured{tail} because {why}. They are on neither side of the comparison: no ingest or stored GB in the estimate, and with the default scope no bill in the ECH figure."]
 
 
+def _estimation_limit_notes(cov: dict) -> list[str]:
+    """Short cover notes for measurement limits recorded by the diagnostic pass."""
+    labels = {
+        "retention_unmeasured": "Diagnostic retention is missing for some measured bulk; those rows are excluded from the weighted retention month.",
+        "short_diagnostic_window": "Some diagnostic bulk rates came from nodes up for under two days.",
+        "bulk_rate_fallback": "Some bulk rates were estimated without a measured ILM write phase.",
+        "unrated_ingest": "Some stored indices took writes but have no measured ingest rate; the quote may understate ingest.",
+        "assumed_observability_mix": "The Observability logs/metrics split uses the 90/10 assumption because the diagnostic bundle did not measure a split.",
+        "eis_quote_pace_proxy": "EIS uses fetched-period billing scaled by account pace because complete deployment/SKU billing data was unavailable.",
+    }
+    return [labels[row.get("code")] for row in (cov or {}).get("estimation_limits") or [] if row.get("code") in labels]
+
+
 def _excluded_notes(record) -> list[str]:
     """Page 1 note naming deployments the run left out by id."""
     deps = (record or {}).get("deployments") or []
@@ -3669,6 +3682,7 @@ def render_consolidation_html(acc: dict) -> str:
     else:
         cover_notes.append("Ingest is the K360 backup: stored GB ÷ assumed retention. K360 does not provide a raw ingest total, so this can sit far below the bulk payload the cluster accepted.")
     cover_notes.extend(_missing_diag_notes(active_cov))
+    cover_notes.extend(_estimation_limit_notes(active_cov))
     cover_notes.extend(_excluded_notes(m.get("excluded_deployments")))
     B.append(bullets(cover_notes, columns=2))
     B.append("</div>")
@@ -3842,13 +3856,19 @@ def render_consolidation_html(acc: dict) -> str:
     search_blk = (svl.get("by_solution") or {}).get("search") or {}
     eis_rows = search_blk.get("eis_workloads") or []
     if eis_rows:
+        exact_eis = search_blk.get("eis_usage_basis") == "quote_window_daily"
+        period_label = "quote window" if exact_eis else "fetched period"
+        period_desc = (
+            f"the exact {int(search_blk.get('eis_usage_days') or 0)}-day quote window, monthly-normalized"
+            if exact_eis else "the fetched-period monthly average scaled by the account quote-usage factor"
+        )
         def _tok(w: dict) -> str:
             v = w.get("million_tokens")
             return "—" if v is None else f"{float(v):,.4f}"
         eis_ecu_sum = sum(float(w.get("ecu") or 0) for w in eis_rows)
         eis_mo_sum = sum(float(w.get("monthly") or 0) for w in eis_rows)
         eis_table = table(
-            ["EIS workload", "What moves", "Million tokens", "ECU, fetched period", "$ / mo"],
+            ["EIS workload", "What moves", f"Million tokens, {period_label}", f"ECU, {period_label}", "$ / mo"],
             [[w["model"], w["kind"], _tok(w), f"{float(w.get('ecu') or 0):,.2f}", f"${float(w.get('monthly') or 0):,.2f}"] for w in eis_rows]
             + [["Total", "", "", f"{eis_ecu_sum:,.2f}", f"${eis_mo_sum:,.2f}"]],
             ["left", "left", "right", "right", "right"],
@@ -3859,11 +3879,11 @@ def render_consolidation_html(acc: dict) -> str:
             callout(
                 "This EIS load is inside the estimate",
                 f"This EIS line covers the sized ECH Search deployments in the accepted Search estimate; existing Serverless projects are excluded. "
-                f"Token and jina ML-node charges use their fetched-period monthly average scaled by the quote-window pace. "
-                f"The selected deployments ran {n0(search_blk.get('jina_ml_ecu'))} ECU of jina-associated ML nodes over the fetched period "
-                f"({n0(search_blk.get('jina_ml_ecu_mo'))} ECU/mo at quote pace). That capacity is in this EIS line with billed tokens, "
+                f"Token and Jina ML-node charges use {period_desc}. "
+                f"The selected deployments ran {n0(search_blk.get('jina_ml_ecu'))} ECU of Jina-associated ML nodes over the {period_label} "
+                f"({n0(search_blk.get('jina_ml_ecu_mo'))} ECU/mo after monthly normalization). That capacity is in this EIS line with billed tokens, "
                 f"${eis_mo_sum:,.2f}/mo before support. It is included in regional Search totals and every Search profile. "
-                f"The quote-window EIS amount is held constant in quieter and busier sensitivity rows. "
+                f"The EIS amount is held constant in quieter and busier sensitivity rows. "
                 f"Another {n0(search_blk.get('other_ml_ecu'))} ECU of ML nodes on these Search deployments have no jina SKU and are not in the line. "
                 "The node ECU is the capacity on the same deployment, not a per-model meter.",
             ) + eis_table,

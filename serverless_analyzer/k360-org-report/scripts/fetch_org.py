@@ -1478,7 +1478,20 @@ def main() -> None:
                             # Same size and order as the top-level roster, so a big spender with
                             # few billing lines is not dropped from a day.
                             "terms": {"field": "deployment.name", "size": DEP_TERMS_SIZE, "order": {"ecu": "desc"}},
-                            "aggs": {"ecu": {"sum": {"field": "cost"}}},
+                            "aggs": {
+                                "ecu": {"sum": {"field": "cost"}},
+                                "eis_skus": {
+                                    "terms": {"field": "sku", "size": 40, "include": ".*inference.*"},
+                                    "aggs": {
+                                        "ecu": {"sum": {"field": "cost"}},
+                                        "qty": {"sum": {"field": "quantity"}},
+                                    },
+                                },
+                                "ml_skus": {
+                                    "terms": {"field": "sku", "size": 30, "include": ".*(\\.es\\.ml\\.|\\.ml\\.).*"},
+                                    "aggs": {"ecu": {"sum": {"field": "cost"}}},
+                                },
+                            },
                         },
                         "ecu": {"sum": {"field": "cost"}},
                     },
@@ -1659,6 +1672,7 @@ def main() -> None:
             if parsed and not hot_instance and parsed["tier"] == "datahot":
                 hot_instance = f"{parsed['provider'].lower()}.{parsed['instance']}"
         ai_sku_agg = b.get("ai_skus") or {}
+        ml_sku_agg = b.get("ml_skus") or {}
         infer_skus = []
         for sb in ai_sku_agg.get("buckets") or []:
             if sb["ecu"]["value"] <= 0 and sb["qty"]["value"] <= 0:
@@ -1701,6 +1715,7 @@ def main() -> None:
                 "inference_ecu": round(families["genai"], 2),
                 "inference_skus": infer_skus,
                 "inference_skus_truncated": int(ai_sku_agg.get("sum_other_doc_count") or 0) > 0,
+                "ml_skus_truncated": int(ml_sku_agg.get("sum_other_doc_count") or 0) > 0,
                 "models": models,
             },
         }
@@ -1714,6 +1729,11 @@ def main() -> None:
     top = [d["name"] for d in deployments[:4]]
     days, total_daily, series = [], [], {n: [] for n in top}
     other_daily = []
+    ai_daily_by_name: dict[str, dict[str, dict[str, float]]] = {}
+    ai_daily_complete = not any(
+        d["ai"].get("inference_skus_truncated") or d["ai"].get("ml_skus_truncated")
+        for d in deployments
+    ) and int((bill["aggregations"].get("by_dep") or {}).get("sum_other_doc_count") or 0) == 0
     # month -> dep -> ecu (for monthly averages)
     month_dep: dict[str, dict[str, float]] = {}
     # day -> set of named deps with spend (for deployments-over-time)
@@ -1725,6 +1745,41 @@ def main() -> None:
         days.append(day)
         total_daily.append(round(bucket["ecu"]["value"], 2))
         dep_map = {x["key"]: x["ecu"]["value"] for x in bucket["by_dep"]["buckets"]}
+        if int((bucket.get("by_dep") or {}).get("sum_other_doc_count") or 0) > 0:
+            ai_daily_complete = False
+        for dep_row in (bucket.get("by_dep") or {}).get("buckets") or []:
+            name = str(dep_row.get("key") or "")
+            if not name or hex_id(name):
+                continue
+            eis_agg = dep_row.get("eis_skus") or {}
+            ml_agg = dep_row.get("ml_skus") or {}
+            if int(eis_agg.get("sum_other_doc_count") or 0) > 0 or int(ml_agg.get("sum_other_doc_count") or 0) > 0:
+                ai_daily_complete = False
+            daily_models = []
+            jina_billed = False
+            eis_ecu = 0.0
+            million_tokens = 0.0
+            for sku_row in eis_agg.get("buckets") or []:
+                decoded = decode_inference_sku(str(sku_row.get("key") or ""))
+                model = str(decoded.get("model") or "")
+                sku_ecu = float(((sku_row.get("ecu") or {}).get("value")) or 0)
+                sku_qty = float(((sku_row.get("qty") or {}).get("value")) or 0)
+                eis_ecu += sku_ecu
+                million_tokens += sku_qty
+                if model and model not in daily_models:
+                    daily_models.append(model)
+                if "jina" in model.lower() and (sku_ecu > 0 or sku_qty > 0):
+                    jina_billed = True
+            ml_ecu = sum(float(((sku_row.get("ecu") or {}).get("value")) or 0) for sku_row in ml_agg.get("buckets") or [])
+            daily_values = {
+                "eis_ecu": eis_ecu,
+                "million_tokens": million_tokens,
+                "ml_node_ecu": float(ml_ecu),
+                "jina_ml_node_ecu": float(ml_ecu) if jina_billed else 0.0,
+                "models": daily_models,
+            }
+            if daily_values["eis_ecu"] or daily_values["million_tokens"] or daily_values["ml_node_ecu"] or daily_models:
+                ai_daily_by_name.setdefault(name, {})[day] = daily_values
         active = {k for k, v in dep_map.items() if not hex_id(k) and v > 0}
         day_active_deps.append(active)
         for k, v in dep_map.items():
@@ -2126,6 +2181,18 @@ def main() -> None:
             },
             "inference_skus_truncated": int(ai_sku_agg.get("sum_other_doc_count") or 0) > 0,
             "inference_skus": ai_skus,
+            "daily_usage_complete": ai_daily_complete,
+            "daily_usage_by_deployment": {
+                name: {
+                    "days": days,
+                    "eis_ecu": [round(float((daily.get(day) or {}).get("eis_ecu") or 0), 6) for day in days],
+                    "million_tokens": [round(float((daily.get(day) or {}).get("million_tokens") or 0), 6) for day in days],
+                    "ml_node_ecu": [round(float((daily.get(day) or {}).get("ml_node_ecu") or 0), 6) for day in days],
+                    "jina_ml_node_ecu": [round(float((daily.get(day) or {}).get("jina_ml_node_ecu") or 0), 6) for day in days],
+                    "models": [list((daily.get(day) or {}).get("models") or []) for day in days],
+                }
+                for name, daily in ai_daily_by_name.items()
+            },
             "models": sorted({m for d in deployments for m in d["ai"]["models"]}),
             "by_deployment": ai_by_dep,
             "notes": [

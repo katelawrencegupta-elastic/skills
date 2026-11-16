@@ -869,6 +869,8 @@ def ai_ml_section(org: dict) -> dict:
             "ai_pct_of_dep": pct(tot, float(d.get("ecu") or 0)),
             "models": model_ids,
             "model_labels": model_labels,
+            "inference_skus_truncated": bool(a.get("inference_skus_truncated")),
+            "ml_skus_truncated": bool(a.get("ml_skus_truncated")),
             "ml_skus": [s.get("label") for s in (d.get("ml_skus") or [])[:4]],
             **flags,
         }
@@ -910,6 +912,8 @@ def ai_ml_section(org: dict) -> dict:
         "unnamed_vector_models": unnamed,
         "inference_skus": org_skus,
         "token_meter": meter,
+        "daily_usage_complete": bool(ai.get("daily_usage_complete")),
+        "daily_usage_by_deployment": ai.get("daily_usage_by_deployment") or {},
         "ml_skus": (ml.get("skus") or [])[:8],
         "by_deployment": by_dep,
         "notes": (ml.get("notes") or []) + (ai.get("notes") or []),
