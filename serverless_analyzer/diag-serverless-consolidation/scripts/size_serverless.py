@@ -48,6 +48,7 @@ sys.path.insert(0, str(ORG_SKILL / "scripts"))
 from privacy import seal_dir, seal_file, seal_text  # noqa: E402
 from quote_checks import (  # noqa: E402
     addon_off_value, cell_range, check_value_ranges, e73_blocks_quote, echo_gate, layout_ranges,
+    observability_echo_gate,
     money as sheet_money, observability_readback, security_readback,
 )
 try:
@@ -537,8 +538,8 @@ def observability_input_cells(acc: dict, support: str, region, retention: int, d
     `raw` writes Option 2: logs on G23 and metrics on G25, and the sheet expands
     them itself. Trace GB/day stays in the logs row there.
 
-    With a `mix` the split is the measured one. With none, GB/day is 90% logs and
-    10% metrics.
+    Product-derived mix is required for nonzero Observability bulk. The estimator
+    is not filled with a synthetic 90/10 split.
     """
     k8s_share = 0.0
     traces = 0.0
@@ -547,8 +548,10 @@ def observability_input_cells(acc: dict, support: str, region, retention: int, d
         metrics = float(mix.get("metrics_gb_day") or 0)
         traces = float(mix.get("traces_gb_day") or 0)
         k8s_share = float(mix.get("k8s_logs_share") or 0)
-    logs = float(daily) * 0.90 if logs is None else float(logs)
-    metrics = float(daily) * 0.10 if metrics is None else float(metrics)
+    elif float(daily or 0) > 0:
+        raise ValueError("Observability product mix is missing; refusing to invent a 90/10 split")
+    else:
+        logs = metrics = 0.0
     cells = {
         "G4": (acc.get("sizing") or {}).get("feature_tier") or "Complete",
         "G5": support,
@@ -1178,25 +1181,14 @@ def _fill_missing_doc_bytes(acc_path: Path, acc: dict) -> None:
 
 
 def org_store_gb(acc: dict) -> float:
-    """Org store behind the Search ingest share: search store ÷ this is Search's part of the org docs/s.
+    """Org store behind the Search telemetry share: project search store ÷ this scales docs/s and QPS.
 
-    It includes deployments left unsized (no bundle, decommissioned), because the K360 org rate
-    includes their ingest. An account written before that figure existed uses the sized store.
+    A diagnostic quote's ``ingest_share_store_gb`` is the sum of matched diagnostic local stores.
+    K360 sizes retained for unsized deployments are excluded. A standalone K360 backup has no
+    diagnostic share and uses its account-level stored-GB total.
     """
     st = acc.get("storage") or {}
     return float(st.get("ingest_share_store_gb") or st.get("data_stored_gb") or 0)
-
-
-def _scale_qps(workload: dict, share: float) -> dict:
-    wl = json.loads(json.dumps(workload or {}))
-    search = wl.get("search") or {}
-    for band in ("peak", "nonpeak"):
-        band_row = dict(search.get(band) or {})
-        if band_row.get("qps") is not None:
-            band_row["qps"] = round(float(band_row["qps"]) * share, 4)
-        search[band] = band_row
-    wl["search"] = search
-    return wl
 
 
 def _fill_regional_job(job: dict, creds) -> dict:
@@ -1243,7 +1235,7 @@ def _fill_regional_job(job: dict, creds) -> dict:
         cells = observability_fill(account, job["support"], reg, int(job["retention"]), job["daily"], job.get("mix"), bool(job.get("forced")), basis)
         n = push_cells(sheets, copied["id"], job["tab"], cells, allowed_text=set(opts))
         rb = observability_readback(read_cells(sheets, copied["id"], job["tab"], job["readback"]), basis)
-        gate = echo_gate(job["daily"], rb.get("echo_gb_day"))
+        gate = observability_echo_gate(job.get("mix"), rb) if basis == "metered" else echo_gate(job["daily"], rb.get("echo_gb_day"))
     else:
         cells, n, rb, gate = fill_security(sheets, copied["id"], account, job["support"], reg, int(job["retention"]), job["daily"], opts, basis)
     entry = {
@@ -1273,8 +1265,6 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
     signature for callers that already opened a client; each copy builds its own.
     """
     del sheets, drive, customer, when
-    from consolidation import REGION_ESTIMATE_MIN_USD, projected_region_monthly
-
     groups = ((acc.get("consolidation") or {}).get("architecture") or {}).get("groups") or []
     by_sol: dict[str, list] = {}
     for g in groups:
@@ -1291,7 +1281,6 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
             continue
         if len(rows) < 2:
             continue
-        total_gb = sum(float(r.get("stored_gb") or 0) for r in rows) or 0.0
         for g in rows:
             gb = float(g.get("stored_gb") or 0)
             if sol == "search" and gb <= 0:
@@ -1300,31 +1289,18 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
                 continue
             source_months = g.get("retention_months") if g.get("retention_months") is not None else (con.get(sol) or {}).get("retention_months")
             retention = _months_for_sheet({"retention_months": source_months}, force_months)
+            try:
+                region_daily = float(g.get("daily_raw_gb") or 0)
+            except (TypeError, ValueError):
+                region_daily = 0.0
+            if sol != "search" and region_daily <= 0:
+                continue
             if sol == "security":
-                try:
-                    security_daily = float(g.get("daily_raw_gb") or 0)
-                except (TypeError, ValueError):
-                    security_daily = 0.0
-                if security_daily <= 0 or retention is None:
+                if retention is None:
                     continue
-            else:
-                projected = projected_region_monthly(
-                    sol,
-                    stored_gb=gb,
-                    daily_raw_gb=g.get("daily_raw_gb"),
-                    retention_months=source_months,
-                    solution_stored_gb=total_gb,
-                    workload=workload if sol == "search" else None,
-                    metered=ingest_basis(acc) == "metered",
-                )
-                if projected <= REGION_ESTIMATE_MIN_USD:
-                    continue
-                if sol != "search" and retention is None:
-                    continue
-            if g.get("daily_raw_gb") is not None:
-                daily = float(g["daily_raw_gb"])
-            else:
-                daily = gb / (float(retention or 3) * DAYS_PER_MONTH) if (retention or 3) else 0.0
+            elif sol != "search" and retention is None:
+                continue
+            daily = region_daily if sol != "search" else 0.0
             region = g["region"]
             title = estimate_title(key, sol, name_suffix, region)
             job = {
@@ -1342,13 +1318,14 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
                 "basis": ingest_basis(acc),
             }
             if sol == "search":
-                share = gb / total_gb if total_gb else 0.0
                 scale = _search_volume_scale(name_suffix)
                 job["stored_gb"] = gb * scale
                 job["org_gb"] = org_gb * scale
                 job["store_scale"] = scale
-                job["workload"] = _scale_qps(workload, share)
+                job["workload"] = workload
             elif sol == "observability":
+                if g.get("mix_error"):
+                    continue
                 job.update({
                     "template_id": o11y_id, "tab": O11Y_TAB, "readback": O11Y_READBACK,
                     "retention": int(retention), "daily": daily,
@@ -1434,22 +1411,21 @@ def assemble_plan_bars(specs: list[dict], fills: list[dict]) -> dict:
 def _search_group_price(group: list[dict], *, workload: dict, org_gb: float, support: str, cache: dict) -> tuple[float | None, str | None]:
     """Performant Search price for one project, on its measured store. A missing notebook total is an error."""
     stored = sum(float(row.get("store_gb") or 0) for row in group)
-    share = (stored / float(org_gb)) if org_gb else 0.0
     region = str(group[0].get("region") or "")
     provider = str(group[0].get("provider") or "")
     if stored <= 0:
         return 0.0, None
-    key = (provider, region, round(stored, 3), round(share, 6), support)
+    org_store = float(org_gb or 0)
+    key = (provider, region, round(stored, 3), round(org_store, 3), support)
     if key in cache:
         return cache[key], None
-    wl = _scale_qps(workload, share) if org_gb else (workload or {})
     result = run_es3({
         "stored_gb": stored,
-        "org_stored_gb": float(org_gb or 0) or stored,
+        "org_stored_gb": org_store or stored,
         "provider": provider,
         "region": region,
         "support_tier": support,
-        "workload": wl,
+        "workload": workload or {},
     })
     money = ((result.get("readback") or {}).get("monthly_steady_state"))
     if money is None:
@@ -1489,7 +1465,7 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
             continue
         groups = []
         for index, group in enumerate(plan["groups"], start=1):
-            summary = diag.summarize(group, force_months)
+            summary = diag.summarize(group, force_months, basis=basis)
             solution = str((group[0] if group else {}).get("solution") or "observability")
             if solution == "search":
                 money, err = _search_group_price(
@@ -1598,7 +1574,7 @@ def fill_plan_sheet(job: dict, creds) -> dict:
         )
         push_cells(sheets, copied["id"], O11Y_TAB, cells, allowed_text=set(opts))
         rb = observability_readback(read_cells(sheets, copied["id"], O11Y_TAB, O11Y_READBACK), basis)
-        gate = echo_gate(float(job["bulk"]), rb.get("echo_gb_day"))
+        gate = observability_echo_gate(job.get("mix"), rb) if basis == "metered" else echo_gate(float(job["bulk"]), rb.get("echo_gb_day"))
         if not gate["accepted"]:
             return {"error": (
                 "Observability deployment-count plan was not priced: "
@@ -1665,23 +1641,31 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
         for dep in (acc.get("solutions") or {}).get("by_deployment") or []
         if dep.get("platform") != "serverless"
     }
+    diagnostic_basis = ingest_basis(acc) == "metered"
     rows = []
     for dep in plan_roster(acc):
-        rec = measured.get(dep.get("name")) or dep
+        measured_rec = measured.get(dep.get("name"))
+        rec = measured_rec or dep
+        if diagnostic_basis and measured_rec is None:
+            store_gb = 0
+        else:
+            store_gb = rec.get("gb")
+            if store_gb is None:
+                store_gb = 0 if diagnostic_basis else dep.get("gb") or 0
         rows.append({
             "name": dep.get("name") or "",
             "solution": _plan_solution(dep, rec),
             "region": dep.get("region") or rec.get("region") or "",
             "provider": dep.get("provider") or provider,
-            "bulk_gb_day": rec.get("daily_raw_gb") or 0,
-            "store_gb": rec.get("gb") if rec.get("gb") is not None else dep.get("gb") or 0,
+            "bulk_gb_day": 0 if diagnostic_basis and measured_rec is None else rec.get("daily_raw_gb") or 0,
+            "store_gb": store_gb,
             "retention_days": rec.get("retention_days"),
             "retention_days_metrics": rec.get("retention_days_metrics"),
             **{key: rec.get(key) for key in ("logs_gb_day", "k8s_logs_gb_day", "metrics_gb_day", "traces_gb_day") if rec.get(key) is not None},
         })
     if not rows:
         return {"bars": [], "error": "Deployment-count plan was not priced: no ECH deployments."}
-    org_gb = sum(float(row["store_gb"] or 0) for row in rows if row["solution"] == "search")
+    org_gb = org_store_gb(acc)
     specs, jobs, error, floor = plan_sheet_jobs(
         rows,
         run_key=acc["meta"]["run_key"],
@@ -1890,8 +1874,8 @@ def main() -> None:
         estimators["observability"] = {"kind": "observability", "status": "skipped — no observability workload detected (use --always-copy to force)"}
         lines.append("Observability → skipped (no workload)")
     elif o_skip == "retention":
-        estimators["observability"] = {"kind": "observability", "status": "skipped — retention was not measured"}
-        lines.append("Observability → skipped (retention was not measured)")
+        estimators["observability"] = {"kind": "observability", "status": "skipped — no diagnostic bulk to write a one-year estimate from"}
+        lines.append("Observability → skipped (no diagnostic bulk to write a one-year estimate from)")
     else:
         title_o = estimate_title(key, "observability", suffix, o_scope)
         o_months = _months_for_sheet(o, args.force_months)
@@ -1916,7 +1900,7 @@ def main() -> None:
         rb = observability_readback(read_cells(sheets, copied["id"], O11Y_TAB, O11Y_READBACK), basis)
         entry = {"kind": "observability", "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.o11y_id, "reused_existing_copy": reused, "tab": O11Y_TAB, "cells": cells, "cells_written": n, "region_match": f"{reg} ({how})", "readback": rb, "status": "filled", "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"]}
         entry["ingest_basis"] = basis
-        entry["echo_gate"] = echo_gate(daily, rb.get("echo_gb_day"))
+        entry["echo_gate"] = observability_echo_gate(o_mix or o, rb) if basis == "metered" else echo_gate(daily, rb.get("echo_gb_day"))
         if not entry["echo_gate"]["accepted"]:
             entry["readback_rejected"] = "the sheet echo differs from the written bulk by more than the tolerance (0.1% of it, at least 0.02 GB/day)"
         if not args.skip_xlsx:
@@ -1940,8 +1924,8 @@ def main() -> None:
         estimators["security"] = {"kind": "security", "status": "skipped — no security workload detected (use --always-copy to force)"}
         lines.append("Security → skipped (no workload)")
     elif s_skip == "retention":
-        estimators["security"] = {"kind": "security", "status": "skipped — retention was not measured"}
-        lines.append("Security → skipped (retention was not measured)")
+        estimators["security"] = {"kind": "security", "status": "skipped — no diagnostic bulk to write a one-year estimate from"}
+        lines.append("Security → skipped (no diagnostic bulk to write a one-year estimate from)")
     else:
         title_s = estimate_title(key, "security", suffix, s_scope)
         s_months = _months_for_sheet(s, args.force_months)

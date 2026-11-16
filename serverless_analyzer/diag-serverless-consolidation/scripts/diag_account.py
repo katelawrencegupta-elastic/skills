@@ -25,7 +25,7 @@ import math
 import re
 from pathlib import Path
 
-from diag_inputs import whole_months
+from diag_inputs import ESTIMATE_MONTHS, whole_months
 
 DAYS_PER_MONTH = 30.416
 RETENTION_MIN = 1.0
@@ -100,15 +100,13 @@ MIX_KEYS = ("logs_gb_day", "k8s_logs_gb_day", "metrics_gb_day", "traces_gb_day")
 def observability_mix(rows: list[dict], bulk_key: str = "daily_raw_gb") -> dict:
     """Logs, Kubernetes logs, metrics, and traces GB/day for a group of deployments.
 
-    A row that carries the measured split (`logs_gb_day` and the other MIX_KEYS,
-    from the bundle's data stream names) keeps its proportions, scaled to that
-    row's bulk, so a compression-applied or paced row stays in proportion. A row
-    with no measured split is taken as 90% logs and 10% metrics. `basis` says
-    which was used. `metrics_retention_days` is the metrics-weighted delete age
-    of the metrics indices, for the TSDS retention row.
+    The product-derived split from the bundle's data stream names/index mode is
+    kept in proportion to that row's bulk. Missing product classification is an
+    error; no 90/10 mix is invented. `metrics_retention_days` is the
+    metrics-weighted delete age for the TSDS retention row.
     """
     logs = k8s = metrics = traces = 0.0
-    measured = assumed = 0.0
+    measured = 0.0
     weight = weighted = 0.0
     for row in rows or []:
         try:
@@ -124,8 +122,7 @@ def observability_mix(rows: list[dict], bulk_key: str = "daily_raw_gb") -> dict:
             if total > 0:
                 parts = [value * bulk / total for value in raw]
         if parts is None:
-            parts = [bulk * 0.90, 0.0, bulk * 0.10, 0.0]
-            assumed += bulk
+            raise ValueError(f"diagnostic product mix is missing for {row.get('name') or 'a deployment'}")
         else:
             measured += bulk
         logs += parts[0]
@@ -136,12 +133,8 @@ def observability_mix(rows: list[dict], bulk_key: str = "daily_raw_gb") -> dict:
         if days is not None and parts[2] > 0:
             weight += parts[2]
             weighted += parts[2] * days
-    if measured and not assumed:
+    if measured:
         basis = "measured"
-    elif assumed and not measured:
-        basis = "assumed 90/10"
-    elif measured:
-        basis = "mixed"
     else:
         basis = None
     return {
@@ -176,12 +169,13 @@ def _rollup_solutions(out: dict, clamped_notes: list[str]) -> None:
         weight_bulk = sum(rate for rate, _days in weighed)
         weighted = sum(rate * days for rate, days in weighed)
         measured = (weighted / weight_bulk / DAYS_PER_MONTH) if weight_bulk else None
-        written = _sheet_months(measured) if measured is not None else None
-        if written is not None and abs(float(written) - measured) > 0.05:
-            clamped_notes.append(f"{sol} retention measures {measured:.1f} months and is written to the estimator as {written}")
+        # Every estimate is a one-year estimate. The measured age is kept for the record only.
+        written = ESTIMATE_MONTHS if daily != 0 else None
+        if measured is not None and abs(ESTIMATE_MONTHS - measured) > 0.05:
+            clamped_notes.append(f"{sol} retention measures {measured:.1f} months. The estimate is a one-year estimate, so {ESTIMATE_MONTHS} is written to the estimator.")
         blk["deployments"] = len(group)
         # Deployments that were actually sized: a matched bundle, or priced from K360 on request.
-        blk["sized_deployments"] = sum(1 for d in group if d.get("ingest_source") in ("diagnostics", "k360_fallback"))
+        blk["sized_deployments"] = sum(1 for d in group if d.get("ingest_source") == "diagnostics")
         ecu_map = active_info.get("ecu_complete_month") or {}
         if use_active and ecu_map:
             blk["ecu_monthly_avg"] = round(sum(float(ecu_map.get(d["name"]) or 0) for d in group), 2)
@@ -191,32 +185,35 @@ def _rollup_solutions(out: dict, clamped_notes: list[str]) -> None:
         blk.pop("retention_months_measured", None)
         if written is not None:
             blk["retention_months"] = written
-            blk["retention_months_measured"] = round(measured, 2)
-        blk["retention_unmeasured"] = bool(daily != 0 and written is None)
-        if blk["retention_unmeasured"]:
-            clamped_notes.append(f"{sol} has bulk and no measured retention, so its sheet is not filled.")
+            if measured is not None:
+                blk["retention_months_measured"] = round(measured, 2)
+        # A one-year estimate does not need a measured age, so a solution with bulk is never skipped for lacking one.
+        blk["retention_unmeasured"] = False
         blk["gb_estimated_from_ecu_share"] = False
         blk["has_workload"] = bool(stored > 0 or daily != 0 or (blk.get("ecu_lookback") or 0))
         blk["ingest_source"] = "diagnostics"
         blk.update(_compression_fields(group))
         if sol == "observability":
-            mix = observability_mix(group)
-            blk["logs_gb_day"] = round(mix["logs_gb_day"], 2)
-            blk["metrics_gb_day"] = round(mix["metrics_gb_day"], 2)
-            blk["traces_gb_day"] = round(mix["traces_gb_day"], 2)
-            blk["k8s_logs_gb_day"] = round(mix["k8s_logs_gb_day"], 2)
-            blk["k8s_logs_share"] = mix["k8s_logs_share"]
-            blk["mix_basis"] = mix["basis"]
-            blk.pop("retention_months_metrics", None)
-            if written is not None:
-                days = mix["metrics_retention_days"]
-                blk["retention_months_metrics"] = _sheet_months(days / DAYS_PER_MONTH) if days else written
-            if mix["basis"] and daily > 0:
-                if mix["basis"] == "assumed 90/10":
-                    clamped_notes.append("Observability bulk is split 90% logs and 10% metrics. The bundles were parsed without the measured split.")
-                else:
+            try:
+                mix = observability_mix(group)
+            except ValueError as exc:
+                blk["mix_basis"] = None
+                blk["mix_error"] = str(exc)
+                clamped_notes.append(f"{exc}. Observability was not given a split.")
+                mix = None
+            if mix is not None:
+                blk["logs_gb_day"] = round(mix["logs_gb_day"], 2)
+                blk["metrics_gb_day"] = round(mix["metrics_gb_day"], 2)
+                blk["traces_gb_day"] = round(mix["traces_gb_day"], 2)
+                blk["k8s_logs_gb_day"] = round(mix["k8s_logs_gb_day"], 2)
+                blk["k8s_logs_share"] = mix["k8s_logs_share"]
+                blk["mix_basis"] = mix["basis"]
+                blk.pop("retention_months_metrics", None)
+                if written is not None:
+                    blk["retention_months_metrics"] = written
+                if mix["basis"] and daily > 0:
                     clamped_notes.append(
-                        f"Observability bulk is split as the bundles measured it ({mix['basis']}): "
+                        f"Observability bulk is split by product classification ({mix['basis']}): "
                         f"{mix['logs_gb_day'] / daily * 100:.1f}% logs ({mix['k8s_logs_share'] * 100:.1f}% of them Kubernetes), "
                         f"{mix['metrics_gb_day'] / daily * 100:.1f}% metrics, {mix['traces_gb_day'] / daily * 100:.1f}% traces."
                     )
@@ -265,15 +262,11 @@ def compressioncalc_account(acc: dict) -> dict:
     return out
 
 
-UNMEASURED_MODES = ("exclude", "k360", "fail")
+UNMEASURED_MODES = ("exclude", "fail")
 # Stored GB ÷ assumed retention is a raw rate. The estimators expand a raw rate to a metered one,
-# and bulk is written as metered, so a K360 fallback rate takes that expansion before it joins bulk.
-K360_FALLBACK_EXPANSION = {"observability": 1.595, "security": 1.66}
-
-
 def apply_diagnostics(
     acc: dict, rows: list[dict], admin_names: set[str] | None = None, *,
-    unmeasured: str = "exclude", fallback_months: float = 3.0, security_fallback_months: float | None = None,
+    unmeasured: str = "exclude",
 ) -> dict:
     """Return a deep copy whose sizing inputs are the diagnostic measurements.
 
@@ -285,9 +278,6 @@ def apply_diagnostics(
     `unmeasured` says what an active deployment with no bundle does:
 
       exclude  not sized: no ingest and no stored GB. Its K360 size is kept as `k360_gb`.
-      k360     priced from K360 stored GB and labelled `k360_fallback`. Observability and
-               Security take stored GB ÷ (`fallback_months` × 30.416) × the estimator's
-               expansion, at that assumed retention. Search keeps its K360 stored GB.
       fail     sized as `exclude`; the run stops on those names after this returns.
     """
     if unmeasured not in UNMEASURED_MODES:
@@ -309,7 +299,6 @@ def apply_diagnostics(
     matched = 0
     fallback = 0
     fallback_names: list[str] = []
-    k360_priced: list[dict] = []
     decommissioned_names: list[str] = []
     inactive = 0
     inactive_bundles: list[str] = []
@@ -402,7 +391,7 @@ def apply_diagnostics(
                 "retention_days": "diagnostics",
                 "retention_days_metrics": "diagnostics",
                 "retention_basis": "diagnostics",
-                "bulk_mix": "diagnostics" if isinstance(split, dict) else "derived_assumption",
+                "bulk_mix": "diagnostic_product_classification" if isinstance(split, dict) else "missing_product_classification",
                 "ecu": "cloud_tracker_billing",
                 "region": "cloud_tracker_infrastructure",
                 "solution": "cloud_tracker_classification",
@@ -430,31 +419,15 @@ def apply_diagnostics(
                 fallback_names.append(name)
             stored = float(dep.get("gb") or 0)
             sol = dep.get("solution") or "search"
-            if unmeasured == "k360" and stored > 0:
-                dep["ingest_source"] = "k360_fallback"
-                dep["field_sources"] = {
-                    "gb": "cloud_tracker_telemetry", "daily_raw_gb": "derived_k360_fallback",
-                    "retention_days": "assumed_fallback_policy", "ecu": "cloud_tracker_billing",
-                    "region": "cloud_tracker_infrastructure",
-                }
-                dep["daily_raw_gb"] = 0.0
-                if sol in K360_FALLBACK_EXPANSION:
-                    months = float(security_fallback_months or fallback_months) if sol == "security" else float(fallback_months)
-                    dep["daily_raw_gb"] = round(stored / (months * DAYS_PER_MONTH) * K360_FALLBACK_EXPANSION[sol], 3)
-                    dep["retention_days"] = round(months * DAYS_PER_MONTH, 3)
-                    dep["retention_basis"] = "assumed"
-                    dep["retention_label"] = f"{months:g} months assumed"
-                k360_priced.append({"name": name, "solution": sol, "stored_gb": round(stored, 2), "gb_day": dep["daily_raw_gb"]})
-            else:
-                dep["k360_gb"] = dep.get("gb")
-                dep["gb"] = 0.0
-                dep["daily_raw_gb"] = 0.0
-                dep["ingest_source"] = "active_no_bundle"
-                dep["field_sources"] = {
-                    "gb": "unmeasured_policy", "k360_gb": "cloud_tracker_telemetry",
-                    "daily_raw_gb": "unmeasured_policy", "ecu": "cloud_tracker_billing",
-                    "region": "cloud_tracker_infrastructure",
-                }
+            dep["k360_gb"] = dep.get("gb")
+            dep["gb"] = 0.0
+            dep["daily_raw_gb"] = 0.0
+            dep["ingest_source"] = "active_no_bundle"
+            dep["field_sources"] = {
+                "gb": "unmeasured_policy", "k360_gb": "cloud_tracker_telemetry",
+                "daily_raw_gb": "unmeasured_policy", "ecu": "cloud_tracker_billing",
+                "region": "cloud_tracker_infrastructure",
+            }
 
     ech = _ech_rows(out)
     clamped_notes: list[str] = []
@@ -477,9 +450,13 @@ def apply_diagnostics(
         ]
     st["data_stored_gb"] = stored_total
     st["data_stored_tb"] = round(stored_total / 1024, 2)
-    # Search ingest is the org's docs/s × search store ÷ org store. The org rate covers every
-    # deployment that billed, so the denominator keeps the K360 size of the ones left unsized.
-    st["ingest_share_store_gb"] = round(sum(float(d.get("gb") or 0) + float(d.get("k360_gb") or 0) for d in ech), 2)
+    # Diagnostic quotes allocate org Search docs/s using only diagnostic local store.
+    # K360 sizes retained on unsized deployments are context only and cannot change an estimate.
+    st["ingest_share_store_gb"] = stored_total
+    st.setdefault("field_sources", {}).update({
+        "data_stored_gb": "diagnostics",
+        "ingest_share_store_gb": "diagnostic_local_primary_store_sum",
+    })
     by_name = {d["name"]: d for d in ech}
     for row in st.get("by_deployment") or []:
         row["field_sources"] = {
@@ -499,6 +476,10 @@ def apply_diagnostics(
     if _store > 0 and all(share is not None for _gb, share in _known):
         blended_share = round(sum(gb * (1.0 - float(share)) for gb, share in _known) / _store, 4)
     active_rows = [r for r in rows if r.get("name") in used and r.get("name") not in inactive_bundles]
+    assumed_retention_rows = [
+        {"name": r.get("name"), "basis": r.get("retention_basis")}
+        for r in active_rows if r.get("retention_basis") in ("assumed", "blended")
+    ]
     bulk_sum = sum(float(r.get("bulk_gb_day") or 0) for r in active_rows)
     accounted_sum, share = _accounted_from_bulk(bulk_sum)
     active_store = sum(float(r.get("store_gb") or 0) for r in active_rows)
@@ -516,11 +497,9 @@ def apply_diagnostics(
     coverage = {
         "bundles": len(rows),
         "matched": matched,
-        "k360_fallback": fallback,
+        "missing_diagnostics": fallback,
         "fallback_names": fallback_names[:12],
         "unmeasured_mode": unmeasured,
-        "k360_priced": k360_priced[:12],
-        "k360_priced_gb_day": round(sum(float(row["gb_day"] or 0) for row in k360_priced), 3),
         "decommissioned": len(decommissioned_names),
         "decommissioned_names": decommissioned_names[:12],
         "unmatched_diagnostics": unmatched_diags[:12],
@@ -531,6 +510,7 @@ def apply_diagnostics(
         "store_gb": round(sum(float(r.get("store_gb") or 0) for r in rows if r.get("name") in used and r.get("name") not in inactive_bundles), 2),
         "snapshot_gb": round(snapshot_gb, 2),
         "retention_unmeasured": no_age,
+        "retention_30d_assumed": assumed_retention_rows[:12],
         "unrated": unrated,
         "bulk_short_window_gb_day": round(sum(float(r.get("bulk_short_window_gb_day") or 0) for r in active_rows), 3),
         "bulk_fallback_gb_day": round(sum(float(r.get("bulk_fallback_gb_day") or 0) for r in active_rows), 3),
@@ -541,7 +521,7 @@ def apply_diagnostics(
             for r in sorted(active_rows, key=lambda r: -float(r.get("bulk_restart_gb_day") or 0))
             if float(r.get("bulk_restart_gb_day") or 0) > 0
         ][:8],
-        # Share of local store whose retention is set by a delete policy. The rest is blended in at its own age.
+        # Share of local store whose retention is set by a delete policy. The rest uses the 30-day default.
         "retention_blended_share": blended_share,
         "retention_clamped": clamped_notes,
         "active_month": active_info.get("month"),
@@ -564,6 +544,7 @@ def apply_diagnostics(
             "solutions.by_deployment.retention_days and retention_days_metrics",
             "measured Observability bulk mix",
             "storage.data_stored_gb and matched storage.by_deployment[].data_stored_gb",
+            "storage.ingest_share_store_gb (diagnostic local store only; K360 sizes excluded)",
             "sizing.consolidated store, bulk, and retention aggregates",
         ],
         "cloud_tracker_authoritative": [
@@ -572,8 +553,8 @@ def apply_diagnostics(
             "Search QPS, ingest docs/s, active hours, and average document size",
             "cloud provider, region, tiers, and deployment metadata",
         ],
-        "fallback_only": [
-            "Cloud Tracker stored GB for a missing bundle only when --unmeasured k360 is selected",
+        "cloud_tracker_context_only": [
+            "solutions.by_deployment.k360_gb (unmeasured deployment size; excluded from diagnostic estimator inputs)",
         ],
     }
     limitations = []
@@ -581,22 +562,21 @@ def apply_diagnostics(
         limitations.append({"code": "missing_diagnostics", "count": fallback, "names": fallback_names[:12], "severity": "high"})
     if no_age:
         limitations.append({"code": "retention_unmeasured", "count": len(no_age), "names": [r["name"] for r in no_age[:12]], "severity": "medium"})
+    if assumed_retention_rows:
+        limitations.append({"code": "retention_30d_assumed", "count": len(assumed_retention_rows), "names": [r["name"] for r in assumed_retention_rows[:12]], "severity": "medium"})
     if short:
         limitations.append({"code": "short_diagnostic_window", "count": len(short), "deployments": short[:12], "severity": "medium"})
     if float(coverage.get("bulk_fallback_gb_day") or 0) > 0:
         limitations.append({"code": "bulk_rate_fallback", "bulk_gb_day": coverage["bulk_fallback_gb_day"], "severity": "medium"})
     if unrated and unrated.get("indices"):
         limitations.append({"code": "unrated_ingest", "indices": unrated["indices"], "store_gb": unrated["store_gb"], "severity": "high"})
-    if (con.get("observability") or {}).get("mix_basis") == "assumed 90/10":
-        limitations.append({"code": "assumed_observability_mix", "basis": "assumed 90/10", "severity": "medium"})
     coverage["source_precedence"] = source_precedence
     coverage["estimation_limits"] = limitations
     notes = [
         "Ingest GB/day is the write-index sum of index.primaries.bulk.est_bytes_per_day from the Elasticsearch diagnostic bundle. "
-        "Retention is the size-weighted ILM delete age on local primary store, or the oldest index age when no delete policy covers that store, rounded up to a whole month for the estimator. "
-        "A bundle with no measured age is left out of that average. "
-        "Those two are summed by solution and by region. Search disk is the local diagnostic store. "
-        "Search query rates stay the K360 workload window. ECH ECU stays the K360 bill.",
+        "Retention is the size-weighted ILM delete age on local primary store, or an explicit 30-day assumption for store without a delete policy or data-stream retention, rounded up to a whole month for the estimator. "
+        "Those two are summed by solution and by region. Search disk and the Search ingest-share denominator use diagnostic local store only; K360 stored sizes are excluded from the diagnostic estimate. "
+        "Search query rates use exact-window Cloud Tracker index telemetry. ECH ECU stays the K360 bill.",
     ]
     if short:
         names = ", ".join(f"{s['name']} ({s['uptime_days']}d)" for s in short[:8])
@@ -633,23 +613,16 @@ def apply_diagnostics(
         adds = "It adds" if fallback == 1 else "They add"
         shown = ", ".join(fallback_names[:8])
         named = f" ({shown})" if shown else ""
-        if k360_priced:
-            gb_day = sum(float(row["gb_day"] or 0) for row in k360_priced)
-            notes.append(
-                f"{fallback} active {noun} {verb} no diagnostic bundle{named}. {len(k360_priced)} of them are priced from K360 stored GB "
-                f"(--unmeasured k360): stored GB ÷ assumed retention × the estimator's expansion, {gb_day:,.1f} GB/day in all. "
-                "That is not a measured rate, and it is why Bundle coverage is flagged."
-            )
-        else:
-            notes.append(
-                f"{fallback} active {noun} {verb} no diagnostic bundle{named}. {adds} no ingest and no stored GB to the estimate. "
-                "Pass --unmeasured k360 to price them from K360 stored GB, or --unmeasured fail to stop the run."
-            )
+        notes.append(
+            f"{fallback} active {noun} {verb} no diagnostic bundle{named}. {adds} no ingest and no stored GB to the estimate. "
+            "Pass --unmeasured fail to stop the run."
+        )
     if blended_share is not None and blended_share > 0.10:
         notes.append(
-            f"{blended_share * 100:.0f}% of local store has no delete policy or data stream retention. It is taken at its own age, "
-            "which is how long that data has been kept so far, so the written month is a floor for it."
+            f"{blended_share * 100:.0f}% of local store has no delete policy or data-stream retention. That share uses the 30-day assumed default, not an observed retention duration."
         )
+    elif assumed_retention_rows:
+        notes.append("No delete policy or data-stream retention was available for some local store; its retention uses the 30-day assumed default.")
     restart_gb = sum(float(r.get("bulk_restart_gb_day") or 0) for r in rows if r.get("name") in used and r.get("name") not in inactive_bundles)
     if restart_gb > 0 and bulk_sum > 0 and restart_gb / bulk_sum > 0.05:
         notes.append(
@@ -702,7 +675,7 @@ def main() -> None:
     from privacy import seal_text
     seal_text(Path(args.out), json.dumps(out, indent=2))
     cov = out["sizing"]["diagnostics"]
-    print(f"wrote {args.out} matched={cov['matched']} fallback={cov['k360_fallback']} bulk={cov['bulk_gb_day']} GB/day")
+    print(f"wrote {args.out} matched={cov['matched']} missing_diagnostics={cov['missing_diagnostics']} bulk={cov['bulk_gb_day']} GB/day")
 
 
 if __name__ == "__main__":

@@ -367,17 +367,14 @@ def _zip_json(archive: zipfile.ZipFile, suffix: str):
 def _retention_label(parts: list[dict], basis: str | None) -> str | None:
     if not parts:
         return None
-    if basis == "observed":
-        days = parts[0]["days"]
-        if days < 1:
-            return "<1 day"
-        return f"{round(days):,} days observed"
+    if basis == "assumed":
+        return f"{round(parts[0]['days']):,} days assumed"
     if parts[0]["pct"] >= 75:
         n = round(parts[0]["days"])
         label = "1 day" if n == 1 else f"{n:,} days"
     else:
         label = " · ".join(f"{round(p['days'])}d ({p['pct']:.0f}%)" for p in parts[:3])
-    return label + (" (part observed)" if basis == "blended" else "")
+    return label + (" (part assumed)" if basis == "blended" else "")
 
 
 def _est_bytes_per_day(bulk_bytes: int, creation: int | None, lifecycle: int | None, action: str | None, collection: int) -> int:
@@ -800,10 +797,7 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
     local = 0.0
     dataset = 0.0
     snapshot = 0.0
-    observed: list[float] = []
-    blended_bytes = 0.0       # store with no delete policy, taken at its own age
-    blended_age_bytes = 0.0
-    captured_ms = captured.timestamp() * 1000
+    blended_bytes = 0.0       # store with no configured retention, priced at the 30-day default
     for ix, body in stats.items():
         store = ((body.get("primaries") or {}).get("store") or {})
         measured = quoted_index_bytes(ix, store)
@@ -819,23 +813,14 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         age = delete_age.get(info.get("policy")) if info.get("managed") else None
         if age is None:
             age = ds_age.get(ix)
-        ms = created.get(ix) or info.get("index_creation_date_millis")
-        own_age = None
-        if ms:
-            own_age = (captured_ms - int(ms)) / 86_400_000
-        else:
-            own_age = _parse_age(info.get("time_since_index_creation"))
-        if own_age is not None and own_age > 0:
-            observed.append(own_age)
         if age is None:
-            # No delete policy covers this index. Its own age is the best evidence of how long
-            # that data is kept, so it joins the weighted age at that age, by its size.
+            # No delete policy covers this index. Use the explicit 30-day default rather than
+            # treating historical index age as the customer's retention setting.
             unknown += nbytes
-            if own_age is not None and own_age > 0:
-                blended_bytes += nbytes
-                blended_age_bytes += own_age * nbytes
-                by_age[round(own_age, 3)] += nbytes
-                age = own_age
+            default_age = 30.0
+            blended_bytes += nbytes
+            by_age[default_age] += nbytes
+            age = default_age
         else:
             by_age[round(age, 3)] += nbytes
         if age is not None and ingest_kind(series_of.get(ix) or ix, index_mode.get(ix)) == "metrics":
@@ -850,17 +835,15 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
     if covered > 0:
         for age, nbytes in sorted(by_age.items(), key=lambda kv: -kv[1]):
             parts.append({"days": age, "pct": round(100 * nbytes / covered, 1)})
-    observed_days = max(observed) if observed else None
     if weighted and known > 0 and blended_bytes > 0:
         basis, days = "blended", weighted
     elif weighted and known > 0:
         basis, days = "policy", weighted
+    elif weighted and blended_bytes > 0:
+        basis, days = "assumed", weighted
+        parts = [{"days": round(weighted, 1), "pct": 100.0, "basis": "assumed"}]
     elif weighted:
-        basis, days = "observed", weighted
-        parts = [{"days": round(weighted, 1), "pct": 100.0, "basis": "observed"}]
-    elif observed_days and observed_days > 0:
-        basis, days = "observed", observed_days
-        parts = [{"days": round(observed_days, 1), "pct": 100.0, "basis": "observed"}]
+        basis, days = "policy", weighted
     else:
         basis, days = None, None
     return {
@@ -874,7 +857,7 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         "retention_days_metrics": round(metrics_age_bytes / metrics_bytes, 3) if metrics_bytes > 0 else None,
         "retention_basis": basis,
         # Share of local store whose age a delete policy or data stream sets. The rest is taken at
-        # its own age (blended) and is what the age would be if nothing were ever deleted.
+        # the 30-day default (assumed) because no retention policy covers it.
         "retention_known_share": None if known_share is None else round(known_share, 4),
         "retention_label": _retention_label(parts, basis),
         "store_gb": round(local / 1e9, 2),

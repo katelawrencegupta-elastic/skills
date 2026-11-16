@@ -104,6 +104,35 @@ def echo_gate(written_bulk: float, sheet_raw) -> dict:
     }
 
 
+def observability_echo_gate(mix: dict | None, readback: dict | None) -> dict:
+    """Accept a diagnostic Observability sheet only when G19 and G20 each echo.
+
+    G19 is the GB/day the sheet priced for logs plus traces. G20 is metrics.
+    Each cell uses the same tolerance as a single echo. A blank cell fails that
+    cell. A swap that keeps the same total fails.
+    """
+    mix = mix or {}
+    readback = readback or {}
+    written_logs = float(mix.get("logs_gb_day") or 0) + float(mix.get("traces_gb_day") or 0)
+    written_metrics = float(mix.get("metrics_gb_day") or 0)
+    logs = echo_gate(written_logs, readback.get("metered_ex_metrics_gb_day"))
+    metrics = echo_gate(written_metrics, readback.get("metered_metrics_gb_day"))
+    sheet_sum = None
+    if logs["sheet_gb_day"] is not None and metrics["sheet_gb_day"] is not None:
+        sheet_sum = round(logs["sheet_gb_day"] + metrics["sheet_gb_day"], 3)
+    written_sum = round(logs["written_bulk"] + metrics["written_bulk"], 3)
+    return {
+        "written_bulk": written_sum,
+        "sheet_gb_day": sheet_sum,
+        "tolerance": round(echo_tolerance(written_sum), 4),
+        "accepted": bool(logs["accepted"] and metrics["accepted"]),
+        "written_logs_traces": logs["written_bulk"],
+        "written_metrics": metrics["written_bulk"],
+        "sheet_logs_traces": logs["sheet_gb_day"],
+        "sheet_metrics": metrics["sheet_gb_day"],
+    }
+
+
 def _integrity_row(name: str, score, passed, detail: str) -> dict:
     return {
         "check": name,
@@ -155,14 +184,22 @@ def _sheet_echo(observability: dict, security: dict, regional: list[dict] | None
     passes: list[bool] = []
     bits: list[str] = []
     if observability.get("has_workload") and observability.get("sheet_read"):
-        _echo_component("The sheet", observability.get("written_bulk"), observability.get("sheet_raw"), parts, passes, bits)
+        if observability.get("cell_echo"):
+            _echo_component("Observability logs and traces", observability.get("written_logs_traces"), observability.get("sheet_logs_traces"), parts, passes, bits)
+            _echo_component("Observability metrics", observability.get("written_metrics"), observability.get("sheet_metrics"), parts, passes, bits)
+        else:
+            _echo_component("The sheet", observability.get("written_bulk"), observability.get("sheet_raw"), parts, passes, bits)
     if security.get("has_workload") and security.get("sheet_read"):
         if "sheet_raw" in security:
             _echo_component("The Security sheet (G5)", security.get("written_bulk"), security.get("sheet_raw"), parts, passes, bits)
         _e73_component("", security.get("e73"), parts, passes, bits)
     for sheet in regional or []:
         where = f"{str(sheet.get('solution') or '').title()} {sheet.get('region') or ''}".strip()
-        _echo_component(f"{where}", sheet.get("written_bulk"), sheet.get("sheet_raw"), parts, passes, bits)
+        if sheet.get("cell_echo"):
+            _echo_component(f"{where} logs and traces", sheet.get("written_logs_traces"), sheet.get("sheet_logs_traces"), parts, passes, bits)
+            _echo_component(f"{where} metrics", sheet.get("written_metrics"), sheet.get("sheet_metrics"), parts, passes, bits)
+        else:
+            _echo_component(f"{where}", sheet.get("written_bulk"), sheet.get("sheet_raw"), parts, passes, bits)
         if sheet.get("solution") == "security":
             _e73_component(f"{where} ", sheet.get("e73"), parts, passes, bits)
     if not parts:
@@ -191,6 +228,22 @@ def _coverage_row(coverage: dict | None) -> dict:
     if names:
         detail += " Missing: " + ", ".join(names) + "."
     return _integrity_row("Bundle coverage", score, passed, detail)
+
+
+def _eis_completeness_row(eis: dict | None) -> dict:
+    """EIS dollars are allowed only from complete filtered totals."""
+    if not eis or eis.get("status") == "not_applicable":
+        return _integrity_row("Search EIS data", None, None, "No quotable Search EIS estimate applies.")
+    status = eis.get("status")
+    if status == "complete":
+        basis = eis.get("usage_basis") or "verified deployment totals"
+        if basis == "quote_window_daily":
+            detail = f"Daily SKU data reconciles to complete deployment totals over {int(eis.get('usage_days') or 0)} quote-window days."
+        else:
+            return _integrity_row("Search EIS data", 0.0, False, "EIS lacks exact quote-window daily telemetry.")
+        return _integrity_row("Search EIS data", 1.0, True, detail)
+    reason = str(eis.get("reason") or "filtered deployment totals are incomplete")
+    return _integrity_row("Search EIS data", 0.0, False, f"EIS was not priced: {reason}.")
 
 
 def _retention_row(coverage: dict | None) -> dict:
@@ -241,6 +294,9 @@ def _rated_row(coverage: dict | None) -> dict:
 
 def _priced_row(priced: dict | None) -> dict:
     """Share of the ECH deployments' billed cost that belongs to deployments with a serverless price."""
+    if priced and priced.get("status") == "unavailable":
+        reason = str(priced.get("reason") or "daily per-deployment billing could not be verified")
+        return _integrity_row("Priced share", 0.0, False, f"Daily deployment billing is unavailable or unreconciled: {reason}.")
     if not priced or priced.get("share_pct") is None:
         return _integrity_row("Priced share", None, None, "This run has no per-deployment billing to split.")
     share = min(max(float(priced["share_pct"]), 0.0), 100.0)
@@ -402,6 +458,7 @@ def integrity_score(facts: dict) -> dict:
         _direct_row(list(facts.get("solutions") or [])),
         _line_row(facts.get("headline_monthly"), list(facts.get("lines") or [])),
         _year_row(list(facts.get("lines") or [])),
+        _eis_completeness_row(facts.get("eis")),
     ]
     scored_rows = [row for row in checks if row["score"] is not None]
     scored = [row["score"] for row in scored_rows]

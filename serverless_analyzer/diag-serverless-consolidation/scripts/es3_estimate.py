@@ -177,26 +177,59 @@ def search_workloads(workload: dict, assumptions: list[str]) -> list[dict]:
     ]
 
 
-def ingest_workloads(workload: dict, stored_gb: float, org_gb: float, assumptions: list[str]) -> list[dict]:
+def workload_share(stored_gb: float, org_gb: float) -> float:
+    """Share of org-wide index telemetry that belongs to one Search project.
+
+    The numerator is that project's diagnostic search store. The denominator is
+    diagnostic org store, the store the telemetry actually covers. A missing org
+    store keeps the whole telemetry on the project. The result is clamped to 0–1.
+    """
+    stored = max(float(stored_gb or 0), 0.0)
+    org = max(float(org_gb or 0), 0.0)
+    if not org or not stored:
+        return 1.0
+    return min(max(stored / org, 0.0), 1.0)
+
+
+def scale_search_workload(workload: dict, share: float) -> dict:
+    """Copy of the org workload with docs/s and both QPS bands multiplied by `share`."""
+    wl = json.loads(json.dumps(workload or {}))
+    factor = float(share)
+    search = dict(wl.get("search") or {})
+    for band in ("peak", "nonpeak"):
+        band_row = dict(search.get(band) or {})
+        if band_row.get("qps") is not None:
+            band_row["qps"] = round(float(band_row["qps"]) * factor, 4)
+        if band_row:
+            search[band] = band_row
+    if search:
+        wl["search"] = search
+    ingest = dict(wl.get("ingest") or {})
+    if ingest.get("docs_per_sec") is not None:
+        ingest["docs_per_sec"] = round(float(ingest["docs_per_sec"]) * factor, 4)
+        wl["ingest"] = ingest
+    return wl
+
+
+def ingest_workloads(workload: dict, assumptions: list[str]) -> list[dict]:
+    """Ingest inputs. Docs/s is already the project's share of the org rate."""
+    del assumptions
     ingest = (workload or {}).get("ingest") or {}
+    telemetry = (workload or {}).get("quote_window_telemetry") or {}
+    if telemetry.get("status") != "complete":
+        raise ValueError(
+            "Search estimate requires Cloud Tracker index telemetry covering the exact billed quote window: "
+            + str(telemetry.get("reason") or "quote-window telemetry was not verified")
+        )
     dps = ingest.get("docs_per_sec")
     avg = ingest.get("avg_doc_bytes")
     if not dps or not avg or float(dps) <= 0 or float(avg) <= 0:
-        assumptions.append(
-            "Ingest omitted: docs/s or average document size is missing, so ingest $ is 0."
-        )
-        return []
-    share = (stored_gb / org_gb) if org_gb and stored_gb else 1.0
-    share = min(max(share, 0.0), 1.0)
-    if org_gb and stored_gb and share < 1:
-        assumptions.append(
-            f"Ingest docs/s scaled by the search share of stored GB ({share:.3f}). QPS is not scaled."
-        )
+        raise ValueError("Search estimate requires measured docs/s and average document size from Cloud Tracker telemetry")
     active = ingest.get("active_hours_mo")
     hours = MONTHLY_HOURS if active is None else min(MONTHLY_HOURS, max(0.0, float(active)))
     return [
         {
-            "docs_per_sec": round(float(dps) * share, 4),
+            "docs_per_sec": round(float(dps), 4),
             "avg_doc_size_bytes": float(avg),
             "active_hours_per_month": round(hours, 2),
         }
@@ -211,6 +244,12 @@ def build_user_info(payload: dict, pricing: dict, support_matrix: dict) -> tuple
     ]
     stored = max(float(payload.get("stored_gb") or 0), 0.0)
     org_gb = max(float(payload.get("org_stored_gb") or 0), 0.0)
+    share = workload_share(stored, org_gb)
+    workload = scale_search_workload(payload.get("workload") or {}, share)
+    if org_gb and stored and share < 1:
+        assumptions.append(
+            f"Docs/s and QPS scaled by this project's share of diagnostic org store ({share:.3f})."
+        )
     provider = match_provider(payload.get("provider"), pricing)
     if provider is None:
         provider = "AWS"
@@ -235,8 +274,8 @@ def build_user_info(payload: dict, pricing: dict, support_matrix: dict) -> tuple
         "CLOUD_PROVIDER": provider,
         "REGION": region,
         "SUPPORT_LEVEL": support,
-        "SEARCH_CONFIG": {"workloads": search_workloads(payload.get("workload") or {}, assumptions)},
-        "INGEST_CONFIG": {"workloads": ingest_workloads(payload.get("workload") or {}, stored, org_gb, assumptions)},
+        "SEARCH_CONFIG": {"workloads": search_workloads(workload, assumptions)},
+        "INGEST_CONFIG": {"workloads": ingest_workloads(workload, assumptions)},
         "TEXT_CONFIG": {"disk_storage_gb": stored},
         "VECTOR_CONFIG": {"num_docs": 0, "dims": 0, "compression": "none"},
         "TS_CONFIG": {"ingest_per_day_gb": 0, "boost_window_days": 0, "retention_days": 0},

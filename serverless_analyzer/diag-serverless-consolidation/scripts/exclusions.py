@@ -4,13 +4,12 @@ An excluded deployment is out of everything: billing ECU (and so the ECH bill on
 diagnostic bulk, stored GB, the deployment count, the plan ceiling, and the estimate sheets.
 
 Ids map to names through the diagnostic manifest (`manifest.json`, written by the admin pull)
-or the admin deployment listing. Billing is monthly per deployment, so the ECU removed from a
-day is that deployment's share of its month's org ECU. The brief and page 1 say so.
+or the admin deployment listing. Excluded billing is removed from direct daily Cloud Tracker
+deployment costs. If those costs are unavailable, the deployment scope is marked incomplete.
 """
 from __future__ import annotations
 
 import re
-from datetime import date
 
 ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 
@@ -75,24 +74,6 @@ def manifest_names(manifest_rows: list[dict]) -> dict[str, str]:
     return {str(r.get("id")).lower(): r.get("name") for r in manifest_rows or [] if r.get("id") and r.get("name")}
 
 
-def _month_keep(acc: dict, org: dict, names: set[str]) -> dict[str, float]:
-    """Share of each month's org ECU that stays after the excluded deployments are removed."""
-    totals = ((acc.get("ecu") or {}).get("monthly") or {})
-    months = list(totals.get("months") or [])
-    org_dep = ((org or {}).get("monthly") or {}).get("by_deployment") or {}
-    removed = {m: 0.0 for m in months}
-    for name in names:
-        series = org_dep.get(name) or {}
-        for m, v in zip(series.get("months") or [], series.get("ecu") or []):
-            if m in removed:
-                removed[m] += float(v or 0)
-    keep: dict[str, float] = {}
-    for m, tot in zip(months, totals.get("totals") or []):
-        tot = float(tot or 0)
-        keep[m] = max(0.0, 1.0 - removed.get(m, 0.0) / tot) if tot > 0 else 1.0
-    return keep
-
-
 def _mean(values: list[float]) -> float:
     return sum(values) / len(values) if values else 0.0
 
@@ -101,11 +82,30 @@ def apply_exclusions(acc: dict, org: dict, excluded: list[dict]) -> dict:
     """Remove the excluded deployments from the account in place. Returns the record kept in the brief."""
     names = {e["name"] for e in excluded}
     ecu = acc.setdefault("ecu", {})
-    keep = _month_keep(acc, org, names)
+    dep_daily = ecu.get("daily_deployment_costs") or {}
+    daily_labels = list(dep_daily.get("days") or [])
+    daily_by_deployment = dep_daily.get("by_deployment") or {}
+    daily_exact = bool(dep_daily.get("complete")) and len(dep_daily.get("org_daily_totals") or []) == len(daily_labels) and all(
+        name not in daily_by_deployment or len(daily_by_deployment[name] or []) == len(daily_labels) for name in names
+    )
     months = list((ecu.get("monthly") or {}).get("months") or [])
     partial = set((ecu.get("monthly") or {}).get("partial_months") or [])
     old_totals = [float(v or 0) for v in (ecu.get("monthly") or {}).get("totals") or []]
-    new_totals = [round(t * keep.get(m, 1.0), 2) for m, t in zip(months, old_totals)]
+    org_monthly = ((org or {}).get("monthly") or {}).get("by_deployment") or {}
+    month_removed = {m: 0.0 for m in months}
+    for name in names:
+        series = org_monthly.get(name) or {}
+        for month, value in zip(series.get("months") or [], series.get("ecu") or []):
+            if month in month_removed:
+                month_removed[month] += float(value or 0)
+    if daily_exact:
+        month_removed = {month: 0.0 for month in months}
+        for name in names:
+            values = daily_by_deployment.get(name) or [0.0] * len(daily_labels)
+            for day, value in zip(daily_labels, values):
+                if day[:7] in month_removed:
+                    month_removed[day[:7]] += float(value or 0)
+    new_totals = [round(max(0.0, t - month_removed.get(m, 0.0)), 2) for m, t in zip(months, old_totals)]
     removed_ecu = round(sum(old_totals) - sum(new_totals), 2)
     if new_totals:
         ecu["monthly"]["totals"] = new_totals
@@ -137,7 +137,26 @@ def apply_exclusions(acc: dict, org: dict, excluded: list[dict]) -> dict:
     days = list(ecu.get("daily_days") or [])
     daily = [float(v or 0) for v in ecu.get("daily_totals") or []]
     if days and len(days) == len(daily):
-        daily = [round(v * keep.get(d[:7], 1.0), 2) for d, v in zip(days, daily)]
+        by_deployment = daily_by_deployment
+        labels_idx = {day: i for i, day in enumerate(daily_labels)}
+        if daily_exact and all(day in labels_idx for day in days):
+            removed_by_day = {
+                day: sum(float((by_deployment.get(name) or [0] * len(daily_labels))[labels_idx[day]] or 0) for name in names)
+                for day in days
+            }
+            daily = [round(max(0.0, value - removed_by_day[day]), 2) for day, value in zip(days, daily)]
+            dep_daily["by_deployment"] = {name: values for name, values in by_deployment.items() if name not in names}
+            org_daily = dep_daily.get("org_daily_totals") or []
+            if len(org_daily) == len(daily_labels):
+                dep_daily["org_daily_totals"] = [
+                    round(max(0.0, float(org_daily[i] or 0) - sum(float((by_deployment.get(name) or [0] * len(daily_labels))[i] or 0) for name in names)), 6)
+                    for i in range(len(daily_labels))
+                ]
+        else:
+            status = dep_daily.setdefault("status", {})
+            status["complete"] = False
+            status["reason"] = "excluded deployments could not be removed from a complete daily deployment billing series"
+            dep_daily["complete"] = False
         ecu["daily_totals"] = daily
         active = [v for v in daily if v > 0]
         ecu["daily_avg"] = round(_mean(daily), 2)
@@ -177,7 +196,7 @@ def apply_exclusions(acc: dict, org: dict, excluded: list[dict]) -> dict:
     record = {
         "deployments": [dict(e) for e in excluded],
         "ecu_removed_over_lookback": removed_ecu,
-        "method": "Each excluded deployment's billed ECU for a month ÷ the org's ECU for that month, removed from every day in that month.",
+        "method": "Excluded deployment costs are subtracted from direct daily and monthly Cloud Tracker deployment billing when available.",
     }
     acc.setdefault("meta", {})["excluded_deployments"] = record
     return record

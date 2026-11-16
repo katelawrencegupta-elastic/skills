@@ -108,6 +108,51 @@ def _quote_account(*, g28: float, e73, observability_monthly: float = 100) -> di
     }
 
 
+def _stamp_reconciled_billing(acc: dict) -> None:
+    """One billed day with no deployments, so priced share is unscored rather than failed."""
+    day = "2026-11-01"
+    ecu = acc.setdefault("ecu", {})
+    ecu["quote_lookback_days"] = 1
+    ecu["daily_days"] = [day]
+    ecu["daily_totals"] = [1.0]
+    ecu["daily_deployment_costs"] = {
+        "complete": True,
+        "days": [day],
+        "org_daily_totals": [1.0],
+        "by_deployment": {},
+        "status": {"complete": True},
+    }
+
+
+def _stamp_search_eis(acc: dict, name: str, *, eis: float, tokens: float, ml: float) -> None:
+    """One reconciled quote-window day of Search inference billing, plus complete telemetry."""
+    day = "2026-11-01"
+    _stamp_reconciled_billing(acc)
+    acc["workload"] = {"quote_window_telemetry": {"status": "complete"}}
+    acc["ai_ml"] = {
+        "billing_by_deployment_complete": True,
+        "billing_by_deployment": {
+            name: {"eis_ecu": eis, "million_tokens": tokens, "ml_node_ecu": ml},
+        },
+        "daily_usage_complete": True,
+        "daily_usage_by_deployment": {
+            name: {
+                "days": [day],
+                "eis_ecu": [eis],
+                "million_tokens": [tokens],
+                "ml_node_ecu": [ml],
+                "models": [["jina-embeddings-v3"]],
+            },
+        },
+        "by_deployment": [{
+            "name": name,
+            "ml_node_ecu": ml,
+            "models": ["jina-embeddings-v3"],
+            "model_labels": ["Jina"],
+        }],
+    }
+
+
 class StoreTests(unittest.TestCase):
     def test_partial_and_system_indexes_are_not_quoted(self):
         self.assertFalse(_user_index("partial-logs"))
@@ -218,7 +263,7 @@ class RetentionTests(unittest.TestCase):
         observability = out["sizing"]["consolidated"]["observability"]
         search = out["sizing"]["consolidated"]["search"]
         security = out["sizing"]["consolidated"]["security"]
-        self.assertEqual(observability["retention_months"], 1)
+        self.assertEqual(observability["retention_months"], 12)   # one-year estimate, not the measured age
         self.assertEqual(observability["stored_gb"], 9.0)
         self.assertEqual(out["sizing"]["diagnostics"]["retention_unmeasured"], [
             {"name": "beta", "bulk_gb_day": 10.0},
@@ -230,8 +275,10 @@ class RetentionTests(unittest.TestCase):
         rows[0]["retention_days"] = None
         bare = apply_diagnostics(acc, rows)
         block = bare["sizing"]["consolidated"]["observability"]
-        self.assertNotIn("retention_months", block)
-        self.assertTrue(block["retention_unmeasured"])
+        # A one-year estimate does not need a measured age: bulk with none is still written at 12 months.
+        self.assertEqual(block["retention_months"], 12)
+        self.assertNotIn("retention_months_measured", block)
+        self.assertFalse(block["retention_unmeasured"])
 
 
 class GateTests(unittest.TestCase):
@@ -280,7 +327,9 @@ class GateTests(unittest.TestCase):
         self.assertIn("1 deployment with no bill", overhead["detail"])
 
     def test_readback_keeps_written_bulk_and_clears_unit_rates(self):
-        quoted = build_consolidation(_quote_account(g28=10.01, e73=0), None)
+        account = _quote_account(g28=10.01, e73=0)
+        _stamp_reconciled_billing(account)
+        quoted = build_consolidation(account, None)
         observability = quoted["serverless"]["by_solution"]["observability"]
         security = quoted["serverless"]["by_solution"]["security"]
         self.assertIn("quotable", observability["pricing"])
@@ -303,6 +352,7 @@ class GateTests(unittest.TestCase):
         self.assertIn("Quote integrity 0.958", page)
         self.assertIn(">Pass<", page)
         bare = _quote_account(g28=10, e73=0)
+        _stamp_reconciled_billing(bare)
         bare["sizing"]["estimators"]["search"] = {"status": "skipped"}
         bare["storage"]["data_stored_gb"] = 100
         unpriced = build_consolidation(bare, None)
@@ -310,6 +360,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(unpriced["savings"]["serverless_mo"], 180)
         self.assertEqual([row["monthly"] for row in quoted["deployment_plan"]], [40, 100])
         skipped = _quote_account(g28=10, e73=0)
+        _stamp_reconciled_billing(skipped)
         skipped["sizing"]["estimators"]["search"] = {"status": "skipped — no search workload detected"}
         skipped["storage"]["data_stored_gb"] = 100
         skipped["workload"] = {"search": {"peak": {"qps": 50}}}
@@ -337,7 +388,9 @@ class GateTests(unittest.TestCase):
         self.assertFalse(row["passed"])
 
     def test_g28_miss_and_nonzero_e73_leave_the_solution_unquoted(self):
-        missed = build_consolidation(_quote_account(g28=10.03, e73=0), None)
+        missed_account = _quote_account(g28=10.03, e73=0)
+        _stamp_reconciled_billing(missed_account)
+        missed = build_consolidation(missed_account, None)
         observability = missed["serverless"]["by_solution"]["observability"]
         self.assertTrue(observability["pricing"].startswith("rejected"))
         self.assertEqual(observability["total_mo"], 0)
@@ -351,7 +404,9 @@ class GateTests(unittest.TestCase):
             blank_security = blanked["serverless"]["by_solution"]["security"]
             self.assertTrue(blank_security["pricing"].startswith("rejected"))
             self.assertEqual(blank_security["total_mo"], 0)
-        kept = build_consolidation(_quote_account(g28=10, e73=0), None)
+        kept_account = _quote_account(g28=10, e73=0)
+        _stamp_reconciled_billing(kept_account)
+        kept = build_consolidation(kept_account, None)
         self.assertIn("quotable", kept["serverless"]["by_solution"]["security"]["pricing"])
         self.assertFalse(missed["integrity"]["passed"])
         self.assertFalse(blanked["integrity"]["passed"])
@@ -477,7 +532,7 @@ class GateTests(unittest.TestCase):
         rows = [{"name": "Has-Bundle", "store_gb": 1, "bulk_gb_day": 2, "retention_days": 30}]
         out = apply_diagnostics(acc, rows)
         coverage = out["sizing"]["diagnostics"]
-        self.assertEqual(coverage["k360_fallback"], 1)
+        self.assertEqual(coverage["missing_diagnostics"], 1)
         self.assertEqual(coverage["fallback_names"], ["Secretsmanagement-Prod"])
         self.assertTrue(any("Secretsmanagement-Prod" in note for note in out["sizing"]["notes"]))
 
@@ -535,82 +590,21 @@ class DeploymentCountTests(unittest.TestCase):
         }
         self.assertEqual([row["name"] for row in plan_roster(acc)], ["a", "b"])
 
-    def test_floor_section_names_projects_under_ten_dollars(self):
-        from consolidation import _replicate_by_region
-
-        notes = []
-        by_solution = {
-            "search": {
-                "pricing": "es3-estimator performant (quotable)",
-                "stored_gb": 1001,
-                "total_mo": 100,
-                "total_yr": 1200,
-            },
-        }
-        groups = [
-            {"solution": "search", "region": "eastus", "stored_gb": 1000, "retention_months": 1},
-            {"solution": "search", "region": "eu-west-1", "stored_gb": 1, "retention_months": 1},
-        ]
-        account = {
-            "sizing": {"estimators": {"projects": [{
-                "solution": "search",
-                "region": "eastus",
-                "readback": {
-                    "monthly_steady_state": 80,
-                    "annual_year1": 960,
-                    "annual_steady_state": 960,
-                },
-            }]}},
-            "workload": {},
-            "storage": {"data_stored_gb": 1001},
-            "cloud": {"summary": {}},
-        }
-        _quoted, omitted = _replicate_by_region(account, by_solution, groups, notes)
-        self.assertEqual([row["region"] for row in omitted], ["eu-west-1"])
-        self.assertLessEqual(omitted[0]["projected_monthly"], 10)
-        self.assertTrue(any("Left out: search eu-west-1 $" in note for note in notes))
+    def test_floor_section_has_no_monthly_price_cutoff(self):
         html = deployment_plan_section({
             "deployment_plan": [
                 {"label": "Ceiling", "projects": 3, "monthly": 120},
                 {"label": "Floor", "projects": 2, "monthly": 80},
             ],
             "deployment_plan_floor": 2,
-            "regions_under_minimum": omitted,
             "basis": {"quote_lookback_days": 90},
         }, {})
         self.assertIn("Monthly estimate as deployments become projects", html)
-        self.assertIn("The floor is 2 projects, one per feature per region.", html)
+        self.assertIn("The floor is one project per feature per region, 2 projects, and the series stops there.", html)
         self.assertIn("90 days of complete billing", html)
         self.assertNotIn("30 days", html)
         self.assertIn("The cover count and this ceiling are the same deployments.", html)
-        self.assertIn("1 estimate sheet was written.", html)
-        self.assertIn("more than $10/mo", html)
-        self.assertIn("Search", html)
-        self.assertIn("eu-west-1", html)
-        self.assertIn(f"${omitted[0]['projected_monthly']:,.2f}", html)
-        from_note = deployment_plan_section({
-            "deployment_plan": [{"label": "Floor", "projects": 14, "monthly": 302697}],
-            "deployment_plan_floor": 14,
-            "notes": [
-                "A regional estimate is produced only when the projected sizing is more than $10/mo. "
-                "Left out: search us-east4 $0.66; search us-central1 $9.30; search eu-west-1 $0.00."
-            ],
-        }, {})
-        self.assertIn("11 estimate sheets were written.", from_note)
-        self.assertIn("These 3 projects stay in the floor:", from_note)
-        self.assertIn("us-east4", from_note)
-        self.assertIn("$0.66", from_note)
-        self.assertIn("us-central1", from_note)
-        self.assertIn("$9.30", from_note)
-        self.assertIn("eu-west-1", from_note)
-        self.assertIn("$0.00", from_note)
-        quiet = deployment_plan_section({
-            "deployment_plan": [{"label": "Floor", "projects": 1, "monthly": 10}],
-            "deployment_plan_floor": 1,
-        }, {})
-        self.assertNotIn("Projected $/mo", quiet)
-
-
+        self.assertNotIn("$10/mo", html)
 class EstimateFolderTests(unittest.TestCase):
     def test_estimates_sit_directly_in_generated_estimates(self):
         for suffix in ("", None, "from_k360", "_30d", "30d"):
@@ -933,8 +927,8 @@ class CompressionCalcTests(unittest.TestCase):
             "storage": {"by_deployment": []},
         }
         rows = [
-            {"name": "alpha", "bulk_gb_day": 100, "compressioncalc_accounted_for": 20, "compression_ratio": 0.2, "retention_days": 30.416, "store_gb": 5, "snapshot_gb": 0},
-            {"name": "beta", "bulk_gb_day": 10, "compressioncalc_accounted_for": 5, "compression_ratio": 0.5, "retention_days": 60.832, "store_gb": 4, "snapshot_gb": 0},
+            {"name": "alpha", "bulk_gb_day": 100, "compressioncalc_accounted_for": 20, "compression_ratio": 0.2, "retention_days": 30.416, "store_gb": 5, "snapshot_gb": 0, "bulk_mix": {"logs": 90, "metrics": 10}},
+            {"name": "beta", "bulk_gb_day": 10, "compressioncalc_accounted_for": 5, "compression_ratio": 0.5, "retention_days": 60.832, "store_gb": 4, "snapshot_gb": 0, "bulk_mix": {"logs": 9, "metrics": 1}},
             {"name": "gamma", "bulk_gb_day": 8, "compressioncalc_accounted_for": 2, "compression_ratio": 0.25, "retention_days": 30.416, "store_gb": 8, "snapshot_gb": 0},
             {"name": "delta", "bulk_gb_day": 10, "compressioncalc_accounted_for": 0, "compression_ratio": None, "retention_days": 30.416, "store_gb": 1, "snapshot_gb": 0},
         ]
@@ -965,11 +959,11 @@ class CompressionCalcTests(unittest.TestCase):
         self.assertEqual(swapped["metrics_gb_day"], 6.6)
         self.assertEqual(swapped["bulk_gb_day"], 110.0)
         self.assertEqual(swapped["compression_ratio"], 0.6)
-        self.assertEqual(swapped["retention_months"], 2)
+        self.assertEqual(swapped["retention_months"], 12)
         self.assertEqual(security["daily_raw_gb"], 6.0)
         self.assertEqual(security["bulk_gb_day"], 10.0)
         self.assertEqual(security["compression_ratio"], 0.6)
-        self.assertEqual(security["retention_months"], 1)
+        self.assertEqual(security["retention_months"], 12)
         self.assertEqual(search["daily_raw_gb"], 8.0)
         self.assertEqual(priced["sizing"]["estimators"]["search"]["readback"]["monthly_steady_state"], 12)
         self.assertNotIn("observability", priced["sizing"]["estimators"])
@@ -983,29 +977,6 @@ class CompressionCalcTests(unittest.TestCase):
 
 
 class RegionalQuoteTests(unittest.TestCase):
-    def test_projection_skips_a_region_at_or_under_ten_dollars(self):
-        from consolidation import REGION_ESTIMATE_MIN_USD, projected_region_monthly
-
-        tiny = projected_region_monthly(
-            "observability", stored_gb=1, daily_raw_gb=0.01, retention_months=1,
-            solution_stored_gb=1, workload=None,
-        )
-        large = projected_region_monthly(
-            "observability", stored_gb=1000, daily_raw_gb=50, retention_months=1,
-            solution_stored_gb=1000, workload=None,
-        )
-        self.assertLessEqual(tiny, REGION_ESTIMATE_MIN_USD)
-        self.assertGreater(large, REGION_ESTIMATE_MIN_USD)
-        search = projected_region_monthly(
-            "search", stored_gb=1, daily_raw_gb=None, retention_months=1,
-            solution_stored_gb=1001, workload={},
-        )
-        kept = projected_region_monthly(
-            "search", stored_gb=1000, daily_raw_gb=None, retention_months=1,
-            solution_stored_gb=1001, workload={},
-        )
-        self.assertLessEqual(search, REGION_ESTIMATE_MIN_USD)
-        self.assertGreater(kept, REGION_ESTIMATE_MIN_USD)
     def test_one_own_readback_keeps_the_consolidated_total(self):
         quote = regional_quote(
             [
@@ -1076,7 +1047,7 @@ class RegionalQuoteTests(unittest.TestCase):
         self.assertEqual(by_solution["observability"]["regional_mode"], "missing")
         self.assertTrue(any("no read-back" in note for note in notes))
 
-    def test_security_readback_at_ten_dollars_is_left_out(self):
+    def test_security_readback_under_ten_dollars_stays(self):
         acc = {
             "cloud": {"summary": {}},
             "storage": {},
@@ -1094,8 +1065,8 @@ class RegionalQuoteTests(unittest.TestCase):
         notes: list[str] = []
         _replicate_by_region(acc, by_solution, groups, notes)
         self.assertEqual(by_solution["security"]["regional_mode"], "per_region")
-        self.assertEqual(by_solution["security"]["total_mo"], 80.0)
-        self.assertEqual([row["region"] for row in by_solution["security"]["by_region"]], ["east"])
+        self.assertEqual(by_solution["security"]["total_mo"], 88.0)
+        self.assertEqual([row["region"] for row in by_solution["security"]["by_region"]], ["east", "west"])
 
     def test_regional_month_keeps_the_fraction_the_fleet_rounds_up(self):
         days = 12.004 * 30.416
@@ -1103,7 +1074,8 @@ class RegionalQuoteTests(unittest.TestCase):
             {"name": "a", "solution": "observability", "platform": "ech", "gb": 10, "ecu": 0, "daily_raw_gb": 10, "retention_days": days},
         ]}}
         groups = _deployment_groups(acc, None, 1)
-        self.assertEqual(_sheet_retention(groups[0]["retention_months"]), 13)
+        self.assertEqual(groups[0]["retention_months"], 12)   # one-year estimate
+        self.assertAlmostEqual(groups[0]["retention_months_measured"], 12.004, places=3)
 
 
 class EfficiencyTests(unittest.TestCase):
@@ -1642,12 +1614,12 @@ class ConsolidationLayoutTests(unittest.TestCase):
         self.assertEqual(acc["sizing"]["consolidated"]["security"]["daily_raw_gb"], 4)
         self.assertEqual(acc["solutions"]["by_deployment"][0]["daily_raw_gb"], 10.0)
         self.assertEqual(acc["solutions"]["by_deployment"][0]["compressioncalc_accounted_for"], 6.0)
-        # Search docs/s is a K360 rate, not a bundle measurement, so it keeps the pace.
-        self.assertAlmostEqual(acc["workload"]["ingest"]["docs_per_sec"], round(100 * expected, 3), places=3)
+        # Billing pace scales ECH only. Search docs/s stays the measured rate.
+        self.assertEqual(acc["workload"]["ingest"]["docs_per_sec"], 100)
         again = apply_quote_lookback(acc, 30)
         self.assertAlmostEqual(again, factor, places=4)
         self.assertEqual(acc["sizing"]["consolidated"]["observability"]["daily_raw_gb"], 10)
-        self.assertAlmostEqual(acc["workload"]["ingest"]["docs_per_sec"], round(100 * expected, 3), places=3)
+        self.assertEqual(acc["workload"]["ingest"]["docs_per_sec"], 100)
         with self.assertRaises(ValueError):
             apply_quote_lookback(acc, 366)
         acc["consolidation"] = build_consolidation(acc, None)
@@ -1664,12 +1636,12 @@ class ConsolidationLayoutTests(unittest.TestCase):
         self.assertIn("Serverless, last 30 billed days", html)
         build = html.split("What you pay for today", 1)[1].split("<h2>", 1)[0]
         self.assertIn("Full lookback", build)
-        self.assertIn("30-day lookback", build)
-        self.assertIn("30-day usage", build)
         self.assertNotIn("ECH today", build)
 
     def test_cover_flips_reduction_to_increase_when_serverless_costs_more(self):
         acc = _quote_account(g28=10, e73=0)
+        _stamp_reconciled_billing(acc)
+        acc["sizing"]["quote_options"] = {"ech_scope": "all", "keep_serverless_spend": True, "min_priced_ecu_pct": 90, "unmeasured": "exclude"}
         acc["consolidation"] = build_consolidation(acc, None)
         html = render_consolidation_html(acc)
         cover = html.split("<section class='sec newpage'>", 1)[0]
@@ -1685,6 +1657,8 @@ class ConsolidationLayoutTests(unittest.TestCase):
 
     def test_cover_keeps_reduction_when_serverless_costs_less(self):
         acc = _quote_account(g28=10, e73=0)
+        _stamp_reconciled_billing(acc)
+        acc["sizing"]["quote_options"] = {"ech_scope": "all", "keep_serverless_spend": True, "min_priced_ecu_pct": 90, "unmeasured": "exclude"}
         acc["consolidation"] = build_consolidation(acc, None)
         sv = acc["consolidation"]["savings"]
         sv["list_mo"], sv["list_pct"] = 50.0, 20.0
@@ -1697,6 +1671,8 @@ class ConsolidationLayoutTests(unittest.TestCase):
     def test_ech_dollars_are_the_k360_billed_cost_not_an_arr_rate(self):
         # ARR 1825 over a commit of 10 ECU/day is $0.50 per ECU. It must not touch the ECH dollars.
         acc = _quote_account(g28=10, e73=0)
+        _stamp_reconciled_billing(acc)
+        acc["sizing"]["quote_options"] = {"ech_scope": "all", "keep_serverless_spend": True, "min_priced_ecu_pct": 90, "unmeasured": "exclude"}
         acc["meta"]["org"]["ARR"] = 1825
         acc["ecu"]["contract"] = {"commit_pace_ecu_per_day": 10}
         cons = acc["consolidation"] = build_consolidation(acc, None)
@@ -2006,7 +1982,7 @@ class ExcludeDeploymentTests(unittest.TestCase):
         e = acc["ecu"]
         self.assertEqual(e["monthly"]["totals"], [60.0, 75.0, 40.0])
         self.assertEqual(rec["ecu_removed_over_lookback"], 75.0)
-        self.assertEqual(e["daily_totals"], [3.0, 3.0, 1.6])
+        self.assertEqual(e["daily_totals"], [4.0, 4.0, 2.0])
         self.assertEqual(e["monthly_avg_complete_months"], 67.5)
         self.assertEqual(acc["deployments"]["count"], 2)
         self.assertEqual(acc["deployments"]["active"]["names"], ["keep"])
@@ -2053,7 +2029,6 @@ class PerClusterPlanTests(unittest.TestCase):
         self.assertEqual(rows["b"]["steps"][1]["pack"], 3)
         for i, step in enumerate(plan["steps"]):
             self.assertAlmostEqual(sum(r["steps"][i]["monthly"] for r in plan["rows"]), step["monthly"], places=1)
-        self.assertEqual({n: r["under_minimum"] for n, r in rows.items()}, {"a": False, "b": True, "c": True})
 
     def test_zero_bulk_with_a_bundle_is_not_sized_and_no_bundle_is_flagged(self):
         from consolidation import per_cluster_plan
@@ -2075,9 +2050,9 @@ class PerClusterPlanTests(unittest.TestCase):
 
     def test_a_long_fleet_folds_its_smallest_clusters_into_one_row(self):
         from render_pdf import per_cluster_section, PER_CLUSTER_MAX_ROWS
-        rows = [{"name": f"c{i}", "solution": "search", "region": "r", "bulk_gb_day": 1, "under_minimum": False,
+        rows = [{"name": f"c{i}", "solution": "search", "region": "r", "bulk_gb_day": 1,
                  "steps": [{"monthly": 100.0 - i, "pack": 1}]} for i in range(PER_CLUSTER_MAX_ROWS + 10)]
-        plan = {"steps": [{"label": "Ceiling", "projects": len(rows), "monthly": 1}], "rows": rows, "min_usd": 10}
+        plan = {"steps": [{"label": "Ceiling", "projects": len(rows), "monthly": 1}], "rows": rows}
         html = per_cluster_section({"per_cluster_plan": plan, "deployment_plan": [1]})
         self.assertIn("11 smaller clusters", html)
         self.assertNotIn(">c45<", html)
@@ -2088,7 +2063,7 @@ class PerClusterPlanTests(unittest.TestCase):
                   "steps": [{"monthly": 100.0 - i, "pack": 1}]} for i in range(PER_CLUSTER_MAX_ROWS)]
         missing = [{"name": f"m{i}", "solution": "observability", "region": "r", "bulk_gb_day": 0, "status": "missing_diag",
                     "steps": [{"monthly": None, "pack": 1}]} for i in range(20)]
-        plan = {"steps": [{"label": "Ceiling", "projects": len(sized) + 20, "monthly": 1}], "rows": sized + missing, "min_usd": 10}
+        plan = {"steps": [{"label": "Ceiling", "projects": len(sized) + 20, "monthly": 1}], "rows": sized + missing}
         html = per_cluster_section({"per_cluster_plan": plan, "deployment_plan": [1]})
         self.assertIn("smaller clusters", html)
         self.assertIn("more clusters not sized", html)
@@ -2128,7 +2103,7 @@ class PerClusterPlanTests(unittest.TestCase):
         self.assertIn("Serverless cost per cluster", html)
         self.assertIn("Floor, 1 project", html)
         self.assertIn("(of 3)", html)
-        self.assertEqual(html.count("background:#EEF0F3"), 2)
+        self.assertEqual(html.count("background:#EEF0F3"), 0)
         self.assertIn("Total", html)
         self.assertEqual(per_cluster_section({"per_cluster_plan": plan}), "")
 
@@ -2374,17 +2349,17 @@ class SeriesRateTests(unittest.TestCase):
 
 
 class MeasuredMixTests(unittest.TestCase):
-    def test_mix_keeps_measured_proportions_and_assumes_90_10_without_them(self):
+    def test_mix_keeps_measured_proportions_and_refuses_a_missing_split(self):
         from diag_account import observability_mix
         measured = {"daily_raw_gb": 60.0, "logs_gb_day": 80.0, "k8s_logs_gb_day": 20.0, "metrics_gb_day": 15.0, "traces_gb_day": 5.0, "retention_days_metrics": 90}
         mix = observability_mix([measured])
         # The row's bulk was scaled to 60 (compression-applied). The proportions hold.
         self.assertEqual((mix["logs_gb_day"], mix["metrics_gb_day"], mix["traces_gb_day"], mix["k8s_logs_gb_day"]), (48.0, 9.0, 3.0, 12.0))
         self.assertEqual((mix["k8s_logs_share"], mix["metrics_retention_days"], mix["basis"]), (0.25, 90.0, "measured"))
-        assumed = observability_mix([{"daily_raw_gb": 100.0}])
-        self.assertEqual((assumed["logs_gb_day"], assumed["metrics_gb_day"], assumed["basis"]), (90.0, 10.0, "assumed 90/10"))
-        both = observability_mix([measured, {"daily_raw_gb": 100.0}])
-        self.assertEqual((both["logs_gb_day"], both["metrics_gb_day"], both["basis"]), (138.0, 19.0, "mixed"))
+        with self.assertRaises(ValueError):
+            observability_mix([{"daily_raw_gb": 100.0}])
+        with self.assertRaises(ValueError):
+            observability_mix([measured, {"daily_raw_gb": 100.0}])
         self.assertIsNone(observability_mix([{"daily_raw_gb": 0}])["basis"])
 
     def test_rollup_writes_the_measured_split_and_the_metrics_month(self):
@@ -2397,10 +2372,12 @@ class MeasuredMixTests(unittest.TestCase):
         blk = apply_diagnostics(acc, [row])["sizing"]["consolidated"]["observability"]
         self.assertEqual((blk["logs_gb_day"], blk["metrics_gb_day"], blk["traces_gb_day"]), (70.0, 25.0, 5.0))
         self.assertEqual((blk["k8s_logs_share"], blk["mix_basis"]), (0.1, "measured"))
-        self.assertEqual((blk["retention_months"], blk["retention_months_metrics"]), (1, 4))   # 95 days rounds up to 4
+        self.assertEqual((blk["retention_months"], blk["retention_months_metrics"]), (12, 12))   # every estimate is one year, measured ages aside
         old = apply_diagnostics(acc, [{"name": "a", "bulk_gb_day": 100.0, "store_gb": 50, "retention_days": 30}])
         blk = old["sizing"]["consolidated"]["observability"]
-        self.assertEqual((blk["logs_gb_day"], blk["metrics_gb_day"], blk["mix_basis"], blk["retention_months_metrics"]), (90.0, 10.0, "assumed 90/10", 1))
+        self.assertIsNone(blk["mix_basis"])
+        self.assertIn("not given a split", " ".join(old["sizing"]["notes"]))
+        self.assertEqual(blk["retention_months"], 12)
 
     def test_metered_basis_writes_option_1_and_leaves_option_2_at_zero(self):
         from size_serverless import observability_input_cells
@@ -2411,9 +2388,8 @@ class MeasuredMixTests(unittest.TestCase):
         self.assertAlmostEqual(cells["G20"] / 730 * 24, 60.0, places=3)
         self.assertEqual((cells["G23"], cells["G24"], cells["G25"], cells["G26"]), (0, "0%", 0, 0))
         self.assertEqual((cells["G11"], cells["G12"]), (2, 4))
-        assumed = observability_input_cells({}, "Premium", "r", 2, 1000.0, basis="metered")
-        self.assertAlmostEqual(assumed["G19"] / 730 * 24, 900.0, places=3)
-        self.assertAlmostEqual(assumed["G20"] / 730 * 24, 100.0, places=3)
+        with self.assertRaises(ValueError):
+            observability_input_cells({}, "Premium", "r", 2, 1000.0, basis="metered")
 
     def test_raw_basis_keeps_option_2_and_folds_traces_into_logs(self):
         from size_serverless import observability_input_cells
@@ -2421,8 +2397,8 @@ class MeasuredMixTests(unittest.TestCase):
         folded = observability_input_cells({}, "Premium", "r", 2, 1000.0, mix=mix)
         self.assertEqual((folded["G19"], folded["G20"], folded["G23"], folded["G25"], folded["G26"], folded["G12"]), (0, 0, 940.0, 60.0, 0, 2))
         self.assertAlmostEqual(folded["G24"], round(45 / 940, 4))    # the same Kubernetes GB over a larger logs row
-        plain = observability_input_cells({}, "Premium", "r", 2, 1000.0)
-        self.assertEqual((plain["G23"], plain["G25"], plain["G24"], plain["G26"]), (900.0, 100.0, "0%", 0))
+        with self.assertRaises(ValueError):
+            observability_input_cells({}, "Premium", "r", 2, 1000.0)
 
     def test_basis_follows_the_ingest_source(self):
         from size_serverless import ingest_basis
@@ -2431,16 +2407,85 @@ class MeasuredMixTests(unittest.TestCase):
         self.assertEqual(ingest_basis({}), "raw")
 
     def test_metered_echo_is_the_two_ladder_inputs_and_raw_echo_is_g28(self):
-        from quote_checks import echo_gate, ingest_echo, observability_readback
+        from quote_checks import echo_gate, ingest_echo, observability_echo_gate, observability_readback
         rb = {"total_raw_gb_day": 0, "metered_gb_day": 0, "metered_ex_metrics_gb_day": 940.0, "metered_metrics_gb_day": 60.0}
         metered = observability_readback(rb, "metered")
         self.assertEqual((metered["echo_gb_day"], metered["metered_gb_day"], metered["total_raw_gb_day"]), (1000.0, 1000.0, None))
         self.assertTrue(echo_gate(1000.0, ingest_echo(metered))["accepted"])
+        mix = {"logs_gb_day": 900.0, "traces_gb_day": 40.0, "metrics_gb_day": 60.0}
+        matched = observability_echo_gate(mix, metered)
+        self.assertTrue(matched["accepted"])
+        self.assertEqual((matched["written_logs_traces"], matched["written_metrics"], matched["sheet_logs_traces"], matched["sheet_metrics"]), (940.0, 60.0, 940.0, 60.0))
+        swapped = observability_echo_gate(mix, {"metered_ex_metrics_gb_day": 60.0, "metered_metrics_gb_day": 940.0})
+        self.assertFalse(swapped["accepted"])
+        self.assertEqual(swapped["written_bulk"], swapped["sheet_gb_day"])
+        blank = observability_echo_gate(mix, {"metered_ex_metrics_gb_day": 940.0, "metered_metrics_gb_day": None})
+        self.assertFalse(blank["accepted"])
         self.assertFalse(echo_gate(1000.0, ingest_echo(observability_readback({**rb, "metered_metrics_gb_day": None}, "metered")))["accepted"])
         raw = observability_readback({"total_raw_gb_day": 10.2, "metered_gb_day": 16.3}, "raw")
         self.assertEqual((raw["echo_gb_day"], raw["metered_gb_day"]), (10.2, 16.3))
         # A read-back saved before the echo field existed still gates on the raw total.
         self.assertEqual(ingest_echo({"total_raw_gb_day": 7}), 7)
+
+    def test_a_swapped_observability_mix_is_not_quoted(self):
+        from quote_checks import observability_echo_gate
+        acc = _quote_account(g28=10, e73=0)
+        acc["sizing"]["estimators"]["observability"]["echo_gate"] = observability_echo_gate(
+            {"logs_gb_day": 9, "metrics_gb_day": 1},
+            {"ingest_basis": "metered", "metered_ex_metrics_gb_day": 1, "metered_metrics_gb_day": 9},
+        )
+        acc["sizing"]["estimators"]["observability"]["readback"]["ingest_basis"] = "metered"
+        cons = build_consolidation(acc, None)
+        observability = cons["serverless"]["by_solution"]["observability"]
+        self.assertTrue(observability["pricing"].startswith("rejected"))
+        self.assertEqual(observability["total_mo"], 0)
+
+    def test_bars_carry_the_cover_eis_and_ml_leaves_the_ech_side(self):
+        from consolidation import per_cluster_plan
+        acc = _quote_account(g28=10, e73=0)
+        acc["ecu"]["monthly_avg_complete_months"] = 100
+        acc["solutions"]["by_deployment"] = [
+            {"name": "ech-search", "solution": "search", "platform": "ech", "ecu": 10, "gb": 50, "ingest_source": "diagnostics"},
+            {"name": "logs", "solution": "observability", "platform": "ech", "ecu": 10, "gb": 20, "daily_raw_gb": 10, "ingest_source": "diagnostics"},
+        ]
+        acc["sizing"]["deployment_plan"] = {"bars": [
+            {"label": "Ceiling", "projects": 2, "monthly": 100, "groups": [
+                {"names": ["ech-search"], "monthly": 40},
+                {"names": ["logs"], "monthly": 60},
+            ]},
+            {"label": "Floor", "projects": 2, "monthly": 90, "groups": [
+                {"names": ["ech-search"], "monthly": 30},
+                {"names": ["logs"], "monthly": 60},
+            ]},
+        ]}
+        _stamp_search_eis(acc, "ech-search", eis=10, tokens=1, ml=0.1)
+        for name in ("ech-search", "logs"):
+            acc["ecu"]["daily_deployment_costs"]["by_deployment"][name] = [1.0]
+        acc["sizing"]["quote_options"] = {"ech_scope": "all", "keep_serverless_spend": True, "min_priced_ecu_pct": 90, "unmeasured": "exclude"}
+        acc["sizing"]["consolidated"]["search"] = {"stored_gb": 50, "daily_raw_gb": 0, "deployments": 1}
+        acc["sizing"]["estimators"]["search"] = {"readback": {
+            "monthly_steady_state": 50.0, "annual_year1": 600.0, "annual_steady_state": 600.0,
+            "search_monthly": 30.0, "ingest_monthly": 10.0, "storage_monthly": 3.48, "support_monthly": 6.52,
+        }}
+        cons = build_consolidation(acc, None)
+        search = cons["serverless"]["by_solution"]["search"]
+        eis = search["eis_with_support_mo"]
+        bars = acc["sizing"]["deployment_plan"]["bars"]
+        self.assertAlmostEqual(bars[0]["monthly"], 100 + eis)
+        self.assertAlmostEqual(bars[1]["monthly"], 90 + eis)
+        self.assertAlmostEqual(bars[0]["groups"][0]["eis_with_support_mo"], eis)
+        self.assertIsNone(bars[0]["groups"][1].get("eis_with_support_mo"))
+        cluster = per_cluster_plan(acc["sizing"], acc, None)
+        sized = [row for row in cluster["rows"] if row["status"] == "sized"]
+        for index, bar in enumerate(bars):
+            column = sum(float((row["steps"][index] or {}).get("monthly") or 0) for row in sized)
+            column += cluster["unallocated"][index]
+            self.assertAlmostEqual(column, bar["monthly"], places=2)
+        ml = search["ml_node_ecu_mo"]
+        self.assertAlmostEqual(search["total_mo"], round(50 + eis, 2))
+        self.assertAlmostEqual(cons["savings"]["ech_ml_excluded_mo"], ml)
+        self.assertAlmostEqual(cons["savings"]["ech_list_mo"], round(cons["ech_scope"]["in_comparison_mo"] - ml, 2))
+        self.assertIn("ML-node ECU", " ".join(cons["notes"]))
 
     def test_security_g4_is_measured_gb_over_the_sheet_expansion(self):
         import size_serverless as ss
@@ -2476,12 +2521,14 @@ class MeasuredMixTests(unittest.TestCase):
                 ss.security_expansion(None, "copy")
 
     def test_ladder_gate_and_band_walk_apply_no_expansion_to_metered_bulk(self):
-        from consolidation import observability_metered_rates, projected_region_monthly
+        from consolidation import observability_metered_rates
         raw = observability_metered_rates([{"name": "a", "daily_raw_gb": 10.0}])[0]
         metered = observability_metered_rates([{"name": "a", "daily_raw_gb": 10.0}], 1.0)[0]
         self.assertEqual((raw["metered_gb_day"], metered["metered_gb_day"]), (15.95, 10.0))
-        kw = dict(stored_gb=1, daily_raw_gb=10.0, retention_months=1, solution_stored_gb=1, workload=None)
-        self.assertLess(projected_region_monthly("observability", metered=True, **kw), projected_region_monthly("observability", **kw))
+        self.assertIsNone(metered["usd_per_gb"])
+        metrics = observability_metered_rates([{"name": "m", "daily_raw_gb": 100.0, "logs_gb_day": 0, "metrics_gb_day": 100, "traces_gb_day": 0}], 1.0)[0]
+        mostly_logs = observability_metered_rates([{"name": "l", "daily_raw_gb": 100.0, "logs_gb_day": 90, "metrics_gb_day": 10, "traces_gb_day": 0}], 1.0)[0]
+        self.assertNotEqual(metrics["usd_per_gb"], mostly_logs["usd_per_gb"])
 
 
 class SecuritySteadyStateTests(unittest.TestCase):
@@ -2512,6 +2559,132 @@ class SecuritySteadyStateTests(unittest.TestCase):
         old = security_readback({"monthly_steady_state": 1150.0, "cps_addon_monthly": 0}, 12)
         self.assertNotIn("other_addons_monthly", old)
         self.assertFalse(e73_blocks_quote(old["cps_addon_monthly"]))
+
+
+class SearchTelemetryShareTests(unittest.TestCase):
+    """Docs/s and QPS take one ratio: project search store / diagnostic org store."""
+
+    WORKLOAD = {
+        "quote_window_telemetry": {"status": "complete"},
+        "search": {
+            "peak": {"qps": 40, "complexity_ms": 25, "pct_hours_mo": 30},
+            "nonpeak": {"qps": 10, "complexity_ms": 25, "pct_hours_mo": 70},
+        },
+        "ingest": {"docs_per_sec": 100, "avg_doc_bytes": 500, "active_hours_mo": 400},
+    }
+
+    def test_two_projects_sum_to_the_fleet_share(self):
+        from es3_estimate import build_user_info, scale_search_workload, workload_share
+        self.assertEqual(workload_share(20, 100), 0.2)
+        self.assertEqual(workload_share(40, 100), 0.4)
+        self.assertEqual(workload_share(20, 0), 1.0)
+        east = scale_search_workload(self.WORKLOAD, workload_share(20, 100))
+        west = scale_search_workload(self.WORKLOAD, workload_share(20, 100))
+        fleet = scale_search_workload(self.WORKLOAD, workload_share(40, 100))
+        self.assertEqual(self.WORKLOAD["ingest"]["docs_per_sec"], 100)
+        self.assertEqual(self.WORKLOAD["search"]["peak"]["qps"], 40)
+        for project in (east, west):
+            self.assertEqual(project["ingest"]["docs_per_sec"], 20.0)
+            self.assertEqual(project["search"]["peak"]["qps"], 8.0)
+            self.assertEqual(project["search"]["nonpeak"]["qps"], 2.0)
+        self.assertEqual(fleet["ingest"]["docs_per_sec"], 40.0)
+        self.assertEqual(fleet["search"]["peak"]["qps"], 16.0)
+        self.assertEqual(
+            east["ingest"]["docs_per_sec"] + west["ingest"]["docs_per_sec"],
+            fleet["ingest"]["docs_per_sec"],
+        )
+        info, _match, assumptions = build_user_info(
+            {
+                "stored_gb": 20, "org_stored_gb": 100, "provider": "aws", "region": "us-east-1",
+                "support_tier": "Premium", "workload": self.WORKLOAD,
+            },
+            {"AWS": {"us-east-1": {}}},
+            {"Enterprise": {}},
+        )
+        search = info["SEARCH_CONFIG"]["workloads"]
+        ingest = info["INGEST_CONFIG"]["workloads"]
+        self.assertEqual(ingest[0]["docs_per_sec"], 20.0)
+        self.assertEqual([row["QPS"] for row in search], [8.0, 2.0])
+        self.assertTrue(any("Docs/s and QPS scaled" in note for note in assumptions))
+        self.assertFalse(any("QPS is not scaled" in note for note in assumptions))
+
+    def _account(self) -> dict:
+        return {
+            "meta": {"run_key": "Acme", "customer": "Acme", "date": "2026-11-16"},
+            "sizing": {"ingest_source": "diagnostics", "feature_tier": "Complete", "region": "east", "consolidated": {"search": {}}},
+            "storage": {"ingest_share_store_gb": 100},
+            "workload": json.loads(json.dumps(self.WORKLOAD)),
+            "solutions": {"by_deployment": [
+                {"name": "east", "solution": "search", "platform": "ech", "gb": 20, "ingest_source": "diagnostics"},
+                {"name": "west", "solution": "search", "platform": "ech", "gb": 20, "ingest_source": "diagnostics"},
+                {"name": "logs", "solution": "observability", "platform": "ech", "gb": 60, "daily_raw_gb": 0, "ingest_source": "diagnostics"},
+            ]},
+            "cloud": {"summary": {"provider": "aws"}, "by_deployment": [
+                {"name": "east", "region": "east", "provider": "aws", "platform": "ech"},
+                {"name": "west", "region": "west", "provider": "aws", "platform": "ech"},
+                {"name": "logs", "region": "east", "provider": "aws", "platform": "ech"},
+            ]},
+        }
+
+    def test_the_plan_and_regional_sheets_pass_org_store_and_unscaled_telemetry(self):
+        import size_serverless as ss
+        seen = []
+
+        def fake_es3(payload):
+            seen.append(payload)
+            return {"readback": {"monthly_steady_state": 10}}
+
+        acc = self._account()
+        with mock.patch.object(ss, "run_es3", side_effect=fake_es3):
+            plan = ss.size_deployment_plan(
+                acc, None, None, {"id": "folder"}, o11y_id="o", security_id="s", support="Premium",
+                provider="aws", force_months=12, name_suffix="", fresh=False,
+            )
+        self.assertFalse(plan.get("error"))
+        self.assertEqual(len(seen), 2)
+        for payload in seen:
+            self.assertEqual(payload["stored_gb"], 20)
+            self.assertEqual(payload["org_stored_gb"], 100)
+            self.assertEqual(payload["workload"]["ingest"]["docs_per_sec"], 100)
+            self.assertEqual(payload["workload"]["search"]["peak"]["qps"], 40)
+        seen.clear()
+        acc["consolidation"] = {"architecture": {"groups": [
+            {"solution": "search", "region": "east", "stored_gb": 20, "daily_raw_gb": 0},
+            {"solution": "search", "region": "west", "stored_gb": 20, "daily_raw_gb": 0},
+        ]}}
+        with mock.patch.object(ss, "run_es3", side_effect=fake_es3), \
+             mock.patch.object(ss, "load_sheet_creds", return_value=None), \
+             mock.patch.object(ss, "services_from", return_value=(None, None)), \
+             mock.patch.object(ss, "sheet_workers", return_value=1):
+            ss.size_regional_projects(
+                acc, None, None, {"id": "folder"}, o11y_id="o", security_id="s", support="Premium",
+                provider="aws", skip_xlsx=True, fresh=False, local_dir=HERE, customer="Acme", when="2026-11-16",
+                force_months=12,
+            )
+        self.assertEqual(len(seen), 2)
+        for payload in seen:
+            self.assertEqual(payload["stored_gb"], 20)
+            self.assertEqual(payload["org_stored_gb"], 100)
+            self.assertEqual(payload["workload"]["search"]["nonpeak"]["qps"], 10)
+        captured = []
+
+        def fake_region(payload):
+            captured.append(payload)
+            return {"readback": {"monthly_steady_state": 10, "annual_year1": 120, "annual_steady_state": 120}}
+
+        groups = [
+            {"solution": "search", "region": "east", "stored_gb": 20, "daily_raw_gb": 0, "deployments": ["east"]},
+            {"solution": "search", "region": "west", "stored_gb": 20, "daily_raw_gb": 0, "deployments": ["west"]},
+        ]
+        by_solution = {"search": {"pricing": "es3-estimator performant (quotable)", "total_mo": 50, "stored_gb": 40}}
+        with mock.patch("consolidation._es3_region", side_effect=fake_region):
+            _replicate_by_region(acc, by_solution, groups, [])
+        self.assertEqual(len(captured), 2)
+        for payload in captured:
+            self.assertEqual(payload["org_stored_gb"], 100)
+            self.assertEqual(payload["stored_gb"], 20)
+            self.assertEqual(payload["workload"]["ingest"]["docs_per_sec"], 100)
+            self.assertEqual(payload["workload"]["search"]["peak"]["qps"], 40)
 
 
 class SearchPlanSeriesTests(unittest.TestCase):
@@ -2580,6 +2753,20 @@ class EchScopeTests(unittest.TestCase):
                 "gone": [15.5, 15.5, 15, 15.5],
             },
             "monthly_serverless": [31, 31, 30, 31],
+            "quote_lookback_days": 90,
+            "daily_deployment_costs": {
+                "complete": True,
+                "days": days,
+                "org_daily_totals": [10.0] * 123,
+                "by_deployment": {
+                    "o11y": [5.0] * 123,
+                    "sec": [1.0] * 123,
+                    "nobundle": [2.0] * 123,
+                    "gone": [0.5] * 123,
+                    "proj": [1.0] * 123,
+                },
+                "status": {"complete": True},
+            },
         })
         acc["solutions"]["by_deployment"] = [
             {"name": "o11y", "solution": "observability", "platform": "ech", "ecu": 600, "daily_raw_gb": 10, "ingest_source": "diagnostics"},
@@ -2651,9 +2838,9 @@ class EchScopeTests(unittest.TestCase):
     def test_no_scope_without_per_deployment_months(self):
         acc = _quote_account(g28=10, e73=0)
         cons = build_consolidation(acc, None)
-        self.assertIsNone(cons["ech_scope"])
+        self.assertEqual(cons["ech_scope"]["status"], "unavailable")
         row = next(r for r in cons["integrity"]["checks"] if r["check"] == "Priced share")
-        self.assertIsNone(row["score"])
+        self.assertFalse(row["passed"])
 
     def test_flag_defaults(self):
         import run_account_analysis as ra
@@ -2695,26 +2882,13 @@ class UnmeasuredDeploymentTests(unittest.TestCase):
         self.assertEqual(con["observability"]["daily_raw_gb"], 20.0)
         self.assertEqual(con["search"]["stored_gb"], 0.0)
         cov = out["sizing"]["diagnostics"]
-        self.assertEqual((cov["unmeasured_mode"], cov["k360_fallback"], cov["k360_priced"]), ("exclude", 2, []))
+        self.assertEqual(cov["unmeasured_mode"], "exclude")
+        self.assertEqual(cov["missing_diagnostics"], 2)
+        self.assertEqual(sorted(cov["fallback_names"]), ["nobundle", "search-nb"])
 
-    def test_k360_prices_it_from_stored_gb_and_labels_it(self):
-        out = apply_diagnostics(self._acc(), self.ROWS, self.ADMIN, unmeasured="k360", fallback_months=3.0)
-        by = {d["name"]: d for d in out["solutions"]["by_deployment"]}
-        # 912.48 GB over 3 × 30.416 days is 10 GB/day raw, × 1.595 as metered.
-        self.assertEqual(by["nobundle"]["ingest_source"], "k360_fallback")
-        self.assertAlmostEqual(by["nobundle"]["daily_raw_gb"], 15.95, places=2)
-        self.assertAlmostEqual(by["nobundle"]["retention_days"], 91.248, places=3)
-        self.assertEqual(by["nobundle"]["retention_basis"], "assumed")
-        self.assertEqual((by["search-nb"]["gb"], by["search-nb"]["ingest_source"], by["search-nb"]["daily_raw_gb"]), (300, "k360_fallback", 0.0))
-        # A decommissioned deployment has nothing to migrate and is never priced.
-        self.assertEqual((by["retired"]["gb"], by["retired"]["ingest_source"]), (0.0, "decommissioned"))
-        con = out["sizing"]["consolidated"]
-        self.assertAlmostEqual(con["observability"]["daily_raw_gb"], 35.95, places=2)
-        self.assertEqual(con["search"]["stored_gb"], 300.0)
-        cov = out["sizing"]["diagnostics"]
-        self.assertEqual([row["name"] for row in cov["k360_priced"]], ["nobundle", "search-nb"])
-        self.assertEqual(cov["k360_fallback"], 2)        # still counted as unmeasured, so Bundle coverage stays flagged
-        self.assertTrue(any("--unmeasured k360" in note for note in out["sizing"]["notes"]))
+    def test_k360_unmeasured_mode_is_refused(self):
+        with self.assertRaises(ValueError):
+            apply_diagnostics(self._acc(), self.ROWS, self.ADMIN, unmeasured="k360")
 
     def test_an_unknown_mode_is_refused(self):
         with self.assertRaises(ValueError):
@@ -2774,7 +2948,7 @@ class ReviewRegressionTests(unittest.TestCase):
 
     """Defects a review found in the window, scope, and unmeasured-deployment changes."""
 
-    def test_search_ingest_share_keeps_unsized_store_in_the_denominator(self):
+    def test_search_ingest_share_excludes_k360_sizes_from_the_denominator(self):
         from size_serverless import org_store_gb
         acc = {
             "deployments": {"active": {"month": "2026-10", "names": ["search", "o11y", "nobundle"]}},
@@ -2788,10 +2962,11 @@ class ReviewRegressionTests(unittest.TestCase):
         rows = [{"name": "search", "bulk_gb_day": 0, "store_gb": 100.0, "retention_days": 30},
                 {"name": "o11y", "bulk_gb_day": 5.0, "store_gb": 900.0, "retention_days": 30}]
         out = apply_diagnostics(acc, rows, {"search", "o11y", "nobundle"})
-        # The unsized 9,000 GB is out of the sized store and still in the share: Search is 1% of the org rate, not 10%.
+        # The unsized K360-only 9,000 GB is context, not an estimator input.
         self.assertEqual(out["storage"]["data_stored_gb"], 1000.0)
-        self.assertEqual(out["storage"]["ingest_share_store_gb"], 10000.0)
-        self.assertEqual(org_store_gb(out), 10000.0)
+        self.assertEqual(out["storage"]["ingest_share_store_gb"], 1000.0)
+        self.assertEqual(out["storage"]["field_sources"]["ingest_share_store_gb"], "diagnostic_local_primary_store_sum")
+        self.assertEqual(org_store_gb(out), 1000.0)
         self.assertEqual(org_store_gb({"storage": {"data_stored_gb": 42}}), 42.0)
 
     def test_a_young_org_is_priced_on_the_days_it_has_billed(self):
@@ -2838,38 +3013,55 @@ class ReviewRegressionTests(unittest.TestCase):
     def test_eis_from_an_unsized_search_deployment_is_not_added(self):
         from consolidation import _search_eis
         acc = {
-            "solutions": {"by_deployment": [
-                {"name": "sized", "solution": "search", "ingest_source": "diagnostics"},
-                {"name": "retired", "solution": "search", "ingest_source": "decommissioned"},
-            ]},
-            "ai_ml": {"by_deployment": [
-                {"name": "sized", "ml_node_ecu": 120, "models": ["jina-embeddings-v3"]},
-                {"name": "retired", "ml_node_ecu": 1200, "models": ["jina-embeddings-v3"]},
-            ]},
+            "ecu": {"quote_lookback_days": 1, "daily_days": ["2026-10-01"], "daily_totals": [1.0]},
+            "ai_ml": {
+                "billing_by_deployment_complete": True,
+                "billing_by_deployment": {"sized": {"eis_ecu": 10, "million_tokens": 0, "ml_node_ecu": 0}},
+                "daily_usage_complete": True,
+                "daily_usage_by_deployment": {"sized": {
+                    "days": ["2026-10-01"], "eis_ecu": [10], "million_tokens": [0],
+                    "ml_node_ecu": [0], "models": [["jina-embeddings-v3"]],
+                }},
+                "by_deployment": [
+                    {"name": "sized", "models": ["jina-embeddings-v3"], "model_labels": ["Jina"]},
+                    {"name": "retired", "models": ["jina-embeddings-v3"]},
+                ],
+            },
         }
         eis = _search_eis(acc, 12.0, eligible_names={"sized"})
+        self.assertEqual(eis["status"], "complete")
         self.assertEqual(eis["deployments"], 1)
-        self.assertAlmostEqual(eis["monthly"], 10.0)
+        self.assertAlmostEqual(eis["monthly"], 10 * 30.416)
 
     def test_search_eis_scales_to_quote_window_and_only_includes_eligible_deployments(self):
         from consolidation import _search_eis
         acc = {
+            "ecu": {"quote_lookback_days": 2, "daily_days": ["2026-10-01", "2026-10-02"], "daily_totals": [1.0, 1.0]},
             "cloud": {"by_deployment": [
                 {"name": "quoted", "region": "us-east-1"},
                 {"name": "existing", "region": "us-west-2"},
             ]},
-            "ai_ml": {"by_deployment": [
-                {"name": "quoted", "ml_node_ecu": 120, "eis_inference_ecu": 240,
-                 "million_tokens": 12, "models": ["jina-embeddings-v3"], "model_labels": ["Jina"]},
-                {"name": "existing", "ml_node_ecu": 1200, "eis_inference_ecu": 2400,
-                 "million_tokens": 120, "models": ["jina-embeddings-v3"], "model_labels": ["Jina"]},
-            ]},
+            "ai_ml": {
+                "billing_by_deployment_complete": True,
+                "billing_by_deployment": {"quoted": {"eis_ecu": 20, "million_tokens": 2, "ml_node_ecu": 0}},
+                "daily_usage_complete": True,
+                "daily_usage_by_deployment": {"quoted": {
+                    "days": ["2026-10-01", "2026-10-02"], "eis_ecu": [10, 10],
+                    "million_tokens": [1, 1], "ml_node_ecu": [0, 0], "models": [[], []],
+                }},
+                "by_deployment": [
+                    {"name": "quoted", "models": ["jina-embeddings-v3"], "model_labels": ["Jina"]},
+                    {"name": "existing", "models": ["jina-embeddings-v3"], "model_labels": ["Jina"]},
+                ],
+            },
         }
-        eis = _search_eis(acc, 12.0, usage_factor=0.5, eligible_names={"quoted"})
+        eis = _search_eis(acc, 12.0, eligible_names={"quoted"})
+        monthly = 20 * 30.416 / 2
         self.assertEqual(eis["deployments"], 1)
-        self.assertAlmostEqual(eis["monthly"], 15.0)
-        self.assertAlmostEqual(eis["by_region"]["us-east-1"], 15.0)
-        self.assertAlmostEqual(sum(row["monthly"] for row in eis["workloads"]), 15.0)
+        self.assertAlmostEqual(eis["monthly"], monthly)
+        self.assertAlmostEqual(eis["by_region"]["us-east-1"], monthly)
+        self.assertAlmostEqual(sum(row["monthly"] for row in eis["workloads"]), monthly)
+        self.assertNotIn("us-west-2", eis["by_region"])
 
     def test_search_eis_uses_exact_quote_window_daily_usage_when_complete(self):
         from consolidation import _search_eis
@@ -2880,6 +3072,8 @@ class ReviewRegressionTests(unittest.TestCase):
                 "daily_totals": [10, 10, 10],
             },
             "ai_ml": {
+                "billing_by_deployment_complete": True,
+                "billing_by_deployment": {"quoted": {"eis_ecu": 160, "million_tokens": 16, "ml_node_ecu": 100}},
                 "daily_usage_complete": True,
                 "daily_usage_by_deployment": {"quoted": {
                     "days": ["2026-10-01", "2026-10-02", "2026-10-03"],
@@ -2900,9 +3094,7 @@ class ReviewRegressionTests(unittest.TestCase):
         eis = _search_eis(acc, 12, usage_factor=0.25, eligible_names={"quoted"})
         self.assertEqual(eis["usage_basis"], "quote_window_daily")
         self.assertEqual(eis["usage_days"], 2)
-        self.assertAlmostEqual(eis["monthly"], (60 + 20) * 30.416 / 2)
-        self.assertAlmostEqual(eis["jina_ml_ecu_mo"], 20 * 30.416 / 2)
-        self.assertAlmostEqual(eis["other_ml_ecu"], 30)
+        self.assertAlmostEqual(eis["monthly"], (20 + 40) * 30.416 / 2)
         self.assertAlmostEqual(sum(row["monthly"] for row in eis["workloads"]), eis["monthly"])
 
     def test_eis_eligible_names_follow_quoteable_active_ech_search_scope(self):
@@ -2941,7 +3133,7 @@ class ReviewRegressionTests(unittest.TestCase):
         }}
         self.assertEqual(_priced_search_names(acc, by_solution, {"unpriced": []}), {"quoted-east"})
 
-    def test_search_quote_scales_eis_and_excludes_existing_serverless_project(self):
+    def test_search_quote_prices_window_eis_and_excludes_existing_serverless_project(self):
         acc = _quote_account(g28=10, e73=0)
         acc["ecu"]["quote_usage_factor"] = 0.5
         acc["sizing"]["consolidated"]["search"] = {"stored_gb": 50, "daily_raw_gb": 0, "deployments": 1}
@@ -2953,18 +3145,23 @@ class ReviewRegressionTests(unittest.TestCase):
             {"name": "ech-search", "solution": "search", "platform": "ech", "ecu": 10, "gb": 50, "ingest_source": "diagnostics"},
             {"name": "existing-search", "solution": "search", "platform": "serverless", "ecu": 10, "gb": 0},
         ]
-        acc["ai_ml"] = {"by_deployment": [
-            {"name": "ech-search", "ml_node_ecu": 1200, "models": ["jina-embeddings-v3"]},
-            {"name": "existing-search", "ml_node_ecu": 12000, "models": ["jina-embeddings-v3"]},
-        ]}
+        _stamp_search_eis(acc, "ech-search", eis=10, tokens=1, ml=40)
+        acc["ai_ml"]["by_deployment"].append(
+            {"name": "existing-search", "ml_node_ecu": 12000, "models": ["jina-embeddings-v3"]}
+        )
 
         cons = build_consolidation(acc, None)
         line = next(q for q in cons["reconciliation"]["quotes"] if q["solution"] == "search")
-        # $50 estimator read-back + $50 quote-paced jina ML nodes and $7.50
-        # support uplift. The existing Serverless project's $500 ML average is
-        # outside this migration quote.
-        self.assertAlmostEqual(line["monthly"], 107.5)
-        self.assertAlmostEqual(line["annual_steady_state"], 1290.0)
+        search = cons["serverless"]["by_solution"]["search"]
+        # Window EIS is 10 ECU on one day, written as a month. The 0.5 billing
+        # pace does not scale it. Support follows the read-back's own ratio.
+        # The existing project's ML nodes stay out of both figures.
+        window_eis = round(10 * 30.416, 2)
+        rate = 6.52 / (30 + 10 + 3.48)
+        self.assertAlmostEqual(line["monthly"], round(50 + window_eis * (1 + rate), 2))
+        self.assertAlmostEqual(search["ml_node_ecu"], 40)
+        self.assertNotAlmostEqual(search["ml_node_ecu"], 12040)
+        self.assertAlmostEqual(line["annual_steady_state"], round(line["monthly"] * 12, 2))
 
     def test_bundle_coverage_counts_ech_deployments_only(self):
         acc = {
@@ -2995,7 +3192,7 @@ class ReviewRegressionTests(unittest.TestCase):
             "search_monthly": 30.0, "ingest_monthly": 10.0, "storage_monthly": 3.48, "support_monthly": 6.52,
         }}
         acc["solutions"]["by_deployment"] = [{"name": "s", "solution": "search", "platform": "ech", "ecu": 10, "gb": 50, "ingest_source": "diagnostics"}]
-        acc["ai_ml"] = {"by_deployment": [{"name": "s", "ml_node_ecu": 1200, "models": ["jina-embeddings-v3"]}]}
+        _stamp_search_eis(acc, "s", eis=10, tokens=1, ml=40)
         cons = build_consolidation(acc, None)
         line = next(q for q in cons["reconciliation"]["quotes"] if q["solution"] == "search")
         self.assertGreater(line["monthly"], 50.0)
@@ -3004,6 +3201,12 @@ class ReviewRegressionTests(unittest.TestCase):
 
     def test_an_increase_is_not_ranked_as_a_cost_saving(self):
         acc = _quote_account(g28=10, e73=0)
+        _stamp_reconciled_billing(acc)
+        acc["sizing"]["consolidated"]["search"] = {"stored_gb": 10, "daily_raw_gb": 0, "deployments": 1}
+        acc["sizing"]["estimators"]["search"]["readback"] = {
+            "monthly_steady_state": 500, "annual_year1": 6000, "annual_steady_state": 6000,
+        }
+        acc["workload"] = {"quote_window_telemetry": {"status": "complete"}}
         acc["analysis"] = {"cost": [{"title": "Move workloads to Serverless (ES3)", "severity": "high", "evidence": "ballpark", "action": "x", "impact": "y"}]}
         build_consolidation(acc, None)
         rec = acc["analysis"]["cost"][0]
@@ -3038,11 +3241,11 @@ class ReviewRegressionTests(unittest.TestCase):
         rows = {r["name"]: r["ech_ecu_mo"] for r in cons["by_deployment"]}
         self.assertAlmostEqual(rows["o11y"], 5 * 30.416, places=1)
         self.assertAlmostEqual(rows["nobundle"], cons["ech_scope"]["unpriced"][0]["ecu_mo"], places=2)
-        self.assertEqual(cons["by_deployment_basis"], "window")
+        self.assertEqual(cons["by_deployment_basis"], "daily_deployment_billing")
 
 
 class RetentionAndRestartTests(unittest.TestCase):
-    """Store with no delete policy joins retention at its own age. A restarted shard is flagged, not corrected."""
+    """Store with no delete policy is priced at 30 days. A restarted shard is flagged, not corrected."""
 
     CAPTURED = datetime(2026, 11, 1, tzinfo=timezone.utc)
     DAY = 86_400_000
@@ -3074,13 +3277,13 @@ class RetentionAndRestartTests(unittest.TestCase):
                 "nopolicy": (3_000_000_000, 100, None, 0),
             }, {"p30": 30})
             row = analyze_bundle(path, captured=self.CAPTURED)
-        # 1 GB at the 30-day policy and 3 GB at its own 100 days: (30 + 300) ÷ 4.
-        self.assertAlmostEqual(row["retention_days"], 82.5, places=1)
+        # 1 GB at the 30-day policy and 3 GB at the 30-day default.
+        self.assertAlmostEqual(row["retention_days"], 30.0, places=1)
         self.assertEqual(row["retention_basis"], "blended")
         self.assertAlmostEqual(row["retention_known_share"], 0.25, places=3)
-        self.assertIn("part observed", row["retention_label"])
+        self.assertIn("assumed", row["retention_label"])
 
-    def test_with_no_policy_anywhere_the_size_weighted_age_replaces_the_oldest_index(self):
+    def test_with_no_policy_anywhere_retention_is_the_30_day_default(self):
         from admin_diags import analyze_bundle
         with tempfile.TemporaryDirectory() as tmp:
             path = self._bundle(Path(tmp), {
@@ -3088,10 +3291,10 @@ class RetentionAndRestartTests(unittest.TestCase):
                 "tiny-old": (1_000_000, 2000, None, 0),
             }, {})
             row = analyze_bundle(path, captured=self.CAPTURED)
-        # The 2000-day index holds 0.01% of the store and used to set the month on its own.
-        self.assertEqual(row["retention_basis"], "observed")
-        self.assertLess(row["retention_days"], 12)
+        self.assertEqual(row["retention_basis"], "assumed")
+        self.assertAlmostEqual(row["retention_days"], 30.0, places=1)
         self.assertEqual(row["retention_known_share"], 0.0)
+        self.assertIn("assumed", row["retention_label"])
 
     def test_a_restarted_primary_is_flagged_and_the_quoted_rate_is_unchanged(self):
         from admin_diags import series_rates
@@ -3159,6 +3362,8 @@ class EstimatorMonotoneTests(unittest.TestCase):
 
     def test_the_check_is_in_the_integrity_score(self):
         acc = _quote_account(g28=10, e73=0)
+        _stamp_reconciled_billing(acc)
+        acc["sizing"]["quote_options"] = {"ech_scope": "all", "keep_serverless_spend": True, "min_priced_ecu_pct": 90, "unmeasured": "exclude"}
         acc["sizing"]["deployment_plan"] = {"bars": [
             {"label": "Ceiling", "projects": 4, "monthly": 100},
             {"label": "Floor", "projects": 1, "monthly": 400},

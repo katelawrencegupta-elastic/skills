@@ -10,7 +10,7 @@ is a separate document.
 
 The quote window is the last 90 billed days (--lookback-days, maximum 365). The account fetch stays a year.
 ECH dollars are the K360 billing cost field for that window, as a month. One consolidation PDF is
-written, at the measured retention month.
+written, as a one-year (12-month retention) estimate.
 
 Run from the project root that holds `.env` (KIBANA_URL, ELASTIC_API_KEY, FOUND_ADMIN_API_KEY).
 The account summary stays on run_account_analysis.py --skip-diags --skip-sizing.
@@ -33,7 +33,8 @@ _account_root = find_skill("k360-account-analysis", HERE)
 K360_SCRIPTS = scripts_dir(_account_root)
 sys.path.insert(0, str(K360_SCRIPTS))
 
-from consolidation import apply_quote_lookback, build_consolidation  # noqa: E402
+from consolidation import apply_quote_lookback, billed_series, build_consolidation  # noqa: E402
+from diag_inputs import ESTIMATE_MONTHS  # noqa: E402
 from privacy import seal_text  # noqa: E402
 from render_pdf import export_documents  # noqa: E402
 from report_md import render  # noqa: E402
@@ -96,7 +97,7 @@ def method_stamp(lookback_days: int, *, diagnostic: bool = True) -> dict:
         "ingest_basis": "metered diagnostic bulk" if diagnostic else "K360 stored GB ÷ assumed retention",
         "ech_dollars": "k360_cost",
         "quote_window_days": int(lookback_days),
-        "retention": "measured month, rounded up" if diagnostic else "assumed month",
+        "retention": "one year (12 months)" if diagnostic else "assumed month",
         "integrity_pass": "every check",
     }
 
@@ -220,6 +221,8 @@ def consolidation_brief(acc: dict) -> dict:
         "fleet": ((cons.get("sensitivity") or {}).get("fleet")) or [],
         "contract_rate": cons.get("contract_rate"),
         "ech_scope": cons.get("ech_scope"),
+        "ech_recent_months": cons.get("ech_recent_months"),
+        "estimate_months": cons.get("estimate_months"),
         "notes": list((cons.get("notes") or [])[:12]),
         "diagnostics_coverage": sz.get("diagnostics") if (cons.get("source") == "diagnostics" or sz.get("ingest_source") == "diagnostics") else None,
         "excluded_deployments": m.get("excluded_deployments"),
@@ -505,7 +508,7 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
                 return None
     zips = list(out_dir.glob("*.zip"))
     if not zips:
-        print("WARN: no diagnostic bundles — the quote falls back to K360 stored GB", file=sys.stderr)
+        print("WARN: no diagnostic bundles — no diagnostic Serverless estimate will be produced", file=sys.stderr)
         sz["diagnostics_status"] = "no diagnostic bundles"
         return None
     captured = datetime.fromtimestamp(max(p.stat().st_mtime for p in zips), timezone.utc)
@@ -533,25 +536,55 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
     diag = apply_diagnostics(
         acc, rows, admin_names,
         unmeasured=options["unmeasured"],
-        fallback_months=float(getattr(args, "retention_months", 3.0) or 3.0),
-        security_fallback_months=getattr(args, "security_retention_months", None),
     )
     missing = (diag["sizing"].get("diagnostics") or {}).get("fallback_names") or []
     if options["unmeasured"] == "fail" and missing:
         raise SystemExit(
             f"ERROR: {len(missing)} active deployment(s) have no diagnostic bundle: {', '.join(str(n) for n in missing)}. "
-            "--unmeasured fail stops the run. Collect the bundles, or pass --unmeasured exclude or --unmeasured k360."
+            "--unmeasured fail stops the run. Collect the diagnostic bundles or pass --unmeasured exclude."
         )
     diag["sizing"]["quote_options"] = options
     diag.setdefault("meta", {})["method"] = method_stamp(args.lookback_days)
     if download_failed:
         diag["sizing"].setdefault("diagnostics", {})["download_failed"] = download_failed
     apply_quote_lookback(diag, args.lookback_days)
+    # Refresh only workload telemetry for the exact billed quote window. The
+    # account report's usual 21-day workload sample cannot stand in for a
+    # different billing window.
+    try:
+        org_root = find_skill("k360-org-report", HERE)
+        org_scripts = scripts_dir(org_root)
+        if str(org_scripts) not in sys.path:
+            sys.path.insert(0, str(org_scripts))
+        from fetch_org import es_base_and_key, fetch_workload
+
+        quote_days = int((diag.get("ecu") or {}).get("quote_lookback_days") or 0)
+        labels, _ = billed_series(diag.get("ecu") or {})
+        quote_labels = labels[-quote_days:] if quote_days else []
+        if not quote_labels or len(quote_labels) != quote_days:
+            raise ValueError("the billed quote window has no complete daily date range")
+        avg_doc_bytes = (((diag.get("workload") or {}).get("ingest") or {}).get("avg_doc_bytes"))
+        base, key = es_base_and_key(env)
+        diag["workload"] = fetch_workload(
+            base, key, org_ids, avg_doc_bytes,
+            telemetry_start=quote_labels[0], telemetry_end=quote_labels[-1],
+        )
+        (diag.get("sizing") or {}).get("consolidated", {}).setdefault("search", {})["workload"] = diag["workload"]
+    except Exception as ex:
+        failed_workload = diag.setdefault("workload", {})
+        failed_workload["quote_window_fetch_error"] = str(ex)
+        failed_workload["quote_window_telemetry"] = {
+            "status": "incomplete",
+            "reason": f"Cloud Tracker quote-window telemetry fetch failed: {ex}",
+        }
+        (diag.get("sizing") or {}).get("consolidated", {}).setdefault("search", {})["workload"] = failed_workload
+    apply_quote_lookback(diag, args.lookback_days)
     diag_path = folder / f"{acc['meta']['run_key']}_diags_account.json"
     seal_text(diag_path, json.dumps(diag, indent=2))
     py = _sheets_py()
     sizing_ran = False
-    extra = ["--sizing-json", "sizing.json"]
+    # Every serverless estimate is a one-year estimate: retention is written as 12 months.
+    extra = ["--sizing-json", "sizing.json", "--force-months", str(ESTIMATE_MONTHS)]
     if args.fresh:
         extra.append("--fresh")
     if py.is_file():
@@ -663,8 +696,9 @@ def main() -> None:
     seal_text(acc_path, json.dumps(acc, indent=2))
 
     k360_for_pdf = None
-    quote_k360 = acc["sizing"]["triggered"] and (diag_acc is None or args.k360_ingest)
+    quote_k360 = acc["sizing"]["triggered"] and args.k360_ingest
     if quote_k360:
+        acc.setdefault("sizing", {})["ingest_source"] = "k360"
         # The backup is priced on the same billing window as a diagnostic quote, so --lookback-days
         # and --ech-scope mean the same thing on both. Its stored-GB ingest takes the window's pace.
         apply_quote_lookback(acc, args.lookback_days)
@@ -718,6 +752,19 @@ def main() -> None:
                 print(f"WARN: regional project sizing failed ({e}); report uses the consolidated read-backs", file=sys.stderr)
         if backup:
             acc["k360_ingest"] = _quote_block(acc)
+    elif acc["sizing"]["triggered"] and diag_acc is None:
+        why = (acc.get("sizing") or {}).get("diagnostics_status") or "diagnostic bundles were not available"
+        acc["consolidation"] = {
+            "triggered": True,
+            "source": "unavailable",
+            "error": f"No measured ingest quote was produced: {why}. K360-derived ingest fallback is disabled.",
+            "quotes": [],
+            "notes": [
+                f"No diagnostic ingest measurement was available ({why}). No Serverless estimate is quoted."
+            ],
+        }
+        acc.setdefault("sizing", {})["ingest_source"] = "unavailable"
+        seal_text(acc_path, json.dumps(acc, indent=2))
 
     if diag_acc is not None and acc.get("k360_ingest"):
         diag_mo = ((diag_acc.get("consolidation") or {}).get("savings") or {}).get("serverless_mo")

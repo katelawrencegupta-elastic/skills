@@ -5,9 +5,8 @@ Reads sizing_from_diags.json (a list of bundle rows). Each printed project is
 Σ bulk_gb_day and the bulk-weighted measured retention. A row with no measured
 retention is left out of that average. Stored GB is used only to pack rows
 into N groups. --each keeps deployments at or above 50 GB/day alone and
-pools the rest into one project. The estimator month is a whole number,
-rounded up, and is omitted when nothing was measured.
---retention-months replaces the headline month and leaves bulk measured.
+pools the rest into one project. The estimator month on a diagnostic run is 12. The measured age is a record.
+--retention-months is the K360 backup only. It replaces that backup's month and leaves bulk measured.
 No K360 stored-GB backfill is added.
 """
 from __future__ import annotations
@@ -44,6 +43,9 @@ def load_rows(path: Path) -> list[dict]:
     return rows
 
 
+ESTIMATE_MONTHS = 12  # every serverless estimate is a one-year estimate: retention is written as 12 months
+
+
 def whole_months(months: float) -> int:
     """Estimator retention is an integer 1–36. Round up.
 
@@ -69,11 +71,23 @@ def _measured_days(value) -> float | None:
     return days
 
 
-def _cells(bulk: float, written: int | None) -> tuple[dict, dict]:
-    o11y = {
-        "G23_logs_gb_day": round(bulk * 0.90, 3),
-        "G25_metrics_gb_day": round(bulk * 0.10, 3),
-    }
+def _cells(bulk: float, written: int | None, mix: dict, basis: str = "raw") -> tuple[dict, dict]:
+    """Recorded cells. A diagnostic run uses Option 1. The K360 backup keeps Option 2."""
+    if basis == "metered":
+        o11y = {
+            "G19": round((mix["logs"] + mix["traces"]) * 730 / 24, 3),
+            "G20": round(mix["metrics"] * 730 / 24, 3),
+            "G23": 0,
+            "G24": "0%",
+            "G25": 0,
+            "G26": 0,
+        }
+    else:
+        o11y = {
+            "G23_logs_gb_day": round(mix["logs"] + mix["traces"], 3),
+            "G24_k8s_logs_share": round(mix["k8s_logs"] / mix["logs"], 4) if mix["logs"] > 0 else 0,
+            "G25_metrics_gb_day": round(mix["metrics"], 3),
+        }
     security = {"G4_siem_gb_day": round(bulk, 3)}
     if written:
         o11y["G11_retention_months"] = written
@@ -82,14 +96,21 @@ def _cells(bulk: float, written: int | None) -> tuple[dict, dict]:
     return o11y, security
 
 
-def summarize(rows: list[dict], retention_months: int | None = None) -> dict:
+def summarize(rows: list[dict], retention_months: int | None = None, *, basis: str = "raw") -> dict:
     bulk = sum(_num(r, "bulk_gb_day") for r in rows)
+    mix = {"logs": 0.0, "k8s_logs": 0.0, "metrics": 0.0, "traces": 0.0}
     store = sum(_num(r, "store_gb") for r in rows)
     weight = 0.0
     weight_bulk = 0.0
     unmeasured = []
     for row in rows:
         rate = _num(row, "bulk_gb_day")
+        raw_mix = row.get("bulk_mix")
+        if rate > 0 and str(row.get("solution") or "") == "observability":
+            if not isinstance(raw_mix, dict):
+                raise ValueError(f"product-derived Observability mix is missing for {row.get('name') or 'a deployment'}")
+            for kind in mix:
+                mix[kind] += float(raw_mix.get(kind) or 0)
         days = _measured_days(row.get("retention_days"))
         if days is None:
             if rate > 0:
@@ -102,7 +123,7 @@ def summarize(rows: list[dict], retention_months: int | None = None) -> dict:
     written = whole_months(months) if months is not None else None
     if retention_months is not None and bulk:
         written = int(min(36, max(1, retention_months)))
-    o11y, security = _cells(bulk, written)
+    o11y, security = _cells(bulk, written, mix, basis)
     short = [
         {"name": r["name"], "uptime_days": r.get("uptime_days_min")}
         for r in rows
@@ -112,6 +133,8 @@ def summarize(rows: list[dict], retention_months: int | None = None) -> dict:
         "clusters": len(rows),
         "names": [r["name"] for r in rows],
         "bulk_gb_day": round(bulk, 3),
+        "bulk_mix_basis": "product-derived",
+        "bulk_mix": {key: round(value, 3) for key, value in mix.items()},
         "bulk_times_days": round(weight, 1),
         "weighted_days": round(days, 2) if days is not None else None,
         "months_measured": round(months, 3) if months is not None else None,
@@ -278,7 +301,7 @@ def main() -> None:
     out: dict = {"source": "diagnostics", "rows": len(rows), "scenarios": []}
     for n in counts:
         groups = [rows] if n == 1 else pack(rows, n)
-        projects = [summarize(g, args.retention_months) for g in groups]
+        projects = [summarize(g, args.retention_months, basis="metered") for g in groups]
         out["scenarios"].append({
             "projects": len(projects),
             "bulk_gb_day": round(sum(p["bulk_gb_day"] for p in projects), 3),
@@ -287,7 +310,7 @@ def main() -> None:
     if args.each:
         each = []
         for group in pooled_deployments(rows):
-            item = summarize(group, args.retention_months)
+            item = summarize(group, args.retention_months, basis="metered")
             if len(group) > 1:
                 item["pool"] = f"deployments under {POOL_UNDER_GB_DAY:g} GB/day"
             each.append(item)
