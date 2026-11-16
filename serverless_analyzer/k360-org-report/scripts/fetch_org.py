@@ -34,6 +34,8 @@ DAYS_PER_MONTH = 30.416
 # Size of every terms aggregation on deployment.name. An aggregation that still
 # leaves deployments out is named in the output's `truncated` list.
 DEP_TERMS_SIZE = 300
+COMPOSITE_PAGE_SIZE = 5000
+COMPOSITE_MAX_PAGES = 10000
 # A storage snapshot older than this many days before the range end is stale.
 STORAGE_STALE_DAYS = 45
 # A deployment with no bill in this many days before the range end is not in org stored GB.
@@ -92,6 +94,45 @@ def es_post(base: str, key: str, path: str, body: dict) -> dict:
             return json.load(resp)
     except urllib.error.HTTPError as e:
         raise SystemExit(f"ES HTTP {e.code} {path}: {e.read()[:600]!r}") from e
+
+
+def composite_pages(base: str, key: str, path: str, body: dict, agg_name: str, consume) -> dict:
+    """Stream every composite bucket using Elasticsearch's returned after_key.
+
+    The callback receives one bucket at a time so large billing histories do not
+    accumulate all pages in memory. A failed or non-progressing page is explicit
+    incomplete data; consumers must not interpret it as a complete zero series.
+    """
+    after = None
+    seen_after: set[str] = set()
+    pages = buckets = 0
+    try:
+        while pages < COMPOSITE_MAX_PAGES:
+            request = json.loads(json.dumps(body))
+            composite = request["aggs"][agg_name]["composite"]
+            if after is not None:
+                composite["after"] = after
+            response = es_post(base, key, path, request)
+            aggregations = response.get("aggregations") or {}
+            if agg_name not in aggregations or "buckets" not in aggregations[agg_name]:
+                raise ValueError(f"composite response is missing {agg_name}.buckets")
+            result = aggregations[agg_name]
+            page_buckets = result["buckets"] or []
+            for bucket in page_buckets:
+                consume(bucket)
+            pages += 1
+            buckets += len(page_buckets)
+            next_after = result.get("after_key")
+            if not page_buckets or not next_after:
+                return {"complete": True, "pages": pages, "buckets": buckets}
+            marker = json.dumps(next_after, sort_keys=True, separators=(",", ":"))
+            if marker in seen_after:
+                return {"complete": False, "pages": pages, "buckets": buckets, "reason": "composite after_key repeated"}
+            seen_after.add(marker)
+            after = next_after
+    except (SystemExit, OSError, ValueError, KeyError, TypeError) as exc:
+        return {"complete": False, "pages": pages, "buckets": buckets, "reason": str(exc)}
+    return {"complete": False, "pages": pages, "buckets": buckets, "reason": f"composite page limit ({COMPOSITE_MAX_PAGES}) reached"}
 
 
 def family(t: str) -> str:
@@ -360,12 +401,28 @@ def org_clause(org_ids: list[str]) -> dict:
     return {"terms": {"organization.id": ids}}
 
 
-def fetch_workload(base: str, key: str, org_id: str | list[str], avg_doc_bytes: float | None) -> dict:
+def fetch_workload(
+    base: str,
+    key: str,
+    org_id: str | list[str],
+    avg_doc_bytes: float | None,
+    *,
+    telemetry_start: str | None = None,
+    telemetry_end: str | None = None,
+) -> dict:
     """Day-average search/ingest sizing inputs from index_telemetry (2 ES calls).
 
     Cadence is ~daily → QPS/docs-sec are day averages; % hours use day-share proxies.
     """
     org = org_clause([org_id] if isinstance(org_id, str) else list(org_id))
+    exact_window = bool(telemetry_start and telemetry_end)
+    if telemetry_start and telemetry_end:
+        start = date.fromisoformat(telemetry_start) - timedelta(days=1)
+        top_range = {"gte": f"{telemetry_start}T00:00:00Z", "lte": f"{telemetry_end}T23:59:59Z"}
+        hist_range = {"gte": f"{start.isoformat()}T00:00:00Z", "lte": f"{telemetry_end}T23:59:59Z"}
+    else:
+        top_range = {"gte": "now-5d"}
+        hist_range = {"gte": "now-21d"}
     exclude = {"bool": {"must_not": [
         {"prefix": {"index.name": "."}},
         {"prefix": {"index.name": "partial-"}},
@@ -377,15 +434,15 @@ def fetch_workload(base: str, key: str, org_id: str | list[str], avg_doc_bytes: 
         {
             "size": 0,
             "query": {"bool": {"filter": [
-                org, exclude, {"range": {"@timestamp": {"gte": "now-5d"}}},
+                org, exclude, {"range": {"@timestamp": top_range}},
             ]}},
             "aggs": {
                 "by_search": {
-                    "terms": {"field": "index.name", "size": 100, "order": {"mx": "desc"}},
+                    "terms": {"field": "index.name", "size": 10000, "order": {"mx": "desc"}},
                     "aggs": {"mx": {"max": {"field": "index.search_total"}}},
                 },
                 "by_docs": {
-                    "terms": {"field": "index.name", "size": 100, "order": {"mx": "desc"}},
+                    "terms": {"field": "index.name", "size": 10000, "order": {"mx": "desc"}},
                     "aggs": {"mx": {"max": {"field": "index.docs_count"}}},
                 },
             },
@@ -395,6 +452,10 @@ def fetch_workload(base: str, key: str, org_id: str | list[str], avg_doc_bytes: 
         *(b["key"] for b in top["aggregations"]["by_search"]["buckets"]),
         *(b["key"] for b in top["aggregations"]["by_docs"]["buckets"]),
     })
+    indices_complete = not any(
+        int(top["aggregations"][name].get("sum_other_doc_count") or 0) > 0
+        for name in ("by_search", "by_docs")
+    )
     empty = {
         "search": {
             "peak": {"qps": None, "complexity": None, "complexity_ms": None, "pct_hours_mo": None},
@@ -403,11 +464,14 @@ def fetch_workload(base: str, key: str, org_id: str | list[str], avg_doc_bytes: 
         },
         "ingest": {
             "docs_per_sec": None,
-            "avg_doc_bytes": round(avg_doc_bytes) if avg_doc_bytes else None,
+            "avg_doc_bytes": None if exact_window else (round(avg_doc_bytes) if avg_doc_bytes else None),
             "active_hours_mo": None,
         },
         "notes": ["No index_telemetry for org"],
         "window_days": 0,
+        "window_start": None,
+        "window_end": None,
+        "indices_complete": indices_complete,
     }
     if not names:
         return empty
@@ -420,7 +484,7 @@ def fetch_workload(base: str, key: str, org_id: str | list[str], avg_doc_bytes: 
             "size": 0,
             "query": {"bool": {"filter": [
                 org,
-                {"range": {"@timestamp": {"gte": "now-21d"}}},
+                {"range": {"@timestamp": hist_range}},
                 {"terms": {"index.name": names}},
             ]}},
             "aggs": {
@@ -433,6 +497,8 @@ def fetch_workload(base: str, key: str, org_id: str | list[str], avg_doc_bytes: 
                                 "st": {"max": {"field": "index.search_total"}},
                                 "tm": {"max": {"field": "index.search_time_ms"}},
                                 "docs": {"max": {"field": "index.docs_count"}},
+                                "size": {"max": {"field": "index.dataset_size_bytes"}},
+                                "doc_count": {"max": {"field": "index.docs_count"}},
                             },
                         }
                     },
@@ -440,7 +506,7 @@ def fetch_workload(base: str, key: str, org_id: str | list[str], avg_doc_bytes: 
             },
         },
     )
-    series: dict[str, dict[str, tuple[float, float, float]]] = defaultdict(dict)
+    series: dict[str, dict[str, tuple[float, float, float, float, float]]] = defaultdict(dict)
     days: list[str] = []
     for b in hist["aggregations"]["by_day"]["buckets"]:
         day = b["key_as_string"][:10]
@@ -450,6 +516,8 @@ def fetch_workload(base: str, key: str, org_id: str | list[str], avg_doc_bytes: 
                 float(ib["st"]["value"] or 0),
                 float(ib["tm"]["value"] or 0),
                 float(ib["docs"]["value"] or 0),
+                float((ib.get("size") or {}).get("value") or 0),
+                float((ib.get("doc_count") or {}).get("value") or 0),
             )
 
     search_rows: list[dict] = []
@@ -461,8 +529,8 @@ def fetch_workload(base: str, key: str, org_id: str | list[str], avg_doc_bytes: 
         for hist_i in series.values():
             if d0 not in hist_i or d1 not in hist_i:
                 continue
-            s0, t0, doc0 = hist_i[d0]
-            s1, t1, doc1 = hist_i[d1]
+            s0, t0, doc0, _size0, _count0 = hist_i[d0]
+            s1, t1, doc1, _size1, _count1 = hist_i[d1]
             dsv = (s1 - s0) if s1 >= s0 else s1
             if dsv > 0:
                 ds += dsv
@@ -482,17 +550,29 @@ def fetch_workload(base: str, key: str, org_id: str | list[str], avg_doc_bytes: 
         "Ingest docs/sec = median daily Δdocs_count; active_hours/mo = active_day_frac×730",
     ]
 
+    last_day = days[-1] if days else None
+    observed_size = observed_count = 0.0
+    if last_day:
+        for hist_i in series.values():
+            if last_day in hist_i:
+                observed_size += hist_i[last_day][3]
+                observed_count += hist_i[last_day][4]
+    telemetry_avg_doc_bytes = observed_size / observed_count if observed_size > 0 and observed_count > 0 else None
+
     if not search_rows:
         return {
             **empty,
             "ingest": {
                 "docs_per_sec": round(median(ingest_dps), 2) if ingest_dps else None,
-                "avg_doc_bytes": round(avg_doc_bytes) if avg_doc_bytes else None,
+                "avg_doc_bytes": round(telemetry_avg_doc_bytes) if telemetry_avg_doc_bytes else (None if exact_window else (round(avg_doc_bytes) if avg_doc_bytes else None)),
                 "active_hours_mo": round(active_ingest_days / max(len(days) - 1, 1) * 730)
                 if days else None,
             },
             "notes": notes,
             "window_days": max(len(days) - 1, 0),
+            "window_start": days[0] if days else None,
+            "window_end": days[-1] if days else None,
+            "indices_complete": indices_complete,
         }
 
     med_q = median(r["qps"] for r in search_rows)
@@ -524,11 +604,15 @@ def fetch_workload(base: str, key: str, org_id: str | list[str], avg_doc_bytes: 
         },
         "ingest": {
             "docs_per_sec": round(median(ingest_dps), 2) if ingest_dps else None,
-            "avg_doc_bytes": round(avg_doc_bytes) if avg_doc_bytes else None,
+            "avg_doc_bytes": round(telemetry_avg_doc_bytes) if telemetry_avg_doc_bytes else (None if exact_window else (round(avg_doc_bytes) if avg_doc_bytes else None)),
             "active_hours_mo": round(active_ingest_days / day_n * 730),
         },
         "notes": notes,
         "window_days": day_n,
+        "window_start": days[0] if days else None,
+        "window_end": days[-1] if days else None,
+        "indices_complete": indices_complete,
+        "avg_doc_bytes_source": "cloud_tracker_index_telemetry dataset_size_bytes / docs_count" if telemetry_avg_doc_bytes else (None if exact_window else "cloud_tracker_telemetry"),
         "indices": len(names),
     }
 
@@ -1458,6 +1542,21 @@ def main() -> None:
                             "terms": {"field": "sku", "size": 40, "include": ".*inference.*"},
                             "aggs": {"ecu": {"sum": {"field": "cost"}}, "qty": {"sum": {"field": "quantity"}}},
                         },
+                        "eis_totals": {
+                            "filter": {"regexp": {"sku": ".*inference.*"}},
+                            "aggs": {
+                                "ecu": {"sum": {"field": "cost"}},
+                                "qty": {"sum": {"field": "quantity"}},
+                            },
+                        },
+                        "ml_totals": {
+                            "filter": {"regexp": {"sku": ".*(\\.es\\.ml\\.|\\.ml\\.).*"}},
+                            "aggs": {"ecu": {"sum": {"field": "cost"}}},
+                        },
+                        "jina_totals": {
+                            "filter": {"regexp": {"sku": ".*inference.*jina.*"}},
+                            "aggs": {"ecu": {"sum": {"field": "cost"}}},
+                        },
                         "ml_skus": {
                             "terms": {"field": "sku", "size": 30, "include": ".*(\\.es\\.ml\\.|\\.ml\\.).*"},
                             "aggs": {"ecu": {"sum": {"field": "cost"}}},
@@ -1473,28 +1572,7 @@ def main() -> None:
                         "min_doc_count": 0,
                         "extended_bounds": {"min": rng["gte"], "max": rng["lte"]},
                     },
-                    "aggs": {
-                        "by_dep": {
-                            # Same size and order as the top-level roster, so a big spender with
-                            # few billing lines is not dropped from a day.
-                            "terms": {"field": "deployment.name", "size": DEP_TERMS_SIZE, "order": {"ecu": "desc"}},
-                            "aggs": {
-                                "ecu": {"sum": {"field": "cost"}},
-                                "eis_skus": {
-                                    "terms": {"field": "sku", "size": 40, "include": ".*inference.*"},
-                                    "aggs": {
-                                        "ecu": {"sum": {"field": "cost"}},
-                                        "qty": {"sum": {"field": "quantity"}},
-                                    },
-                                },
-                                "ml_skus": {
-                                    "terms": {"field": "sku", "size": 30, "include": ".*(\\.es\\.ml\\.|\\.ml\\.).*"},
-                                    "aggs": {"ecu": {"sum": {"field": "cost"}}},
-                                },
-                            },
-                        },
-                        "ecu": {"sum": {"field": "cost"}},
-                    },
+                    "aggs": {"ecu": {"sum": {"field": "cost"}}},
                 },
                 "types_total": {"terms": {"field": "type", "size": 80}, "aggs": {"ecu": {"sum": {"field": "cost"}}}},
                 "cloud_skus": {
@@ -1516,9 +1594,165 @@ def main() -> None:
                     "terms": {"field": "sku", "size": 40, "include": ".*(\\.es\\.ml\\.|\\.ml\\.).*"},
                     "aggs": {"ecu": {"sum": {"field": "cost"}}},
                 },
+                "ml_total": {
+                    "filter": {"regexp": {"sku": ".*(\\.es\\.ml\\.|\\.ml\\.).*"}},
+                    "aggs": {"ecu": {"sum": {"field": "cost"}}},
+                },
             },
         },
     )
+
+    def composite_day(value) -> str:
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(float(value) / 1000, timezone.utc).date().isoformat()
+        return str(value)[:10]
+
+    daily_dep_costs: dict[str, dict[str, float]] = defaultdict(dict)
+    daily_dep_status = composite_pages(
+        base,
+        key,
+        "cloud-tracker-billing-*/_search",
+        {
+            "size": 0,
+            "query": {"bool": {"filter": filt}},
+            "aggs": {
+                "daily_deployments": {
+                    "composite": {
+                        "size": COMPOSITE_PAGE_SIZE,
+                        "sources": [
+                            {"day": {"date_histogram": {"field": "@timestamp", "calendar_interval": "day"}}},
+                            {"deployment": {"terms": {"field": "deployment.name"}}},
+                        ],
+                    },
+                    "aggs": {"ecu": {"sum": {"field": "cost"}}},
+                }
+            },
+        },
+        "daily_deployments",
+        lambda bucket: daily_dep_costs[composite_day((bucket.get("key") or {}).get("day"))].__setitem__(
+            str((bucket.get("key") or {}).get("deployment") or ""),
+            float(((bucket.get("ecu") or {}).get("value")) or 0),
+        ),
+    )
+
+    daily_ai_by_name: dict[str, dict[str, dict]] = defaultdict(dict)
+
+    def collect_daily_ai(bucket: dict) -> None:
+        key_row = bucket.get("key") or {}
+        name = str(key_row.get("deployment") or "")
+        day = composite_day(key_row.get("day"))
+        sku = str(key_row.get("sku") or "")
+        ecu = float(((bucket.get("ecu") or {}).get("value")) or 0)
+        qty = float(((bucket.get("qty") or {}).get("value")) or 0)
+        daily = daily_ai_by_name[name].setdefault(day, {
+            "eis_ecu": 0.0,
+            "million_tokens": 0.0,
+            "ml_node_ecu": 0.0,
+            "models": set(),
+        })
+        if "inference" in sku.lower():
+            decoded = decode_inference_sku(sku)
+            model = str(decoded.get("model") or "")
+            daily["eis_ecu"] += ecu
+            daily["million_tokens"] += qty
+            if model:
+                daily["models"].add(model)
+        elif is_ml_sku(sku):
+            daily["ml_node_ecu"] += ecu
+
+    ai_sku_status = composite_pages(
+        base,
+        key,
+        "cloud-tracker-billing-*/_search",
+        {
+            "size": 0,
+            "query": {"bool": {
+                "filter": filt,
+                "should": [
+                    {"regexp": {"sku": ".*inference.*"}},
+                    {"regexp": {"sku": ".*(\\.es\\.ml\\.|\\.ml\\.).*"}},
+                ],
+                "minimum_should_match": 1,
+            }},
+            "aggs": {
+                "daily_ai_skus": {
+                    "composite": {
+                        "size": COMPOSITE_PAGE_SIZE,
+                        "sources": [
+                            {"day": {"date_histogram": {"field": "@timestamp", "calendar_interval": "day"}}},
+                            {"deployment": {"terms": {"field": "deployment.name"}}},
+                            {"sku": {"terms": {"field": "sku"}}},
+                        ],
+                    },
+                    "aggs": {
+                        "ecu": {"sum": {"field": "cost"}},
+                        "qty": {"sum": {"field": "quantity"}},
+                    },
+                }
+            },
+        },
+        "daily_ai_skus",
+        collect_daily_ai,
+    )
+
+    billing_ai_by_name: dict[str, dict] = {}
+
+    def collect_billing_ai(bucket: dict) -> None:
+        name = str((bucket.get("key") or {}).get("deployment") or "")
+        if not name:
+            return
+        billing_ai_by_name[name] = {
+            "eis_ecu": float(((bucket.get("eis") or {}).get("ecu") or {}).get("value") or 0),
+            "million_tokens": float(((bucket.get("eis") or {}).get("qty") or {}).get("value") or 0),
+            "ml_node_ecu": float(((bucket.get("ml") or {}).get("ecu") or {}).get("value") or 0),
+            "jina_inference_ecu": float(((bucket.get("jina") or {}).get("ecu") or {}).get("value") or 0),
+        }
+
+    billing_ai_status = composite_pages(
+        base,
+        key,
+        "cloud-tracker-billing-*/_search",
+        {
+            "size": 0,
+            "query": {"bool": {"filter": filt}},
+            "aggs": {
+                "deployment_ai_totals": {
+                    "composite": {
+                        "size": COMPOSITE_PAGE_SIZE,
+                        "sources": [{"deployment": {"terms": {"field": "deployment.name"}}}],
+                    },
+                    "aggs": {
+                        "eis": {
+                            "filter": {"regexp": {"sku": ".*inference.*"}},
+                            "aggs": {"ecu": {"sum": {"field": "cost"}}, "qty": {"sum": {"field": "quantity"}}},
+                        },
+                        "ml": {
+                            "filter": {"regexp": {"sku": ".*(\\.es\\.ml\\.|\\.ml\\.).*"}},
+                            "aggs": {"ecu": {"sum": {"field": "cost"}}},
+                        },
+                        "jina": {
+                            "filter": {"regexp": {"sku": ".*inference.*jina.*"}},
+                            "aggs": {"ecu": {"sum": {"field": "cost"}}},
+                        },
+                    },
+                }
+            },
+        },
+        "deployment_ai_totals",
+        collect_billing_ai,
+    )
+    for name, by_day in daily_ai_by_name.items():
+        for daily in by_day.values():
+            daily["models"] = sorted(daily["models"])
+    if not daily_dep_status["complete"]:
+        truncated.append("billing.daily_deployment_composite")
+        print(f"WARN: daily deployment billing is incomplete: {daily_dep_status['reason']}", file=sys.stderr)
+    if not ai_sku_status["complete"]:
+        truncated.append("billing.daily_ai_sku_composite")
+        print(f"WARN: daily AI SKU billing is incomplete: {ai_sku_status['reason']}", file=sys.stderr)
+    if not billing_ai_status["complete"]:
+        truncated.append("billing.deployment_ai_totals_composite")
+        print(f"WARN: filtered deployment AI totals are incomplete: {billing_ai_status['reason']}", file=sys.stderr)
 
     feats = es_post(
         base,
@@ -1593,8 +1827,6 @@ def main() -> None:
 
     if _other(bill["aggregations"]["by_dep"]) > 0:
         truncated.append("billing.by_dep")
-    if any(_other(b.get("by_dep")) > 0 for b in bill["aggregations"]["by_day"]["buckets"]):
-        truncated.append("billing.by_day.by_dep")
     if _other(feats.get("aggregations", {}).get("by_dep")) > 0:
         truncated.append("features.by_dep")
     if _other(telem.get("aggregations", {}).get("by_dep")) > 0:
@@ -1657,7 +1889,8 @@ def main() -> None:
                 if c > 0 and is_ml_sku(s):
                     ml_skus.append({**decode_ml_sku(s), "ecu": round(c, 2)})
         ml_skus.sort(key=lambda x: -x["ecu"])
-        ml_ecu = round(sum(x["ecu"] for x in ml_skus), 2)
+        ml_total_agg = b.get("ml_totals") or {}
+        ml_ecu = round(float(((ml_total_agg.get("ecu") or {}).get("value")) or 0), 2)
         # Infer provider/region from billing SKUs when inventory missing
         region = None
         for s, c in skus.items():
@@ -1673,6 +1906,11 @@ def main() -> None:
                 hot_instance = f"{parsed['provider'].lower()}.{parsed['instance']}"
         ai_sku_agg = b.get("ai_skus") or {}
         ml_sku_agg = b.get("ml_skus") or {}
+        eis_total_agg = b.get("eis_totals") or {}
+        jina_total_agg = b.get("jina_totals") or {}
+        eis_ecu_total = float(((eis_total_agg.get("ecu") or {}).get("value")) or 0)
+        eis_qty_total = float(((eis_total_agg.get("qty") or {}).get("value")) or 0)
+        jina_ecu_total = float(((jina_total_agg.get("ecu") or {}).get("value")) or 0)
         infer_skus = []
         for sb in ai_sku_agg.get("buckets") or []:
             if sb["ecu"]["value"] <= 0 and sb["qty"]["value"] <= 0:
@@ -1713,6 +1951,10 @@ def main() -> None:
                 "ai_assistant": bool((ff.get("observability") or {}).get("ai_assistant")),
                 "attack_discovery": bool((ff.get("security") or {}).get("attack_discovery")),
                 "inference_ecu": round(families["genai"], 2),
+                "eis_ecu": round(eis_ecu_total, 6),
+                "eis_million_tokens": round(eis_qty_total, 6),
+                "jina_inference_ecu": round(jina_ecu_total, 6),
+                "eis_totals_complete": "eis_totals" in b and "ml_totals" in b and "jina_totals" in b,
                 "inference_skus": infer_skus,
                 "inference_skus_truncated": int(ai_sku_agg.get("sum_other_doc_count") or 0) > 0,
                 "ml_skus_truncated": int(ml_sku_agg.get("sum_other_doc_count") or 0) > 0,
@@ -1727,13 +1969,10 @@ def main() -> None:
     deployments.sort(key=lambda d: -d["ecu"])
 
     top = [d["name"] for d in deployments[:4]]
-    days, total_daily, series = [], [], {n: [] for n in top}
+    days, total_daily, total_daily_exact, series = [], [], [], {n: [] for n in top}
     other_daily = []
-    ai_daily_by_name: dict[str, dict[str, dict[str, float]]] = {}
-    ai_daily_complete = not any(
-        d["ai"].get("inference_skus_truncated") or d["ai"].get("ml_skus_truncated")
-        for d in deployments
-    ) and int((bill["aggregations"].get("by_dep") or {}).get("sum_other_doc_count") or 0) == 0
+    ai_daily_complete = bool(daily_dep_status["complete"] and ai_sku_status["complete"])
+    ai_totals_complete = bool(billing_ai_status["complete"])
     # month -> dep -> ecu (for monthly averages)
     month_dep: dict[str, dict[str, float]] = {}
     # day -> set of named deps with spend (for deployments-over-time)
@@ -1743,43 +1982,10 @@ def main() -> None:
     for bucket in bill["aggregations"]["by_day"]["buckets"]:
         day = bucket["key_as_string"][:10]
         days.append(day)
-        total_daily.append(round(bucket["ecu"]["value"], 2))
-        dep_map = {x["key"]: x["ecu"]["value"] for x in bucket["by_dep"]["buckets"]}
-        if int((bucket.get("by_dep") or {}).get("sum_other_doc_count") or 0) > 0:
-            ai_daily_complete = False
-        for dep_row in (bucket.get("by_dep") or {}).get("buckets") or []:
-            name = str(dep_row.get("key") or "")
-            if not name or hex_id(name):
-                continue
-            eis_agg = dep_row.get("eis_skus") or {}
-            ml_agg = dep_row.get("ml_skus") or {}
-            if int(eis_agg.get("sum_other_doc_count") or 0) > 0 or int(ml_agg.get("sum_other_doc_count") or 0) > 0:
-                ai_daily_complete = False
-            daily_models = []
-            jina_billed = False
-            eis_ecu = 0.0
-            million_tokens = 0.0
-            for sku_row in eis_agg.get("buckets") or []:
-                decoded = decode_inference_sku(str(sku_row.get("key") or ""))
-                model = str(decoded.get("model") or "")
-                sku_ecu = float(((sku_row.get("ecu") or {}).get("value")) or 0)
-                sku_qty = float(((sku_row.get("qty") or {}).get("value")) or 0)
-                eis_ecu += sku_ecu
-                million_tokens += sku_qty
-                if model and model not in daily_models:
-                    daily_models.append(model)
-                if "jina" in model.lower() and (sku_ecu > 0 or sku_qty > 0):
-                    jina_billed = True
-            ml_ecu = sum(float(((sku_row.get("ecu") or {}).get("value")) or 0) for sku_row in ml_agg.get("buckets") or [])
-            daily_values = {
-                "eis_ecu": eis_ecu,
-                "million_tokens": million_tokens,
-                "ml_node_ecu": float(ml_ecu),
-                "jina_ml_node_ecu": float(ml_ecu) if jina_billed else 0.0,
-                "models": daily_models,
-            }
-            if daily_values["eis_ecu"] or daily_values["million_tokens"] or daily_values["ml_node_ecu"] or daily_models:
-                ai_daily_by_name.setdefault(name, {})[day] = daily_values
+        raw_total = float(bucket["ecu"]["value"] or 0)
+        total_daily_exact.append(raw_total)
+        total_daily.append(round(raw_total, 2))
+        dep_map = daily_dep_costs.get(day, {})
         active = {k for k, v in dep_map.items() if not hex_id(k) and v > 0}
         day_active_deps.append(active)
         for k, v in dep_map.items():
@@ -1796,6 +2002,25 @@ def main() -> None:
         other_daily.append(
             round(sum(v for k, v in dep_map.items() if k not in top and not hex_id(k)), 2)
         )
+    # Preserve measured daily deployment billing for downstream quote-window
+    # allocation, and verify it reconciles to the org daily cost series.
+    daily_dep_reconciliation = []
+    for day, org_total in zip(days, total_daily_exact):
+        dep_total = sum(float(v or 0) for v in daily_dep_costs.get(day, {}).values())
+        tolerance = max(0.02, abs(org_total) * 0.001)
+        if abs(dep_total - org_total) > tolerance:
+            daily_dep_reconciliation.append({
+                "day": day,
+                "org_ecu": round(org_total, 6),
+                "deployment_ecu": round(dep_total, 6),
+                "difference_ecu": round(dep_total - org_total, 6),
+            })
+    daily_dep_complete = bool(daily_dep_status["complete"] and not daily_dep_reconciliation)
+    daily_dep_reason = daily_dep_status.get("reason")
+    if daily_dep_reconciliation:
+        mismatch_reason = f"deployment costs do not reconcile to org daily billing on {len(daily_dep_reconciliation)} day(s)"
+        daily_dep_reason = f"{daily_dep_reason}; {mismatch_reason}" if daily_dep_reason else mismatch_reason
+        print(f"WARN: daily deployment billing does not reconcile to org totals: {mismatch_reason}", file=sys.stderr)
     series_list = [series[n] for n in top]
     names = top + (["Other"] if any(other_daily) else [])
     if any(other_daily):
@@ -2182,16 +2407,33 @@ def main() -> None:
             "inference_skus_truncated": int(ai_sku_agg.get("sum_other_doc_count") or 0) > 0,
             "inference_skus": ai_skus,
             "daily_usage_complete": ai_daily_complete,
+            "daily_usage_status": {
+                "complete": ai_daily_complete,
+                "deployment_pages": daily_dep_status["pages"],
+                "deployment_buckets": daily_dep_status["buckets"],
+                "sku_pages": ai_sku_status["pages"],
+                "sku_buckets": ai_sku_status["buckets"],
+                "reason": None if ai_daily_complete else "; ".join(
+                    str(value) for value in (daily_dep_status.get("reason"), ai_sku_status.get("reason")) if value
+                ),
+            },
+            "billing_by_deployment_complete": ai_totals_complete,
+            "billing_by_deployment_status": {
+                "complete": ai_totals_complete,
+                "pages": billing_ai_status["pages"],
+                "buckets": billing_ai_status["buckets"],
+                "reason": billing_ai_status.get("reason"),
+            },
+            "billing_by_deployment": billing_ai_by_name,
             "daily_usage_by_deployment": {
                 name: {
                     "days": days,
                     "eis_ecu": [round(float((daily.get(day) or {}).get("eis_ecu") or 0), 6) for day in days],
                     "million_tokens": [round(float((daily.get(day) or {}).get("million_tokens") or 0), 6) for day in days],
                     "ml_node_ecu": [round(float((daily.get(day) or {}).get("ml_node_ecu") or 0), 6) for day in days],
-                    "jina_ml_node_ecu": [round(float((daily.get(day) or {}).get("jina_ml_node_ecu") or 0), 6) for day in days],
                     "models": [list((daily.get(day) or {}).get("models") or []) for day in days],
                 }
-                for name, daily in ai_daily_by_name.items()
+                for name, daily in daily_ai_by_name.items()
             },
             "models": sorted({m for d in deployments for m in d["ai"]["models"]}),
             "by_deployment": ai_by_dep,
@@ -2230,6 +2472,24 @@ def main() -> None:
             ],
         },
         "chart": chart,
+        "billing": {
+            "daily_deployment_costs": {
+                "days": days,
+                "by_deployment": {
+                    name: [round(float(daily_dep_costs.get(day, {}).get(name, 0.0) or 0), 6) for day in days]
+                    for name in sorted({name for by_day in daily_dep_costs.values() for name in by_day})
+                },
+                "org_daily_totals": [round(value, 6) for value in total_daily_exact],
+                "complete": daily_dep_complete,
+                "status": {
+                    "complete": daily_dep_complete,
+                    "pages": daily_dep_status["pages"],
+                    "buckets": daily_dep_status["buckets"],
+                    "reconciliation_mismatches": daily_dep_reconciliation,
+                    "reason": daily_dep_reason,
+                },
+            },
+        },
         "monthly": month_series,
         "totals": {
             "ecu": org_total_ecu,
