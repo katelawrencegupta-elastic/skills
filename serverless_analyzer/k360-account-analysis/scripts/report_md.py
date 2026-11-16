@@ -232,6 +232,7 @@ def consolidation_section(acc: dict) -> list[str]:
     sv, comp, svl, fr, cr = c.get("savings") or {}, c.get("ech_composition") or {}, c.get("serverless") or {}, c.get("fragmentation") or {}, c.get("contract_rate") or {}
     b = c.get("basis") or {}
     per_region = (c.get("architecture") or {}).get("per_region")
+    scope_unavailable = (c.get("ech_scope") or {}).get("status") == "unavailable"
     shape = "one serverless project per solution in each region" if per_region else "one serverless project per solution"
     if sv.get("ech_contract_mo") is not None:
         L.append(f"ECH today **{n0(sv.get('ech_list_mo'))} ECU/mo** at the contract rate, **{usd(sv.get('ech_contract_mo'))}/mo** → {shape}, **{usd(sv.get('serverless_mo'))}/mo estimate** → **{usd(sv.get('cost_mo'))}/mo ({s(sv.get('cost_pct'))}%)** below the contract rate, {usd(sv.get('cost_yr'))}/yr.")
@@ -241,7 +242,10 @@ def consolidation_section(acc: dict) -> list[str]:
         _gap = sv.get("list_mo")
         _side = "above" if isinstance(_gap, (int, float)) and _gap < 0 else "below"
         _abs = (lambda v: abs(v) if isinstance(v, (int, float)) else v)
-        L.append(f"ECH billed cost **{usd(sv.get('ech_list_mo'))}/mo** → {shape}, **{usd(sv.get('serverless_mo'))}/mo estimate** → **{usd(_abs(_gap))}/mo ({s(_abs(sv.get('list_pct')))}%)** {_side} the ECH billed cost, {usd(_abs(sv.get('list_yr')))}/yr.")
+        if scope_unavailable:
+            L.append(f"The deployment-scoped ECH comparison is unavailable because daily Cloud Tracker deployment billing could not be verified. The serverless estimate is **{usd(sv.get('serverless_mo'))}/mo**; savings are not calculated.")
+        else:
+            L.append(f"ECH billed cost **{usd(sv.get('ech_list_mo'))}/mo** → {shape}, **{usd(sv.get('serverless_mo'))}/mo estimate** → **{usd(_abs(_gap))}/mo ({s(_abs(sv.get('list_pct')))}%)** {_side} the ECH billed cost, {usd(_abs(sv.get('list_yr')))}/yr.")
         L.append("")
         L.append("_ECH billed cost_ = the K360 billing cost field as a month, with no ARR ÷ commit rate applied. _Estimate_ = from the serverless estimators, not a quote or a bill.")
     L.append("")
@@ -257,10 +261,11 @@ def consolidation_section(acc: dict) -> list[str]:
     missing = (fr.get("n_deployments") or 0) - (fr.get("n_with_gb") if fr.get("n_with_gb") is not None else (fr.get("n_priced") or 0))
     src = (st.get("notes") or ["account storage block"])[0]
     from_diags = c.get("source") == "diagnostics" or (acc.get("sizing") or {}).get("ingest_source") == "diagnostics"
-    L.append(f"- **Lookback ECU** {n0(e.get('total_lookback'))} from {s(rng.get('start'))} → {s(rng.get('end'))} ({s(e.get('lookback_days'))} d), cloud-tracker-billing. Headline ECH/mo is the complete-month average, {n0(sv.get('ech_list_mo'))} ECU. Partial months excluded: {', '.join(partial) if partial else 'none'}.")
+    comparison = (f"Deployment-scoped ECH comparison is {n0(sv.get('ech_list_mo'))} ECU/mo." if sv.get("ech_list_mo") is not None else "Deployment-scoped ECH comparison is unavailable; savings are not calculated.")
+    L.append(f"- **Lookback ECU** {n0(e.get('total_lookback'))} from {s(rng.get('start'))} → {s(rng.get('end'))} ({s(e.get('lookback_days'))} d), cloud-tracker-billing. Full-org quote-window bill is {n0(b.get('ech_window_ecu'))} ECU/mo. {comparison} Partial months excluded from the calendar-month average: {', '.join(partial) if partial else 'none'}.")
     if from_diags:
-        L.append(f"- **Stored size** {n1(b.get('stored_gb'))} GB on the quote. Matched deployments use the diagnostic primary store. A deployment with no bundle is not sized, unless --unmeasured k360 priced it from its K360 size. GB/day is measured bulk, not stored GB ÷ retention.")
-        L.append(f"- **Retention** {s(b.get('retention_months'))} is the ingest-weighted diagnostic retention written to the estimator (1–36 months). K360 does not provide a raw ingest total. Stored GB ÷ assumed retention is the --k360-ingest backup and can sit far below this bulk rate.")
+        L.append(f"- **Stored size** {n1(b.get('stored_gb'))} GB on the quote. Matched deployments use the diagnostic primary store. A deployment with no bundle is not sized. GB/day is measured bulk, not stored GB ÷ retention.")
+        L.append(f"- **Retention** {s(b.get('retention_months'))} is the ingest-weighted diagnostic retention written to the estimator (1–36 months); store with no configured retention uses the labeled 30-day default. K360 does not provide a raw ingest total. Stored GB ÷ assumed retention is the separately requested --k360-ingest scenario, not the diagnostic quote.")
         source_map = (acc.get("sizing") or {}).get("source_precedence") or ((acc.get("sizing") or {}).get("diagnostics") or {}).get("source_precedence") or {}
         diagnostic_fields = source_map.get("diagnostic_authoritative") or []
         tracker_fields = source_map.get("cloud_tracker_authoritative") or []
@@ -269,11 +274,13 @@ def consolidation_section(acc: dict) -> list[str]:
         limit_labels = {
             "missing_diagnostics": "some active deployments have no diagnostic bundle",
             "retention_unmeasured": "retention is unmeasured for some bulk rows",
+            "retention_30d_assumed": "some retention uses the labeled 30-day default",
             "short_diagnostic_window": "some bulk rates came from nodes up for under two days",
             "bulk_rate_fallback": "some bulk rates lack a measured ILM write phase",
             "unrated_ingest": "some indices have writes but no measured ingest rate",
             "assumed_observability_mix": "the Observability logs/metrics split uses the 90/10 assumption",
-            "eis_quote_pace_proxy": "EIS uses fetched-period billing scaled by account pace because complete deployment/SKU billing data was unavailable",
+            "eis_quote_pace_proxy": "EIS uses complete fetched-period deployment totals scaled by account pace because exact daily data was unavailable or failed reconciliation",
+            "eis_data_incomplete": "EIS was omitted because complete filtered deployment billing totals could not be verified",
         }
         diag_coverage = (acc.get("sizing") or {}).get("diagnostics") or {}
         limits = [limit_labels[row.get("code")] for row in diag_coverage.get("estimation_limits") or [] if row.get("code") in limit_labels]
@@ -292,7 +299,10 @@ def consolidation_section(acc: dict) -> list[str]:
     if sv.get("ech_contract_mo") is not None:
         L.append(f"ECH at the contract rate: {n0(sv.get('ech_list_mo'))} ECU × ARR ÷ (commit × 365) = **{usd(sv.get('ech_contract_mo'))}/mo**. The serverless estimate is {usd(sv.get('serverless_mo'))}/mo, **{usd(sv.get('cost_mo'))}/mo ({s(sv.get('cost_pct'))}%)** below that, {usd(sv.get('cost_yr'))}/yr. Serverless is not discounted.")
     else:
-        L.append(f"ECH billed cost {usd(sv.get('ech_list_mo'))} − serverless estimate {usd(sv.get('serverless_mo'))} = **{usd(sv.get('list_mo'))}/mo ({s(sv.get('list_pct'))}%)**, {usd(sv.get('list_yr'))}/yr. A negative figure is an increase.")
+        if scope_unavailable:
+            L.append("The deployment-scoped ECH comparison is unavailable because daily Cloud Tracker deployment billing could not be verified. Savings are not calculated.")
+        else:
+            L.append(f"ECH billed cost {usd(sv.get('ech_list_mo'))} − serverless estimate {usd(sv.get('serverless_mo'))} = **{usd(sv.get('list_mo'))}/mo ({s(sv.get('list_pct'))}%)**, {usd(sv.get('list_yr'))}/yr. A negative figure is an increase.")
     L.append("")
     bs_early = svl.get("by_solution") or {}
     search = bs_early.get("search") or {}
@@ -329,15 +339,13 @@ def consolidation_section(acc: dict) -> list[str]:
     search_blk_early = bs.get("search") or {}
     eis_rows = search_blk_early.get("eis_workloads") or []
     if eis_rows:
-        L.append("### Search machine learning, priced as EIS")
+        L.append("### Search inference, priced as EIS")
         exact_eis = search_blk_early.get("eis_usage_basis") == "quote_window_daily"
         if exact_eis:
             period_desc = f"the exact {int(search_blk_early.get('eis_usage_days') or 0)}-day quote window, monthly-normalized"
-            period_label = "quote window"
         else:
             period_desc = "the fetched-period monthly average scaled by the account quote-usage factor"
-            period_label = "fetched period"
-        L.append(f"This EIS line covers the sized ECH Search deployments in the accepted Search estimate; existing Serverless projects are excluded. Token and Jina ML-node charges use {period_desc}. The selected deployments ran {n0(search_blk_early.get('jina_ml_ecu'))} ECU of Jina-associated ML nodes over the {period_label} ({n0(search_blk_early.get('jina_ml_ecu_mo'))} ECU/mo after monthly normalization). That capacity is in the EIS line with billed tokens: **{usd(search_blk_early.get('eis_mo'))}/mo** before support. The EIS amount is held constant in quieter and busier sensitivity rows. Another {n0(search_blk_early.get('other_ml_ecu'))} ECU of ML nodes on these Search deployments have no Jina SKU in that period and are not in the line.")
+        L.append(f"This EIS line covers the sized ECH Search deployments in the accepted Search estimate; existing Serverless projects are excluded. Billed inference ECU and tokens use {period_desc}: **{usd(search_blk_early.get('eis_mo'))}/mo** before support. ML-node ECU is tracked separately and is not attributed to EIS. The EIS amount is held constant in quieter and busier sensitivity rows.")
         L.append("")
         period_column = "quote window" if exact_eis else "fetched period"
         L.append(table(["EIS workload", "What is billed", f"Million tokens, {period_column}", f"ECU, {period_column}", "$ / mo"],
@@ -353,7 +361,7 @@ def consolidation_section(acc: dict) -> list[str]:
     L.append(f"### 11.2 {s(oh)}% of the active deployments' ECU is cluster overhead" if oh is not None else "### 11.2 Cluster overhead")
     search_blk = ((svl.get("by_solution") or {}).get("search") or {})
     if search_blk.get("eis_mo") is not None and search_blk.get("ml_node_ecu_mo"):
-        ml_sentence = f"Machine learning on Search is in the EIS line: {usd(search_blk.get('eis_mo'))}/mo, the billed tokens plus {n0(search_blk.get('jina_ml_ecu'))} ECU of ML nodes on deployments that billed jina."
+        ml_sentence = f"Search EIS is {usd(search_blk.get('eis_mo'))}/mo from billed inference ECU and tokens. ML-node capacity is tracked separately at {n0(search_blk.get('ml_node_ecu_mo'))} ECU/mo and is not attributed to EIS."
     else:
         ml_sentence = f"Machine learning adds {n0(comp.get('ml_nodes_mo'))} ECU/mo."
     L.append(f"These are nodes that do not hold data: master, Kibana, coordinating, integrations, enterprise search, and APM. Together they are {n0(shown_fixed)} ECU/mo. Serverless does not charge for them. {ml_sentence} Snapshot storage, snapshot API calls, and data transfer add {n0(comp.get('non_capacity_mo'))} ECU/mo. Data in stays free. Data out carries over outside the serverless total: Observability and Security list it at 50 GB free, then $0.05 per GB, including Private Link. Inter-node does not carry over, and on Azure it is already waived. The bill is ECU, not GB, so this does not convert the hosted charge into a serverless dollar.")

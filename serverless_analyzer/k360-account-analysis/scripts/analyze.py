@@ -483,6 +483,21 @@ def ecu_section(org: dict, infra: dict | None, platform: dict) -> dict:
     tot = [float(x or 0) for x in (chart.get("total") or [])]
     grain = chart.get("grain") or "day"
     days_t, tot_t = _trim_trailing_zeros(days, tot)
+    billing_daily = ((org.get("billing") or {}).get("daily_deployment_costs") or {})
+    billing_days = list(billing_daily.get("days") or [])
+    billing_by_dep = billing_daily.get("by_deployment") or {}
+    billing_index = {day: i for i, day in enumerate(billing_days)}
+    quote_daily_by_dep = {
+        name: [round(float(values[billing_index[day]] or 0), 6)
+               for day in days_t if day in billing_index and billing_index[day] < len(values)]
+        for name, values in billing_by_dep.items()
+    } if grain == "day" else {}
+    quote_billing_days = [day for day in days_t if day in billing_index] if grain == "day" else []
+    quote_org_daily_totals = [
+        round(float((billing_daily.get("org_daily_totals") or [])[billing_index[day]] or 0), 6)
+        for day in quote_billing_days
+        if billing_index[day] < len(billing_daily.get("org_daily_totals") or [])
+    ]
     if grain == "day" and tot_t:
         daily_avg = round(sum(tot_t) / len(tot_t), 2)
         active = [v for v in tot_t if v > 0]
@@ -539,6 +554,16 @@ def ecu_section(org: dict, infra: dict | None, platform: dict) -> dict:
         "last_30d_daily_avg": last_30d_avg,
         "daily_days": days_t if grain == "day" else [],
         "daily_totals": [round(v, 2) for v in tot_t] if grain == "day" else [],
+        "daily_deployment_costs": {
+            "days": quote_billing_days,
+            "by_deployment": quote_daily_by_dep,
+            "org_daily_totals": quote_org_daily_totals,
+            "complete": bool(billing_daily.get("complete")) and len(quote_billing_days) == len(days_t),
+            "status": billing_daily.get("status") or {
+                "complete": False,
+                "reason": "daily per-deployment billing is unavailable in source report",
+            },
+        },
         "trend": trend,
         "weekly_series": {"weeks": wk_days, "totals": wk_tot},
         "contract": {
@@ -913,7 +938,25 @@ def ai_ml_section(org: dict) -> dict:
         "inference_skus": org_skus,
         "token_meter": meter,
         "daily_usage_complete": bool(ai.get("daily_usage_complete")),
+        "daily_usage_status": ai.get("daily_usage_status") or {
+            "complete": bool(ai.get("daily_usage_complete")),
+            "reason": "status unavailable in source report" if not ai.get("daily_usage_complete") else None,
+        },
         "daily_usage_by_deployment": ai.get("daily_usage_by_deployment") or {},
+        "billing_by_deployment_complete": bool(ai.get("billing_by_deployment_complete")),
+        "billing_by_deployment_status": ai.get("billing_by_deployment_status") or {
+            "complete": bool(ai.get("billing_by_deployment_complete")),
+            "reason": "filtered deployment totals unavailable in source report",
+        },
+        "billing_by_deployment": {
+            name: {
+                "eis_ecu": r2(row.get("eis_ecu")),
+                "million_tokens": round(float(row.get("million_tokens") or 0), 6),
+                "ml_node_ecu": r2(row.get("ml_node_ecu")),
+                "jina_inference_ecu": r2(row.get("jina_inference_ecu")),
+            }
+            for name, row in (ai.get("billing_by_deployment") or {}).items()
+        },
         "ml_skus": (ml.get("skus") or [])[:8],
         "by_deployment": by_dep,
         "notes": (ml.get("notes") or []) + (ai.get("notes") or []),
@@ -1512,6 +1555,7 @@ def sizing_inputs(acc: dict, org: dict, retention_months: float, security_retent
     o = block("observability", retention_months)
     o["logs_gb_day"] = round(o["daily_raw_gb"] * 0.90)
     o["metrics_gb_day"] = round(o["daily_raw_gb"] * 0.10)
+    o["mix_basis"] = "product-defined"
     s = block("security", security_retention_months)
     s["siem_gb_day"] = round(s["daily_raw_gb"])
     se = block("search", retention_months)
@@ -1528,7 +1572,7 @@ def sizing_inputs(acc: dict, org: dict, retention_months: float, security_retent
         "consolidated": {"observability": o, "security": s, "search": se},
         "notes": [
             f"K360 backup only: K360 does not provide a raw ingest total, so daily_raw_gb = stored_gb / (retention_months × {DAYS_PER_MONTH}). Confirm retention with the account team. This can sit far below measured bulk.",
-            "Observability split 90% logs / 10% metrics; Security = SIEM ingest; Search is priced by es3-estimator during sizing (performant is the quotable profile)",
+            "Observability workload mix is product-defined (90% logs / 10% metrics); Security = SIEM ingest; Search is priced by es3-estimator during sizing (performant is the quotable profile)",
             "gb_estimated_from_ecu_share = no telemetry for that slice; GB prorated by ECU share",
             "stored_gb comes from ECH telemetry — existing serverless projects contribute ECU but no GB",
         ],
