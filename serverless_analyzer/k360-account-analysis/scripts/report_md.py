@@ -312,9 +312,9 @@ def consolidation_section(acc: dict) -> list[str]:
     eis_rows = search_blk_early.get("eis_workloads") or []
     if eis_rows:
         L.append("### Search machine learning, priced as EIS")
-        L.append(f"Deployments that billed jina embeddings also ran {n0(search_blk_early.get('jina_ml_ecu'))} ECU of ML nodes over the year ({n0(search_blk_early.get('jina_ml_ecu_mo'))} ECU/mo). That capacity is in the EIS line at list, with the billed tokens: **{usd(search_blk_early.get('eis_mo'))}/mo** before support. It is in the Search total, the regional projects, every Search profile, and every fleet row. Quieter and busier months scale the rest of the estimate and leave this line unchanged. Another {n0(search_blk_early.get('other_ml_ecu'))} ECU of ML nodes have no jina SKU and are not in the line.")
+        L.append(f"This EIS line covers the sized ECH Search deployments in the accepted Search estimate; existing Serverless projects are excluded. Token and jina ML-node charges use their fetched-period monthly average scaled by the quote-window pace. The selected deployments ran {n0(search_blk_early.get('jina_ml_ecu'))} ECU of jina-associated ML nodes over the fetched period ({n0(search_blk_early.get('jina_ml_ecu_mo'))} ECU/mo at quote pace). That capacity is in the EIS line with billed tokens: **{usd(search_blk_early.get('eis_mo'))}/mo** before support. The quote-window EIS amount is held constant in quieter and busier sensitivity rows. Another {n0(search_blk_early.get('other_ml_ecu'))} ECU of ML nodes on these Search deployments have no jina SKU and are not in the line.")
         L.append("")
-        L.append(table(["EIS workload", "What is billed", "Million tokens", "ECU, full year", "$ / mo"],
+        L.append(table(["EIS workload", "What is billed", "Million tokens", "ECU, fetched period", "$ / mo"],
                        [[w["model"], w["kind"], "—" if w.get("million_tokens") is None else f"{float(w.get('million_tokens') or 0):,.4f}", f"{float(w.get('ecu') or 0):,.2f}", f"${float(w.get('monthly') or 0):,.2f}"] for w in eis_rows]
                        + [["Total", "", "", f"{sum(float(w.get('ecu') or 0) for w in eis_rows):,.2f}", f"${float(search_blk_early.get('eis_mo') or 0):,.2f}"]]))
         L.append("")

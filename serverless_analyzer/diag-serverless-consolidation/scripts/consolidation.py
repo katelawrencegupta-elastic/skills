@@ -1069,21 +1069,31 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
     return regional_quoted, omitted_small
 
 
-def _search_eis(acc: dict, months: float) -> dict | None:
-    """Search ML that moves to EIS: billed tokens, plus ML-node ECU on deployments that billed jina."""
-    solution = {d.get("name"): d.get("solution") for d in ((acc.get("solutions") or {}).get("by_deployment") or [])}
+def _search_eis(
+    acc: dict,
+    months: float,
+    *,
+    usage_factor: float = 1.0,
+    eligible_names: set[str] | None = None,
+) -> dict | None:
+    """Search EIS for quoted ECH Search deployments at the quote-window pace.
+
+    The account data holds EIS and ML ECU over the fetched billing period. Scale
+    those monthly averages by the same quote-window usage factor used for other
+    K360-derived Search rates. `eligible_names` is the set of deployments that
+    are actually represented in the accepted Search estimate.
+    """
     region = {
         d.get("name"): d.get("region")
         for d in ((acc.get("cloud") or {}).get("by_deployment") or [])
         if d.get("region")
     }
-    unsized = {
-        d.get("name") for d in ((acc.get("solutions") or {}).get("by_deployment") or [])
-        if d.get("ingest_source") in ("decommissioned", "active_no_bundle")
-    }
+    eligible_names = eligible_names or set()
+    scale = float(usage_factor or 1.0) / max(float(months or 0), 1.0)
     rows = []
     for d in (acc.get("ai_ml") or {}).get("by_deployment") or []:
-        if solution.get(d.get("name")) != "search" or d.get("name") in unsized:
+        name = d.get("name")
+        if not name or name not in eligible_names:
             continue
         ml = float(d.get("ml_node_ecu") or 0)
         eis = float(d.get("eis_inference_ecu") or 0)
@@ -1091,11 +1101,13 @@ def _search_eis(acc: dict, months: float) -> dict | None:
         if ml <= 0 and eis <= 0 and not d.get("elser") and not models:
             continue
         rows.append({
-            "name": d.get("name"),
-            "region": region.get(d.get("name")) or "unknown region",
+            "name": name,
+            "region": region.get(name) or "unknown region",
             "ml": ml,
             "eis": eis,
+            "million_tokens": float(d.get("million_tokens") or 0),
             "models": models,
+            "model_labels": list(d.get("model_labels") or []),
             "elser": bool(d.get("elser")),
             "jina": any("jina" in str(m).lower() for m in models),
         })
@@ -1104,44 +1116,22 @@ def _search_eis(acc: dict, months: float) -> dict | None:
     by_region: dict[str, float] = {}
     for r in rows:
         moved = r["ml"] if r["jina"] else 0.0
-        by_region[r["region"]] = by_region.get(r["region"], 0.0) + (r["eis"] + moved) / months
+        by_region[r["region"]] = by_region.get(r["region"], 0.0) + (r["eis"] + moved) * scale
     models = sorted({m for r in rows for m in r["models"] if m})
     if any(r["elser"] for r in rows) and "ELSER" not in models:
         models.append("ELSER")
-    labels = {"rainbow-sprinkles": "Elastic Managed LLM"}
-    kind_label = {
-        "chat_input": "Input tokens",
-        "chat_output": "Output tokens",
-        "embed_dense": "Embedding tokens",
-        "embed_sparse": "Sparse embedding tokens",
-    }
-    # Tokens move with the deployment that billed them. An org-wide SKU list
-    # would put Observability and Security chat onto the Search estimate.
-    meter = (acc.get("ai_ml") or {}).get("token_meter")
-    if isinstance(meter, dict):
-        token_source = meter.get("search_rows") or []
-    else:
-        token_source = (acc.get("ai_ml") or {}).get("inference_skus") or []
     workloads = []
-    for sku in token_source:
-        ecu = float(sku.get("ecu") or 0)
-        qty = sku.get("million_tokens")
-        if qty is None:
-            qty = sku.get("qty")
-        if ecu <= 0 and not qty:
+    for r in rows:
+        if r["eis"] <= 0 and r["million_tokens"] <= 0:
             continue
-        if sku.get("model_label"):
-            model_name = sku["model_label"]
-        elif str(sku.get("kind") or "").startswith("chat"):
-            model_name = "Chat"
-        else:
-            model_name = sku.get("label") or labels.get(sku.get("model"), sku.get("model") or "EIS")
+        labels = r["model_labels"] or r["models"]
         workloads.append({
-            "model": model_name,
-            "kind": sku.get("kind_label") or kind_label.get(sku.get("kind"), sku.get("kind") or "Tokens"),
-            "million_tokens": round(float(qty or 0), 4),
-            "ecu": round(ecu, 2),
-            "monthly": round(ecu / months, 2),
+            "model": ", ".join(str(label) for label in labels) or r["name"],
+            "kind": f"Inference tokens · {r['region']}",
+            "deployment": r["name"],
+            "million_tokens": round(r["million_tokens"], 4),
+            "ecu": round(r["eis"], 2),
+            "monthly": round(r["eis"] * scale, 2),
         })
     moved_rows = [r for r in rows if r["jina"] and r["ml"] > 0]
     moved_rows.sort(key=lambda r: -r["ml"])
@@ -1149,34 +1139,37 @@ def _search_eis(acc: dict, months: float) -> dict | None:
         workloads.append({
             "model": r["name"],
             "kind": f"ML nodes · {r['region']}",
+            "deployment": r["name"],
             "million_tokens": None,
             "ecu": round(r["ml"], 2),
-            "monthly": round(r["ml"] / months, 2),
+            "monthly": round(r["ml"] * scale, 2),
         })
     moved_ecu = sum(r["ml"] for r in moved_rows)
     other_ml = sum(r["ml"] for r in rows if not r["jina"])
-    for sku in token_source:
-        if sku.get("model") and sku.get("model_label"):
-            labels[sku["model"]] = sku["model_label"]
-    for d in (acc.get("ai_ml") or {}).get("by_deployment") or []:
-        for mid, lab in zip(d.get("models") or [], d.get("model_labels") or []):
-            labels.setdefault(mid, lab)
     return {
         "monthly": round(sum(by_region.values()), 2),
         "by_region": {k: round(v, 2) for k, v in by_region.items()},
-        "ml_node_ecu_mo": round(sum(r["ml"] for r in rows) / months, 2),
+        "ml_node_ecu_mo": round(sum(r["ml"] for r in rows) * scale, 2),
         "jina_ml_ecu": round(moved_ecu, 2),
-        "jina_ml_ecu_mo": round(moved_ecu / months, 2),
+        "jina_ml_ecu_mo": round(moved_ecu * scale, 2),
         "other_ml_ecu": round(other_ml, 2),
-        "models": [labels.get(m, m) for m in models],
+        "models": models,
         "deployments": len(rows),
         "jina_deployments": len(moved_rows),
         "workloads": workloads,
     }
 
 
-def _apply_search_eis(acc: dict, by_solution: dict, months: float, notes: list[str]) -> None:
-    eis = _search_eis(acc, months)
+def _apply_search_eis(
+    acc: dict,
+    by_solution: dict,
+    months: float,
+    notes: list[str],
+    *,
+    usage_factor: float = 1.0,
+    eligible_names: set[str] | None = None,
+) -> None:
+    eis = _search_eis(acc, months, usage_factor=usage_factor, eligible_names=eligible_names)
     blk = by_solution.get("search") or {}
     if not eis or "quotable" not in str(blk.get("pricing") or ""):
         return
@@ -1215,11 +1208,38 @@ def _apply_search_eis(acc: dict, by_solution: dict, months: float, notes: list[s
         if isinstance(row.get("Support $/month"), (int, float)):
             row["Support $/month"] = round(float(row["Support $/month"]) + extra_support, 2)
     notes.append(
-        f"Deployments that billed jina embeddings also ran {eis['jina_ml_ecu']:,.0f} ECU of ML nodes over the year "
-        f"({eis['jina_ml_ecu_mo']:,.0f} ECU/mo). That capacity is in the EIS line at list, with the billed token usage. "
+        f"The Search EIS line includes activity found on {eis['deployments']} sized ECH Search deployment(s). "
+        f"Jina deployments ran {eis['jina_ml_ecu']:,.0f} ECU of ML nodes over the fetched billing period "
+        f"({eis['jina_ml_ecu_mo']:,.0f} ECU/mo at the quote-window pace). That capacity is in the EIS line at list, with the billed token usage. "
         f"EIS is ${usage:,.2f}/mo before support. "
         f"Another {eis['other_ml_ecu']:,.0f} ECU of ML nodes sit on Search deployments with no jina SKU, and are not in this line."
     )
+
+
+def _priced_search_names(acc: dict, by_solution: dict, scope: dict | None) -> set[str]:
+    """ECH Search deployments represented in the accepted Search quote."""
+    search = by_solution.get("search") or {}
+    if "quotable" not in str(search.get("pricing") or ""):
+        return set()
+    rows = (acc.get("solutions") or {}).get("by_deployment") or []
+    active = (acc.get("deployments") or {}).get("active") or {}
+    active_names = set(active.get("names") or [])
+    unpriced_names = {str(row.get("name")) for row in (scope or {}).get("unpriced") or []}
+    diagnostic = (acc.get("sizing") or {}).get("ingest_source") == "diagnostics"
+    eligible = set()
+    for dep in rows:
+        name = str(dep.get("name") or "")
+        if not name or dep.get("platform") == "serverless" or (dep.get("solution") or "search") != "search":
+            continue
+        if active_names and name not in active_names:
+            continue
+        if scope is not None:
+            if name in unpriced_names:
+                continue
+        elif unpriced_reason(dep, by_solution, diagnostic) is not None:
+            continue
+        eligible.add(name)
+    return eligible
 
 
 def _align_primary_cost_rec(acc: dict, savings: dict, by_solution: dict) -> None:
@@ -1452,11 +1472,21 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
     region_groups = _deployment_groups(acc, infra, months)
     regional_quoted, regions_under_minimum = _replicate_by_region(acc, by_solution, region_groups, notes)
     quoted = regional_quoted or quoted
-    _apply_search_eis(acc, by_solution, months, notes)
+    # Scope is independent of EIS dollars and provides the exact set of Search
+    # deployments represented in the quote. Existing Serverless projects are
+    # never part of the proposed migration line.
+    scope = ech_scope(acc, by_solution)
+    _apply_search_eis(
+        acc,
+        by_solution,
+        months,
+        notes,
+        usage_factor=usage,
+        eligible_names=_priced_search_names(acc, by_solution, scope),
+    )
     svls_total_mo = sum(float(p.get("total_mo") or 0) for p in by_solution.values())
     # The window month for the whole org, before the comparison scope narrows it.
     ech_window_mo = ech_mo
-    scope = ech_scope(acc, by_solution)
     if scope:
         ech_mo = float(scope["in_comparison_mo"])
         names = ", ".join(f"{row['name']} ({row['reason']})" for row in scope["unpriced"][:6])

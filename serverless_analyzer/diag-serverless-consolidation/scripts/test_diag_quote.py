@@ -2797,9 +2797,70 @@ class ReviewRegressionTests(unittest.TestCase):
                 {"name": "retired", "ml_node_ecu": 1200, "models": ["jina-embeddings-v3"]},
             ]},
         }
-        eis = _search_eis(acc, 12.0)
+        eis = _search_eis(acc, 12.0, eligible_names={"sized"})
         self.assertEqual(eis["deployments"], 1)
         self.assertAlmostEqual(eis["monthly"], 10.0)
+
+    def test_search_eis_scales_to_quote_window_and_only_includes_eligible_deployments(self):
+        from consolidation import _search_eis
+        acc = {
+            "cloud": {"by_deployment": [
+                {"name": "quoted", "region": "us-east-1"},
+                {"name": "existing", "region": "us-west-2"},
+            ]},
+            "ai_ml": {"by_deployment": [
+                {"name": "quoted", "ml_node_ecu": 120, "eis_inference_ecu": 240,
+                 "million_tokens": 12, "models": ["jina-embeddings-v3"], "model_labels": ["Jina"]},
+                {"name": "existing", "ml_node_ecu": 1200, "eis_inference_ecu": 2400,
+                 "million_tokens": 120, "models": ["jina-embeddings-v3"], "model_labels": ["Jina"]},
+            ]},
+        }
+        eis = _search_eis(acc, 12.0, usage_factor=0.5, eligible_names={"quoted"})
+        self.assertEqual(eis["deployments"], 1)
+        self.assertAlmostEqual(eis["monthly"], 15.0)
+        self.assertAlmostEqual(eis["by_region"]["us-east-1"], 15.0)
+        self.assertAlmostEqual(sum(row["monthly"] for row in eis["workloads"]), 15.0)
+
+    def test_eis_eligible_names_follow_quoteable_active_ech_search_scope(self):
+        from consolidation import _priced_search_names
+        acc = {
+            "deployments": {"active": {"names": ["sized", "no-bundle", "existing"]}},
+            "sizing": {"ingest_source": "diagnostics"},
+            "solutions": {"by_deployment": [
+                {"name": "sized", "solution": "search", "platform": "ech", "gb": 10, "ingest_source": "diagnostics"},
+                {"name": "no-bundle", "solution": "search", "platform": "ech", "gb": 0, "k360_gb": 20, "ingest_source": "active_no_bundle"},
+                {"name": "existing", "solution": "search", "platform": "serverless", "gb": 0},
+                {"name": "inactive", "solution": "search", "platform": "ech", "gb": 10, "ingest_source": "diagnostics"},
+            ]},
+        }
+        by_solution = {"search": {"pricing": "es3-estimator performant (quotable)"}}
+        scope = {"unpriced": [{"name": "no-bundle", "reason": "no diagnostic bundle"}]}
+        self.assertEqual(_priced_search_names(acc, by_solution, scope), {"sized"})
+
+    def test_search_quote_scales_eis_and_excludes_existing_serverless_project(self):
+        acc = _quote_account(g28=10, e73=0)
+        acc["ecu"]["quote_usage_factor"] = 0.5
+        acc["sizing"]["consolidated"]["search"] = {"stored_gb": 50, "daily_raw_gb": 0, "deployments": 1}
+        acc["sizing"]["estimators"]["search"] = {"readback": {
+            "monthly_steady_state": 50.0, "annual_year1": 600.0, "annual_steady_state": 600.0,
+            "search_monthly": 30.0, "ingest_monthly": 10.0, "storage_monthly": 3.48, "support_monthly": 6.52,
+        }}
+        acc["solutions"]["by_deployment"] = [
+            {"name": "ech-search", "solution": "search", "platform": "ech", "ecu": 10, "gb": 50, "ingest_source": "diagnostics"},
+            {"name": "existing-search", "solution": "search", "platform": "serverless", "ecu": 10, "gb": 0},
+        ]
+        acc["ai_ml"] = {"by_deployment": [
+            {"name": "ech-search", "ml_node_ecu": 1200, "models": ["jina-embeddings-v3"]},
+            {"name": "existing-search", "ml_node_ecu": 12000, "models": ["jina-embeddings-v3"]},
+        ]}
+
+        cons = build_consolidation(acc, None)
+        line = next(q for q in cons["reconciliation"]["quotes"] if q["solution"] == "search")
+        # $50 estimator read-back + $50 quote-paced jina ML nodes and $7.50
+        # support uplift. The existing Serverless project's $500 ML average is
+        # outside this migration quote.
+        self.assertAlmostEqual(line["monthly"], 107.5)
+        self.assertAlmostEqual(line["annual_steady_state"], 1290.0)
 
     def test_bundle_coverage_counts_ech_deployments_only(self):
         acc = {

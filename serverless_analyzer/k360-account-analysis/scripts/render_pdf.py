@@ -3848,7 +3848,7 @@ def render_consolidation_html(acc: dict) -> str:
         eis_ecu_sum = sum(float(w.get("ecu") or 0) for w in eis_rows)
         eis_mo_sum = sum(float(w.get("monthly") or 0) for w in eis_rows)
         eis_table = table(
-            ["EIS workload", "What moves", "Million tokens", "ECU, full year", "$ / mo"],
+            ["EIS workload", "What moves", "Million tokens", "ECU, fetched period", "$ / mo"],
             [[w["model"], w["kind"], _tok(w), f"{float(w.get('ecu') or 0):,.2f}", f"${float(w.get('monthly') or 0):,.2f}"] for w in eis_rows]
             + [["Total", "", "", f"{eis_ecu_sum:,.2f}", f"${eis_mo_sum:,.2f}"]],
             ["left", "left", "right", "right", "right"],
@@ -3858,12 +3858,13 @@ def render_consolidation_html(acc: dict) -> str:
             "Search machine learning, priced as EIS",
             callout(
                 "This EIS load is inside the estimate",
-                f"Deployments that billed jina also ran {n0(search_blk.get('jina_ml_ecu'))} ECU of ML nodes over the year "
-                f"({n0(search_blk.get('jina_ml_ecu_mo'))} ECU/mo). That capacity is in this EIS line at list, together with the billed tokens, "
-                f"${eis_mo_sum:,.2f}/mo before support. "
-                f"It is in the Search total, in the regional projects, in every Search profile, and in every row of the fleet sensitivity. "
-                f"Quieter and busier months scale the rest of the estimate and leave this line unchanged. "
-                f"Another {n0(search_blk.get('other_ml_ecu'))} ECU of ML nodes have no jina SKU and are not in the line. "
+                f"This EIS line covers the sized ECH Search deployments in the accepted Search estimate; existing Serverless projects are excluded. "
+                f"Token and jina ML-node charges use their fetched-period monthly average scaled by the quote-window pace. "
+                f"The selected deployments ran {n0(search_blk.get('jina_ml_ecu'))} ECU of jina-associated ML nodes over the fetched period "
+                f"({n0(search_blk.get('jina_ml_ecu_mo'))} ECU/mo at quote pace). That capacity is in this EIS line with billed tokens, "
+                f"${eis_mo_sum:,.2f}/mo before support. It is included in regional Search totals and every Search profile. "
+                f"The quote-window EIS amount is held constant in quieter and busier sensitivity rows. "
+                f"Another {n0(search_blk.get('other_ml_ecu'))} ECU of ML nodes on these Search deployments have no jina SKU and are not in the line. "
                 "The node ECU is the capacity on the same deployment, not a per-model meter.",
             ) + eis_table,
             new_page=True,
