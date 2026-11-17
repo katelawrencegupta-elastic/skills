@@ -96,27 +96,47 @@ def match_provider(raw: str | None, pricing: dict) -> str | None:
     return None
 
 
-def match_region(provider: str, region: str | None, pricing: dict) -> tuple[str, str]:
-    options = list(pricing[provider])
-    if not options:
-        raise ValueError(f"no regions priced for {provider}")
-    token = _norm(region or "")
-    for prefix in ("aws", "azure", "gcp"):
-        if token.startswith(prefix):
-            token = token[len(prefix):]
-            break
-    want = _azure_aliases(token) if token else set()
-    for option in options:
-        if _norm(option) in want:
-            how = "exact" if _norm(option) == token else "alias"
-            return option, how
-    loose = {item[:-1] if item and item[-1].isdigit() else item for item in want}
-    for option in options:
-        folded = _norm(option)
-        folded = folded[:-1] if folded and folded[-1].isdigit() else folded
-        if folded and folded in loose:
-            return option, "alias"
-    return options[0], "provider_default"
+def _shared_match():
+    org = Path(__file__).resolve().parents[2] / "k360-org-report" / "scripts"
+    if str(org) not in sys.path:
+        sys.path.insert(0, str(org))
+    from estimator_layout import match_region as shared
+    return shared
+
+
+def _nearest_name(provider: str, region: str | None, names: list[str]) -> str | None:
+    want = _norm(region)
+    best = None
+    best_score = -1
+    for name in names:
+        token = _norm(name)
+        shared = 0
+        for left, right in zip(want, token):
+            if left != right:
+                break
+            shared += 1
+        if shared > best_score:
+            best_score = shared
+            best = name
+    return best
+
+
+def match_region(provider: str, region: str | None, pricing: dict, *, allow_nearest: bool = False) -> tuple[str | None, str]:
+    """Same rule as the sheet matcher: no other region and no other cloud.
+
+    A missing match does not pick the first priced region. Nearest is opt-in and stays same-provider.
+    """
+    names = list((pricing or {}).get(provider) or [])
+    options = [f"{provider}: {name} ({name})" for name in names]
+    option, how = _shared_match()(provider, region, options)
+    if option is not None:
+        matched = option.split(":", 1)[-1].strip().split(" (", 1)[0].strip()
+        return matched, how
+    if allow_nearest:
+        nearest = _nearest_name(provider, region, names)
+        if nearest is not None:
+            return nearest, "nearest"
+    return None, "none"
 
 
 def _hours(pct) -> float | None:
@@ -252,17 +272,15 @@ def build_user_info(payload: dict, pricing: dict, support_matrix: dict) -> tuple
         )
     provider = match_provider(payload.get("provider"), pricing)
     if provider is None:
-        provider = "AWS"
-        how = "provider_default"
-        assumptions.append(f"Cloud provider {payload.get('provider')!r} is not in the estimator. Used AWS.")
-    else:
-        how = None
-    region, region_how = match_region(provider, payload.get("region"), pricing)
-    if how is None:
-        how = region_how
-    if how == "provider_default":
+        raise ValueError(f"region {payload.get('region')} is not on the estimator list")
+    region, how = match_region(
+        provider, payload.get("region"), pricing, allow_nearest=bool(payload.get("allow_nearest_region")),
+    )
+    if how == "none" or not region:
+        raise ValueError(f"region {payload.get('region')} is not on the estimator list")
+    if how == "nearest":
         assumptions.append(
-            f"Region {payload.get('region')!r} did not match a priced {provider} region. Used {region}."
+            f"Region {payload.get('region')!r} is not on the estimator list. Nearest same-provider option {region} was written."
         )
     tier = str(payload.get("support_tier") or "Premium").strip().lower()
     support = SUPPORT_BY_TIER.get(tier)

@@ -647,6 +647,8 @@ def fill_security(sheets, sid: str, account: dict, support: str, region, retenti
         gate = echo_gate(daily, rb.get("metered_gb_day"))
         if not gate["accepted"]:
             rb["monthly_steady_state"] = None
+            rb["annual_year1"] = None
+            rb["annual_steady_state"] = None
     return cells, written, rb, gate
 
 
@@ -748,6 +750,10 @@ def search_markdown(customer: str, when: str, se: dict, provider, region, result
     return "\n".join(lines)
 
 
+# Set from --allow-nearest-region. The default refuses any other region.
+_ALLOW_NEAREST = False
+
+
 def run_es3(payload: dict) -> dict:
     py = es3_python()
     if py is None:
@@ -756,13 +762,19 @@ def run_es3(payload: dict) -> dict:
             "error": "es3-estimator venv missing. Create ~/.config/es3-estimator/venv and pip install pandas numpy joblib 'scikit-learn==1.7.2'.",
         }
     script = Path(__file__).resolve().parent / "es3_estimate.py"
-    proc = subprocess.run(
-        [str(py), str(script)],
-        input=json.dumps(payload),
-        text=True,
-        capture_output=True,
-        timeout=180,
-    )
+    body = dict(payload)
+    if _ALLOW_NEAREST:
+        body["allow_nearest_region"] = True
+    try:
+        proc = subprocess.run(
+            [str(py), str(script)],
+            input=json.dumps(body),
+            text=True,
+            capture_output=True,
+            timeout=180,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "error", "error": "timeout"}
     raw = (proc.stdout or "").strip()
     try:
         out = json.loads(raw) if raw else {}
@@ -777,27 +789,50 @@ def run_es3(payload: dict) -> dict:
     return out
 
 
-def match_region(provider: str | None, region: str | None, options: list[str]) -> tuple[str | None, str]:
-    """→ (option string, how). how ∈ exact | alias | provider_default | none."""
-    prov = (provider or "").upper()
-    cands = [o for o in options if o.upper().startswith(prov)] if prov else options
-    if not cands:
-        return (options[0] if options else None), "none"
-    want = _azure_aliases(region or "") if region else set()
-    for o in cands:
-        m = _REGION_OPT.match(o)
-        if not m:
+def _nearest_same_provider(provider: str | None, region: str | None, options: list[str]) -> str | None:
+    """Closest same-provider dropdown option, by shared prefix of the region token."""
+    from estimator_layout import _REGION_OPT as _opt
+    from estimator_layout import _norm as _fold
+
+    prov = str(provider or "").strip().upper()
+    want = _fold(region)
+    best = None
+    best_score = -1.0
+    for option in options or []:
+        match = _opt.match(option)
+        if not match or match.group(1).upper() != prov:
             continue
-        tok = _norm(m.group(2))
-        if tok in want:
-            return o, "exact" if _norm(region) == tok else "alias"
-    # loose: strip trailing digits ("us-east-1" vs "us-east1")
-    want_loose = {re.sub(r"\d+$", "", w) for w in want}
-    for o in cands:
-        m = _REGION_OPT.match(o)
-        if m and re.sub(r"\d+$", "", _norm(m.group(2))) in want_loose:
-            return o, "alias"
-    return cands[0], "provider_default"
+        token = _fold(match.group(2))
+        shared = 0
+        for left, right in zip(want, token):
+            if left != right:
+                break
+            shared += 1
+        score = shared / max(len(want), len(token), 1)
+        if score > best_score:
+            best_score = score
+            best = option
+    return best
+
+
+def match_region(provider: str | None, region: str | None, options: list[str]) -> tuple[str | None, str]:
+    """Shared matcher. No other region and no other cloud. Nearest is opt-in.
+
+    how is exact, alias, nearest, or none. A missing match does not write a region cell.
+    """
+    from estimator_layout import match_region as _shared
+
+    option, how = _shared(provider, region, options)
+    if option is not None or not _ALLOW_NEAREST:
+        return option, how
+    nearest = _nearest_same_provider(provider, region, options)
+    if nearest is None:
+        return None, "none"
+    return nearest, "nearest"
+
+
+def _region_rejected(region: str | None) -> str:
+    return f"region {region} is not on the estimator list"
 
 
 DAYS_PER_MONTH = 30.416
@@ -1220,6 +1255,12 @@ def _fill_regional_job(job: dict, creds) -> dict:
             "url": published.get("url"),
             "spreadsheet_id": published.get("spreadsheet_id"),
         }
+        if result.get("error"):
+            entry["error"] = result["error"]
+            if "not on the estimator list" in str(result["error"]):
+                entry["region_match"] = "none"
+                entry["readback_rejected"] = str(result["error"])
+                entry["readback"] = None
         if published.get("error"):
             entry["error"] = published["error"]
         return entry
@@ -1228,6 +1269,14 @@ def _fill_regional_job(job: dict, creds) -> dict:
     )
     opts = region_options(sheets, copied["id"])
     reg, how = match_region(job["provider"], job["region"], opts)
+    if how == "none" or not reg:
+        return {
+            "solution": sol, "region": job["region"], "title": copied["name"],
+            "spreadsheet_id": copied["id"], "url": copied["url"], "reused_existing_copy": reused,
+            "region_match": "none", "readback_rejected": _region_rejected(job.get("region")),
+            "readback": {}, "status": "unquoted", "error": _region_rejected(job.get("region")),
+        }
+    match_text = f"{reg} (nearest; wanted {job.get('region')})" if how == "nearest" else f"{reg} ({how})"
     basis = job.get("basis") or "raw"
     account = {"sizing": {"feature_tier": job.get("feature_tier")}}
     gate = None
@@ -1241,7 +1290,7 @@ def _fill_regional_job(job: dict, creds) -> dict:
     entry = {
         "solution": sol, "region": job["region"], "title": copied["name"], "stored_gb": job["stored_gb"],
         "spreadsheet_id": copied["id"], "url": copied["url"], "reused_existing_copy": reused,
-        "cells": cells, "cells_written": n, "region_match": f"{reg} ({how})",
+        "cells": cells, "cells_written": n, "region_match": match_text,
         "readback": rb, "status": "filled", "daily_raw_gb": round(job["daily"], 2),
         "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"],
     }
@@ -1358,11 +1407,9 @@ def _diag_inputs():
 def assemble_plan_bars(specs: list[dict], fills: list[dict]) -> dict:
     """Join sheet read-backs onto plan bars. Input order is the cut order.
 
-    One failed fill clears every bar. The 100% bar reuses the headline and has no sheet.
+    A group that carries an error makes that bar unpriced. It is never added as $0.
+    Later bars stay priced, and the bar records the gap. The 100% bar reuses the headline.
     """
-    for fill in fills:
-        if fill.get("error"):
-            return {"bars": [], "error": str(fill["error"])}
     bars = []
     for spec in specs:
         if spec.get("reused_headline"):
@@ -1377,34 +1424,79 @@ def assemble_plan_bars(specs: list[dict], fills: list[dict]) -> dict:
             continue
         monthly = 0.0
         priced = []
+        gap = False
+        bar_error = None
         for group in spec.get("groups") or []:
+            names = group.get("names") or []
+            if group.get("error"):
+                gap = True
+                bar_error = str(group.get("error"))
+                priced.append({
+                    "names": names,
+                    "monthly": None,
+                    "unpriced_reason": bar_error,
+                    "bulk_gb_day": group.get("bulk_gb_day") or 0,
+                    "months_written": group.get("months_written"),
+                })
+                continue
             if group.get("sheet") is None:
+                if group.get("monthly") is None:
+                    gap = True
+                    priced.append({
+                        "names": names,
+                        "monthly": None,
+                        "unpriced_reason": group.get("unpriced_reason") or "unpriced",
+                        "bulk_gb_day": group.get("bulk_gb_day") or 0,
+                        "months_written": group.get("months_written"),
+                    })
+                    continue
                 money = float(group.get("monthly") or 0)
                 monthly += money
                 priced.append({
-                    "names": group.get("names") or [],
+                    "names": names,
                     "monthly": round(money, 2),
                     "bulk_gb_day": group.get("bulk_gb_day") or 0,
                     "months_written": group.get("months_written"),
                 })
                 continue
-            fill = fills[group["sheet"]]
+            fill = fills[group["sheet"]] if group["sheet"] < len(fills) else {}
+            if fill.get("error") or fill.get("monthly") is None:
+                gap = True
+                reason = str(fill.get("error") or fill.get("unpriced_reason") or "unpriced")
+                bar_error = bar_error or reason
+                priced.append({
+                    "names": names,
+                    "monthly": None,
+                    "unpriced_reason": reason,
+                    "bulk_gb_day": group.get("bulk_gb_day"),
+                    "months_written": group.get("months_written"),
+                    "url": fill.get("url"),
+                })
+                continue
             monthly += float(fill["monthly"])
             priced.append({
-                "names": group.get("names") or [],
+                "names": names,
                 "monthly": round(float(fill["monthly"]), 2),
                 "bulk_gb_day": group.get("bulk_gb_day"),
                 "months_written": group.get("months_written"),
                 "url": fill.get("url"),
             })
-        bars.append({
+        row = {
             "cut_pct": spec["cut_pct"],
             "label": spec["label"],
             "projects": spec["projects"],
             "from_projects": spec.get("from_projects"),
-            "monthly": round(monthly, 2),
             "groups": priced,
-        })
+        }
+        if bar_error:
+            row["monthly"] = None
+            row["unpriced_reason"] = bar_error
+            row["gap"] = True
+        else:
+            row["monthly"] = round(monthly, 2)
+            if gap:
+                row["gap"] = True
+        bars.append(row)
     return {"bars": bars}
 
 
@@ -1560,7 +1652,9 @@ def fill_plan_sheet(job: dict, creds) -> dict:
             kind=solution, tab=SEC_TAB if solution == "security" else O11Y_TAB,
         )
         opts = region_options(sheets, copied["id"])
-        reg, _how = match_region(job["provider"], job["region_name"], opts)
+        reg, how = match_region(job["provider"], job["region_name"], opts)
+        if how == "none" or not reg:
+            return {"error": _region_rejected(job.get("region_name")), "unpriced_reason": _region_rejected(job.get("region_name"))}
         account = {"sizing": {"feature_tier": job.get("feature_tier")}}
         basis = job.get("basis") or "raw"
         if solution == "security":
@@ -1598,6 +1692,21 @@ def fill_plan_sheet(job: dict, creds) -> dict:
         raise
     except Exception as ex:  # noqa: BLE001
         return {"error": f"{label} deployment-count plan was not priced: {ex}"}
+
+
+def _plan_bulk_mix(rec: dict) -> dict | None:
+    """The four product streams `diag_inputs.summarize` reads, from the deployment's GB/day fields."""
+    if isinstance(rec.get("bulk_mix"), dict):
+        return rec.get("bulk_mix")
+    fields = {
+        "logs": rec.get("logs_gb_day"),
+        "k8s_logs": rec.get("k8s_logs_gb_day"),
+        "metrics": rec.get("metrics_gb_day"),
+        "traces": rec.get("traces_gb_day"),
+    }
+    if not any(value is not None for value in fields.values()):
+        return None
+    return {key: float(value or 0) for key, value in fields.items()}
 
 
 def _plan_solution(cloud_row: dict, measured: dict) -> str:
@@ -1671,6 +1780,7 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
             "store_gb": store_gb,
             "retention_days": rec.get("retention_days"),
             "retention_days_metrics": rec.get("retention_days_metrics"),
+            "bulk_mix": _plan_bulk_mix(rec),
             **{key: rec.get(key) for key in ("logs_gb_day", "k8s_logs_gb_day", "metrics_gb_day", "traces_gb_day") if rec.get(key) is not None},
         })
     if not rows:
@@ -1712,6 +1822,12 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
 
 
 # ----------------------------------------------------------------------------- main
+def _checkpoint_sizing(local_dir: Path, sizing_name: str, sz: dict, estimators: dict) -> None:
+    """Write sizing.json after a solution so a later timeout keeps the read-backs already priced."""
+    sz["estimators"] = estimators
+    seal_text(Path(local_dir) / sizing_name, json.dumps(sz, indent=2))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--account-json", required=True)
@@ -1731,7 +1847,10 @@ def main() -> None:
     ap.add_argument("--dedupe", action="store_true", help="Trash all but the newest sheet for each estimate title under this run's Drive folder, then exit")
     ap.add_argument("--dedupe-dry-run", action="store_true", help="With --dedupe: list the duplicates and trash nothing")
     ap.add_argument("--deployment-plan", action="store_true", help="Price the deployment-count bars from one project per ECH deployment down to one project per feature per region")
+    ap.add_argument("--allow-nearest-region", action="store_true", help="Write the nearest same-provider region when the deployment's region is not on the estimator list. The quote stays unverified.")
     args = ap.parse_args()
+    global _ALLOW_NEAREST
+    _ALLOW_NEAREST = bool(args.allow_nearest_region)
     args.skip_xlsx = not args.xlsx
 
     acc_path = Path(args.account_json)
@@ -1892,35 +2011,47 @@ def main() -> None:
         copied, reused, layout = copy_verified(drive, sheets, args.o11y_id, title_o, folder["id"], reuse=not args.fresh, kind="observability", tab=O11Y_TAB)
         opts = region_options(sheets, copied["id"])
         reg, how = match_region(provider, o_scope or region, opts)
-        daily = float(o.get("daily_raw_gb") or 0)
-        o_mix = None
-        if o.get("mix_basis"):
-            o_mix = {
-                "basis": o.get("mix_basis"),
-                "logs_gb_day": o.get("logs_gb_day"), "metrics_gb_day": o.get("metrics_gb_day"),
-                "traces_gb_day": o.get("traces_gb_day"), "k8s_logs_share": o.get("k8s_logs_share"),
-                "metrics_retention_days": float(o["retention_months_metrics"]) * DAYS_PER_MONTH if o.get("retention_months_metrics") else None,
+        if how == "none" or not reg:
+            reason = _region_rejected(o_scope or region)
+            estimators["observability"] = {
+                "kind": "observability", "title": copied["name"], "spreadsheet_id": copied["id"],
+                "url": copied["url"], "region_match": "none", "readback_rejected": reason,
+                "readback": {}, "status": "unquoted",
             }
-            cells = observability_fill(acc, support, reg, o_months, daily, o_mix, args.force_months is not None, basis)
+            lines.append(f"Observability → {reason}")
         else:
-            cells = observability_input_cells(
-                acc, support, reg, o_months, daily, logs=o.get("logs_gb_day"), metrics=o.get("metrics_gb_day"), basis=basis,
-            )
-        n = push_cells(sheets, copied["id"], O11Y_TAB, cells, allowed_text=set(opts))
-        rb = observability_readback(read_cells(sheets, copied["id"], O11Y_TAB, O11Y_READBACK), basis)
-        entry = {"kind": "observability", "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.o11y_id, "reused_existing_copy": reused, "tab": O11Y_TAB, "cells": cells, "cells_written": n, "region_match": f"{reg} ({how})", "readback": rb, "status": "filled", "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"]}
-        entry["ingest_basis"] = basis
-        entry["echo_gate"] = observability_echo_gate(o_mix or o, rb) if basis == "metered" else echo_gate(daily, rb.get("echo_gb_day"))
-        if not entry["echo_gate"]["accepted"]:
-            entry["readback_rejected"] = "the sheet echo differs from the written bulk by more than the tolerance (0.1% of it, at least 0.02 GB/day)"
-        if not args.skip_xlsx:
-            try:
-                x = export_xlsx(drive, copied["id"], estimate_dir / f"{title_o}.xlsx")
-                entry["local_xlsx"] = str(x)
-            except Exception as ex:  # noqa: BLE001
-                entry["local_xlsx_error"] = str(ex)
-        estimators["observability"] = entry
-        lines.append(f"Observability → {copied['url']}  ({n} cells; Y1 {rb.get('annual_year1')}, monthly {rb.get('monthly_steady_state')}; region {reg} [{how}])")
+            daily = float(o.get("daily_raw_gb") or 0)
+            match_text = f"{reg} (nearest; wanted {o_scope or region})" if how == "nearest" else f"{reg} ({how})"
+            o_mix = None
+            if o.get("mix_basis"):
+                o_mix = {
+                    "basis": o.get("mix_basis"),
+                    "logs_gb_day": o.get("logs_gb_day"), "metrics_gb_day": o.get("metrics_gb_day"),
+                    "traces_gb_day": o.get("traces_gb_day"), "k8s_logs_share": o.get("k8s_logs_share"),
+                    "metrics_retention_days": float(o["retention_months_metrics"]) * DAYS_PER_MONTH if o.get("retention_months_metrics") else None,
+                }
+                cells = observability_fill(acc, support, reg, o_months, daily, o_mix, args.force_months is not None, basis)
+            else:
+                cells = observability_input_cells(
+                    acc, support, reg, o_months, daily, logs=o.get("logs_gb_day"), metrics=o.get("metrics_gb_day"), basis=basis,
+                )
+            n = push_cells(sheets, copied["id"], O11Y_TAB, cells, allowed_text=set(opts))
+            rb = observability_readback(read_cells(sheets, copied["id"], O11Y_TAB, O11Y_READBACK), basis)
+            entry = {"kind": "observability", "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.o11y_id, "reused_existing_copy": reused, "tab": O11Y_TAB, "cells": cells, "cells_written": n, "region_match": match_text, "readback": rb, "status": "filled", "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"]}
+            entry["ingest_basis"] = basis
+            entry["echo_gate"] = observability_echo_gate(o_mix or o, rb) if basis == "metered" else echo_gate(daily, rb.get("echo_gb_day"))
+            if not entry["echo_gate"]["accepted"]:
+                entry["readback_rejected"] = "the sheet echo differs from the written bulk by more than the tolerance (0.1% of it, at least 0.02 GB/day)"
+            if not args.skip_xlsx:
+                try:
+                    x = export_xlsx(drive, copied["id"], estimate_dir / f"{title_o}.xlsx")
+                    entry["local_xlsx"] = str(x)
+                except Exception as ex:  # noqa: BLE001
+                    entry["local_xlsx_error"] = str(ex)
+            estimators["observability"] = entry
+            lines.append(f"Observability → {copied['url']}  ({n} cells; Y1 {rb.get('annual_year1')}, monthly {rb.get('monthly_steady_state')}; region {reg} [{how}])")
+
+    _checkpoint_sizing(local_dir, sizing_name, sz, estimators)
 
     # ---------------- Security
     s = con["security"]
@@ -1942,22 +2073,34 @@ def main() -> None:
         copied, reused, layout = copy_verified(drive, sheets, args.security_id, title_s, folder["id"], reuse=not args.fresh, kind="security", tab=SEC_TAB)
         opts = region_options(sheets, copied["id"])
         reg, how = match_region(provider, s_scope or region, opts)
-        s_daily = float(s.get("siem_gb_day") if s.get("siem_gb_day") is not None else s.get("daily_raw_gb") or 0)
-        cells, n, rb, s_gate = fill_security(sheets, copied["id"], acc, support, reg, s_months, s_daily, opts, basis)
-        entry = {"kind": "security", "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.security_id, "reused_existing_copy": reused, "tab": SEC_TAB, "cells": cells, "cells_written": n, "region_match": f"{reg} ({how})", "readback": rb, "status": "filled", "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"]}
-        entry["ingest_basis"] = basis
-        if s_gate is not None:
-            entry["echo_gate"] = s_gate
-            if not s_gate["accepted"]:
-                entry["readback_rejected"] = "the sheet echo differs from the written bulk by more than the tolerance (0.1% of it, at least 0.02 GB/day)"
-        if not args.skip_xlsx:
-            try:
-                x = export_xlsx(drive, copied["id"], estimate_dir / f"{title_s}.xlsx")
-                entry["local_xlsx"] = str(x)
-            except Exception as ex:  # noqa: BLE001
-                entry["local_xlsx_error"] = str(ex)
-        estimators["security"] = entry
-        lines.append(f"Security → {copied['url']}  ({n} cells; Y1 {rb.get('annual_year1')}; region {reg} [{how}])")
+        if how == "none" or not reg:
+            reason = _region_rejected(s_scope or region)
+            estimators["security"] = {
+                "kind": "security", "title": copied["name"], "spreadsheet_id": copied["id"],
+                "url": copied["url"], "region_match": "none", "readback_rejected": reason,
+                "readback": {}, "status": "unquoted",
+            }
+            lines.append(f"Security → {reason}")
+        else:
+            s_daily = float(s.get("siem_gb_day") if s.get("siem_gb_day") is not None else s.get("daily_raw_gb") or 0)
+            cells, n, rb, s_gate = fill_security(sheets, copied["id"], acc, support, reg, s_months, s_daily, opts, basis)
+            match_text = f"{reg} (nearest; wanted {s_scope or region})" if how == "nearest" else f"{reg} ({how})"
+            entry = {"kind": "security", "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.security_id, "reused_existing_copy": reused, "tab": SEC_TAB, "cells": cells, "cells_written": n, "region_match": match_text, "readback": rb, "status": "filled", "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"]}
+            entry["ingest_basis"] = basis
+            if s_gate is not None:
+                entry["echo_gate"] = s_gate
+                if not s_gate["accepted"]:
+                    entry["readback_rejected"] = "the sheet echo differs from the written bulk by more than the tolerance (0.1% of it, at least 0.02 GB/day)"
+            if not args.skip_xlsx:
+                try:
+                    x = export_xlsx(drive, copied["id"], estimate_dir / f"{title_s}.xlsx")
+                    entry["local_xlsx"] = str(x)
+                except Exception as ex:  # noqa: BLE001
+                    entry["local_xlsx_error"] = str(ex)
+            estimators["security"] = entry
+            lines.append(f"Security → {copied['url']}  ({n} cells; Y1 {rb.get('annual_year1')}; region {reg} [{how}])")
+
+    _checkpoint_sizing(local_dir, sizing_name, sz, estimators)
 
     # ---------------- Search (es3-estimator notebook library)
     se = con["search"]
@@ -2012,12 +2155,17 @@ def main() -> None:
         }
         if result.get("error"):
             entry["error"] = result["error"]
+            if "not on the estimator list" in str(result["error"]):
+                entry["region_match"] = "none"
+                entry["readback_rejected"] = str(result["error"])
+                entry["readback"] = None
         if published.get("error"):
             entry["error"] = published["error"]
             entry["note"] = f"{entry.get('note')}; Drive upload failed: {published['error']}"
         rb = result.get("readback") or {}
         lines.append(f"Search → {entry.get('url') or entry.get('local')}  (performant {rb.get('monthly_steady_state') or entry['status']}; region {result.get('region_match')})")
         estimators["search"] = entry
+    _checkpoint_sizing(local_dir, sizing_name, sz, estimators)
     project_only = {"observability", "security"} if args.skip_search else None
     fresh_projects = size_regional_projects(
         acc, sheets, drive, folder, o11y_id=args.o11y_id, security_id=args.security_id,

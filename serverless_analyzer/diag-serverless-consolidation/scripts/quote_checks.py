@@ -247,18 +247,27 @@ def _eis_completeness_row(eis: dict | None) -> dict:
 
 
 def _retention_row(coverage: dict | None) -> dict:
+    """Share of bulk whose age comes from a configured policy. Informational.
+
+    An assumed 30-day default is not configured retention, so it does not count.
+    The check does not pass or fail the quote: under the one-year headline,
+    retention does not change the price. The share is reported on the sensitivity row.
+    """
     if not coverage:
-        return _integrity_row("Measured retention", None, None, "This run has no diagnostic coverage.")
+        return _integrity_row("Retention basis", None, None, "This run has no diagnostic coverage.")
     bulk = float(coverage.get("bulk_gb_day") or 0)
-    unmeasured = float(coverage.get("unmeasured_bulk") or 0)
     if bulk <= 0:
-        return _integrity_row("Measured retention", None, None, "No bulk to weight.")
-    score = max(0.0, 1.0 - unmeasured / bulk)
+        return _integrity_row("Retention basis", None, None, "No bulk to weight.")
+    if coverage.get("retention_policy_bulk_gb_day") is None:
+        return _integrity_row("Retention basis", None, None, "Configured retention was not recorded for this run.")
+    policy = max(0.0, float(coverage.get("retention_policy_bulk_gb_day") or 0))
+    score = min(policy / bulk, 1.0)
     return _integrity_row(
-        "Measured retention",
+        "Retention basis",
         score,
-        unmeasured == 0,
-        f"{unmeasured:.3f} GB/day of {bulk:.3f} has no measured age.",
+        None,
+        f"{policy:.3f} GB/day of {bulk:.3f} has a configured retention policy. "
+        "Assumed 30-day store is not counted as measured. Retention does not change the headline.",
     )
 
 
@@ -438,6 +447,126 @@ def _year_row(lines: list[dict]) -> dict:
     )
 
 
+# Short-window bulk and restarted counters, as a share of quoted bulk. One place.
+RATE_WINDOW_MAX_SHARE = 0.25
+COUNTER_AGE_MAX_SHARE = 0.25
+# Floor versus headline while the floor is one project per solution and region.
+PLAN_HEADLINE_SHARE = 0.01
+PLAN_HEADLINE_USD = 5.0
+
+
+def region_match_how(value) -> str:
+    """The match recorded on a sheet: exact, alias, nearest, provider_default, none, or unknown."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    found = re.findall(r"\((exact|alias|nearest|provider_default|none)\b", text, re.IGNORECASE)
+    if found:
+        return found[-1].lower()
+    low = text.lower()
+    if low in {"exact", "alias", "nearest", "provider_default", "none"}:
+        return low
+    return "unknown"
+
+
+def _quote_present_row(solutions: list[dict]) -> dict:
+    """A solution with a workload and no monthly price is not a quote."""
+    watched = [row for row in solutions if row.get("has_workload") and "serverless_mo" in row]
+    if not watched:
+        return _integrity_row("Quote present", None, None, "No solution has a workload.")
+    missing = []
+    for row in watched:
+        monthly = row.get("serverless_mo")
+        if monthly is None or float(monthly) == 0:
+            missing.append(str(row.get("solution") or "a solution"))
+    if not missing:
+        return _integrity_row("Quote present", 1.0, True, "Every solution with a workload has a serverless monthly price.")
+    return _integrity_row(
+        "Quote present",
+        0.0,
+        False,
+        f"{', '.join(missing)} has a workload and no serverless monthly price.",
+    )
+
+
+def _region_fidelity_row(sheets: list[dict]) -> dict:
+    """Every written sheet is an exact or alias match, same provider and same region number."""
+    written = [row for row in sheets if row.get("region_match") or row.get("readback_rejected")]
+    if not written:
+        return _integrity_row("Region fidelity", None, None, "No region was written to an estimator.")
+    bad = []
+    for row in written:
+        how = region_match_how(row.get("region_match"))
+        region = str(row.get("region") or "a region")
+        if how not in {"exact", "alias"}:
+            bad.append(f"{region} ({how or 'none'})")
+            continue
+        if how == "alias" and not _alias_same_number(region, str(row.get("region_match") or "")):
+            bad.append(f"{region} (alias of a different region number)")
+    if bad:
+        return _integrity_row(
+            "Region fidelity",
+            0.0,
+            False,
+            "A written region is not an exact or same-number alias: " + "; ".join(bad) + ".",
+        )
+    return _integrity_row("Region fidelity", 1.0, True, f"{len(written)} written regions match the estimator list.")
+
+
+def _alias_same_number(region: str, recorded: str) -> bool:
+    """An alias may reorder the name. It may not change the region number or the provider."""
+    want = re.findall(r"\d+", region or "")
+    option = recorded.split("(")[0]
+    got = re.findall(r"\d+", option)
+    return want == got
+
+
+def _plan_consistency_row(block: dict | None) -> dict:
+    """The floor matches the headline, and no bar prices a solution the headline left out."""
+    block = block or {}
+    if block.get("bar_prices_unquoted"):
+        return _integrity_row(
+            "Plan consistency",
+            0.0,
+            False,
+            "A deployment-count bar prices a solution the headline did not quote.",
+        )
+    headline = block.get("headline")
+    floor = block.get("floor_monthly")
+    floor_projects = block.get("floor_projects")
+    regional = block.get("regional_projects")
+    if headline is None or floor is None or floor_projects is None or regional is None:
+        return _integrity_row("Plan consistency", None, None, "The plan has no floor to compare with the headline.")
+    if int(floor_projects) != int(regional):
+        return _integrity_row("Plan consistency", None, None, "The floor is not one project per solution and region.")
+    gap = abs(float(floor) - float(headline))
+    limit = abs(float(headline)) * PLAN_HEADLINE_SHARE + PLAN_HEADLINE_USD
+    passed = gap <= limit
+    return _integrity_row(
+        "Plan consistency",
+        1.0 if passed else 0.0,
+        passed,
+        f"Floor ${float(floor):,.2f} versus headline ${float(headline):,.2f}, gap ${gap:,.2f}. The bar is 1% plus $5.",
+    )
+
+
+def _share_limit_row(name: str, coverage: dict | None, key: str, limit: float, noun: str) -> dict:
+    if not coverage or not float(coverage.get("bulk_gb_day") or 0):
+        return _integrity_row(name, None, None, "No bulk to compare.")
+    if coverage.get(key) is None:
+        return _integrity_row(name, None, None, f"{noun.capitalize()} was not recorded.")
+    bulk = float(coverage.get("bulk_gb_day") or 0)
+    part = float(coverage.get(key) or 0)
+    share = part / bulk if bulk else 0.0
+    passed = share <= limit
+    return _integrity_row(
+        name,
+        round(max(0.0, 1.0 - min(share, 1.0)), 3),
+        passed,
+        f"{part:.3f} GB/day of {bulk:.3f} is {noun} ({share * 100:.1f}%). The bar is {limit * 100:.0f}%.",
+    )
+
+
 def integrity_score(facts: dict) -> dict:
     """Quote integrity, 0 to 1. The mean skips a check that does not apply.
 
@@ -445,7 +574,8 @@ def integrity_score(facts: dict) -> dict:
     the checks, whatever the mean is. One failed check fails the quote. The
     score is the mean and is reported beside that verdict. It does not decide
     it, because a check can pass its bar and score under 1 (an echo gap inside
-    the tolerance, or unrated store under 5%). This is not a serverless bill.
+    the tolerance, or unrated store under 5%). A check with no pass/fail
+    (retention basis) is reported and left out of the mean. This is not a serverless bill.
     """
     coverage = facts.get("coverage")
     checks = [
@@ -459,14 +589,16 @@ def integrity_score(facts: dict) -> dict:
         _line_row(facts.get("headline_monthly"), list(facts.get("lines") or [])),
         _year_row(list(facts.get("lines") or [])),
         _eis_completeness_row(facts.get("eis")),
+        _region_fidelity_row(list(facts.get("written_regions") or [])),
+        _quote_present_row(list(facts.get("solutions") or [])),
+        _plan_consistency_row(facts.get("plan_consistency")),
+        _share_limit_row("Rate window", coverage, "bulk_short_window_gb_day", RATE_WINDOW_MAX_SHARE, "rated over a short window"),
+        _share_limit_row("Counter age", coverage, "bulk_restart_gb_day", COUNTER_AGE_MAX_SHARE, "from a restarted bulk counter"),
     ]
-    scored_rows = [row for row in checks if row["score"] is not None]
-    scored = [row["score"] for row in scored_rows]
+    applicable = [row for row in checks if row.get("passed") is not None]
+    scored = [row["score"] for row in applicable if row.get("score") is not None]
     score = None if not scored else round(sum(scored) / len(scored), 3)
-    if score is None:
-        passed = None
-    else:
-        passed = all(row["passed"] is True for row in scored_rows)
+    passed = None if score is None else all(row["passed"] is True for row in applicable)
     return {
         "score": score,
         "passed": passed,

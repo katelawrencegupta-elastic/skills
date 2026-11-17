@@ -114,13 +114,34 @@ def _is_zip(path: Path) -> bool:
         return fh.read(2) == b"PK"
 
 
+class BundleIncomplete(Exception):
+    """A diagnostic zip is missing a member the bulk rate is read from."""
+
+
+def _bundle_has_members(names: list[str]) -> bool:
+    """nodes_stats and the index-stats member. Either name the admin console or esdiag uses."""
+    folded = [name.replace("\\", "/").lower() for name in names]
+
+    def has(suffixes: tuple[str, ...]) -> bool:
+        return any(name.endswith(suffix) or name == suffix.lstrip("/") for name in folded for suffix in suffixes)
+
+    return has(("/nodes_stats.json", "nodes_stats.json")) and has((
+        "/indices_stats.json", "indices_stats.json", "/index_stats.json", "index_stats.json",
+    ))
+
+
 def _zip_ok(path: Path) -> bool:
-    """A complete bundle: a readable zip whose every member passes its CRC check."""
+    """A complete bundle: a readable zip whose every member passes its CRC check.
+
+    A zip that is missing nodes_stats or the index-stats member is not complete.
+    The capture retries it instead of parsing a 0 GB/day rate.
+    """
     if not _is_zip(path):
         return False
     try:
         with zipfile.ZipFile(path) as zf:
-            return bool(zf.namelist()) and zf.testzip() is None
+            names = zf.namelist()
+            return bool(names) and zf.testzip() is None and _bundle_has_members(names)
     except (zipfile.BadZipFile, OSError, EOFError, RuntimeError):
         return False
 
@@ -716,6 +737,9 @@ def series_rates(stats: dict, streams: list, alias: dict, explain: dict, created
 def analyze_bundle(path: Path, *, captured: datetime) -> dict:
     """Bulk GB/day, retention, and primary store size from one diagnostic zip."""
     with zipfile.ZipFile(path) as archive:
+        names = archive.namelist()
+        if not _bundle_has_members(names):
+            raise BundleIncomplete(f"{path.name} is missing nodes_stats.json or the index-stats member")
         health = _zip_json(archive, "/cluster_health.json") or {}
         nodes = (_zip_json(archive, "/nodes_stats.json") or {}).get("nodes") or {}
         policies = _zip_json(archive, "/commercial/ilm_policies.json") or {}

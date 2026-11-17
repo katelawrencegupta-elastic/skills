@@ -511,6 +511,10 @@ def apply_diagnostics(
         "snapshot_gb": round(snapshot_gb, 2),
         "retention_unmeasured": no_age,
         "retention_30d_assumed": assumed_retention_rows[:12],
+        # Bulk whose age is a delete policy or data-stream retention. Assumed 30-day bulk is not included.
+        "retention_policy_bulk_gb_day": round(sum(
+            float(row.get("bulk_gb_day") or 0) for row in active_rows if row.get("retention_basis") == "policy"
+        ), 3),
         "unrated": unrated,
         "bulk_short_window_gb_day": round(sum(float(r.get("bulk_short_window_gb_day") or 0) for r in active_rows), 3),
         "bulk_fallback_gb_day": round(sum(float(r.get("bulk_fallback_gb_day") or 0) for r in active_rows), 3),

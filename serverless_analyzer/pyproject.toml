@@ -1,0 +1,5 @@
+[project]
+name = "serverless-analyzer"
+version = "0.0.0"
+description = "Elastic Cloud account, org, and diagnostic consolidation skills"
+requires-python = ">=3.10"

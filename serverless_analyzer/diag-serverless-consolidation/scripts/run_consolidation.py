@@ -121,6 +121,8 @@ def _estimator_flags(args) -> list[str]:
         flags.append("--always-copy")
     if getattr(args, "fresh", False):
         flags.append("--fresh")
+    if getattr(args, "allow_nearest_region", False):
+        flags.append("--allow-nearest-region")
     return flags
 
 
@@ -179,6 +181,52 @@ def _plan_brief(plan) -> list[dict]:
     return out
 
 
+def _ordered_notes(cons: dict, sz: dict) -> list:
+    """Estimation limits, then gate notes, then the rest. Nothing is dropped."""
+    limits = ((sz.get("diagnostics") or {}).get("estimation_limits")) or []
+    first = []
+    for row in limits:
+        if isinstance(row, dict):
+            text = row.get("detail") or row.get("code")
+            if text:
+                first.append(str(text))
+        elif row:
+            first.append(str(row))
+    gate_words = ("echo", "gate", "not quoted", "estimator list", "unverified")
+    gate = []
+    rest = []
+    for note in cons.get("notes") or []:
+        text = str(note)
+        if any(word in text.lower() for word in gate_words):
+            gate.append(note)
+        else:
+            rest.append(note)
+    return first + gate + rest
+
+
+def _region_matches(estimators: dict) -> list[dict]:
+    rows = []
+    for key, entry in (estimators or {}).items():
+        if key == "projects" or not isinstance(entry, dict):
+            continue
+        if entry.get("region_match") or entry.get("readback_rejected"):
+            rows.append({
+                "solution": key,
+                "region": entry.get("region"),
+                "region_match": entry.get("region_match"),
+                "readback_rejected": entry.get("readback_rejected"),
+            })
+    for entry in (estimators or {}).get("projects") or []:
+        if isinstance(entry, dict) and (entry.get("region_match") or entry.get("readback_rejected")):
+            rows.append({
+                "solution": entry.get("solution"),
+                "region": entry.get("region"),
+                "region_match": entry.get("region_match"),
+                "readback_rejected": entry.get("readback_rejected"),
+            })
+    return rows
+
+
 def consolidation_brief(acc: dict) -> dict:
     """Quote slice for the diagnostic skill. The account-summary brief stays separate."""
     m = acc.get("meta") or {}
@@ -223,7 +271,10 @@ def consolidation_brief(acc: dict) -> dict:
         "ech_scope": cons.get("ech_scope"),
         "ech_recent_months": cons.get("ech_recent_months"),
         "estimate_months": cons.get("estimate_months"),
-        "notes": list((cons.get("notes") or [])[:12]),
+        "notes": _ordered_notes(cons, sz),
+        "limits": list(((sz.get("diagnostics") or {}).get("estimation_limits")) or []),
+        "region_matches": _region_matches(est_in),
+        "per_cluster_plan": cons.get("per_cluster_plan"),
         "diagnostics_coverage": sz.get("diagnostics") if (cons.get("source") == "diagnostics" or sz.get("ingest_source") == "diagnostics") else None,
         "excluded_deployments": m.get("excluded_deployments"),
         "method": m.get("method"),
@@ -407,6 +458,9 @@ def _run_compressioncalc(diag: dict, diag_path: Path, infra: dict, py: Path, arg
                 _stamp_compression(comp, scenario="rounded")
                 seal_text(path, json.dumps(comp, indent=2))
             except subprocess.CalledProcessError as e:
+                if not getattr(args, "allow_partial", False):
+                    print(f"ERROR: compressioncalc_accounted_for regional sizing failed ({e}). The run stopped.", file=sys.stderr)
+                    raise SystemExit(2) from e
                 print(f"WARN: compressioncalc_accounted_for regional sizing failed ({e})", file=sys.stderr)
                 block["regional_status"] = f"consolidated read-back kept ({e})"
     except subprocess.CalledProcessError as e:
@@ -617,7 +671,11 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
             sizing_ran = True
             diag = json.loads(diag_path.read_text())
         except subprocess.CalledProcessError as e:
+            if not getattr(args, "allow_partial", False):
+                print(f"ERROR: diagnostics sizing failed ({e}). The run stopped.", file=sys.stderr)
+                raise SystemExit(2) from e
             print(f"WARN: diagnostics sizing failed ({e}); the diagnostics document keeps the measured inputs", file=sys.stderr)
+            diag.setdefault("meta", {})["draft"] = True
     else:
         print(f"WARN: Sheets venv missing at {py} — diagnostics document has no estimator read-backs", file=sys.stderr)
     try:
@@ -636,7 +694,11 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
             diag["consolidation"] = build_consolidation(diag, infra)
             seal_text(diag_path, json.dumps(diag, indent=2))
         except subprocess.CalledProcessError as e:
+            if not getattr(args, "allow_partial", False):
+                print(f"ERROR: diagnostics regional sizing failed ({e}). The run stopped.", file=sys.stderr)
+                raise SystemExit(2) from e
             print(f"WARN: diagnostics regional sizing failed ({e}); document uses the consolidated read-backs", file=sys.stderr)
+            diag.setdefault("meta", {})["draft"] = True
     if sizing_ran and py.is_file() and not (diag.get("consolidation") or {}).get("error"):
         if not args.skip_deployment_plan:
             plan_cmd = [str(py), str(HERE / "size_serverless.py"), "--account-json", str(diag_path), "--deployment-plan", *extra]
@@ -645,7 +707,11 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
             try:
                 _run(plan_cmd)
             except subprocess.CalledProcessError as e:
+                if not getattr(args, "allow_partial", False):
+                    print(f"ERROR: deployment-count plan failed ({e}). The run stopped.", file=sys.stderr)
+                    raise SystemExit(2) from e
                 diag = json.loads(diag_path.read_text())
+                diag.setdefault("meta", {})["draft"] = True
                 diag.setdefault("sizing", {})["deployment_plan"] = {
                     "bars": [],
                     "error": f"Observability deployment-count plan was not priced ({e}).",
@@ -680,6 +746,9 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
 
 def main() -> None:
     args = parse_args(description=__doc__)
+    stamp = method_stamp(int(args.lookback_days))
+    if stamp.get("uncommitted_changes") and not getattr(args, "allow_dirty", False):
+        raise SystemExit(2)
     if not 1 <= int(args.lookback_days) <= 365:
         raise SystemExit("--lookback-days must be from 1 to 365")
     if not 0 <= float(args.min_priced_ecu_pct) <= 100:
@@ -740,7 +809,11 @@ def main() -> None:
                 sizing_ran = True
                 acc = json.loads(acc_path.read_text())
             except subprocess.CalledProcessError as e:
+                if not getattr(args, "allow_partial", False):
+                    print(f"ERROR: K360 sizing step failed ({e}). The run stopped.", file=sys.stderr)
+                    raise SystemExit(2) from e
                 print(f"WARN: K360 sizing step failed ({e}); report still generated", file=sys.stderr)
+                acc.setdefault("meta", {})["draft"] = True
                 acc["sizing"]["estimators"] = {"error": f"size_serverless.py exit {e.returncode}"}
                 seal_text(acc_path, json.dumps(acc, indent=2))
         try:
@@ -766,7 +839,11 @@ def main() -> None:
                     acc["consolidation"].setdefault("notes", []).insert(0, f"Diagnostic bundles were not used ({why}). This quote is the K360 backup.")
                 seal_text(acc_path, json.dumps(acc, indent=2))
             except subprocess.CalledProcessError as e:
+                if not getattr(args, "allow_partial", False):
+                    print(f"ERROR: regional project sizing failed ({e}). The run stopped.", file=sys.stderr)
+                    raise SystemExit(2) from e
                 print(f"WARN: regional project sizing failed ({e}); report uses the consolidated read-backs", file=sys.stderr)
+                acc.setdefault("meta", {})["draft"] = True
         if backup:
             acc["k360_ingest"] = _quote_block(acc)
     elif acc["sizing"]["triggered"] and diag_acc is None:

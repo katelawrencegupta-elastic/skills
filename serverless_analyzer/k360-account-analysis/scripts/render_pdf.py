@@ -212,12 +212,22 @@ def _delta_tone(cost) -> str:
 
 
 def _method_bit(meta: dict) -> str:
-    """The commit that produced this report, so a PDF can be tied to its method."""
+    """The commit that produced this report, so a PDF can be tied to its method.
+
+    A dirty checkout or a partial sizing adds DRAFT. The uncommitted phrase stays
+    so a reader can see both the commit and that the tree was not clean.
+    """
     method = (meta or {}).get("method") or {}
     commit = method.get("commit")
-    if not commit:
-        return ""
-    return f" · method {esc(commit)}" + (" + uncommitted changes" if method.get("uncommitted_changes") else "")
+    dirty = bool(method.get("uncommitted_changes") or (meta or {}).get("draft"))
+    parts = []
+    if commit:
+        parts.append(f" · method {esc(commit)}")
+        if method.get("uncommitted_changes"):
+            parts.append(" + uncommitted changes")
+    if dirty:
+        parts.append(" · DRAFT")
+    return "".join(parts)
 
 
 def _window_bill(c: dict):
@@ -256,7 +266,7 @@ def _scope_note(c: dict) -> str | None:
     if not scope:
         return None
     if scope.get("status") == "unavailable":
-        return "ECH billed cost could not be compared by deployment because daily Cloud Tracker deployment billing was incomplete or unreconciled. Savings are omitted. " + esc(scope.get("reason") or "")
+        return "ECH billed cost could not be compared by deployment because daily Cloud Tracker deployment billing was incomplete or unreconciled. The comparison is omitted. " + esc(scope.get("reason") or "")
     unpriced = scope.get("unpriced") or []
     shown = ", ".join(f"{esc(row.get('name'))} ({esc(row.get('reason'))}, {usd(row.get('ecu_mo'))}/mo)" for row in unpriced[:4])
     more = "" if len(unpriced) <= 4 else f", and {len(unpriced) - 4} more"
@@ -1132,6 +1142,8 @@ a { color: #0B64DD; text-decoration: none; }
 .topo table { table-layout: fixed; }
 .topo td:first-child { width: 24%; overflow-wrap: anywhere; }
 .foot { color: #69707D; font-size: 11px; border-top: 1px solid #D3DAE6; margin-top: 14px; padding-top: 6px; }
+body.draft { position: relative; }
+body.draft::before { content: "DRAFT"; position: fixed; left: 0; right: 0; top: 38%; text-align: center; font-size: 92px; font-weight: 700; letter-spacing: .18em; color: rgba(189, 39, 30, 0.16); transform: rotate(-18deg); pointer-events: none; z-index: 5; }
 body.consolidation h3 { margin: 12px 0 8px; break-after: avoid; }
 body.consolidation h2 + h3,
 body.consolidation .panel > h3:first-child,
@@ -1232,8 +1244,9 @@ body.consolidation .sec.newpage ul.notes.cols4 { font-size: 9.5px; line-height: 
 """
 
 
-def page(title: str, body: str, *, kind: str = "") -> str:
-    cls = f" class='{kind}'" if kind else ""
+def page(title: str, body: str, *, kind: str = "", draft: bool = False) -> str:
+    classes = " ".join(part for part in (kind, "draft" if draft else "") if part)
+    cls = f" class='{classes}'" if classes else ""
     return f"<!doctype html><html><head><meta charset='utf-8'><title>{esc(title)}</title><style>{CSS}</style></head><body{cls}>{body}</body></html>"
 
 
@@ -2106,7 +2119,13 @@ def search_power_section(acc: dict, *, new_page: bool = True) -> str:
 _INTEGRITY_FORMULA = {
     "Sheet echo": "Mean of the echo and E73 components over every sheet read, fleet or regional. echo component = 1 − min(|echo − written bulk| ÷ tolerance, 1), where the tolerance is 0.1% of the written bulk, at least 0.02 GB/day. A blank echo scores 0. E73 scores 1 when the parsed amount is 0, and 0 when it is blank or the amount is above 0.005.",
     "Bundle coverage": "Matched deployments ÷ active deployments. When the active count is absent, the denominator is matched bundles plus bundles that fell back.",
-    "Measured retention": "1 − (bulk with no measured age ÷ Σ bulk).",
+    "Retention basis": "Share of bulk with a configured retention policy. Assumed 30-day store is not counted. Informational.",
+    "Search EIS data": "1 when filtered Search EIS billing for the quote window is complete.",
+    "Region fidelity": "1 when every written sheet is an exact or same-number alias match.",
+    "Quote present": "1 when every solution with a workload has a serverless monthly price.",
+    "Plan consistency": "1 when the Floor bar is within 1% plus $5 of the headline.",
+    "Rate window": "1 when short-window bulk is 25% of bulk or less.",
+    "Counter age": "1 when restarted-counter bulk is 25% of bulk or less.",
     "Rated ingest": "1 − (store in indices that took bulk writes and have no rate ÷ local store). Those indices are not a data stream, a write alias, or an ILM rollover, or their write index has no write phase. Passes at 5% or less.",
     "Priced share": "Billed cost of the ECH deployments that got a serverless price ÷ billed cost of every ECH deployment on the roster, over the quote window. Passes at the --min-priced-ecu-pct bar, 90% unless set.",
     "Estimator monotone": "1 − (merge steps in the deployment-count plan that cost more than the step before them ÷ merge steps). A step rising more than 2% and $5 fails. The read-back stays the dollar.",
@@ -3463,7 +3482,11 @@ def render_consolidation_html(acc: dict) -> str:
     B: list[str] = []
     diag = _from_diagnostics(acc)
     scope_unavailable = (c.get("ech_scope") or {}).get("status") == "unavailable"
-    recent = (c.get("ech_recent_months") or {}).get("months") or []
+    integrity = c.get("integrity") or {}
+    integrity_failed = integrity.get("passed") is False
+    priced_block = c.get("ech_recent_months_priced") or {}
+    # An unverified deployment scope uses only the deployments that received a price.
+    recent = (priced_block.get("months") or []) if scope_unavailable else ((c.get("ech_recent_months") or {}).get("months") or [])
     est_months = int(c.get("estimate_months") or 12)
     month_pairs = []
     for row in recent:
@@ -3471,21 +3494,34 @@ def render_consolidation_html(acc: dict) -> str:
             month_pairs.append((_month_label(row["month"]), float(row["cost"])))
         except (TypeError, ValueError, KeyError):
             continue
-    month_avg = sum(v for _label, v in month_pairs) / len(month_pairs) if month_pairs else None
+    month_avg = priced_block.get("average") if scope_unavailable else (sum(v for _label, v in month_pairs) / len(month_pairs) if month_pairs else None)
     svl_total = sv.get("serverless_mo")
     # Page 1 keeps the spreadsheet or notebook read-back when the deployment-scoped bill cannot be verified.
-    cover_from_months = sv.get("ech_list_mo") is None and svl_total is not None and month_avg is not None
+    # Without a priced-only average there is no difference and no percentage.
+    cover_from_months = (
+        scope_unavailable and svl_total is not None and month_avg is not None and bool(month_pairs)
+    ) or (
+        not scope_unavailable and sv.get("ech_list_mo") is None and svl_total is not None and month_avg is not None
+    )
     if cover_from_months:
-        cover_delta = month_avg - float(svl_total)
-        cover_pct = round(100 * cover_delta / month_avg, 1) if month_avg else None
+        cover_delta = float(month_avg) - float(svl_total)
+        cover_pct = round(100 * cover_delta / float(month_avg), 1) if month_avg else None
+    elif scope_unavailable:
+        cover_delta = None
+        cover_pct = None
     else:
         cover_delta = sv.get("list_mo")
         cover_pct = sv.get("list_pct")
     _change = sv.get("cost_mo") if sv.get("cost_mo") is not None else cover_delta
+    # A failed integrity check never titles the page as a saving. An unverified comparison has no difference.
+    neutral_title = integrity_failed or _change is None or bool(m.get("draft"))
     _outcome = "estimated cost increase from" if _increase(_change) else "estimated savings from"
+    # An unverified comparison (integrity failed, scope not measured) carries no saving and no reduction.
+    hide_saving_words = bool((integrity_failed and scope_unavailable) or m.get("draft"))
+    change_tag = "unverified" if integrity_failed else "estimate"
     headline = (
         f"{esc(m.get('customer'))} — serverless estimate for consolidating on {esc(dom_key.title())} Serverless"
-        if _change is None else
+        if neutral_title else
         f"{esc(m.get('customer'))} — {_outcome} consolidating on {esc(dom_key.title())} Serverless"
     )
     if diag:
@@ -3524,6 +3560,19 @@ def render_consolidation_html(acc: dict) -> str:
     B.append("<div class='cover'><header class='masthead'><div class='brand'>Elastic<i></i></div>"
              f"<h1>{headline}</h1>"
              f"<div class='sub'>{dep_label} · {ecu_label} · {n0(b0.get('stored_gb'))} GB stored · {esc(cloud.get('provider'))} {esc(cloud.get('region'))} · {esc(m.get('date'))}{source_bit}</div></header>")
+    if integrity_failed:
+        failed_names = [
+            str(row.get("check"))
+            for row in (integrity.get("checks") or [])
+            if isinstance(row, dict) and row.get("passed") is False and row.get("check")
+        ]
+        B.append(callout(
+            "Unverified",
+            "This estimate did not pass every integrity check"
+            + (": " + ", ".join(failed_names) if failed_names else ".")
+            + ("" if failed_names else ""),
+            "danger",
+        ))
     rc = c.get("reconciliation") or {}
     project_n = _priced_project_count(svl)
     _scope = c.get("ech_scope") or {}
@@ -3558,8 +3607,8 @@ def render_consolidation_html(acc: dict) -> str:
         stats = [
             stat(usd(sv.get("ech_contract_mo")), ech_stat, tag="calculated"),
             stat(usd(sv.get("serverless_mo")), svl_stat, "success", tag="estimate", estimate=True),
-            stat(_delta_usd(sv.get("cost_mo")), save_stat, dtone, tag="estimate", estimate=True),
-            stat(_delta_pct(sv.get("cost_pct")), pct_stat, dtone, tag="estimate", estimate=True, down=_reduction(sv.get("cost_pct")), up=_increase(sv.get("cost_pct"))),
+                stat(_delta_usd(sv.get("cost_mo")), save_stat, dtone, tag=change_tag, estimate=True),
+            stat(_delta_pct(sv.get("cost_pct")), pct_stat, dtone, tag=change_tag, estimate=True, down=_reduction(sv.get("cost_pct")), up=_increase(sv.get("cost_pct"))),
         ]
         if cover_rate is not None:
             ech_cat, svl_cat = "ECH at contract rate", "Serverless at list"
@@ -3578,11 +3627,18 @@ def render_consolidation_html(acc: dict) -> str:
             stats = [
                 stat(usd(month_avg), ech_stat, tag="billed"),
                 stat(usd(svl_total), svl_stat, "success", tag="estimate", estimate=True),
-                stat(_delta_usd(cover_delta), save_stat, dtone, tag="estimate", estimate=True),
-                stat(_delta_pct(cover_pct), pct_stat, dtone, tag="estimate", estimate=True, down=_reduction(cover_pct), up=_increase(cover_pct)),
+                stat(_delta_usd(cover_delta), save_stat, dtone, tag=change_tag, estimate=True),
+                stat(_delta_pct(cover_pct), pct_stat, dtone, tag=change_tag, estimate=True, down=_reduction(cover_pct), up=_increase(cover_pct)),
             ]
             chart_cats = [f"ECH, last {len(month_pairs)} complete months", "Serverless estimate"]
             chart_series = [(chart_cats[0], [float(month_avg), 0.0]), (chart_cats[1], [0.0, float(svl_total)])]
+        elif cover_delta is None and sv.get("list_mo") is None:
+            svl_stat = "Estimated monthly serverless cost, 12-month retention" + (f", {window}" if window else "")
+            stats = [
+                stat(usd(svl_total), svl_stat, "success", tag="estimate", estimate=True),
+            ]
+            chart_cats = [ech_cat, svl_cat]
+            chart_series = [(ech_cat, [0.0, 0.0]), (svl_cat, [0.0, float(svl_total or 0)])]
         else:
             ech_stat = "Monthly ECH billed cost (K360)" + (f", {window}" if window else "")
             svl_stat = "Estimated monthly serverless cost, 12-month retention" + (f", {window}" if window else "")
@@ -3593,8 +3649,8 @@ def render_consolidation_html(acc: dict) -> str:
             stats = [
                 stat(usd(sv.get("ech_list_mo")), ech_stat, tag="billed"),
                 stat(usd(sv.get("serverless_mo")), svl_stat, "success", tag="estimate", estimate=True),
-                stat(_delta_usd(sv.get("list_mo")), save_stat, dtone, tag="estimate", estimate=True),
-                stat(_delta_pct(sv.get("list_pct")), pct_stat, dtone, tag="estimate", estimate=True, down=_reduction(sv.get("list_pct")), up=_increase(sv.get("list_pct"))),
+                stat(_delta_usd(sv.get("list_mo")), save_stat, dtone, tag=change_tag, estimate=True),
+                stat(_delta_pct(sv.get("list_pct")), pct_stat, dtone, tag=change_tag, estimate=True, down=_reduction(sv.get("list_pct")), up=_increase(sv.get("list_pct"))),
             ]
             chart_cats = [ech_cat, svl_cat]
             chart_series = [(ech_cat, [float(sv.get("ech_list_mo") or 0), 0.0]), (svl_cat, [0.0, float(sv.get("serverless_mo") or 0)])]
@@ -3633,6 +3689,13 @@ def render_consolidation_html(acc: dict) -> str:
             f"(a one-year estimate), the total reported by the spreadsheet or notebook."
             + (f" The comparison covers {usd(sv.get('ech_list_mo'))}/mo of the account's billing; the rest is named below as not compared." if _scope_is_partial(c) else "")
             + month_note))
+        unpriced_rows = priced_block.get("unpriced") or []
+        if scope_unavailable and unpriced_rows:
+            named = ", ".join(
+                f"{row.get('name')} {usd(row.get('avg_mo'))}/mo ({row.get('reason')})"
+                for row in unpriced_rows if isinstance(row, dict)
+            )
+            B.append(caption(f"Left out of the priced-only average: {named}."))
     else:
         B.append(f"<h3>{esc(chart_title)}</h3>" + bar_chart(
             chart_cats, chart_series,
@@ -4184,7 +4247,13 @@ def render_consolidation_html(acc: dict) -> str:
     B.extend(cost_sizing_sections(acc, sizing=False, new_page=True, numbered=False))
     pricing_src = re.sub(r"\s*parent \S+ \([^)]*\)", "", str(svl.get("pricing_source") or "")).strip(" ·")
     B.append(section("Reconciliation and what to confirm before quoting", recon + f"<div class='foot'>Source: {foot_src}{(' · ' + esc(pricing_src)) if pricing_src else ''} · generated {esc(m.get('generated_at'))}{_method_bit(m)} · only estimator read-backs are quotable $</div>", new_page=True))
-    return page(f"{m.get('customer')} — serverless consolidation savings", "".join(B), kind="consolidation")
+    draft = bool(((m.get("method") or {}).get("uncommitted_changes")) or m.get("draft"))
+    title = f"{m.get('customer')} — serverless consolidation estimate" if hide_saving_words else f"{m.get('customer')} — serverless consolidation savings"
+    html = page(title, "".join(B), kind="consolidation", draft=draft)
+    if hide_saving_words:
+        html = re.sub(r"(?i)savings", "difference", html)
+        html = re.sub(r"(?i)reduction", "difference", html)
+    return html
 
 
 def render_appendix_html(acc: dict) -> str:

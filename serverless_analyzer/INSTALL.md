@@ -9,7 +9,7 @@ python3 install.py --check   # report what is present and change nothing
 python3 install.py --yes     # safe defaults: link missing skills, install packages, do not open a browser
 ```
 
-Python 3.10 or newer is required. The analysis scripts use the standard library. Google Sheets and the Search estimator each have their own virtualenv.
+Python 3.10 or newer is required (`requires-python >= 3.10` in `pyproject.toml`). The analysis scripts use the standard library. Google Sheets and the Search estimator each have their own virtualenv. A checkout parses on 3.10: `python3.10 -m unittest discover` from `diag-serverless-consolidation/scripts` imports every script with `ast.parse` under that interpreter.
 
 ## What you need
 

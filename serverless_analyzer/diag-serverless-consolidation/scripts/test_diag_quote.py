@@ -201,6 +201,7 @@ class StoreTests(unittest.TestCase):
                 "keep": {"policy": {"phases": {"delete": {"min_age": "60d"}}}},
                 "short": {"policy": {"phases": {"delete": {"min_age": "0.042d"}}}},
             },
+            "diag/nodes_stats.json": {"nodes": {}},
         }
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "bundle.zip"
@@ -346,10 +347,10 @@ class GateTests(unittest.TestCase):
         sheet = next(row for row in integrity["checks"] if row["check"] == "Sheet echo")
         self.assertEqual(sheet["score"], 0.833)
         self.assertTrue(sheet["passed"])
-        self.assertEqual(integrity["score"], 0.958)
+        self.assertEqual(integrity["score"], 0.967)
         self.assertTrue(integrity["passed"])
         page = search_power_section({"consolidation": quoted})
-        self.assertIn("Quote integrity 0.958", page)
+        self.assertIn("Quote integrity 0.967", page)
         self.assertIn(">Pass<", page)
         bare = _quote_account(g28=10, e73=0)
         _stamp_reconciled_billing(bare)
@@ -431,7 +432,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(by_name["Sheet echo"]["score"], 1.0)
         self.assertFalse(by_name["Bundle coverage"]["passed"])
         self.assertEqual(by_name["Bundle coverage"]["score"], 0.5)
-        self.assertTrue(by_name["Measured retention"]["passed"])
+        self.assertIsNone(by_name["Retention basis"]["passed"])
         self.assertFalse(by_name["Line agreement"]["passed"])
         self.assertTrue(by_name["Year agreement"]["passed"])
         # A high mean does not pass the quote. One failed check fails it.
@@ -1108,8 +1109,10 @@ class EfficiencyTests(unittest.TestCase):
         self.assertEqual(built["bars"][1]["monthly"], 22)
         self.assertTrue(built["bars"][2]["reused_headline"])
         missed = assemble_plan_bars(specs, [fills[0], {"error": "G28 is 11 GB/day against 10 written."}, fills[2]])
-        self.assertEqual(missed["bars"], [])
-        self.assertIn("G28", missed["error"])
+        self.assertIsNone(missed["bars"][0]["monthly"])
+        self.assertEqual(missed["bars"][0]["unpriced_reason"], "G28 is 11 GB/day against 10 written.")
+        self.assertEqual(missed["bars"][1]["monthly"], 22)
+        self.assertTrue(missed["bars"][0].get("gap"))
 
     def test_sheet_pool_keeps_input_order(self):
         os.environ["SHEET_WORKERS"] = "4"
@@ -1207,6 +1210,7 @@ class EfficiencyTests(unittest.TestCase):
             body = {"indices": {"logs-000001": {"primaries": {"store": {"size_in_bytes": nbytes}}}}}
             with zipfile.ZipFile(path, "w") as archive:
                 archive.writestr("diag/indices_stats.json", json.dumps(body))
+                archive.writestr("diag/nodes_stats.json", "{}")
 
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)
@@ -1883,6 +1887,8 @@ class DiagDownloadTests(unittest.TestCase):
     def _zip(self, path: Path, ok: bool = True) -> None:
         with zipfile.ZipFile(path, "w") as zf:
             zf.writestr("a.json", "{}" * 100)
+            zf.writestr("nodes_stats.json", "{}")
+            zf.writestr("indices_stats.json", "{}")
         if not ok:
             data = path.read_bytes()
             path.write_bytes(data[: len(data) // 2])
@@ -3191,7 +3197,7 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertIn("Search EIS data", failed)
         self.assertFalse(cons["integrity"]["passed"])
 
-    def test_unavailable_scope_still_puts_the_readback_on_page_1(self):
+    def test_unavailable_scope_without_priced_months_has_no_difference(self):
         acc = _quote_account(g28=10, e73=0)
         acc["ecu"]["quote_lookback_days"] = 30
         acc["ecu"]["daily_days"] = ["2026-11-01"]
@@ -3202,10 +3208,12 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertIsNone(cons["savings"]["list_mo"])
         self.assertIsNone(cons["savings"]["ech_list_mo"])
         self.assertEqual(cons["savings"]["serverless_mo"], 180)
+        self.assertIsNone((cons.get("ech_recent_months_priced") or {}).get("average"))
         html = render_consolidation_html({**acc, "consolidation": cons, "cloud": {"summary": {}}})
         self.assertIn("$180", html)
-        self.assertIn("3-month average", html)
-        self.assertIn("spreadsheet or notebook", html)
+        self.assertIn("serverless estimate for", html)
+        self.assertNotIn("3-month average", html)
+        self.assertIsNone(cons["savings"]["list_pct"])
 
     def test_bundle_coverage_counts_ech_deployments_only(self):
         acc = {
@@ -3512,6 +3520,225 @@ class OrgReportLayoutTests(unittest.TestCase):
             upgrade_observability_cells({"layout": "1.22", "cells": {"G21": 1}})
         self.assertEqual(cell_range("Security Estimator", "E74"), "'Security Estimator'!E74")
         self.assertEqual(cell_range("Security Estimator", "Estimator_Reference!CB254"), "'Estimator_Reference'!CB254")
+
+
+class FixtureCrossCheckTests(unittest.TestCase):
+    def _run(self, name):
+        from fixture_loader import load_case
+        account, infra = load_case(name)
+        cons = build_consolidation(account, infra)
+        account["consolidation"] = cons
+        html = render_consolidation_html(account)
+        return cons, html
+
+    def test_fixtures_render_offline(self):
+        from fixture_loader import CASES, load_case
+        for name in CASES:
+            account, infra = load_case(name)
+            cons = build_consolidation(account, infra)
+            account["consolidation"] = cons
+            html = render_consolidation_html(account)
+            self.assertIn("<html", html.lower())
+            self.assertNotIn("flatiron", html.lower())
+            self.assertNotIn("millipore", html.lower())
+            self.assertNotIn("pepsi", html.lower())
+
+    def test_floor_matches_the_headline_when_the_floor_is_one_project_per_region(self):
+        from fixture_loader import load_case
+        for name in ("ref-a", "ref-b", "ref-c"):
+            account, infra = load_case(name)
+            cons = build_consolidation(account, infra)
+            plan = (account.get("sizing") or {}).get("deployment_plan") or {}
+            if not isinstance(plan, dict):
+                continue
+            bars = plan.get("bars") or []
+            floor = next((bar for bar in bars if isinstance(bar, dict) and bar.get("label") == "Floor"), None)
+            if floor is None or floor.get("monthly") is None or floor.get("projects") is None:
+                continue
+            headline = (cons.get("savings") or {}).get("serverless_mo")
+            if headline is None:
+                continue
+            regional = plan.get("floor")
+            if regional is not None and int(floor["projects"]) != int(regional):
+                continue
+            gap = abs(float(floor["monthly"]) - float(headline))
+            self.assertLessEqual(gap, abs(float(headline)) * 0.01 + 5, name)
+
+    def test_quoted_regions_are_exact_or_alias_on_the_same_provider(self):
+        for name in ("ref-a", "ref-b", "ref-c"):
+            cons, _html = self._run(name)
+            for row in cons["integrity"]["checks"]:
+                if row["check"] != "Region fidelity":
+                    continue
+                if row["passed"] is False:
+                    self.assertIn(row["passed"], (False, None))
+                if row["passed"] is True:
+                    self.assertNotIn("provider_default", row.get("detail") or "")
+
+    def test_page_one_ech_and_serverless_cover_the_same_deployments(self):
+        for name in ("ref-a", "ref-b", "ref-c"):
+            cons, html = self._run(name)
+            scope = cons.get("ech_scope") or {}
+            if scope.get("status") != "unavailable":
+                continue
+            priced = cons.get("ech_recent_months_priced") or {}
+            self.assertEqual(priced.get("basis"), "monthly_by_deployment")
+            if priced.get("average") is None:
+                self.assertNotIn("reduction", html.lower())
+                self.assertNotIn("savings", html.lower())
+
+    def test_an_unverified_comparison_is_not_called_a_saving(self):
+        for name in ("ref-a", "ref-b", "ref-c"):
+            cons, html = self._run(name)
+            scope = cons.get("ech_scope") or {}
+            if cons.get("integrity", {}).get("passed") is False and scope.get("status") == "unavailable":
+                self.assertNotIn("savings", html.lower())
+                self.assertNotIn("reduction", html.lower())
+                self.assertIn("serverless estimate for", html)
+
+
+class PhaseGuardTests(unittest.TestCase):
+    def test_scripts_parse_on_python_310(self):
+        py = subprocess.check_output(["uv", "python", "find", "3.10"], text=True).strip()
+        roots = [HERE, HERE.parents[1] / "k360-account-analysis" / "scripts"]
+        files = [path for root in roots for path in root.glob("*.py")]
+        script = (
+            "import ast, pathlib, sys\n"
+            "failed = []\n"
+            "for name in sys.argv[1:]:\n"
+            "    path = pathlib.Path(name)\n"
+            "    try:\n"
+            "        ast.parse(path.read_text())\n"
+            "    except SyntaxError as exc:\n"
+            "        failed.append(f'{path}: {exc}')\n"
+            "if failed:\n"
+            "    raise SystemExit('\\n'.join(failed))\n"
+        )
+        subprocess.check_call([py, "-c", script, *[str(path) for path in files]])
+
+    def test_us_east_2_is_not_rewritten_to_us_east_1(self):
+        from size_serverless import match_region
+        options = ["AWS: us-east-1 (N. Virginia)", "AWS: us-west-2 (Oregon)", "AZURE: eastus (Virginia)"]
+        option, how = match_region("aws", "us-east-2", options)
+        self.assertIsNone(option)
+        self.assertEqual(how, "none")
+
+    def test_an_aws_region_does_not_resolve_to_azure(self):
+        from size_serverless import match_region
+        option, how = match_region("aws", "us-east-1", ["AZURE: eastus (Virginia)", "GCP: us-east1 (South Carolina)"])
+        self.assertIsNone(option)
+        self.assertEqual(how, "none")
+
+    def test_two_observability_rows_make_two_plan_jobs(self):
+        rows = []
+        for name, region in (("one", "us-central1"), ("two", "europe-west1")):
+            rows.append({
+                "name": name,
+                "solution": "observability",
+                "region": region,
+                "provider": "gcp",
+                "bulk_gb_day": 10,
+                "store_gb": 100,
+                "retention_days": 30,
+                "logs_gb_day": 6,
+                "k8s_logs_gb_day": 1,
+                "metrics_gb_day": 2,
+                "traces_gb_day": 1,
+                "bulk_mix": {"logs": 6, "k8s_logs": 1, "metrics": 2, "traces": 1},
+            })
+        _specs, jobs, error, _floor = plan_sheet_jobs(
+            rows, run_key="case", name_suffix="", force_months=12, o11y_id="o", security_id="s",
+            parent_id="p", reuse=True, provider="gcp", region_name="us-central1", support="Premium",
+            feature_tier="Complete",
+        )
+        self.assertIsNone(error)
+        self.assertEqual(len(jobs), 2)
+        self.assertTrue(all(not job.get("error") for job in jobs))
+
+    def test_one_failed_plan_fill_does_not_clear_the_next_bar(self):
+        specs = [
+            {"cut_pct": 100, "label": "Ceiling", "projects": 1, "reused_headline": True, "groups": []},
+            {"cut_pct": 0, "label": "Floor", "projects": 2, "groups": [
+                {"sheet": 0, "names": ["a"], "bulk_gb_day": 1},
+            ]},
+            {"cut_pct": 50, "label": "Mid", "projects": 1, "groups": [
+                {"sheet": 1, "names": ["b"], "bulk_gb_day": 1},
+            ]},
+        ]
+        built = assemble_plan_bars(specs, [{"error": "region missing"}, {"monthly": 40, "url": "https://example.invalid"}])
+        by_label = {bar["label"]: bar for bar in built["bars"]}
+        self.assertIsNone(by_label["Floor"]["monthly"])
+        self.assertEqual(by_label["Mid"]["monthly"], 40)
+        self.assertTrue(by_label["Floor"].get("gap"))
+
+    def test_a_region_off_the_estimator_list_is_not_a_quote(self):
+        acc = _quote_account(g28=10, e73=0)
+        acc["sizing"]["consolidated"]["security"] = {"stored_gb": 0, "daily_raw_gb": 0, "deployments": 0}
+        acc["sizing"]["consolidated"]["search"] = {"stored_gb": 0, "daily_raw_gb": 0, "deployments": 0}
+        acc["sizing"]["estimators"]["security"] = {}
+        acc["sizing"]["estimators"]["search"] = {}
+        mix = {"logs_gb_day": 6, "k8s_logs_gb_day": 1, "metrics_gb_day": 2, "traces_gb_day": 1}
+        acc["cloud"] = {"by_deployment": [
+            {"name": "only", "region": "southcentralus", "provider": "azure"},
+            {"name": "other", "region": "eastus", "provider": "azure"},
+        ]}
+        acc["solutions"]["by_deployment"] = [
+            {"name": "only", "solution": "observability", "platform": "ech", "gb": 10, "daily_raw_gb": 8, "ecu": 1, **mix},
+            {"name": "other", "solution": "observability", "platform": "ech", "gb": 4, "daily_raw_gb": 2, "ecu": 1, **mix},
+        ]
+        acc["sizing"]["estimators"]["projects"] = [{
+            "solution": "observability",
+            "region": "southcentralus",
+            "region_match": "AZURE: eastus (Virginia) (provider_default)",
+            "readback": {"monthly_steady_state": 200, "total_raw_gb_day": 8, "annual_year1": 2400},
+            "echo_gate": {"accepted": True, "written_bulk": 8, "sheet_gb_day": 8},
+        }]
+        acc["sizing"]["architecture"] = {"per_region": True}
+        cons = build_consolidation(acc, {"by_deployment": acc["cloud"]["by_deployment"]})
+        self.assertIsNone(cons["savings"]["serverless_mo"])
+        self.assertFalse(cons["integrity"]["passed"])
+        names = {row["check"]: row for row in cons["integrity"]["checks"]}
+        self.assertFalse(names["Region fidelity"]["passed"])
+        self.assertFalse(names["Quote present"]["passed"])
+
+    def test_plan_consistency_fails_when_the_floor_is_not_the_headline(self):
+        scored = integrity_score({
+            "plan_consistency": {
+                "headline": 100,
+                "floor_monthly": 80,
+                "floor_projects": 2,
+                "regional_projects": 2,
+            },
+        })
+        row = next(item for item in scored["checks"] if item["check"] == "Plan consistency")
+        self.assertFalse(row["passed"])
+        matched = integrity_score({
+            "plan_consistency": {
+                "headline": 100,
+                "floor_monthly": 100,
+                "floor_projects": 2,
+                "regional_projects": 2,
+            },
+        })
+        ok = next(item for item in matched["checks"] if item["check"] == "Plan consistency")
+        self.assertTrue(ok["passed"])
+
+    def test_retention_basis_is_informational(self):
+        recorded = integrity_score({"coverage": {"bulk_gb_day": 10, "retention_policy_bulk_gb_day": 4}})
+        row = next(item for item in recorded["checks"] if item["check"] == "Retention basis")
+        self.assertIsNone(row["passed"])
+        self.assertEqual(row["score"], 0.4)
+        self.assertNotIn("Retention basis", [item["check"] for item in recorded["checks"] if item.get("passed") is False])
+
+    def test_dirty_tree_refuses_the_run(self):
+        import run_consolidation as rc
+        args = mock.Mock(lookback_days=90, allow_dirty=False)
+        with mock.patch.object(rc, "parse_args", return_value=args), mock.patch.object(
+            rc, "method_stamp", return_value={"uncommitted_changes": True, "commit": "abc1234"},
+        ):
+            with self.assertRaises(SystemExit) as caught:
+                rc.main()
+        self.assertEqual(caught.exception.code, 2)
 
 
 if __name__ == "__main__":

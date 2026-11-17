@@ -21,7 +21,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-from quote_checks import e73_blocks_quote, echo_gate, ingest_echo, integrity_score, money as _money, observability_echo_gate
+from quote_checks import (
+    e73_blocks_quote, echo_gate, ingest_echo, integrity_score, money as _money,
+    observability_echo_gate, region_match_how,
+)
 from skill_paths import find_skill
 
 DAYS_PER_MONTH = 30.416
@@ -942,6 +945,15 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
             saved_rb = saved_hit.get("readback") or {}
             saved_search = sol == "search" and _money(saved_rb.get("monthly_steady_state")) is not None
             if sol == "search" and g["stored_gb"] > 0 and (str(blk.get("pricing") or "").startswith("es3-estimator") or saved_search):
+                search_how = region_match_how(saved_hit.get("region_match"))
+                if saved_rb and search_how in {"provider_default", "nearest", "none", "unknown"}:
+                    notes.append(f"Search {g['region']} is not on the estimator list, so that region was not quoted.")
+                    classified.append({
+                        "region": g["region"], "stored_gb": g["stored_gb"], "kind": "rejected",
+                        "own_pricing": f"rejected — region {g['region']} is not on the estimator list",
+                        "region_match": saved_hit.get("region_match"), "url": saved_hit.get("url"),
+                    })
+                    continue
                 result = {"readback": saved_rb, "profiles": saved_hit.get("profiles"), "region_match": saved_hit.get("region_match")} if _money(saved_rb.get("monthly_steady_state")) is not None else _es3_region({
                     "stored_gb": g["stored_gb"],
                     "org_stored_gb": org_gb,
@@ -974,14 +986,25 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                     "own_pricing": "rejected — " + str(g["mix_error"]),
                 })
                 continue
-            gate = (saved_hit.get("echo_gate") or saved_hit.get("g28_gate") or saved_hit.get("g26_gate") or {}) if sol == "observability" else {}
-            echo_rejected = sol == "observability" and (
+            gate = saved_hit.get("echo_gate") or saved_hit.get("g28_gate") or saved_hit.get("g26_gate") or {}
+            how = region_match_how(saved_hit.get("region_match"))
+            if saved_hit.get("readback") and how in {"provider_default", "nearest", "none", "unknown"}:
+                notes.append(
+                    f"{sol.title()} {g['region']} is not on the estimator list, so that region was not quoted."
+                )
+                classified.append({
+                    "region": g["region"], "stored_gb": g["stored_gb"], "kind": "rejected",
+                    "own_pricing": f"rejected — region {g['region']} is not on the estimator list",
+                    "region_match": saved_hit.get("region_match"), "url": saved_hit.get("url"),
+                })
+                continue
+            echo_rejected = sol in {"observability", "security"} and (
                 bool(saved_hit.get("readback_rejected")) or (bool(gate) and not gate.get("accepted"))
             )
             sheet_read = _security_sheet_was_read(saved_hit)
             e73_rejected = sol == "security" and sheet_read and e73_blocks_quote(saved_rb.get("cps_addon_monthly"))
             if echo_rejected:
-                notes.append(f"Observability {g['region']} the sheet echo differed from the written bulk, so that region was not quoted.")
+                notes.append(f"{sol.title()} {g['region']} the sheet echo differed from the written bulk, so that region was not quoted.")
                 classified.append({
                     "region": g["region"], "stored_gb": g["stored_gb"], "kind": "rejected",
                     "own_pricing": "rejected — the sheet echo differs from the written bulk",
@@ -1012,11 +1035,21 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                 "own_steady": _money(saved_rb.get("annual_steady_state")),
                 "region_match": saved_hit.get("region_match"), "url": saved_hit.get("url"),
             })
+        fidelity = [
+            row for row in classified
+            if row.get("kind") == "rejected" and "not on the estimator list" in str(row.get("own_pricing") or "")
+        ]
+        if fidelity and sol == "search":
+            # Search is not zeroed by one rejected region. The unmatched regions stay out of the sum.
+            left = ", ".join(str(row.get("region")) for row in fidelity)
+            notes.append(f"Search {left} is not on the estimator list, so those regions were not quoted.")
+            classified = [row for row in classified if row not in fidelity]
         if not classified:
             blk["by_region"] = []
             blk["regional_mode"] = "no_eligible_region"
             blk["total_mo"] = 0.0
             blk["total_yr"] = 0.0
+            blk["pricing"] = "omitted — region is not on the estimator list" if fidelity else blk.get("pricing")
             continue
         est_rb = (((acc.get("sizing") or {}).get("estimators") or {}).get(sol) or {}).get("readback") or {}
         steady_total = _money(est_rb.get("annual_steady_state"))
@@ -1445,6 +1478,138 @@ def _cell_echo_fields(gate: dict) -> dict:
     }
 
 
+def _written_regions(estimators: dict) -> list[dict]:
+    """Sheets and notebooks that were actually written, with the region match they recorded."""
+    rows = []
+    for sol in ("observability", "security", "search"):
+        entry = estimators.get(sol) or {}
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("region_match") or entry.get("readback_rejected"):
+            rows.append({
+                "solution": sol,
+                "region": entry.get("region"),
+                "region_match": entry.get("region_match"),
+                "readback_rejected": entry.get("readback_rejected"),
+                "provider": entry.get("provider"),
+            })
+    for project in estimators.get("projects") or []:
+        if not isinstance(project, dict):
+            continue
+        if not (project.get("region_match") or project.get("readback_rejected") or (project.get("readback") or {}).get("monthly_steady_state") is not None):
+            continue
+        rows.append({
+            "solution": project.get("solution"),
+            "region": project.get("region"),
+            "region_match": project.get("region_match"),
+            "readback_rejected": project.get("readback_rejected"),
+            "provider": project.get("provider"),
+        })
+    return rows
+
+
+def _plan_consistency_facts(sz: dict, by_solution: dict, headline: float) -> dict:
+    plan = sz.get("deployment_plan") or {}
+    bars = [bar for bar in (plan.get("bars") or []) if isinstance(bar, dict)]
+    floor = next((bar for bar in bars if bar.get("label") == "Floor"), None)
+    quoted = {
+        sol for sol, blk in by_solution.items()
+        if "quotable" in str(blk.get("pricing") or "") and float(blk.get("total_mo") or 0) > 0
+    }
+    unquoted_priced = False
+    for bar in bars:
+        for group in bar.get("groups") or []:
+            if float(group.get("monthly") or 0) <= 0:
+                continue
+            sols = set()
+            # Group solution is carried when the plan builder set it. Otherwise leave the check to the floor gap.
+            if group.get("solution"):
+                sols.add(group.get("solution"))
+            if sols and not sols <= quoted:
+                unquoted_priced = True
+    regional = plan.get("floor")
+    return {
+        "headline": headline,
+        "floor_monthly": None if floor is None else floor.get("monthly"),
+        "floor_projects": None if floor is None else floor.get("projects"),
+        "regional_projects": regional,
+        "bar_prices_unquoted": unquoted_priced,
+    }
+
+
+def _sync_plan_to_quote(acc: dict, by_solution: dict) -> None:
+    """Drop plan dollars for a region or solution the headline did not quote.
+
+    The remaining groups stay priced, and the bar is their sum. A gap is marked
+    where a group was taken off.
+    """
+    plan = (acc.get("sizing") or {}).get("deployment_plan") or {}
+    bars = plan.get("bars") or []
+    if not bars:
+        return
+    region_by_name = {
+        dep.get("name"): dep.get("region")
+        for dep in ((acc.get("cloud") or {}).get("by_deployment") or [])
+        if dep.get("name") and dep.get("region")
+    }
+    by_name = {
+        dep.get("name"): dep
+        for dep in (acc.get("solutions") or {}).get("by_deployment") or []
+        if dep.get("name")
+    }
+    quoted_regions: dict[str, set[str] | None] = {}
+    for sol, blk in by_solution.items():
+        if "quotable" not in str(blk.get("pricing") or "") or float(blk.get("total_mo") or 0) <= 0:
+            continue
+        regions = {
+            row.get("region") for row in (blk.get("by_region") or [])
+            if row.get("monthly") not in (None, 0) and "rejected" not in str(row.get("pricing") or "")
+        }
+        quoted_regions[sol] = regions or None
+    for bar in bars:
+        if not isinstance(bar, dict) or bar.get("reused_headline"):
+            continue
+        total = 0.0
+        priced = False
+        gap = False
+        for group in bar.get("groups") or []:
+            if not isinstance(group, dict):
+                continue
+            if group.get("error"):
+                group["monthly"] = None
+                group["unpriced_reason"] = str(group.get("error"))
+                gap = True
+                continue
+            names = [name for name in (group.get("names") or []) if name]
+            sols = {str((by_name.get(name) or {}).get("solution") or "search") for name in names}
+            regions = {region_by_name.get(name) for name in names if region_by_name.get(name)}
+            sol = next(iter(sols)) if len(sols) == 1 else None
+            region = next(iter(regions)) if len(regions) == 1 else None
+            allowed = quoted_regions.get(sol) if sol else None
+            if sol not in quoted_regions:
+                group["monthly"] = None
+                group["unpriced_reason"] = f"{(sol or 'solution').title()} was not quoted"
+                gap = True
+                continue
+            if allowed is not None and region not in allowed:
+                group["monthly"] = None
+                group["unpriced_reason"] = f"region {region} is not on the estimator list"
+                gap = True
+                continue
+            if group.get("monthly") is None:
+                gap = True
+                continue
+            total += float(group.get("monthly") or 0)
+            priced = True
+        if priced:
+            bar["monthly"] = round(total, 2)
+            if gap:
+                bar["gap"] = True
+        elif gap:
+            bar["monthly"] = None
+            bar["unpriced_reason"] = bar.get("unpriced_reason") or "unpriced"
+
+
 def _integrity(acc: dict, sz: dict, by_solution: dict, quotes: list[dict], headline: float, scope: dict | None = None) -> dict:
     """Quote integrity checks. The mean skips a check that does not apply."""
     estimators = sz.get("estimators") or {}
@@ -1452,7 +1617,18 @@ def _integrity(acc: dict, sz: dict, by_solution: dict, quotes: list[dict], headl
     security = estimators.get("security") or {}
     o11y_blk = by_solution.get("observability") or {}
     sec_blk = by_solution.get("security") or {}
-    coverage = (sz.get("diagnostics") or {}) if sz.get("ingest_source") == "diagnostics" else {}
+    coverage = dict((sz.get("diagnostics") or {}) if sz.get("ingest_source") == "diagnostics" else {})
+    if coverage and coverage.get("retention_policy_bulk_gb_day") is None:
+        policy = sum(
+            float(dep.get("daily_raw_gb") or 0)
+            for dep in (acc.get("solutions") or {}).get("by_deployment") or []
+            if isinstance(dep, dict) and dep.get("platform") != "serverless" and dep.get("retention_basis") == "policy"
+        )
+        if any(
+            isinstance(dep, dict) and dep.get("retention_basis")
+            for dep in (acc.get("solutions") or {}).get("by_deployment") or []
+        ):
+            coverage["retention_policy_bulk_gb_day"] = round(policy, 3)
     unmeasured = sum(float(row.get("bulk_gb_day") or 0) for row in (coverage.get("retention_unmeasured") or []))
     regional_sheets = []
     for project in (estimators.get("projects") or []):
@@ -1495,6 +1671,9 @@ def _integrity(acc: dict, sz: dict, by_solution: dict, quotes: list[dict], headl
             "missing_diagnostics": coverage.get("missing_diagnostics"),
             "fallback_names": coverage.get("fallback_names") or [],
             "bulk_gb_day": coverage.get("bulk_gb_day"),
+            "retention_policy_bulk_gb_day": coverage.get("retention_policy_bulk_gb_day"),
+            "bulk_short_window_gb_day": coverage.get("bulk_short_window_gb_day"),
+            "bulk_restart_gb_day": coverage.get("bulk_restart_gb_day"),
             "unmeasured_bulk": unmeasured,
             "unrated": coverage.get("unrated"),
             "estimation_limits": coverage.get("estimation_limits") or [],
@@ -1502,11 +1681,15 @@ def _integrity(acc: dict, sz: dict, by_solution: dict, quotes: list[dict], headl
         "eis": (by_solution.get("search") or {}).get("eis_data_status"),
         "solutions": [
             {
+                "solution": sol,
                 "has_workload": _has_workload(blk),
                 "direct": "quotable" in str(blk.get("pricing") or "") and blk.get("regional_mode") != "store_split",
+                "serverless_mo": blk.get("total_mo"),
             }
-            for blk in by_solution.values()
+            for sol, blk in by_solution.items()
         ],
+        "written_regions": _written_regions(estimators),
+        "plan_consistency": _plan_consistency_facts(sz, by_solution, headline),
         "headline_monthly": headline,
         "lines": quotes,
         "priced": None if not scope else {
@@ -1523,6 +1706,82 @@ def _integrity(acc: dict, sz: dict, by_solution: dict, quotes: list[dict], headl
 
 
 # --------------------------------------------------------------------------- main build
+def _excluded_names(acc: dict) -> set[str]:
+    """Deployment names removed from the run. They are never part of a priced average."""
+    raw = ((acc.get("meta") or {}).get("excluded_deployments") or {}).get("deployments") or []
+    names: set[str] = set()
+    for item in raw:
+        if isinstance(item, dict) and item.get("name"):
+            names.add(str(item["name"]))
+        elif isinstance(item, str) and item:
+            names.add(item)
+    return names
+
+
+def recent_ech_months_priced(acc: dict, by_solution: dict, n: int = 3) -> dict:
+    """Last `n` complete calendar months of ECH cost for priced deployments only.
+
+    Each month is the sum of `ecu.monthly_by_deployment` for ECH deployments whose
+    `unpriced_reason` is None. Those are whole calendar months, not a share of a
+    daily bill. An excluded deployment is left out of the average and the unpriced list.
+    """
+    empty = {"months": [], "average": None, "unpriced": [], "unpriced_avg_mo": None, "basis": "monthly_by_deployment"}
+    ecu = acc.get("ecu") or {}
+    monthly = ecu.get("monthly") or {}
+    labels = [str(month) for month in (monthly.get("months") or [])]
+    by_dep = ecu.get("monthly_by_deployment") or {}
+    if not labels or not isinstance(by_dep, dict):
+        return empty
+    partial = {str(month) for month in (monthly.get("partial_months") or [])}
+    chosen = [(index, label) for index, label in enumerate(labels) if label not in partial][-n:]
+    if not chosen:
+        return empty
+    diagnostic = (acc.get("sizing") or {}).get("ingest_source") == "diagnostics"
+    excluded = _excluded_names(acc)
+    priced_names: list[str] = []
+    unpriced: list[dict] = []
+    for dep in (acc.get("solutions") or {}).get("by_deployment") or []:
+        if not isinstance(dep, dict) or not dep.get("name") or dep.get("platform") == "serverless":
+            continue
+        name = str(dep["name"])
+        if name in excluded:
+            continue
+        series = by_dep.get(name) or []
+        values = [float(series[index] or 0) if index < len(series) else 0.0 for index, _label in chosen]
+        average = round(sum(values) / len(values), 2) if values else 0.0
+        reason = unpriced_reason(dep, by_solution, diagnostic)
+        if reason is None:
+            priced_names.append(name)
+        else:
+            unpriced.append({"name": name, "reason": reason, "avg_mo": average})
+    if not priced_names:
+        unpriced.sort(key=lambda row: (-row["avg_mo"], row["name"]))
+        return {
+            "months": [],
+            "average": None,
+            "unpriced": unpriced,
+            "unpriced_avg_mo": round(sum(row["avg_mo"] for row in unpriced), 2) if unpriced else 0.0,
+            "basis": "monthly_by_deployment",
+        }
+    months = []
+    for index, label in chosen:
+        total = 0.0
+        for name in priced_names:
+            series = by_dep.get(name) or []
+            if index < len(series):
+                total += float(series[index] or 0)
+        months.append({"month": label, "cost": round(total, 2)})
+    average = round(sum(row["cost"] for row in months) / len(months), 2) if months else None
+    unpriced.sort(key=lambda row: (-row["avg_mo"], row["name"]))
+    return {
+        "months": months,
+        "average": average,
+        "unpriced": unpriced,
+        "unpriced_avg_mo": round(sum(row["avg_mo"] for row in unpriced), 2) if unpriced else 0.0,
+        "basis": "monthly_by_deployment",
+    }
+
+
 def recent_ech_months(acc: dict, n: int = 3) -> dict:
     """The last `n` complete calendar months of billed ECH cost, oldest first.
 
@@ -1724,7 +1983,23 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
                 "severity": "high",
             })
     svls_total_mo = sum(float(p.get("total_mo") or 0) for p in by_solution.values())
+    quoted = any("quotable" in str(p.get("pricing") or "") for p in by_solution.values()) and svls_total_mo > 0
+    scope = ech_scope(acc, by_solution)
     _apply_eis_to_plan(acc, float((by_solution.get("search") or {}).get("eis_with_support_mo") or 0))
+    _sync_plan_to_quote(acc, by_solution)
+    priced_months = recent_ech_months_priced(acc, by_solution)
+    if isinstance(coverage, dict) and sz.get("ingest_source") == "diagnostics":
+        deps = [
+            dep for dep in (acc.get("solutions") or {}).get("by_deployment") or []
+            if isinstance(dep, dict) and dep.get("platform") != "serverless"
+        ]
+        if coverage.get("retention_policy_bulk_gb_day") is None and any(dep.get("retention_basis") for dep in deps):
+            coverage["retention_policy_bulk_gb_day"] = round(sum(
+                float(dep.get("daily_raw_gb") or 0) for dep in deps if dep.get("retention_basis") == "policy"
+            ), 3)
+        for key in ("bulk_short_window_gb_day", "bulk_restart_gb_day"):
+            if coverage.get(key) is None and any(dep.get(key) is not None for dep in deps):
+                coverage[key] = round(sum(float(dep.get(key) or 0) for dep in deps), 3)
     # The window month for the whole org, before the comparison scope narrows it.
     ech_window_mo = ech_mo
     ech_comparison_available = True
@@ -2139,6 +2414,7 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         "contract_rate": contract_rate,
         "savings": savings,
         "ech_recent_months": recent_ech_months(acc),
+        "ech_recent_months_priced": priced_months,
         "estimate_months": 12,
         "ech_scope": scope,
         "ladder": [] if quoted else (_ladder_walk(metered) if metered else []),
@@ -2155,7 +2431,15 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         "tail": tail_block,
         "overhead_buckets": buckets,
         "highest_overhead_deployments": [{"name": r["name"], "fixed_overhead_pct": round(100 * r["fixed_overhead_ecu_mo"] / r["ech_ecu_mo"], 1), "ech_ecu_mo": r["ech_ecu_mo"]} for r in highest_overhead],
-        "sensitivity": {"retention": retention_rows, "fleet": fleet_rows},
+        "sensitivity": {
+            "retention": retention_rows,
+            "retention_basis": {
+                "policy_bulk_gb_day": (coverage or {}).get("retention_policy_bulk_gb_day"),
+                "bulk_gb_day": (coverage or {}).get("bulk_gb_day"),
+                "detail": "Share of bulk with a configured retention policy. Assumed 30-day store is not measured, and retention does not change the headline.",
+            },
+            "fleet": fleet_rows,
+        },
         "reconciliation": recon,
         "integrity": integrity,
         "callouts": callouts,

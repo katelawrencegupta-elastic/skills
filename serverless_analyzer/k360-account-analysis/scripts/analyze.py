@@ -1774,7 +1774,9 @@ def chat_bullets(acc: dict) -> list[str]:
         f"{acc['meta']['customer']}: {p['label']} — {p['ech_count']} ECH / {p['serverless_count']} serverless deployments; "
         f"{cs.get('provider')} {cs.get('region')} ({cs.get('hot_instance')}, {cs.get('zones')} AZ); ECH share {p['ech_share_pct']}%",
         f"ECU: {e['total_lookback']:,.0f} over {e.get('lookback_days')}d · peak month {(e.get('monthly_peak') or {}).get('month')} = {((e.get('monthly_peak') or {}).get('ecu') or 0):,.0f} · daily avg {e.get('daily_avg') or 0:,.0f}",
-        f"Deployments: {d['count']} ({d['trend'].get('flag')}); versions {', '.join(f'{v['version']}×{v['count']}' for v in d['by_version'][:4])}",
+        "Deployments: "
+        + f"{d['count']} ({d['trend'].get('flag')}); versions "
+        + ", ".join(f"{v['version']}×{v['count']}" for v in d["by_version"][:4]),
         f"Storage {s['data_stored_tb']} TB (as of {s['as_of']}); ECU by solution: O11y {sol['observability']['ecu_pct']}% / Search {sol['search']['ecu_pct']}% / Security {sol['security']['ecu_pct']}%{token_bit}",
         f"Burndown {b['level']}: " + ("; ".join(f['flag'] for f in b['flags'][:3]) or "no flags") + _projection_bit(acc),
     ]
