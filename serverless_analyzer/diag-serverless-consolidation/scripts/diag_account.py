@@ -27,7 +27,7 @@ from pathlib import Path
 
 from diag_inputs import ESTIMATE_MONTHS, whole_months
 
-DAYS_PER_MONTH = 30.416
+from constants import DAYS_PER_MONTH
 RETENTION_MIN = 1.0
 RETENTION_MAX = 36.0
 COMPRESSIONCALC = "compressioncalc_accounted_for"
@@ -632,7 +632,7 @@ def apply_diagnostics(
         notes.append(
             f"Primary shards of write indices restarted or moved after those indices were created, so their bulk counter is younger than the "
             f"write phase. Spread over the counter's own age, the bulk rate would be up to {restart_gb:,.1f} GB/day higher "
-            f"({restart_gb / bulk_sum * 100:.0f}% of the quoted {bulk_sum:,.1f}). The quote keeps esdiag's figure."
+            f"({restart_gb / bulk_sum * 100:.0f}% of the quoted {bulk_sum:,.1f}). The quote keeps the write-phase rate (esdiag's per-index formula, with first-day pooling)."
         )
     if snapshot_gb > 0:
         notes.append(

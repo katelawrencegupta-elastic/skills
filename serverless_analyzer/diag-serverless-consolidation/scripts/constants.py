@@ -1,0 +1,17 @@
+"""Shared numbers for the diagnostic consolidation quote.
+
+One copy of each figure. A local copy in another module will drift.
+"""
+
+DAYS_PER_MONTH = 30.416
+HOURS_PER_MONTH = 730
+ESTIMATE_MONTHS = 12
+SECURITY_EXPANSION = 1.66
+O11Y_METER_FACTOR = 1.595
+RATE_WINDOW_MAX_SHARE = 0.25
+COUNTER_AGE_MAX_SHARE = 0.25
+PLAN_HEADLINE_SHARE = 0.01
+PLAN_HEADLINE_USD = 5.0
+BILLING_WINDOW_MIN_SHARE = 0.5
+ECHO_TOLERANCE_SHARE = 0.001
+ECHO_TOLERANCE_GB_DAY = 0.02

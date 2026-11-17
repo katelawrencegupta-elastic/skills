@@ -14,6 +14,10 @@ if _ORG_SCRIPTS not in sys.path:
 from estimator_layout import (  # noqa: E402,F401
     TEMPLATE_ANCHORS, cell_range, check_value_ranges, layout_ranges, template_check, template_version,
 )
+from constants import (  # noqa: E402
+    BILLING_WINDOW_MIN_SHARE, COUNTER_AGE_MAX_SHARE, PLAN_HEADLINE_SHARE, PLAN_HEADLINE_USD,
+    RATE_WINDOW_MAX_SHARE,
+)
 
 # The sheet echo has to match the GB/day written. The sheet rounds a little, so there is a floor,
 # and a large rate gets a share of itself. It was a flat 0.51 GB/day, which no sheet under 0.51
@@ -447,13 +451,7 @@ def _year_row(lines: list[dict]) -> dict:
     )
 
 
-# Short-window bulk and restarted counters, as a share of quoted bulk. One place.
-RATE_WINDOW_MAX_SHARE = 0.25
-BILLING_WINDOW_MIN_SHARE = 0.5
-COUNTER_AGE_MAX_SHARE = 0.25
-# Floor versus headline while the floor is one project per solution and region.
-PLAN_HEADLINE_SHARE = 0.01
-PLAN_HEADLINE_USD = 5.0
+# Short-window bulk, restarted counters, and the floor gap live in constants.py.
 
 
 def region_match_how(value) -> str:
@@ -653,12 +651,8 @@ SECURITY_MONTH12_STEADY_MAX = 12
 def security_readback(readback: dict, retention_months) -> dict:
     """Security read-back with the steady month and the add-on lines made explicit.
 
-    E74 is the sheet's month-12 statement. Retained GB on the sheet starts at
-    zero in month 1 and fills for `retention` months, so month 12 is the steady
-    state only up to 12 months. Above that the steady month is the reference
-    tab's month 36 (`steady_total`), and the steady annual is 12 × that month.
-    If month 36 cannot be read above 12 months, the monthly is cleared so the
-    solution is not quoted on an unfinished ramp.
+    E74 is the sheet's month-12 statement and the monthly quote. The headline
+    writes 12 months, so E74 is the steady month.
 
     E74 also sums the endpoint, cloud, workflow, LLM, and SOAR lines. Whatever
     E74 holds beyond ingest, retention, support, and E73 is `other_addons_monthly`.
@@ -682,17 +676,6 @@ def security_readback(readback: dict, retention_months) -> dict:
     except (TypeError, ValueError):
         months = None
     out["steady_basis"] = "month 12 (E74)"
-    if months is not None and months > SECURITY_MONTH12_STEADY_MAX:
-        steady = money(out.get("steady_total"))
-        if steady is None:
-            out["monthly_steady_state"] = None
-            out["steady_basis"] = "unread — month 36 was blank above 12 months of retention"
-        else:
-            # Row 254 leaves E73 out. E73 has to be 0 for a quote, so adding it keeps E74's meaning.
-            steady = steady + (money(out.get("cps_addon_monthly")) or 0.0)
-            out["monthly_steady_state"] = steady
-            out["annual_steady_state"] = steady * 12
-            out["steady_basis"] = "month 36 (Estimator_Reference CB254)"
     return out
 
 

@@ -222,13 +222,13 @@ class RetentionTests(unittest.TestCase):
             {"name": "a", "bulk_gb_day": 10, "retention_days": 0, "store_gb": 1},
             {"name": "b", "bulk_gb_day": 10, "retention_days": 30.416, "store_gb": 1},
         ])
-        self.assertEqual(mixed["months_written"], 1)
+        self.assertEqual(mixed["months_written"], 12)
         self.assertEqual(mixed["retention_unmeasured"], [{"name": "a", "bulk_gb_day": 10.0}])
         empty = summarize([{"name": "a", "bulk_gb_day": 5, "retention_days": None, "store_gb": 1}])
-        self.assertIsNone(empty["months_written"])
-        self.assertNotIn("G11_retention_months", empty["observability_cells"])
+        self.assertEqual(empty["months_written"], 12)
+        self.assertEqual(empty["observability_cells"]["G11_retention_months"], 12)
         subday = summarize([{"name": "a", "bulk_gb_day": 2, "retention_days": 0.042, "store_gb": 1}])
-        self.assertEqual(subday["months_written"], 1)
+        self.assertEqual(subday["months_written"], 12)
         self.assertEqual(subday["retention_unmeasured"], [])
         year = summarize([{"name": "a", "bulk_gb_day": 10, "retention_days": 365, "store_gb": 1}])
         self.assertEqual(year["months_written"], 12)
@@ -1634,7 +1634,7 @@ class ConsolidationLayoutTests(unittest.TestCase):
         self.assertNotIn("complete-month", header)
         self.assertIn("Each is 30 days of complete billing.", html)
         self.assertIn("30-day lookback", html)
-        self.assertIn("Complete-month average", html)
+        self.assertIn("ECH billing pace applied to the estimate (illustrative)", html)
         self.assertIn("Last 30 days of billed usage", html)
         self.assertIn("ECH, last 30 billed days", html)
         self.assertIn("Serverless, last 30 billed days", html)
@@ -1736,7 +1736,7 @@ class SkillPathTests(unittest.TestCase):
         found = find_skill("k360-org-report", HERE)
         self.assertTrue((found / "scripts" / "fetch_org.py").is_file())
 
-    def test_artifacts_land_beside_the_skills(self):
+    def test_artifacts_land_outside_the_checkout(self):
         from skill_paths import artifacts_root
 
         saved = {
@@ -1749,8 +1749,7 @@ class SkillPathTests(unittest.TestCase):
             for name, value in saved.items():
                 if value is not None:
                     os.environ[name] = value
-        self.assertEqual(root.name, "diag_artifacts")
-        self.assertTrue((root.parent / "k360-org-report" / "SKILL.md").is_file())
+        self.assertEqual(root, Path.home() / "serverless_analyzer_artifacts")
 
     def test_env_override_wins_over_the_sibling(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1918,9 +1917,9 @@ class DiagDownloadTests(unittest.TestCase):
                 row = admin_diags._capture_with_retry("b", "k", {"id": "a" * 32, "name": "n"}, Path(tmp) / "x.zip", pause=0)
         finally:
             admin_diags._capture_one = orig
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(len(calls), 3)
         self.assertEqual(row["result"], "error")
-        self.assertEqual(row["attempts"], 4)
+        self.assertEqual(row["attempts"], 3)
 
     def test_capture_recovers_on_a_later_attempt(self):
         import admin_diags
@@ -2548,12 +2547,13 @@ class SecuritySteadyStateTests(unittest.TestCase):
         self.assertEqual(rb["steady_basis"], "month 12 (E74)")
         self.assertFalse(e73_blocks_quote(rb["cps_addon_monthly"]))
 
-    def test_month_36_is_the_quote_above_twelve_months(self):
+    def test_e74_stays_the_quote_above_twelve_months(self):
         from quote_checks import security_readback
         rb = security_readback(self.RB, 24)
-        self.assertEqual((rb["monthly_steady_state"], rb["month12_monthly"], rb["annual_steady_state"]), (1495.0, 1150.0, 17940.0))
+        self.assertEqual(rb["monthly_steady_state"], 1150.0)
+        self.assertEqual(rb["steady_basis"], "month 12 (E74)")
         unread = security_readback({**self.RB, "steady_total": None}, 24)
-        self.assertIsNone(unread["monthly_steady_state"])
+        self.assertEqual(unread["monthly_steady_state"], 1150.0)
 
     def test_any_other_line_in_e74_blocks_the_quote(self):
         from quote_checks import security_readback

@@ -49,12 +49,6 @@ from run_account_analysis import (  # noqa: E402
 )
 
 
-# The compression-applied set wrote bulk × 0.60 into the raw-data cells, where the
-# sheets multiply by 1.66. Since 0.60 × 1.66 is 0.996, that set was the metered quote
-# under another name. Bulk now goes into the metered cells directly, so the set
-# is not produced. Its code stays until it is removed.
-RUN_COMPRESSION_SET = False
-
 # size_serverless.py exits with this status when an estimator copy does not have
 # the layout its cell addresses were written for.
 TEMPLATE_MISMATCH_EXIT = 3
@@ -301,6 +295,35 @@ def consolidation_brief(acc: dict) -> dict:
     if integrity:
         out["integrity"] = integrity
     return out
+
+
+def chat_lines(brief: dict) -> list[str]:
+    """At most six lines: the headline, failed checks, the top limits, and links."""
+    lines: list[str] = []
+    savings = brief.get("savings") or {}
+    monthly = savings.get("serverless_mo")
+    checks = ((brief.get("integrity") or {}).get("checks")) or []
+    failed = [str(row.get("name")) for row in checks if isinstance(row, dict) and row.get("passed") is False and row.get("name")]
+    draft = bool(((brief.get("method") or {}).get("uncommitted_changes")) or ((brief.get("method") or {}).get("draft")))
+    if monthly is None or failed or draft:
+        lines.append("not verified")
+    else:
+        lines.append(f"Serverless ${float(monthly):,.0f}/mo")
+    if failed:
+        lines.append("Failed checks: " + ", ".join(failed))
+    limits = [row for row in (brief.get("limits") or []) if isinstance(row, dict)]
+    rank = {"high": 0, "medium": 1, "low": 2}
+    limits.sort(key=lambda row: rank.get(str(row.get("severity") or "low"), 3))
+    for row in limits[:3]:
+        lines.append(str(row.get("detail") or row.get("code") or "limit"))
+    links = brief.get("links") or {}
+    shown = [links.get("drive")] if links.get("drive") else []
+    for entry in (links.get("pdfs") or {}).values():
+        if isinstance(entry, dict) and entry.get("drive_url"):
+            shown.append(entry["drive_url"])
+    if shown:
+        lines.append("Links: " + " ".join(shown[:2]))
+    return lines[:6]
 
 
 def _with_appendix(docs: list[tuple[dict, str]]) -> list[tuple[dict, str]]:
@@ -726,17 +749,6 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
         if not (diag.get("consolidation") or {}).get("error"):
             diag.setdefault("consolidation", {})["retention_scenario"] = "rounded"
         seal_text(diag_path, json.dumps(diag, indent=2))
-    if RUN_COMPRESSION_SET:
-        try:
-            _run_compressioncalc(
-                diag, diag_path, infra, py, args,
-                size_sheets=sizing_ran and not (diag.get("consolidation") or {}).get("error"),
-            )
-        except Exception as ex:
-            print(f"WARN: compressioncalc_accounted_for failed ({ex!r})", file=sys.stderr)
-            diag.setdefault("consolidation", {}).setdefault("notes", []).append(
-                f"compressioncalc_accounted_for was not priced ({ex!r})."
-            )
     seal_text(diag_path, json.dumps(diag, indent=2))
     sz["diagnostics_status"] = "ok"
     sz["diagnostics_dir"] = str(out_dir)
@@ -965,14 +977,16 @@ def main() -> None:
     brief_path = folder / f"{run_key}_brief.json"
     seal_text(brief_path, json.dumps(brief, separators=(",", ":")))
     printed = brief_path
+    bullets = brief["chat_bullets"]
     if brief.get("ingest_source") == "diagnostics" or (acc.get("sizing") or {}).get("ingest_source") == "diagnostics":
         quote = consolidation_brief(acc)
         printed = folder / f"{run_key}_consolidation_brief.json"
         seal_text(printed, json.dumps(quote, separators=(",", ":")))
+        bullets = chat_lines(quote)
     est_in = acc["sizing"].get("estimators") if isinstance(acc["sizing"].get("estimators"), dict) else {}
     seal_text(folder / f"{run_key}_summary.json", json.dumps({
         "run_key": run_key,
-        "chat_bullets": brief["chat_bullets"],
+        "chat_bullets": bullets,
         "brief": str(printed),
         "links": brief["links"],
         "estimators": {k: view for k, v in est_in.items() if (view := _est(v))},

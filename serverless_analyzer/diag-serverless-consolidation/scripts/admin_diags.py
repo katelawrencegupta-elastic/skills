@@ -22,6 +22,7 @@ import json
 import os
 import re
 import time
+import zlib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -142,27 +143,51 @@ def _zip_ok(path: Path) -> bool:
         with zipfile.ZipFile(path) as zf:
             names = zf.namelist()
             return bool(names) and zf.testzip() is None and _bundle_has_members(names)
-    except (zipfile.BadZipFile, OSError, EOFError, RuntimeError):
+    except (zipfile.BadZipFile, OSError, EOFError, RuntimeError, zlib.error):
         return False
 
 
-# One try plus three retries before a deployment is reported as failed.
-CAPTURE_RETRIES = 3
+# Three tries in the pool, then one more on its own. Four attempts in total.
+CAPTURE_RETRIES = 2
+
+
+def _merge_manifest(out_dir: Path, rows: list[dict]) -> list[dict]:
+    """Keep every deployment id already in the folder. A later org updates its own ids."""
+    path = out_dir / "manifest.json"
+    by_id: dict[str, dict] = {}
+    if path.is_file():
+        try:
+            previous = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            previous = []
+        for row in previous if isinstance(previous, list) else []:
+            if isinstance(row, dict) and row.get("id"):
+                by_id[str(row["id"])] = row
+    for row in rows:
+        if isinstance(row, dict) and row.get("id"):
+            by_id[str(row["id"])] = row
+    merged = sorted(by_id.values(), key=lambda row: (str(row.get("name") or "").lower(), str(row.get("id"))))
+    seal_text(path, json.dumps(merged, indent=2))
+    return merged
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """The admin key stays on the host it was sent to. A redirect is refused."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise RuntimeError(f"admin API redirect refused ({code})")
+
+
+_OPENER = urllib.request.build_opener(_RefuseRedirect)
 
 
 def _api(base: str, key: str, method: str, path: str, body: dict | None = None, timeout: int = 60) -> dict:
     data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(
-        base + path,
-        data=data,
-        method=method,
-        headers={
-            "Authorization": f"ApiKey {key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    req = urllib.request.Request(base + path, data=data, method=method)
+    req.add_unredirected_header("Authorization", f"ApiKey {key}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    with _OPENER.open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode())
 
 
@@ -190,17 +215,12 @@ def list_deployments(base: str, key: str, org_id: str) -> list[dict]:
 
 def _capture_one(base: str, key: str, row: dict, dest: Path) -> dict:
     url = capture_url(base, row.get("id"), row.get("ref_id") or "main-elasticsearch")
-    req = urllib.request.Request(
-        url,
-        data=b"",
-        method="POST",
-        headers={
-            "Authorization": f"ApiKey {key}",
-            "Content-Type": "application/json",
-            "Accept": "application/zip",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=300) as resp, dest.open("wb") as fh:
+    req = urllib.request.Request(url, data=b"", method="POST")
+    req.add_unredirected_header("Authorization", f"ApiKey {key}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/zip")
+    part = dest.with_name(dest.name + ".part")
+    with _OPENER.open(req, timeout=300) as resp, part.open("wb") as fh:
         expected = resp.headers.get("Content-Length")
         n = 0
         while True:
@@ -210,11 +230,12 @@ def _capture_one(base: str, key: str, row: dict, dest: Path) -> dict:
             fh.write(chunk)
             n += len(chunk)
     if expected and expected.isdigit() and int(expected) != n:
-        dest.unlink(missing_ok=True)
+        part.unlink(missing_ok=True)
         raise RuntimeError(f"download was cut short ({n} of {expected} bytes)")
-    if not _zip_ok(dest):
-        dest.unlink(missing_ok=True)
+    if not _zip_ok(part):
+        part.unlink(missing_ok=True)
         raise RuntimeError("response was not a complete zip")
+    part.replace(dest)
     seal_file(dest)
     return {**row, "result": "ok", "bytes": n, "file": str(dest)}
 
@@ -319,12 +340,11 @@ def pull_diagnostics(env: dict[str, str], org_id: str, out_dir: Path, *, workers
         print(f"diagnostics: retrying {len(failed)} failed deployments one at a time", flush=True)
         by_id = {r["id"]: dest for r, dest in pending}
         for bad_row in failed:
-            again = _capture_with_retry(base, key, {k: v for k, v in bad_row.items() if k not in ("result", "error", "attempts")}, by_id[bad_row["id"]])
+            again = _capture_with_retry(base, key, {k: v for k, v in bad_row.items() if k not in ("result", "error", "attempts")}, by_id[bad_row["id"]], retries=0)
             again["attempts"] = int(bad_row.get("attempts") or 0) + int(again.get("attempts") or 0)
             fresh[fresh.index(bad_row)] = again
             print(("ok " if again["result"] == "ok" else "ERR ") + f"{again['name']} after {again['attempts']} attempts", flush=True)
-    manifest = sorted(reused + fresh, key=lambda r: (r.get("name") or "").lower()) + skipped
-    seal_text(out_dir / "manifest.json", json.dumps(manifest, indent=2))
+    manifest = _merge_manifest(out_dir, sorted(reused + fresh, key=lambda r: (r.get("name") or "").lower()) + skipped)
     ok = [r for r in manifest if r.get("result") == "ok"]
     bad = [r for r in manifest if r.get("result") == "error"]
     print(f"diagnostics: ok={len(ok)} error={len(bad)} skipped={len(skipped)} dir={out_dir}", flush=True)
@@ -396,19 +416,6 @@ def _retention_label(parts: list[dict], basis: str | None) -> str | None:
     else:
         label = " · ".join(f"{round(p['days'])}d ({p['pct']:.0f}%)" for p in parts[:3])
     return label + (" (part assumed)" if basis == "blended" else "")
-
-
-def _est_bytes_per_day(bulk_bytes: int, creation: int | None, lifecycle: int | None, action: str | None, collection: int) -> int:
-    """index.primaries.bulk.est_bytes_per_day from the esdiag indices_stats processor.
-
-    Bytes per day are the primary bulk request size over the index write phase.
-    The write phase is creation until rollover, or the index age while ILM's
-    current action is rollover. A missing write phase is 0.
-    """
-    seconds = _write_phase_sec(creation, lifecycle, action, collection)
-    if not bulk_bytes or seconds <= 0:
-        return 0
-    return int(int(bulk_bytes) * (86400.0 / seconds))
 
 
 def _write_phase_sec(creation: int | None, lifecycle: int | None, action: str | None, collection: int) -> int:
@@ -686,7 +693,7 @@ def series_rates(stats: dict, streams: list, alias: dict, explain: dict, created
             elif born(later):
                 end = int(born(later))
             phase = (end - int(start)) // 1000 if start and end and end > int(start) else 0
-            usable = (older_info.get("phase") in (None, "hot")) and phase > 0 and _counter_intact(stats, older, write_name)
+            usable = older_info.get("phase") == "hot" and phase > 0 and _counter_intact(stats, older, write_name)
             generations.append((_bulk_bytes(stats, older), int(phase), usable))
             later = older
         rate, window, _used = _window_rate(generations)
@@ -799,13 +806,17 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
     for name, pol in (policies.items() if isinstance(policies, dict) else []):
         phases = ((pol.get("policy") or pol).get("phases") or {})
         age = _parse_age((phases.get("delete") or {}).get("min_age"))
-        if age and age > 0:
+        if age is not None:
             delete_age[name] = age
     ds_age: dict[str, float] = {}
     for ds in streams:
         life = ds.get("lifecycle") or {}
-        age = _parse_age(life.get("data_retention")) if life.get("enabled", True) else None
-        if not age:
+        if not life.get("enabled", True):
+            continue
+        age = _parse_age(life.get("data_retention"))
+        if age is None:
+            age = _parse_age(life.get("effective_retention"))
+        if age is None:
             continue
         for ix in ds.get("indices") or []:
             ds_age[ix.get("index_name") or ""] = age

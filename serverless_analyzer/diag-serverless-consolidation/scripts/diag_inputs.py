@@ -2,12 +2,12 @@
 """Print diagnostic-only Serverless inputs. Does not quote dollars.
 
 Reads sizing_from_diags.json (a list of bundle rows). Each printed project is
-Σ bulk_gb_day and the bulk-weighted measured retention. A row with no measured
-retention is left out of that average. Stored GB is used only to pack rows
-into N groups. --each keeps deployments at or above 50 GB/day alone and
-pools the rest into one project. The estimator month on a diagnostic run is 12. The measured age is a record.
---retention-months is the K360 backup only. It replaces that backup's month and leaves bulk measured.
-No K360 stored-GB backfill is added.
+Σ bulk_gb_day. The written month is 12 unless --retention-months overrides it.
+A row with no measured retention is left out of the measured-age average.
+Projects are packed inside one region and one solution. Observability cells
+use Observability rows only, Security G4 uses Security bulk ÷ 1.66, and
+Search disk uses Search store only. --each keeps deployments at or above
+50 GB/day alone and pools the rest into one project.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ import json
 import math
 from pathlib import Path
 
-DAYS_PER_MONTH = 30.416
+from constants import DAYS_PER_MONTH, ESTIMATE_MONTHS, HOURS_PER_MONTH, SECURITY_EXPANSION
 # First Observability ingest tier. A deployment under this, priced alone, never
 # leaves the top $/GB band. Pool those rows into one project.
 POOL_UNDER_GB_DAY = 50.0
@@ -43,7 +43,6 @@ def load_rows(path: Path) -> list[dict]:
     return rows
 
 
-ESTIMATE_MONTHS = 12  # every serverless estimate is a one-year estimate: retention is written as 12 months
 
 
 def whole_months(months: float) -> int:
@@ -75,8 +74,8 @@ def _cells(bulk: float, written: int | None, mix: dict, basis: str = "raw") -> t
     """Recorded cells. A diagnostic run uses Option 1. The K360 backup keeps Option 2."""
     if basis == "metered":
         o11y = {
-            "G19": round((mix["logs"] + mix["traces"]) * 730 / 24, 3),
-            "G20": round(mix["metrics"] * 730 / 24, 3),
+            "G19": round((mix["logs"] + mix["traces"]) * HOURS_PER_MONTH / 24, 3),
+            "G20": round(mix["metrics"] * HOURS_PER_MONTH / 24, 3),
             "G23": 0,
             "G24": "0%",
             "G25": 0,
@@ -88,7 +87,11 @@ def _cells(bulk: float, written: int | None, mix: dict, basis: str = "raw") -> t
             "G24_k8s_logs_share": round(mix["k8s_logs"] / mix["logs"], 4) if mix["logs"] > 0 else 0,
             "G25_metrics_gb_day": round(mix["metrics"], 3),
         }
-    security = {"G4_siem_gb_day": round(bulk, 3)}
+    if bulk:
+        entered = round(bulk / SECURITY_EXPANSION, 4) if basis == "metered" else round(bulk, 3)
+        security = {"G4_siem_gb_day": entered}
+    else:
+        security = {}
     if written:
         o11y["G11_retention_months"] = written
         o11y["G12_tsds_retention_months"] = written
@@ -97,8 +100,17 @@ def _cells(bulk: float, written: int | None, mix: dict, basis: str = "raw") -> t
 
 
 def summarize(rows: list[dict], retention_months: int | None = None, *, basis: str = "raw") -> dict:
+    def _is(row: dict, solution: str) -> bool:
+        return str(row.get("solution") or "observability") == solution
+
+    o11y_rows = [row for row in rows if _is(row, "observability")]
+    security_rows = [row for row in rows if _is(row, "security")]
+    search_rows = [row for row in rows if _is(row, "search")]
     bulk = sum(_num(r, "bulk_gb_day") for r in rows)
+    o11y_bulk = sum(_num(r, "bulk_gb_day") for r in o11y_rows)
+    security_bulk = sum(_num(r, "bulk_gb_day") for r in security_rows)
     mix = {"logs": 0.0, "k8s_logs": 0.0, "metrics": 0.0, "traces": 0.0}
+    search_store = sum(_num(r, "store_gb") for r in search_rows)
     store = sum(_num(r, "store_gb") for r in rows)
     weight = 0.0
     weight_bulk = 0.0
@@ -106,11 +118,12 @@ def summarize(rows: list[dict], retention_months: int | None = None, *, basis: s
     for row in rows:
         rate = _num(row, "bulk_gb_day")
         raw_mix = row.get("bulk_mix")
-        if rate > 0 and str(row.get("solution") or "") == "observability":
-            if not isinstance(raw_mix, dict):
+        if rate > 0 and _is(row, "observability"):
+            if row.get("solution") == "observability" and not isinstance(raw_mix, dict):
                 raise ValueError(f"product-derived Observability mix is missing for {row.get('name') or 'a deployment'}")
-            for kind in mix:
-                mix[kind] += float(raw_mix.get(kind) or 0)
+            if isinstance(raw_mix, dict):
+                for kind in mix:
+                    mix[kind] += float(raw_mix.get(kind) or 0)
         days = _measured_days(row.get("retention_days"))
         if days is None:
             if rate > 0:
@@ -120,10 +133,11 @@ def summarize(rows: list[dict], retention_months: int | None = None, *, basis: s
         weight += rate * days
     days = (weight / weight_bulk) if weight_bulk else None
     months = (days / DAYS_PER_MONTH) if days is not None else None
-    written = whole_months(months) if months is not None else None
+    written = ESTIMATE_MONTHS if bulk else None
     if retention_months is not None and bulk:
         written = int(min(36, max(1, retention_months)))
-    o11y, security = _cells(bulk, written, mix, basis)
+    o11y, _ignored = _cells(o11y_bulk, written if o11y_rows else None, mix, basis)
+    _ignored, security = _cells(security_bulk, written if security_rows else None, mix, basis)
     short = [
         {"name": r["name"], "uptime_days": r.get("uptime_days_min")}
         for r in rows
@@ -143,7 +157,7 @@ def summarize(rows: list[dict], retention_months: int | None = None, *, basis: s
         "store_gb": round(store, 1),
         "observability_cells": o11y,
         "security_cells": security,
-        "search_disk_gb": round(store, 1),
+        "search_disk_gb": round(search_store, 1),
         "short_uptime": short,
     }
 
@@ -300,7 +314,11 @@ def main() -> None:
         counts.append(n)
     out: dict = {"source": "diagnostics", "rows": len(rows), "scenarios": []}
     for n in counts:
-        groups = [rows] if n == 1 else pack(rows, n)
+        buckets: dict[tuple[str, str], list[dict]] = {}
+        for row in rows:
+            buckets.setdefault(_pair_key(row), []).append(row)
+        pairs = list(buckets.values())
+        groups = _split_within_pairs(pairs, max(n, len(pairs)))
         projects = [summarize(g, args.retention_months, basis="metered") for g in groups]
         out["scenarios"].append({
             "projects": len(projects),
