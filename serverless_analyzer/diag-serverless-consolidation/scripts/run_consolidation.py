@@ -565,12 +565,29 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
             raise ValueError("the billed quote window has no complete daily date range")
         avg_doc_bytes = (((diag.get("workload") or {}).get("ingest") or {}).get("avg_doc_bytes"))
         base, key = es_base_and_key(env)
-        diag["workload"] = fetch_workload(
-            base, key, org_ids, avg_doc_bytes,
-            telemetry_start=quote_labels[0], telemetry_end=quote_labels[-1],
-        )
+        # A large fleet's 90-day index scan can sit on one socket past the HTTP timeout.
+        # Bound it so Observability and Security still quote, and Search stays unquoted.
+        fetched: dict = {}
+
+        def _fetch_quote_window() -> None:
+            try:
+                fetched["value"] = fetch_workload(
+                    base, key, org_ids, avg_doc_bytes,
+                    telemetry_start=quote_labels[0], telemetry_end=quote_labels[-1],
+                )
+            except BaseException as exc:
+                fetched["error"] = exc
+
+        worker = __import__("threading").Thread(target=_fetch_quote_window, daemon=True)
+        worker.start()
+        worker.join(180)
+        if worker.is_alive():
+            raise TimeoutError("quote-window telemetry fetch exceeded 180s")
+        if "error" in fetched:
+            raise fetched["error"]
+        diag["workload"] = fetched["value"]
         (diag.get("sizing") or {}).get("consolidated", {}).setdefault("search", {})["workload"] = diag["workload"]
-    except Exception as ex:
+    except (Exception, SystemExit) as ex:
         failed_workload = diag.setdefault("workload", {})
         failed_workload["quote_window_fetch_error"] = str(ex)
         failed_workload["quote_window_telemetry"] = {

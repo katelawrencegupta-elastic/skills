@@ -3163,6 +3163,50 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertNotAlmostEqual(search["ml_node_ecu"], 12040)
         self.assertAlmostEqual(line["annual_steady_state"], round(line["monthly"] * 12, 2))
 
+    def test_incomplete_eis_keeps_the_notebook_readback(self):
+        acc = _quote_account(g28=10, e73=0)
+        acc["workload"] = {"quote_window_telemetry": {"status": "complete"}}
+        acc["sizing"]["consolidated"]["search"] = {"stored_gb": 50, "daily_raw_gb": 0, "deployments": 1}
+        acc["sizing"]["estimators"]["search"] = {"readback": {
+            "monthly_steady_state": 76.0, "annual_year1": 912.0, "annual_steady_state": 912.0,
+            "search_monthly": 60.0, "ingest_monthly": 5.0, "storage_monthly": 4.0, "support_monthly": 7.0,
+        }}
+        acc["solutions"]["by_deployment"] = [
+            {"name": "ech-search", "solution": "search", "platform": "ech", "ecu": 10, "gb": 50, "ingest_source": "diagnostics"},
+        ]
+        acc["ai_ml"] = {
+            "billing_by_deployment_complete": False,
+            "billing_by_deployment_status": {"reason": "totals missing"},
+        }
+        _stamp_reconciled_billing(acc)
+        cons = build_consolidation(acc, None)
+        search = cons["serverless"]["by_solution"]["search"]
+        self.assertIn("quotable", search["pricing"])
+        self.assertAlmostEqual(search["total_mo"], 76.0)
+        line = next(q for q in cons["reconciliation"]["quotes"] if q["solution"] == "search")
+        self.assertAlmostEqual(line["monthly"], 76.0)
+        self.assertAlmostEqual(cons["savings"]["serverless_mo"], 100 + 80 + 76)
+        self.assertTrue(any("Search EIS was not added" in note for note in cons["notes"]))
+        failed = [row["check"] for row in cons["integrity"]["checks"] if row.get("passed") is False]
+        self.assertIn("Search EIS data", failed)
+        self.assertFalse(cons["integrity"]["passed"])
+
+    def test_unavailable_scope_still_puts_the_readback_on_page_1(self):
+        acc = _quote_account(g28=10, e73=0)
+        acc["ecu"]["quote_lookback_days"] = 30
+        acc["ecu"]["daily_days"] = ["2026-11-01"]
+        acc["ecu"]["daily_totals"] = [10.0]
+        acc["ecu"]["monthly"] = {"months": ["2026-08", "2026-09", "2026-10"], "totals": [100, 200, 300]}
+        cons = build_consolidation(acc, None)
+        self.assertEqual(cons["ech_scope"]["status"], "unavailable")
+        self.assertIsNone(cons["savings"]["list_mo"])
+        self.assertIsNone(cons["savings"]["ech_list_mo"])
+        self.assertEqual(cons["savings"]["serverless_mo"], 180)
+        html = render_consolidation_html({**acc, "consolidation": cons, "cloud": {"summary": {}}})
+        self.assertIn("$180", html)
+        self.assertIn("3-month average", html)
+        self.assertIn("spreadsheet or notebook", html)
+
     def test_bundle_coverage_counts_ech_deployments_only(self):
         acc = {
             "deployments": {"active": {"month": "2026-10", "names": ["ech", "named-project"]}},

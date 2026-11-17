@@ -1288,11 +1288,10 @@ def _apply_search_eis(
         return
     blk["eis_data_status"] = {key: value for key, value in eis.items() if key in ("status", "reason", "usage_basis", "usage_days")}
     if eis.get("status") == "incomplete":
-        notes.append("Search EIS was not priced because complete filtered deployment billing totals could not be verified.")
-        blk["pricing"] = "rejected — exact quote-window EIS telemetry is unavailable"
-        blk["total_mo"] = 0.0
-        blk["total_yr"] = 0.0
-        blk["by_region"] = []
+        notes.append(
+            "Search EIS was not added because complete filtered deployment billing totals could not be verified. "
+            "The Search estimate stays the read-back from the notebook or spreadsheet."
+        )
         return
     if eis.get("status") == "not_applicable":
         return
@@ -1615,7 +1614,8 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         by_solution[sol] = p
     quoted = _apply_search_estimator(by_solution, sz)
     search_telemetry = (workload.get("quote_window_telemetry") or {})
-    if search_telemetry.get("status") == "complete" and not quoted:
+    # A fleet sheet can be absent when each region has its own notebook. Those read-backs are the quote.
+    if search_telemetry.get("status") == "complete" and not quoted and not _solution_has_regional_readback(sz, "search"):
         search = by_solution.get("search") or {}
         if float(search.get("stored_gb") or 0) or float(search.get("total_mo") or 0):
             search["pricing"] = "rejected — the performant read-back is missing"
@@ -1730,9 +1730,15 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
     ech_comparison_available = True
     if scope and scope.get("status") == "unavailable":
         ech_comparison_available = False
+        kept = (
+            f" The serverless estimate stays the estimator read-back, ${svls_total_mo:,.2f}/mo."
+            if quoted else
+            " No estimator read-back was returned."
+        )
         notes.append(
             "ECH deployment scope could not be measured from complete, reconciled daily Cloud Tracker billing. "
-            f"The deployment-scoped ECH comparison and savings are unavailable: {scope.get('reason') or 'daily deployment billing is unavailable'}."
+            f"The deployment-scoped ECH comparison is unavailable: {scope.get('reason') or 'daily deployment billing is unavailable'}."
+            + kept
         )
     elif scope:
         ech_mo = float(scope["in_comparison_mo"])
@@ -1823,18 +1829,25 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         "note": "ECH dollars are the K360 billing cost field, summed as billed. No ARR ÷ commit rate is applied. Serverless stays at estimator list.",
     }
 
-    # ---- savings: ECH billed cost minus the estimator read-backs
-    if quoted and ech_comparison_available and (ech_mo or ech_ml_excluded):
-        save_list_mo = ech_mo - svls_total_mo
+    # ---- savings: the estimator read-back is the serverless dollar.
+    # The deployment-scoped difference needs a reconciled daily bill. The read-back does not.
+    if quoted:
         savings = {
-            "ech_list_mo": round(ech_mo, 2),
+            "ech_list_mo": None,
             "serverless_mo": round(svls_total_mo, 2),
-            "list_mo": round(save_list_mo, 2),
-            "list_yr": round(save_list_mo * 12, 2),
-            "list_pct": round(100 * save_list_mo / ech_mo, 1) if ech_mo else None,
+            "list_mo": None,
+            "list_yr": None,
+            "list_pct": None,
         }
+        if ech_comparison_available and (ech_mo or ech_ml_excluded):
+            save_list_mo = ech_mo - svls_total_mo
+            savings.update({
+                "ech_list_mo": round(ech_mo, 2),
+                "list_mo": round(save_list_mo, 2),
+                "list_yr": round(save_list_mo * 12, 2),
+                "list_pct": round(100 * save_list_mo / ech_mo, 1) if ech_mo else None,
+            })
     else:
-        save_list_mo = 0.0
         savings = {"ech_list_mo": round(ech_mo, 2) if ech_comparison_available else None, "serverless_mo": None, "list_mo": None, "list_yr": None, "list_pct": None}
     savings["ech_basis"] = "k360_cost"
     if ech_ml_excluded is not None:
@@ -2170,7 +2183,11 @@ def main() -> None:
     c = attach(acc_path, infra_path)
     s = c["savings"]
     if s.get("serverless_mo") is None:
-        print(f"consolidation: ECH billed cost ${s['ech_list_mo']:,.0f}/mo · no estimator read-back")
+        ech = s.get("ech_list_mo")
+        ech_bit = f"${ech:,.0f}/mo" if isinstance(ech, (int, float)) else "unavailable"
+        print(f"consolidation: ECH billed cost {ech_bit} · no estimator read-back")
+    elif s.get("list_mo") is None:
+        print(f"consolidation: serverless ${s['serverless_mo']:,.0f}/mo · deployment-scoped comparison unavailable")
     else:
         side = "above" if float(s["list_mo"]) < 0 else "below"
         print(f"consolidation: ECH billed cost ${s['ech_list_mo']:,.0f}/mo → serverless ${s['serverless_mo']:,.0f}/mo · ${abs(float(s['list_mo'])):,.0f}/mo {side} ({abs(float(s['list_pct']))}%)")

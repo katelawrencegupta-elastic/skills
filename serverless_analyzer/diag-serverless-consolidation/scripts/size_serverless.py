@@ -1465,7 +1465,17 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
             continue
         groups = []
         for index, group in enumerate(plan["groups"], start=1):
-            summary = diag.summarize(group, force_months, basis=basis)
+            try:
+                summary = diag.summarize(group, force_months, basis=basis)
+            except ValueError as exc:
+                # A missing Observability mix leaves that project unquoted. The other projects still price.
+                groups.append({
+                    "sheet": None,
+                    "names": [str(row.get("name")) for row in group if row.get("name")],
+                    "bulk_gb_day": 0,
+                    "error": str(exc),
+                })
+                continue
             solution = str((group[0] if group else {}).get("solution") or "observability")
             if solution == "search":
                 money, err = _search_group_price(

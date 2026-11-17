@@ -300,7 +300,7 @@ def consolidation_section(acc: dict) -> list[str]:
         L.append(f"ECH at the contract rate: {n0(sv.get('ech_list_mo'))} ECU × ARR ÷ (commit × 365) = **{usd(sv.get('ech_contract_mo'))}/mo**. The serverless estimate is {usd(sv.get('serverless_mo'))}/mo, **{usd(sv.get('cost_mo'))}/mo ({s(sv.get('cost_pct'))}%)** below that, {usd(sv.get('cost_yr'))}/yr. Serverless is not discounted.")
     else:
         if scope_unavailable:
-            L.append("The deployment-scoped ECH comparison is unavailable because daily Cloud Tracker deployment billing could not be verified. Savings are not calculated.")
+            L.append(f"The deployment-scoped ECH comparison is unavailable because daily Cloud Tracker deployment billing could not be verified. Savings against that scoped bill are not calculated. The serverless estimate is {usd(sv.get('serverless_mo'))}/mo, the spreadsheet or notebook read-back, and page 1 compares it with the last complete months of billed cost.")
         else:
             L.append(f"ECH billed cost {usd(sv.get('ech_list_mo'))} − serverless estimate {usd(sv.get('serverless_mo'))} = **{usd(sv.get('list_mo'))}/mo ({s(sv.get('list_pct'))}%)**, {usd(sv.get('list_yr'))}/yr. A negative figure is an increase.")
     L.append("")

@@ -1642,6 +1642,7 @@ def consolidation_inputs_html(acc: dict) -> str:
     sol = (acc.get("solutions") or {}).get("totals") or {}
     wl = acc.get("workload") or {}
     c = acc.get("consolidation") or {}
+    scope_unavailable = (c.get("ech_scope") or {}).get("status") == "unavailable"
     sv, cr, fr, b = (c.get(k) or {} for k in ("savings", "contract_rate", "fragmentation", "basis"))
     svl = c.get("serverless") or {}
     rng = e.get("range") or {}
@@ -3462,11 +3463,29 @@ def render_consolidation_html(acc: dict) -> str:
     B: list[str] = []
     diag = _from_diagnostics(acc)
     scope_unavailable = (c.get("ech_scope") or {}).get("status") == "unavailable"
-    _change = sv.get("cost_mo") if sv.get("cost_mo") is not None else sv.get("list_mo")
+    recent = (c.get("ech_recent_months") or {}).get("months") or []
+    est_months = int(c.get("estimate_months") or 12)
+    month_pairs = []
+    for row in recent:
+        try:
+            month_pairs.append((_month_label(row["month"]), float(row["cost"])))
+        except (TypeError, ValueError, KeyError):
+            continue
+    month_avg = sum(v for _label, v in month_pairs) / len(month_pairs) if month_pairs else None
+    svl_total = sv.get("serverless_mo")
+    # Page 1 keeps the spreadsheet or notebook read-back when the deployment-scoped bill cannot be verified.
+    cover_from_months = sv.get("ech_list_mo") is None and svl_total is not None and month_avg is not None
+    if cover_from_months:
+        cover_delta = month_avg - float(svl_total)
+        cover_pct = round(100 * cover_delta / month_avg, 1) if month_avg else None
+    else:
+        cover_delta = sv.get("list_mo")
+        cover_pct = sv.get("list_pct")
+    _change = sv.get("cost_mo") if sv.get("cost_mo") is not None else cover_delta
     _outcome = "estimated cost increase from" if _increase(_change) else "estimated savings from"
     headline = (
         f"{esc(m.get('customer'))} — serverless estimate for consolidating on {esc(dom_key.title())} Serverless"
-        if scope_unavailable else
+        if _change is None else
         f"{esc(m.get('customer'))} — {_outcome} consolidating on {esc(dom_key.title())} Serverless"
     )
     if diag:
@@ -3549,30 +3568,43 @@ def render_consolidation_html(acc: dict) -> str:
         chart_colors = [PALETTE[0], PALETTE[2]]
         chart_subs = compare_subs
     else:
-        ech_stat = "Monthly ECH billed cost (K360)" + (f", {window}" if window else "")
-        svl_stat = "Estimated monthly serverless cost, 12-month retention" + (f", {window}" if window else "")
-        word = _delta_word(sv.get("list_mo"))
-        save_stat = f"Estimated monthly {word} versus ECH billed cost" + (f", {window}" if window else "")
-        pct_stat = f"Estimated {word} versus ECH billed cost" + (f", {window}" if window else "")
-        dtone = _delta_tone(sv.get("list_mo"))
-        stats = [
-            stat(usd(sv.get("ech_list_mo")), ech_stat, tag="billed"),
-            stat(usd(sv.get("serverless_mo")), svl_stat, "success", tag="estimate", estimate=True),
-            stat(_delta_usd(sv.get("list_mo")), save_stat, dtone, tag="estimate", estimate=True),
-            stat(_delta_pct(sv.get("list_pct")), pct_stat, dtone, tag="estimate", estimate=True, down=_reduction(sv.get("list_pct")), up=_increase(sv.get("list_pct"))),
-        ]
-        chart_cats = [ech_cat, svl_cat]
-        chart_series = [(ech_cat, [float(sv.get("ech_list_mo") or 0), 0.0]), (svl_cat, [0.0, float(sv.get("serverless_mo") or 0)])]
+        if cover_from_months:
+            ech_stat = f"Average ECH billed cost, last {len(month_pairs)} complete months"
+            svl_stat = f"Estimated monthly serverless cost, {est_months}-month retention"
+            word = _delta_word(cover_delta)
+            save_stat = f"Estimated monthly {word}, {len(month_pairs)}-month average versus the estimate"
+            pct_stat = f"Estimated {word}, {len(month_pairs)}-month average versus the estimate"
+            dtone = _delta_tone(cover_delta)
+            stats = [
+                stat(usd(month_avg), ech_stat, tag="billed"),
+                stat(usd(svl_total), svl_stat, "success", tag="estimate", estimate=True),
+                stat(_delta_usd(cover_delta), save_stat, dtone, tag="estimate", estimate=True),
+                stat(_delta_pct(cover_pct), pct_stat, dtone, tag="estimate", estimate=True, down=_reduction(cover_pct), up=_increase(cover_pct)),
+            ]
+            chart_cats = [f"ECH, last {len(month_pairs)} complete months", "Serverless estimate"]
+            chart_series = [(chart_cats[0], [float(month_avg), 0.0]), (chart_cats[1], [0.0, float(svl_total)])]
+        else:
+            ech_stat = "Monthly ECH billed cost (K360)" + (f", {window}" if window else "")
+            svl_stat = "Estimated monthly serverless cost, 12-month retention" + (f", {window}" if window else "")
+            word = _delta_word(sv.get("list_mo"))
+            save_stat = f"Estimated monthly {word} versus ECH billed cost" + (f", {window}" if window else "")
+            pct_stat = f"Estimated {word} versus ECH billed cost" + (f", {window}" if window else "")
+            dtone = _delta_tone(sv.get("list_mo"))
+            stats = [
+                stat(usd(sv.get("ech_list_mo")), ech_stat, tag="billed"),
+                stat(usd(sv.get("serverless_mo")), svl_stat, "success", tag="estimate", estimate=True),
+                stat(_delta_usd(sv.get("list_mo")), save_stat, dtone, tag="estimate", estimate=True),
+                stat(_delta_pct(sv.get("list_pct")), pct_stat, dtone, tag="estimate", estimate=True, down=_reduction(sv.get("list_pct")), up=_increase(sv.get("list_pct"))),
+            ]
+            chart_cats = [ech_cat, svl_cat]
+            chart_series = [(ech_cat, [float(sv.get("ech_list_mo") or 0), 0.0]), (svl_cat, [0.0, float(sv.get("serverless_mo") or 0)])]
         chart_colors = [PALETTE[0], PALETTE[2]]
         chart_subs = compare_subs
     B.append(f"<div class='stats' style='grid-template-columns:repeat({len(stats)},1fr)'>{''.join(stats)}</div>")
     rate_label = ""
     if cover_rate is not None and cr.get("implied_usd_per_ecu") is not None:
         rate_label = caption(f"Contract rate ${cr.get('implied_usd_per_ecu')} per ECU")
-    recent = (c.get("ech_recent_months") or {}).get("months") or []
-    est_months = int(c.get("estimate_months") or 12)
-    svl_total = sv.get("serverless_mo")
-    if recent and svl_total is not None and not scope_unavailable:
+    if month_pairs and svl_total is not None:
         # Last complete months of ECH spend, month by month, beside the one-year serverless estimate.
         usd_per_ecu = float(cr.get("implied_usd_per_ecu") or 1) if cover_rate is not None else 1.0
         costs = [(_month_label(r["month"]), float(r["cost"]) * usd_per_ecu) for r in recent]
@@ -3592,10 +3624,15 @@ def render_consolidation_html(acc: dict) -> str:
         rows.append([f"{len(costs)}-month average", usd(avg_cost), usd(svl_total)])
         rows.append([f"Estimated monthly {_delta_word(diff)}, average vs. the {est_months}-month estimate", _delta_usd(diff), "—"])
         B.append(table(["Month", "ECH billed cost", f"Serverless at list, {est_months}-month retention"], rows, ["left", "right", "right"]))
+        month_note = (
+            " The deployment-scoped comparison is unavailable, so this row is the complete-month average minus the spreadsheet or notebook read-back."
+            if scope_unavailable else ""
+        )
         B.append(caption(
             f"ECH months are complete calendar months of billed cost. The serverless figure is the estimator's monthly price with retention written as {est_months} months "
-            f"(a one-year estimate), from diagnostic bulk GB/day as measured."
-            + (f" The comparison covers {usd(sv.get('ech_list_mo'))}/mo of the account's billing; the rest is named below as not compared." if _scope_is_partial(c) else "")))
+            f"(a one-year estimate), the total reported by the spreadsheet or notebook."
+            + (f" The comparison covers {usd(sv.get('ech_list_mo'))}/mo of the account's billing; the rest is named below as not compared." if _scope_is_partial(c) else "")
+            + month_note))
     else:
         B.append(f"<h3>{esc(chart_title)}</h3>" + bar_chart(
             chart_cats, chart_series,
@@ -3615,6 +3652,13 @@ def render_consolidation_html(acc: dict) -> str:
             f"Calculated: ECU at the contract rate, ARR ÷ (commit ECU per day × 365). Serverless at list is the estimator total. The {_delta_word(sv.get('cost_mo'))} is the difference between ECH at the contract rate and serverless at list.",
             ("The serverless estimate is " + " plus ".join(quote_bits) + ".") if quote_bits else "The serverless estimate is one project per solution.",
             f"The rate is ${cr.get('implied_usd_per_ecu')} per ECU, shown rounded and applied unrounded. That puts ECH at {usd(sv.get('ech_contract_mo'))}/mo. Serverless at list is {usd(sv.get('serverless_mo'))}/mo. The {_delta_word(sv.get('cost_mo'))} is {_delta_usd(sv.get('cost_mo'))}/mo, {_delta_pct(sv.get('cost_pct'))}.",
+        ]
+    elif cover_from_months:
+        cover_notes = [
+            f"Billed: the last {len(month_pairs)} complete calendar months of the K360 billing cost field. No contract rate is applied. Estimate: the monthly total reported by the serverless spreadsheet or notebook, with retention written as {est_months} months.",
+            ("The serverless estimate is " + " plus ".join(quote_bits) + ".") if quote_bits else "The serverless estimate is the estimator read-back.",
+            f"The {len(month_pairs)}-month average is {usd(month_avg)}/mo. The estimator read-back is {usd(svl_total)}/mo. The {_delta_word(cover_delta)} is {_delta_usd(cover_delta)}/mo, {_delta_pct(cover_pct)}.",
+            "The deployment-scoped comparison of the quote window is unavailable because daily deployment billing could not be verified. It is not the figure on this page.",
         ]
     elif quote_days:
         cover_notes = [
