@@ -401,6 +401,85 @@ def org_clause(org_ids: list[str]) -> dict:
     return {"terms": {"organization.id": ids}}
 
 
+# One histogram response is day buckets × index buckets. Stay under search.max_buckets (65536).
+_WORKLOAD_HIST_BATCH = 400
+
+
+def _workload_index_names(base: str, key: str, org: dict, time_range: dict) -> tuple[list[str], bool]:
+    """Every index name in the window, paged so a large fleet does not exceed the bucket limit."""
+    names: list[str] = []
+    body = {
+        "size": 0,
+        "query": {"bool": {"filter": [
+            org,
+            {"bool": {"must_not": [
+                {"prefix": {"index.name": "."}},
+                {"prefix": {"index.name": "partial-"}},
+            ]}},
+            {"range": {"@timestamp": time_range}},
+        ]}},
+        "aggs": {
+            "indices": {
+                "composite": {
+                    "size": 2000,
+                    "sources": [{"index": {"terms": {"field": "index.name"}}}],
+                },
+            }
+        },
+    }
+    status = composite_pages(
+        base, key, "cloud-tracker-index_telemetry-*/_search", body, "indices",
+        lambda bucket: names.append(str((bucket.get("key") or {}).get("index") or "")) or None,
+    )
+    return [name for name in names if name], bool(status.get("complete"))
+
+
+def _workload_histogram(base: str, key: str, org: dict, hist_range: dict, names: list[str]) -> list[dict]:
+    """Daily max counters for `names`, in batches that stay under the bucket limit."""
+    merged: dict[str, dict[str, dict]] = {}
+    for start in range(0, len(names), _WORKLOAD_HIST_BATCH):
+        chunk = names[start:start + _WORKLOAD_HIST_BATCH]
+        hist = es_post(
+            base,
+            key,
+            "cloud-tracker-index_telemetry-*/_search",
+            {
+                "size": 0,
+                "query": {"bool": {"filter": [
+                    org,
+                    {"range": {"@timestamp": hist_range}},
+                    {"terms": {"index.name": chunk}},
+                ]}},
+                "aggs": {
+                    "by_day": {
+                        "date_histogram": {"field": "@timestamp", "calendar_interval": "day"},
+                        "aggs": {
+                            "by_idx": {
+                                "terms": {"field": "index.name", "size": len(chunk)},
+                                "aggs": {
+                                    "st": {"max": {"field": "index.search_total"}},
+                                    "tm": {"max": {"field": "index.search_time_ms"}},
+                                    "docs": {"max": {"field": "index.docs_count"}},
+                                    "size": {"max": {"field": "index.dataset_size_bytes"}},
+                                    "doc_count": {"max": {"field": "index.docs_count"}},
+                                },
+                            }
+                        },
+                    }
+                },
+            },
+        )
+        for bucket in (hist.get("aggregations") or {}).get("by_day", {}).get("buckets") or []:
+            day = str(bucket.get("key_as_string") or "")[:10]
+            slot = merged.setdefault(day, {})
+            for row in (bucket.get("by_idx") or {}).get("buckets") or []:
+                slot[row["key"]] = row
+    return [
+        {"key_as_string": f"{day}T00:00:00.000Z", "by_idx": {"buckets": list(rows.values())}}
+        for day, rows in sorted(merged.items())
+    ]
+
+
 def fetch_workload(
     base: str,
     key: str,
@@ -427,35 +506,38 @@ def fetch_workload(
         {"prefix": {"index.name": "."}},
         {"prefix": {"index.name": "partial-"}},
     ]}}
-    top = es_post(
-        base,
-        key,
-        "cloud-tracker-index_telemetry-*/_search",
-        {
-            "size": 0,
-            "query": {"bool": {"filter": [
-                org, exclude, {"range": {"@timestamp": top_range}},
-            ]}},
-            "aggs": {
-                "by_search": {
-                    "terms": {"field": "index.name", "size": 10000, "order": {"mx": "desc"}},
-                    "aggs": {"mx": {"max": {"field": "index.search_total"}}},
-                },
-                "by_docs": {
-                    "terms": {"field": "index.name", "size": 10000, "order": {"mx": "desc"}},
-                    "aggs": {"mx": {"max": {"field": "index.docs_count"}}},
+    if exact_window:
+        names, indices_complete = _workload_index_names(base, key, org, top_range)
+    else:
+        top = es_post(
+            base,
+            key,
+            "cloud-tracker-index_telemetry-*/_search",
+            {
+                "size": 0,
+                "query": {"bool": {"filter": [
+                    org, exclude, {"range": {"@timestamp": top_range}},
+                ]}},
+                "aggs": {
+                    "by_search": {
+                        "terms": {"field": "index.name", "size": 10000, "order": {"mx": "desc"}},
+                        "aggs": {"mx": {"max": {"field": "index.search_total"}}},
+                    },
+                    "by_docs": {
+                        "terms": {"field": "index.name", "size": 10000, "order": {"mx": "desc"}},
+                        "aggs": {"mx": {"max": {"field": "index.docs_count"}}},
+                    },
                 },
             },
-        },
-    )
-    names = list({
-        *(b["key"] for b in top["aggregations"]["by_search"]["buckets"]),
-        *(b["key"] for b in top["aggregations"]["by_docs"]["buckets"]),
-    })
-    indices_complete = not any(
-        int(top["aggregations"][name].get("sum_other_doc_count") or 0) > 0
-        for name in ("by_search", "by_docs")
-    )
+        )
+        names = list({
+            *(b["key"] for b in top["aggregations"]["by_search"]["buckets"]),
+            *(b["key"] for b in top["aggregations"]["by_docs"]["buckets"]),
+        })
+        indices_complete = not any(
+            int(top["aggregations"][name].get("sum_other_doc_count") or 0) > 0
+            for name in ("by_search", "by_docs")
+        )
     empty = {
         "search": {
             "peak": {"qps": None, "complexity": None, "complexity_ms": None, "pct_hours_mo": None},
@@ -473,42 +555,16 @@ def fetch_workload(
         "window_end": None,
         "indices_complete": indices_complete,
     }
-    if not names:
+    if not names or (exact_window and not indices_complete):
+        empty["indices_complete"] = indices_complete
+        if exact_window and not indices_complete:
+            empty["notes"] = ["index telemetry composite did not finish; Search is not quoted from a partial index set"]
         return empty
 
-    hist = es_post(
-        base,
-        key,
-        "cloud-tracker-index_telemetry-*/_search",
-        {
-            "size": 0,
-            "query": {"bool": {"filter": [
-                org,
-                {"range": {"@timestamp": hist_range}},
-                {"terms": {"index.name": names}},
-            ]}},
-            "aggs": {
-                "by_day": {
-                    "date_histogram": {"field": "@timestamp", "calendar_interval": "day"},
-                    "aggs": {
-                        "by_idx": {
-                            "terms": {"field": "index.name", "size": len(names)},
-                            "aggs": {
-                                "st": {"max": {"field": "index.search_total"}},
-                                "tm": {"max": {"field": "index.search_time_ms"}},
-                                "docs": {"max": {"field": "index.docs_count"}},
-                                "size": {"max": {"field": "index.dataset_size_bytes"}},
-                                "doc_count": {"max": {"field": "index.docs_count"}},
-                            },
-                        }
-                    },
-                }
-            },
-        },
-    )
+    day_buckets = _workload_histogram(base, key, org, hist_range, names)
     series: dict[str, dict[str, tuple[float, float, float, float, float]]] = defaultdict(dict)
     days: list[str] = []
-    for b in hist["aggregations"]["by_day"]["buckets"]:
+    for b in day_buckets:
         day = b["key_as_string"][:10]
         days.append(day)
         for ib in b["by_idx"]["buckets"]:
