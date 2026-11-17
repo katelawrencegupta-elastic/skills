@@ -11,7 +11,11 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SKILL = HERE.parent
-DOCS = [SKILL / "SKILL.md", SKILL / "references" / "calculations.md"]
+DOCS = [
+    SKILL / "SKILL.md",
+    SKILL / "references" / "calculations.md",
+    SKILL / "references" / "sizing-cells.md",
+]
 RETIRED = (
     "measured month",
     "at the measured month",

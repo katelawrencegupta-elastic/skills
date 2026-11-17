@@ -449,6 +449,7 @@ def _year_row(lines: list[dict]) -> dict:
 
 # Short-window bulk and restarted counters, as a share of quoted bulk. One place.
 RATE_WINDOW_MAX_SHARE = 0.25
+BILLING_WINDOW_MIN_SHARE = 0.5
 COUNTER_AGE_MAX_SHARE = 0.25
 # Floor versus headline while the floor is one project per solution and region.
 PLAN_HEADLINE_SHARE = 0.01
@@ -550,6 +551,32 @@ def _plan_consistency_row(block: dict | None) -> dict:
     )
 
 
+def _billing_window_row(window: dict | None) -> dict:
+    """Fail when an earlier priced month is under half the latest month.
+
+    The comparison is then the latest month. Fewer than two months is n/a.
+    """
+    window = window or {}
+    months = list(window.get("months") or [])
+    if len(months) < 2 or window.get("stable") is None:
+        return _integrity_row("Billing window", None, None, "Fewer than two priced months were recorded.")
+    latest = months[-1]
+    if window.get("stable"):
+        return _integrity_row(
+            "Billing window",
+            1.0,
+            True,
+            f"Each of {len(months)} months is at least half of {latest.get('month')} (${float(latest.get('cost') or 0):,.2f}).",
+        )
+    earlier = ", ".join(f"{row.get('month')} ${float(row.get('cost') or 0):,.2f}" for row in months[:-1])
+    return _integrity_row(
+        "Billing window",
+        0.0,
+        False,
+        f"The comparison is {latest.get('month')} ${float(latest.get('cost') or 0):,.2f}. Not averaged: {earlier}.",
+    )
+
+
 def _share_limit_row(name: str, coverage: dict | None, key: str, limit: float, noun: str) -> dict:
     if not coverage or not float(coverage.get("bulk_gb_day") or 0):
         return _integrity_row(name, None, None, "No bulk to compare.")
@@ -594,6 +621,7 @@ def integrity_score(facts: dict) -> dict:
         _plan_consistency_row(facts.get("plan_consistency")),
         _share_limit_row("Rate window", coverage, "bulk_short_window_gb_day", RATE_WINDOW_MAX_SHARE, "rated over a short window"),
         _share_limit_row("Counter age", coverage, "bulk_restart_gb_day", COUNTER_AGE_MAX_SHARE, "from a restarted bulk counter"),
+        _billing_window_row(facts.get("billing_window")),
     ]
     applicable = [row for row in checks if row.get("passed") is not None]
     scored = [row["score"] for row in applicable if row.get("score") is not None]

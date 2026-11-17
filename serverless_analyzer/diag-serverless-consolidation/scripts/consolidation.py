@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 
 from quote_checks import (
+    BILLING_WINDOW_MIN_SHARE,
     e73_blocks_quote, echo_gate, ingest_echo, integrity_score, money as _money,
     observability_echo_gate, region_match_how,
 )
@@ -830,11 +831,11 @@ def regional_quote(
     """One price mode per solution.
 
     Every region has its own accepted read-back, or every region is a store share
-    of the one consolidated total. A rejected Observability or Security region
-    zeros that solution. Search uses the same all-or-nothing choice and is not zeroed.
+    of the one consolidated total. A rejected region zeros that solution.
+    Search, Observability, and Security use the same rule.
     """
     rejected = [row for row in classified if row.get("kind") == "rejected"]
-    if rejected and solution != "search":
+    if rejected:
         priced = []
         for row in classified:
             item = dict(row)
@@ -1039,11 +1040,6 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
             row for row in classified
             if row.get("kind") == "rejected" and "not on the estimator list" in str(row.get("own_pricing") or "")
         ]
-        if fidelity and sol == "search":
-            # Search is not zeroed by one rejected region. The unmatched regions stay out of the sum.
-            left = ", ".join(str(row.get("region")) for row in fidelity)
-            notes.append(f"Search {left} is not on the estimator list, so those regions were not quoted.")
-            classified = [row for row in classified if row not in fidelity]
         if not classified:
             blk["by_region"] = []
             blk["regional_mode"] = "no_eligible_region"
@@ -1610,7 +1606,7 @@ def _sync_plan_to_quote(acc: dict, by_solution: dict) -> None:
             bar["unpriced_reason"] = bar.get("unpriced_reason") or "unpriced"
 
 
-def _integrity(acc: dict, sz: dict, by_solution: dict, quotes: list[dict], headline: float, scope: dict | None = None) -> dict:
+def _integrity(acc: dict, sz: dict, by_solution: dict, quotes: list[dict], headline: float, scope: dict | None = None, billing_window: dict | None = None) -> dict:
     """Quote integrity checks. The mean skips a check that does not apply."""
     estimators = sz.get("estimators") or {}
     o11y = estimators.get("observability") or {}
@@ -1690,6 +1686,7 @@ def _integrity(acc: dict, sz: dict, by_solution: dict, quotes: list[dict], headl
         ],
         "written_regions": _written_regions(estimators),
         "plan_consistency": _plan_consistency_facts(sz, by_solution, headline),
+        "billing_window": billing_window,
         "headline_monthly": headline,
         "lines": quotes,
         "priced": None if not scope else {
@@ -1725,7 +1722,10 @@ def recent_ech_months_priced(acc: dict, by_solution: dict, n: int = 3) -> dict:
     `unpriced_reason` is None. Those are whole calendar months, not a share of a
     daily bill. An excluded deployment is left out of the average and the unpriced list.
     """
-    empty = {"months": [], "average": None, "unpriced": [], "unpriced_avg_mo": None, "basis": "monthly_by_deployment"}
+    empty = {
+        "months": [], "average": None, "comparison": None, "comparison_basis": None,
+        "stable": None, "unpriced": [], "unpriced_avg_mo": None, "basis": "monthly_by_deployment",
+    }
     ecu = acc.get("ecu") or {}
     monthly = ecu.get("monthly") or {}
     labels = [str(month) for month in (monthly.get("months") or [])]
@@ -1759,6 +1759,9 @@ def recent_ech_months_priced(acc: dict, by_solution: dict, n: int = 3) -> dict:
         return {
             "months": [],
             "average": None,
+            "comparison": None,
+            "comparison_basis": None,
+            "stable": None,
             "unpriced": unpriced,
             "unpriced_avg_mo": round(sum(row["avg_mo"] for row in unpriced), 2) if unpriced else 0.0,
             "basis": "monthly_by_deployment",
@@ -1772,10 +1775,24 @@ def recent_ech_months_priced(acc: dict, by_solution: dict, n: int = 3) -> dict:
                 total += float(series[index] or 0)
         months.append({"month": label, "cost": round(total, 2)})
     average = round(sum(row["cost"] for row in months) / len(months), 2) if months else None
+    latest_cost = months[-1]["cost"] if months else None
+    stable = None
+    if len(months) >= 2 and latest_cost is not None:
+        stable = all(float(row["cost"]) >= float(latest_cost) * BILLING_WINDOW_MIN_SHARE for row in months)
+    elif len(months) == 1:
+        stable = True
+    comparison = None
+    comparison_basis = None
+    if months and latest_cost is not None:
+        comparison = average if stable else latest_cost
+        comparison_basis = "three_complete_months" if stable and len(months) > 1 else "latest_complete_month"
     unpriced.sort(key=lambda row: (-row["avg_mo"], row["name"]))
     return {
         "months": months,
         "average": average,
+        "comparison": comparison,
+        "comparison_basis": comparison_basis,
+        "stable": stable,
         "unpriced": unpriced,
         "unpriced_avg_mo": round(sum(row["avg_mo"] for row in unpriced), 2) if unpriced else 0.0,
         "basis": "monthly_by_deployment",
@@ -2342,7 +2359,7 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
                 line["monthly_unrounded"] = float(line["monthly"])
                 line["annual_year1"] = line["annual_steady_state"] = round(float(line["monthly"]) * 12, 2)
     recon = {"kind": "readbacks", "quotes": quotes, "total_mo": round(svls_total_mo, 2), "quotable": "estimator read-backs"} if quotes else None
-    integrity = _integrity(acc, sz, by_solution, quotes, svls_total_mo, scope)
+    integrity = _integrity(acc, sz, by_solution, quotes, svls_total_mo, scope, priced_months)
 
     callouts: list[dict] = []
     if per:

@@ -194,7 +194,9 @@ def _increase(x) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and x < 0
 
 
-def _delta_word(cost) -> str:
+def _delta_word(cost, *, neutral: bool = False) -> str:
+    if neutral and not _increase(cost):
+        return "difference"
     return "increase" if _increase(cost) else "reduction"
 
 
@@ -2126,6 +2128,7 @@ _INTEGRITY_FORMULA = {
     "Plan consistency": "1 when the Floor bar is within 1% plus $5 of the headline.",
     "Rate window": "1 when short-window bulk is 25% of bulk or less.",
     "Counter age": "1 when restarted-counter bulk is 25% of bulk or less.",
+    "Billing window": "1 when every priced month is at least half the latest priced month. The comparison is then the latest month, and the earlier months are not averaged.",
     "Rated ingest": "1 − (store in indices that took bulk writes and have no rate ÷ local store). Those indices are not a data stream, a write alias, or an ILM rollover, or their write index has no write phase. Passes at 5% or less.",
     "Priced share": "Billed cost of the ECH deployments that got a serverless price ÷ billed cost of every ECH deployment on the roster, over the quote window. Passes at the --min-priced-ecu-pct bar, 90% unless set.",
     "Estimator monotone": "1 − (merge steps in the deployment-count plan that cost more than the step before them ÷ merge steps). A step rising more than 2% and $5 fails. The read-back stays the dollar.",
@@ -3494,7 +3497,13 @@ def render_consolidation_html(acc: dict) -> str:
             month_pairs.append((_month_label(row["month"]), float(row["cost"])))
         except (TypeError, ValueError, KeyError):
             continue
-    month_avg = priced_block.get("average") if scope_unavailable else (sum(v for _label, v in month_pairs) / len(month_pairs) if month_pairs else None)
+    if scope_unavailable:
+        month_avg = priced_block.get("comparison")
+        if month_avg is None:
+            month_avg = priced_block.get("average")
+    else:
+        month_avg = sum(v for _label, v in month_pairs) / len(month_pairs) if month_pairs else None
+    window_unstable = scope_unavailable and priced_block.get("stable") is False
     svl_total = sv.get("serverless_mo")
     # Page 1 keeps the spreadsheet or notebook read-back when the deployment-scoped bill cannot be verified.
     # Without a priced-only average there is no difference and no percentage.
@@ -3513,11 +3522,11 @@ def render_consolidation_html(acc: dict) -> str:
         cover_delta = sv.get("list_mo")
         cover_pct = sv.get("list_pct")
     _change = sv.get("cost_mo") if sv.get("cost_mo") is not None else cover_delta
-    # A failed integrity check never titles the page as a saving. An unverified comparison has no difference.
-    neutral_title = integrity_failed or _change is None or bool(m.get("draft"))
-    _outcome = "estimated cost increase from" if _increase(_change) else "estimated savings from"
     # An unverified comparison (integrity failed, scope not measured) carries no saving and no reduction.
     hide_saving_words = bool((integrity_failed and scope_unavailable) or m.get("draft"))
+    # A failed integrity check never titles the page as a saving. An unverified comparison has no difference.
+    neutral_title = integrity_failed or _change is None or bool(m.get("draft"))
+    _outcome = "estimated cost increase from" if _increase(_change) else ("estimated difference from" if hide_saving_words else "estimated savings from")
     change_tag = "unverified" if integrity_failed else "estimate"
     headline = (
         f"{esc(m.get('customer'))} — serverless estimate for consolidating on {esc(dom_key.title())} Serverless"
@@ -3600,7 +3609,7 @@ def render_consolidation_html(acc: dict) -> str:
         ech_c = float(sv.get("ech_contract_mo") or 0)
         ech_stat = "Monthly ECH cost at the contract rate" + (f", {window}" if window else "")
         svl_stat = "Estimated monthly serverless cost at list, 12-month retention" + (f", {window}" if window else "")
-        word = _delta_word(sv.get("cost_mo"))
+        word = _delta_word(sv.get("cost_mo"), neutral=hide_saving_words)
         save_stat = f"Estimated monthly {word} at the contract rate" + (f", {window}" if window else "")
         pct_stat = f"Estimated {word} at the contract rate" + (f", {window}" if window else "")
         dtone = _delta_tone(sv.get("cost_mo"))
@@ -3618,11 +3627,18 @@ def render_consolidation_html(acc: dict) -> str:
         chart_subs = compare_subs
     else:
         if cover_from_months:
-            ech_stat = f"Average ECH billed cost, last {len(month_pairs)} complete months"
-            svl_stat = f"Estimated monthly serverless cost, {est_months}-month retention"
-            word = _delta_word(cover_delta)
-            save_stat = f"Estimated monthly {word}, {len(month_pairs)}-month average versus the estimate"
-            pct_stat = f"Estimated {word}, {len(month_pairs)}-month average versus the estimate"
+            word = _delta_word(cover_delta, neutral=hide_saving_words)
+            if window_unstable:
+                latest_label = month_pairs[-1][0]
+                ech_stat = f"ECH billed cost, {latest_label}"
+                svl_stat = f"Estimated monthly serverless cost, {est_months}-month retention"
+                save_stat = f"Estimated monthly {word}, {latest_label} versus the estimate"
+                pct_stat = f"Estimated {word}, {latest_label} versus the estimate"
+            else:
+                ech_stat = f"Average ECH billed cost, last {len(month_pairs)} complete months"
+                svl_stat = f"Estimated monthly serverless cost, {est_months}-month retention"
+                save_stat = f"Estimated monthly {word}, {len(month_pairs)}-month average versus the estimate"
+                pct_stat = f"Estimated {word}, {len(month_pairs)}-month average versus the estimate"
             dtone = _delta_tone(cover_delta)
             stats = [
                 stat(usd(month_avg), ech_stat, tag="billed"),
@@ -3632,6 +3648,11 @@ def render_consolidation_html(acc: dict) -> str:
             ]
             chart_cats = [f"ECH, last {len(month_pairs)} complete months", "Serverless estimate"]
             chart_series = [(chart_cats[0], [float(month_avg), 0.0]), (chart_cats[1], [0.0, float(svl_total)])]
+        elif svl_total is None:
+            bill_avg = (c.get("ech_recent_months") or {}).get("average")
+            stats = [stat(usd(bill_avg), "ECH billed cost, complete months", tag="billed")]
+            chart_cats = []
+            chart_series = []
         elif cover_delta is None and sv.get("list_mo") is None:
             svl_stat = "Estimated monthly serverless cost, 12-month retention" + (f", {window}" if window else "")
             stats = [
@@ -3642,7 +3663,7 @@ def render_consolidation_html(acc: dict) -> str:
         else:
             ech_stat = "Monthly ECH billed cost (K360)" + (f", {window}" if window else "")
             svl_stat = "Estimated monthly serverless cost, 12-month retention" + (f", {window}" if window else "")
-            word = _delta_word(sv.get("list_mo"))
+            word = _delta_word(sv.get("list_mo"), neutral=hide_saving_words)
             save_stat = f"Estimated monthly {word} versus ECH billed cost" + (f", {window}" if window else "")
             pct_stat = f"Estimated {word} versus ECH billed cost" + (f", {window}" if window else "")
             dtone = _delta_tone(sv.get("list_mo"))
@@ -3675,15 +3696,28 @@ def render_consolidation_html(acc: dict) -> str:
             m_cats, m_series, stacked=True, width=940, height=168, show_values=True, prefix="$", exact_values=True,
             colors=[PALETTE[0], PALETTE[2]],
             sublabels=([compare_subs[0] or ""] * len(costs) + [compare_subs[1] or ""]) if compare_subs else None) + rate_label)
-        diff = avg_cost - float(svl_total)  # positive is a saving, as everywhere else on the cover
+        compare_cost = costs[-1][1] if window_unstable else avg_cost
+        diff = compare_cost - float(svl_total)  # positive is a saving, as everywhere else on the cover
         rows = [[label, usd(v), "—"] for label, v in costs]
-        rows.append([f"{len(costs)}-month average", usd(avg_cost), usd(svl_total)])
-        rows.append([f"Estimated monthly {_delta_word(diff)}, average vs. the {est_months}-month estimate", _delta_usd(diff), "—"])
-        B.append(table(["Month", "ECH billed cost", f"Serverless at list, {est_months}-month retention"], rows, ["left", "right", "right"]))
-        month_note = (
-            " The deployment-scoped comparison is unavailable, so this row is the complete-month average minus the spreadsheet or notebook read-back."
-            if scope_unavailable else ""
-        )
+        if window_unstable:
+            rows.append([f"Comparison, {costs[-1][0]}", usd(compare_cost), usd(svl_total)])
+            rows.append([
+                f"Estimated monthly {_delta_word(diff, neutral=hide_saving_words)}, {costs[-1][0]} vs. the {est_months}-month estimate",
+                _delta_usd(diff),
+                "—",
+            ])
+            month_note = " Earlier months are under half the latest month, so they are not averaged into the comparison."
+        else:
+            rows.append([f"{len(costs)}-month average", usd(avg_cost), usd(svl_total)])
+            rows.append([
+                f"Estimated monthly {_delta_word(diff, neutral=hide_saving_words)}, average vs. the {est_months}-month estimate",
+                _delta_usd(diff),
+                "—",
+            ])
+            month_note = (
+                " The deployment-scoped comparison is unavailable, so this row is the complete-month average minus the spreadsheet or notebook read-back."
+                if scope_unavailable else ""
+            )
         B.append(caption(
             f"ECH months are complete calendar months of billed cost. The serverless figure is the estimator's monthly price with retention written as {est_months} months "
             f"(a one-year estimate), the total reported by the spreadsheet or notebook."
@@ -3696,6 +3730,23 @@ def render_consolidation_html(acc: dict) -> str:
                 for row in unpriced_rows if isinstance(row, dict)
             )
             B.append(caption(f"Left out of the priced-only average: {named}."))
+    elif svl_total is None:
+        bill_rows = []
+        for row in (c.get("ech_recent_months") or {}).get("months") or []:
+            try:
+                bill_rows.append((_month_label(row["month"]), float(row["cost"])))
+            except (TypeError, ValueError, KeyError):
+                continue
+        if bill_rows:
+            B.append("<h3>ECH bill, no serverless price</h3>" + bar_chart(
+                [label for label, _value in bill_rows],
+                [("ECH billed cost", [value for _label, value in bill_rows])],
+                stacked=True, width=940, height=168, show_values=True, prefix="$", exact_values=True,
+                colors=[PALETTE[0]],
+            ))
+            B.append(caption("No serverless price was returned. These are complete months of the ECH bill. They are not a comparison."))
+        else:
+            B.append(caption("No serverless price was returned, so there is no comparison on this page."))
     else:
         B.append(f"<h3>{esc(chart_title)}</h3>" + bar_chart(
             chart_cats, chart_series,
@@ -3717,10 +3768,30 @@ def render_consolidation_html(acc: dict) -> str:
             f"The rate is ${cr.get('implied_usd_per_ecu')} per ECU, shown rounded and applied unrounded. That puts ECH at {usd(sv.get('ech_contract_mo'))}/mo. Serverless at list is {usd(sv.get('serverless_mo'))}/mo. The {_delta_word(sv.get('cost_mo'))} is {_delta_usd(sv.get('cost_mo'))}/mo, {_delta_pct(sv.get('cost_pct'))}.",
         ]
     elif cover_from_months:
+        if window_unstable:
+            latest_label = month_pairs[-1][0]
+            billed_line = (
+                f"Billed: {latest_label} is the comparison because an earlier complete month is under half of it. "
+                "No contract rate is applied. Estimate: the monthly total reported by the serverless spreadsheet or notebook, "
+                f"with retention written as {est_months} months."
+            )
+            figure_line = (
+                f"{latest_label} is {usd(month_avg)}/mo. The estimator read-back is {usd(svl_total)}/mo. "
+                f"The {_delta_word(cover_delta, neutral=hide_saving_words)} is {_delta_usd(cover_delta)}/mo, {_delta_pct(cover_pct)}."
+            )
+        else:
+            billed_line = (
+                f"Billed: the last {len(month_pairs)} complete calendar months of the K360 billing cost field. No contract rate is applied. "
+                f"Estimate: the monthly total reported by the serverless spreadsheet or notebook, with retention written as {est_months} months."
+            )
+            figure_line = (
+                f"The {len(month_pairs)}-month average is {usd(month_avg)}/mo. The estimator read-back is {usd(svl_total)}/mo. "
+                f"The {_delta_word(cover_delta, neutral=hide_saving_words)} is {_delta_usd(cover_delta)}/mo, {_delta_pct(cover_pct)}."
+            )
         cover_notes = [
-            f"Billed: the last {len(month_pairs)} complete calendar months of the K360 billing cost field. No contract rate is applied. Estimate: the monthly total reported by the serverless spreadsheet or notebook, with retention written as {est_months} months.",
+            billed_line,
             ("The serverless estimate is " + " plus ".join(quote_bits) + ".") if quote_bits else "The serverless estimate is the estimator read-back.",
-            f"The {len(month_pairs)}-month average is {usd(month_avg)}/mo. The estimator read-back is {usd(svl_total)}/mo. The {_delta_word(cover_delta)} is {_delta_usd(cover_delta)}/mo, {_delta_pct(cover_pct)}.",
+            figure_line,
             "The deployment-scoped comparison of the quote window is unavailable because daily deployment billing could not be verified. It is not the figure on this page.",
         ]
     elif quote_days:
@@ -4249,11 +4320,7 @@ def render_consolidation_html(acc: dict) -> str:
     B.append(section("Reconciliation and what to confirm before quoting", recon + f"<div class='foot'>Source: {foot_src}{(' · ' + esc(pricing_src)) if pricing_src else ''} · generated {esc(m.get('generated_at'))}{_method_bit(m)} · only estimator read-backs are quotable $</div>", new_page=True))
     draft = bool(((m.get("method") or {}).get("uncommitted_changes")) or m.get("draft"))
     title = f"{m.get('customer')} — serverless consolidation estimate" if hide_saving_words else f"{m.get('customer')} — serverless consolidation savings"
-    html = page(title, "".join(B), kind="consolidation", draft=draft)
-    if hide_saving_words:
-        html = re.sub(r"(?i)savings", "difference", html)
-        html = re.sub(r"(?i)reduction", "difference", html)
-    return html
+    return page(title, "".join(B), kind="consolidation", draft=draft)
 
 
 def render_appendix_html(acc: dict) -> str:

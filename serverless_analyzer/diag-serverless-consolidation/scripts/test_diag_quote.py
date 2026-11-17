@@ -3576,25 +3576,55 @@ class FixtureCrossCheckTests(unittest.TestCase):
                     self.assertNotIn("provider_default", row.get("detail") or "")
 
     def test_page_one_ech_and_serverless_cover_the_same_deployments(self):
+        from consolidation import unpriced_reason
+        from fixture_loader import load_case
         for name in ("ref-a", "ref-b", "ref-c"):
-            cons, html = self._run(name)
-            scope = cons.get("ech_scope") or {}
-            if scope.get("status") != "unavailable":
-                continue
+            account, _infra = load_case(name)
+            cons, _html = self._run(name)
             priced = cons.get("ech_recent_months_priced") or {}
             self.assertEqual(priced.get("basis"), "monthly_by_deployment")
-            if priced.get("average") is None:
-                self.assertNotIn("reduction", html.lower())
-                self.assertNotIn("savings", html.lower())
+            by_solution = (cons.get("serverless") or {}).get("by_solution") or {}
+            regions = {}
+            for dep in ((account.get("cloud") or {}).get("by_deployment") or []):
+                if isinstance(dep, dict) and dep.get("name"):
+                    regions[str(dep["name"])] = dep.get("region")
+            diagnostic = (account.get("sizing") or {}).get("ingest_source") == "diagnostics"
+            for dep in (account.get("solutions") or {}).get("by_deployment") or []:
+                if not isinstance(dep, dict) or not dep.get("name") or dep.get("platform") == "serverless":
+                    continue
+                if unpriced_reason(dep, by_solution, diagnostic) is not None:
+                    continue
+                blk = by_solution.get(dep.get("solution") or "search") or {}
+                self.assertIn("quotable", str(blk.get("pricing") or ""), dep["name"])
+                rows = blk.get("by_region") or []
+                if not rows:
+                    continue
+                quoted_regions = {row.get("region") for row in rows if row.get("monthly") is not None}
+                self.assertIn(regions.get(str(dep["name"])), quoted_regions, dep["name"])
+            for sol, blk in by_solution.items():
+                rows = blk.get("by_region") or []
+                if any(str(row.get("pricing") or "").startswith("rejected") or row.get("monthly") is None and "not quoted" in str(row.get("pricing") or "") for row in rows):
+                    self.assertNotIn("quotable", str(blk.get("pricing") or ""), sol)
 
     def test_an_unverified_comparison_is_not_called_a_saving(self):
         for name in ("ref-a", "ref-b", "ref-c"):
             cons, html = self._run(name)
             scope = cons.get("ech_scope") or {}
             if cons.get("integrity", {}).get("passed") is False and scope.get("status") == "unavailable":
-                self.assertNotIn("savings", html.lower())
-                self.assertNotIn("reduction", html.lower())
+                self.assertNotIn("estimated savings from", html.lower())
+                self.assertNotIn("estimated monthly reduction", html.lower())
                 self.assertIn("serverless estimate for", html)
+
+    def test_fixtures_have_no_live_identifiers(self):
+        from pathlib import Path
+        import re
+        root = Path(__file__).resolve().parent / "tests" / "fixtures"
+        banned = re.compile(r"docs\.google\.com|drive\.google\.com|/Users/|acct-[abc][_A-Za-z]|\"ARR\"")
+        hex_id = re.compile(r"\b[0-9a-f]{32}\b")
+        for path in root.rglob("*.json"):
+            text = path.read_text()
+            self.assertIsNone(banned.search(text), path.name)
+            self.assertIsNone(hex_id.search(text), path.name)
 
 
 class PhaseGuardTests(unittest.TestCase):
@@ -3701,6 +3731,114 @@ class PhaseGuardTests(unittest.TestCase):
         self.assertFalse(names["Region fidelity"]["passed"])
         self.assertFalse(names["Quote present"]["passed"])
 
+    def test_one_off_list_search_region_drops_the_solution(self):
+        acc = _quote_account(g28=10, e73=0)
+        acc["sizing"]["consolidated"]["observability"] = {"stored_gb": 0, "daily_raw_gb": 0, "deployments": 0}
+        acc["sizing"]["consolidated"]["security"] = {"stored_gb": 0, "daily_raw_gb": 0, "deployments": 0}
+        acc["sizing"]["consolidated"]["search"] = {"stored_gb": 20, "daily_raw_gb": 0, "deployments": 2}
+        acc["sizing"]["estimators"]["observability"] = {}
+        acc["sizing"]["estimators"]["security"] = {}
+        acc["sizing"]["estimators"]["search"] = {"readback": {"monthly_steady_state": 500, "annual_year1": 6000}}
+        acc["cloud"] = {"by_deployment": [
+            {"name": "kept", "region": "us-central1", "provider": "gcp"},
+            {"name": "dropped", "region": "asia-east1", "provider": "gcp"},
+        ], "summary": {"provider": "gcp"}}
+        acc["solutions"]["by_deployment"] = [
+            {"name": "kept", "solution": "search", "platform": "ech", "gb": 12, "ecu": 10},
+            {"name": "dropped", "solution": "search", "platform": "ech", "gb": 8, "ecu": 20},
+        ]
+        acc["ecu"]["monthly"] = {"months": ["2026-10"], "totals": [30], "partial_months": []}
+        acc["ecu"]["monthly_by_deployment"] = {"kept": [10], "dropped": [20]}
+        acc["sizing"]["estimators"]["projects"] = [
+            {"solution": "search", "region": "us-central1", "region_match": "GCP us-central1 (exact)",
+             "readback": {"monthly_steady_state": 300, "annual_year1": 3600}},
+            {"solution": "search", "region": "asia-east1", "region_match": "GCP us-central1 (provider_default)",
+             "readback": {"monthly_steady_state": 200, "annual_year1": 2400}},
+        ]
+        acc["sizing"]["architecture"] = {"per_region": True}
+        cons = build_consolidation(acc, {"by_deployment": acc["cloud"]["by_deployment"]})
+        self.assertIsNone(cons["savings"]["serverless_mo"])
+        self.assertNotIn("quotable", str(cons["serverless"]["by_solution"]["search"].get("pricing") or ""))
+        left_out = {row["name"] for row in (cons.get("ech_recent_months_priced") or {}).get("unpriced") or []}
+        self.assertIn("dropped", left_out)
+        self.assertIn("kept", left_out)
+
+    def test_an_unstable_bill_compares_the_latest_month(self):
+        from consolidation import recent_ech_months_priced
+        acc = {
+            "meta": {"customer": "Example", "date": "2026-11-16"},
+            "ecu": {"monthly": {"months": ["2026-08", "2026-09", "2026-10"], "partial_months": []},
+                    "monthly_by_deployment": {"kept": [396, 377, 9682]}},
+            "solutions": {"by_deployment": [
+                {"name": "kept", "solution": "search", "platform": "ech", "gb": 10},
+            ]},
+            "sizing": {"ingest_source": "diagnostics"},
+        }
+        priced = recent_ech_months_priced(acc, {"search": {"pricing": "es3-estimator performant (quotable)"}})
+        self.assertFalse(priced["stable"])
+        self.assertEqual(priced["comparison"], 9682)
+        self.assertEqual(priced["comparison_basis"], "latest_complete_month")
+        scored = integrity_score({"billing_window": priced})
+        row = next(item for item in scored["checks"] if item["check"] == "Billing window")
+        self.assertFalse(row["passed"])
+        acc["consolidation"] = {
+            "savings": {"serverless_mo": 2600, "list_mo": None, "ech_list_mo": None, "list_pct": None},
+            "ech_scope": {"status": "unavailable"},
+            "ech_recent_months_priced": priced,
+            "integrity": {"passed": False, "checks": [row]},
+            "serverless": {"dominant_solution": "search", "by_solution": {"search": {"total_mo": 2600}}},
+            "basis": {},
+            "estimate_months": 12,
+            "sensitivity": {"fleet": [{"scenario": "Complete-month average", "ech_ecu_mo": 9682, "serverless_mo": 2600, "scale": 1}], "retention": []},
+        }
+        html = render_consolidation_html(acc)
+        self.assertNotIn("3-month average", html)
+        self.assertIn("$9,682", html)
+
+    def test_a_missing_quote_shows_the_bill_and_no_zero_bar(self):
+        acc = {
+            "meta": {"customer": "Example", "date": "2026-11-16"},
+            "cloud": {"summary": {}},
+            "consolidation": {
+                "savings": {"serverless_mo": None, "list_mo": None, "ech_list_mo": None, "list_pct": None},
+                "ech_scope": {"status": "unavailable"},
+                "ech_recent_months": {"months": [{"month": "2026-10", "cost": 317000}], "average": 317000},
+                "ech_recent_months_priced": {"months": [], "average": None, "comparison": None},
+                "integrity": {"passed": False, "checks": [{"check": "Quote present", "passed": False}]},
+                "serverless": {"dominant_solution": "observability", "by_solution": {}},
+                "basis": {},
+                "sensitivity": {"fleet": [{"scenario": "Complete-month average", "ech_ecu_mo": 317000, "scale": 1}], "retention": []},
+            },
+        }
+        html = render_consolidation_html(acc)
+        self.assertIn("$317,000", html)
+        self.assertIn("No serverless price was returned", html)
+        self.assertIn("ECH bill, no serverless price", html)
+        self.assertNotIn("estimated monthly reduction", html.lower())
+
+    def test_neutral_wording_leaves_product_text_and_filenames(self):
+        acc = {
+            "meta": {"customer": "Example", "date": "2026-11-16", "draft": True},
+            "cloud": {"summary": {}},
+            "consolidation": {
+                "savings": {"serverless_mo": 10, "list_mo": None, "ech_list_mo": None},
+                "ech_scope": {"status": "unavailable"},
+                "integrity": {"passed": False, "checks": [{"check": "Quote present", "passed": False}]},
+                "serverless": {"dominant_solution": "search", "by_solution": {"search": {"total_mo": 10}}},
+                "basis": {},
+                "notes": [
+                    "Upgrade to unlock LogsDB / TSDS storage savings",
+                    "see bulk_savings.pdf",
+                ],
+                "sensitivity": {"fleet": [{"scenario": "Complete-month average", "ech_ecu_mo": 10, "serverless_mo": 10, "scale": 1}], "retention": []},
+            },
+        }
+        html = render_consolidation_html(acc)
+        self.assertIn("Upgrade to unlock LogsDB / TSDS storage savings", html)
+        self.assertIn("bulk_savings.pdf", html)
+        self.assertIn("serverless estimate for", html)
+        self.assertNotIn("estimated savings from", html.lower())
+
     def test_plan_consistency_fails_when_the_floor_is_not_the_headline(self):
         scored = integrity_score({
             "plan_consistency": {
@@ -3731,14 +3869,35 @@ class PhaseGuardTests(unittest.TestCase):
         self.assertNotIn("Retention basis", [item["check"] for item in recorded["checks"] if item.get("passed") is False])
 
     def test_dirty_tree_refuses_the_run(self):
+        import contextlib
+        import io
         import run_consolidation as rc
         args = mock.Mock(lookback_days=90, allow_dirty=False)
+        err = io.StringIO()
         with mock.patch.object(rc, "parse_args", return_value=args), mock.patch.object(
             rc, "method_stamp", return_value={"uncommitted_changes": True, "commit": "abc1234"},
         ):
-            with self.assertRaises(SystemExit) as caught:
-                rc.main()
+            with contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as caught:
+                    rc.main()
         self.assertEqual(caught.exception.code, 2)
+        self.assertIn("uncommitted changes", err.getvalue())
+        self.assertIn("--allow-dirty", err.getvalue())
+
+    def test_a_tree_that_is_not_a_checkout_refuses_the_run(self):
+        import contextlib
+        import io
+        import run_consolidation as rc
+        args = mock.Mock(lookback_days=90, allow_dirty=False)
+        err = io.StringIO()
+        with mock.patch.object(rc, "parse_args", return_value=args), mock.patch.object(
+            rc, "method_stamp", return_value={"uncommitted_changes": None, "commit": None},
+        ):
+            with contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as caught:
+                    rc.main()
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("not in a git checkout", err.getvalue())
 
 
 if __name__ == "__main__":

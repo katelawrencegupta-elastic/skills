@@ -747,8 +747,22 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
 def main() -> None:
     args = parse_args(description=__doc__)
     stamp = method_stamp(int(args.lookback_days))
-    if stamp.get("uncommitted_changes") and not getattr(args, "allow_dirty", False):
-        raise SystemExit(2)
+    if not getattr(args, "allow_dirty", False):
+        state = stamp.get("uncommitted_changes")
+        if state is None:
+            print(
+                "ERROR: these scripts are not in a git checkout, so the tree cannot be proven clean. "
+                "Pass --allow-dirty to mark the PDF DRAFT.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        if state:
+            print(
+                "ERROR: uncommitted changes under serverless_analyzer. "
+                "Commit them, or pass --allow-dirty to mark the PDF DRAFT.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
     if not 1 <= int(args.lookback_days) <= 365:
         raise SystemExit("--lookback-days must be from 1 to 365")
     if not 0 <= float(args.min_priced_ecu_pct) <= 100:

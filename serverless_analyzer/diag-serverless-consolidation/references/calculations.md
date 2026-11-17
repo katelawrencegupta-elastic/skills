@@ -214,6 +214,7 @@ The score is the mean of the checks that apply. A check with no inputs is n/a an
 | Plan consistency | 1 when the Floor bar is within 1% plus $5 of the headline and the floor is one project per solution and region. 0 when a bar prices a solution the headline did not quote, or the floor gap is larger. n/a when the plan has no comparable floor. | The deployment-count floor matches the headline. |
 | Rate window | 1 − min(short-window bulk ÷ bulk, 1). n/a when the short-window field was not recorded. | Short-window bulk is 25% of bulk or less. |
 | Counter age | 1 − min(restarted-counter bulk ÷ bulk, 1). n/a when the restarted-counter field was not recorded. | Bulk from a restarted counter is 25% of bulk or less. |
+| Billing window | 1 when every priced month is at least half the latest priced month. 0 when an earlier month is under that share. n/a with fewer than two priced months. | The comparison is the latest complete month when the window is not one fleet. The earlier months stay on the chart and are not averaged into the difference. |
 
 The detail prints both cents and the gap. A missing monthly or a missing steady annual on a quote line scores 0 for that line. The overall result passes only when every scored check passes. One check below its own bar fails the quote, and its detail names the gap. A check can pass its bar and score under 1, so a passing quote can show a score below 1.000. Bundle coverage below 1.0 names each deployment that has no bundle.
 
