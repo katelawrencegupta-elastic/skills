@@ -53,9 +53,12 @@ def _fill_regional_job(job: dict, creds) -> dict:
     opts = region_options(sheets, copied["id"])
     reg, how = match_region(job["provider"], job["region"], opts)
     if how == "none" or not reg:
+        try:
+            trash_file(drive, copied["id"])
+        except Exception:  # noqa: BLE001
+            pass
         return {
-            "solution": sol, "region": job["region"], "title": copied["name"],
-            "spreadsheet_id": copied["id"], "url": copied["url"], "reused_existing_copy": reused,
+            "solution": sol, "region": job["region"], "title": job["title"],
             "region_match": "none", "readback_rejected": _region_rejected(job.get("region")),
             "readback": {}, "status": "unquoted", "error": _region_rejected(job.get("region")),
         }
@@ -615,6 +618,28 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
     if not built.get("error"):
         built["floor"] = floor
     return built
+
+
+def fleet_measured_copy(job: dict) -> dict | None:
+    """A second Observability or Security sheet at the recorded age.
+
+    The headline sheet stays at the written month. This copy is not the quote.
+    """
+    from diag_inputs import whole_months
+
+    measured = job.get("measured")
+    written = job.get("retention")
+    if measured is None or written is None or job.get("solution") == "search":
+        return None
+    months = whole_months(float(measured))
+    if months == int(written):
+        return None
+    extra = dict(job)
+    extra["retention"] = months
+    extra["title"] = f"{job['title']} measured retention"
+    extra["role"] = "measured_retention"
+    extra["forced"] = True
+    return _fill_regional_job(extra, load_sheet_creds())
 
 
 def org_store_gb(acc: dict) -> float:

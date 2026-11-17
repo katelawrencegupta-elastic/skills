@@ -280,9 +280,39 @@ def pack(rows: list[dict], n: int) -> list[list[dict]]:
     return groups
 
 
+def _join_solution_region(rows: list[dict], account_path: Path | None) -> list[dict]:
+    """Rows from a bundle file often omit solution and region. Join them, or stop."""
+    missing = [row for row in rows if not row.get("solution") or not row.get("region")]
+    if not missing:
+        return rows
+    if account_path is None:
+        names = ", ".join(str(row.get("name") or "unnamed") for row in missing[:8])
+        raise SystemExit(f"rows have no solution or region ({names}). Pass --account-json.")
+    account = json.loads(account_path.read_text())
+    by_name = {
+        dep.get("name"): dep
+        for dep in ((account.get("solutions") or {}).get("by_deployment") or [])
+        if isinstance(dep, dict) and dep.get("name")
+    }
+    joined = []
+    still = []
+    for row in rows:
+        item = dict(row)
+        dep = by_name.get(item.get("name")) or {}
+        item["solution"] = item.get("solution") or dep.get("solution")
+        item["region"] = item.get("region") or dep.get("region")
+        if not item.get("solution") or not item.get("region"):
+            still.append(str(item.get("name") or "unnamed"))
+        joined.append(item)
+    if still:
+        raise SystemExit("no solution or region for " + ", ".join(still[:8]))
+    return joined
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--diags-json", required=True, help="sizing_from_diags.json")
+    ap.add_argument("--account-json", default=None, help="Join solution and region onto rows that do not carry them")
     ap.add_argument(
         "--retention-months",
         type=int,
@@ -302,7 +332,7 @@ def main() -> None:
     args = ap.parse_args()
     if args.retention_months is not None and not 1 <= args.retention_months <= 36:
         raise SystemExit("--retention-months must be from 1 to 36")
-    rows = load_rows(Path(args.diags_json))
+    rows = _join_solution_region(load_rows(Path(args.diags_json)), Path(args.account_json) if args.account_json else None)
     counts = []
     for part in args.projects.split(","):
         part = part.strip()
@@ -327,11 +357,15 @@ def main() -> None:
         })
     if args.each:
         each = []
-        for group in pooled_deployments(rows):
-            item = summarize(group, args.retention_months, basis="metered")
-            if len(group) > 1:
-                item["pool"] = f"deployments under {POOL_UNDER_GB_DAY:g} GB/day"
-            each.append(item)
+        buckets: dict[tuple[str, str], list[dict]] = {}
+        for row in rows:
+            buckets.setdefault(_pair_key(row), []).append(row)
+        for group_rows in buckets.values():
+            for group in pooled_deployments(group_rows):
+                item = summarize(group, args.retention_months, basis="metered")
+                if len(group) > 1:
+                    item["pool"] = f"deployments under {POOL_UNDER_GB_DAY:g} GB/day"
+                each.append(item)
         out["each"] = each
     print(json.dumps(out, indent=2))
 

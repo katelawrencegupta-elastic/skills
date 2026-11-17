@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from sizing_shared import *  # noqa: F401,F403
+from sheets_io import *  # noqa: F401,F403
 
 def _suffix(raw: str | None) -> str:
     text = (raw or "").strip()
@@ -300,7 +301,7 @@ def fleet_sheet_region(acc: dict, solution: str, fallback: str | None) -> str | 
 def estimate_title(run_key: str, solution: str, name_suffix: str | None = "", region: str | None = None) -> str:
     """Google Sheet title for one serverless estimate.
 
-    <customer>_<date>_<solution>_<full retention|30d>_<bulk|compression-applied>_<region>_serverless_estimate
+    <customer>_<date>_<solution>_full retention_bulk_<region>_serverless_estimate
     The region is the cloud region the sheet was scoped to.
     A K360 backup uses k360 in the basis slot so it does not replace the bulk sheet.
     """
@@ -338,17 +339,12 @@ def _months_for_sheet(block: dict, force: int | None) -> int | None:
 
 
 def _search_volume_scale(name_suffix: str | None) -> float:
-    """Scale on Search disk. 1.0: Search is priced on the measured local store.
+    """Scale on Search disk. Search is priced on the measured local store.
 
     Search disk is never scaled by a retention month. An index's age is not a
-    retention window for search content, and dividing store by it moved the
-    Search price many times over on one cluster's write rate. Only a title from
-    the retired compression-applied set still multiplies by 0.60.
+    retention window for search content.
     """
-    from admin_diags import COMPRESSION_RATIO
-
-    _retention, basis = _estimate_parts(name_suffix)
-    return COMPRESSION_RATIO if basis == "compression-applied" else 1.0
+    return 1.0
 
 
 def estimator_skip(block: dict, force: int | None, *, always_copy: bool = False) -> str | None:

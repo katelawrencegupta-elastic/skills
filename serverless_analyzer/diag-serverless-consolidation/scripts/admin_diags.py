@@ -482,10 +482,6 @@ def ingest_kind(series: str, index_mode: str | None = None) -> str:
     return "logs"
 
 
-# The second estimate keeps 60% of write-index bulk.
-COMPRESSION_RATIO = 0.60
-
-
 def _write_indices(streams: list, alias: dict) -> set[str]:
     """Data-stream write index (last generation) plus any alias marked is_write_index."""
     write: set[str] = set()
@@ -793,14 +789,6 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
     rated = rates["rated"]
     est_bytes = rates["bytes_per_day"]
     gb_day = est_bytes / 1e9
-    # compressioncalc_accounted_for = bulk GB/day × 0.60.
-    # On-disk bytes do not change it.
-    if gb_day <= 0:
-        compression_ratio = None
-        accounted_gb = 0.0
-    else:
-        compression_ratio = COMPRESSION_RATIO
-        accounted_gb = gb_day * COMPRESSION_RATIO
 
     delete_age: dict[str, float] = {}
     for name, pol in (policies.items() if isinstance(policies, dict) else []):
@@ -884,8 +872,6 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
     return {
         "cluster": health.get("cluster_name"),
         "bulk_gb_day": round(gb_day, 3),
-        "compression_ratio": None if compression_ratio is None else round(compression_ratio, 3),
-        "compressioncalc_accounted_for": round(accounted_gb, 3),
         "uptime_days_min": round(min(hot_up), 1) if hot_up else None,
         "retention_days": round(days, 3) if days else None,
         # Size-weighted delete age of the metrics indices alone, for the TSDS retention row.

@@ -23,11 +23,11 @@ Quote Serverless from diagnostic measurements. Reuse the K360 org report. Do not
 cd <project with .env>
 
 python <skill>/scripts/run_consolidation.py --org "ORG NAME" \
-  --reuse serverless_analyzer/diag_artifacts/<customer>_<date>/<customer>_<date>_org_report.json
+  --reuse ~/serverless_analyzer_artifacts/<customer>_<date>/<customer>_<date>_org_report.json
 
 python <skill>/scripts/run_consolidation.py --org "ORG NAME" \
-  --reuse serverless_analyzer/diag_artifacts/<customer>_<date>/<customer>_<date>_org_report.json \
-  --diags-dir serverless_analyzer/diag_artifacts/<org_id>_diags_<date>
+  --reuse ~/serverless_analyzer_artifacts/<customer>_<date>/<customer>_<date>_org_report.json \
+  --diags-dir ~/serverless_analyzer_artifacts/<org_id>_diags_<date>
 
 python <skill>/scripts/run_consolidation.py --org "ORG NAME" \
   --org-id ID1 --org-id ID2 --org-id ID3
@@ -41,7 +41,9 @@ The command prints `brief <path>`. That file is `<run_key>_consolidation_brief.j
 
 Quote only when `ingest_source` is `diagnostics`.
 
-Read from the brief: `savings`, `quotes`, `fleet`, `contract_rate`, `ech_scope`, `ech_recent_months`, `estimate_months`, `notes`, `limits`, `region_matches`, `per_cluster_plan`, `diagnostics_coverage`, `excluded_deployments`, `method`, `deployment_plan`, `metered_rates`, `estimators`, `links`, `integrity`, `search_power`.
+Read from the brief: `savings`, `quotes`, `fleet`, `contract_rate`, `ech_scope`, `ech_recent_months`, `ech_recent_months_priced`, `estimate_months`, `draft`, `notes`, `limits`, `region_matches`, `per_cluster_plan`, `diagnostics_coverage`, `excluded_deployments`, `method`, `deployment_plan`, `metered_rates`, `estimators`, `links`, `integrity`, `search_power`.
+
+When the scope is unavailable, page 1 compares `ech_recent_months_priced` (`comparison`, `comparison_basis`, `stable`), not the whole-org `ech_recent_months`. `draft` true means the run is not verified.
 
 `method.uncommitted_changes` true means the checkout was dirty. Two runs are comparable only when `method` matches.
 

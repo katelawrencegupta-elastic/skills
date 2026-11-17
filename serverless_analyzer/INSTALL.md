@@ -23,7 +23,7 @@ Python 3.10 or newer is required (`requires-python >= 3.10` in `pyproject.toml`)
 | Google Chrome | PDF print | `/Applications`, or `CHROME_PATH` |
 | Aviatrix VPN | A fresh admin-console pull | An `openvpn` process. `--diags-dir` does not need it |
 
-Reports and diagnostic bundles are written to `serverless_analyzer/diag_artifacts/`, beside the three skill folders. Keep `.env` and that directory's contents out of git. A run directory is created mode `0700`, and the customer files inside it are mode `0600`. `--artifacts-root` overrides the directory.
+Reports and diagnostic bundles are written to `~/serverless_analyzer_artifacts/`, outside this repository. Keep `.env` out of git. A run directory is created mode `0700`, and the customer files inside it are mode `0600`. `SERVERLESS_ANALYZER_ARTIFACTS` or `--artifacts-root` overrides the directory.
 
 ## 1. Link the skills
 
@@ -102,8 +102,8 @@ python <skill>/scripts/run_account_analysis.py \
 
 python <skill>/scripts/run_consolidation.py \
   --org "ORG NAME" \
-  --reuse serverless_analyzer/diag_artifacts/<customer>_<date>/<customer>_<date>_org_report.json \
-  --diags-dir serverless_analyzer/diag_artifacts/<org_id>_diags_<date>
+  --reuse ~/serverless_analyzer_artifacts/<customer>_<date>/<customer>_<date>_org_report.json \
+  --diags-dir ~/serverless_analyzer_artifacts/<org_id>_diags_<date>
 ```
 
 `--report full` expands the same K360 fetch. A diagnostic run without `--diags-dir` calls the admin API and needs the Aviatrix tunnel. `--skip-vpn-check` skips that reachability check.

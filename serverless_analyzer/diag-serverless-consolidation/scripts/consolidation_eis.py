@@ -1,6 +1,7 @@
 """Search EIS read for the consolidation quote."""
 from __future__ import annotations
 
+from constants import ECHO_TOLERANCE_GB_DAY, ECHO_TOLERANCE_SHARE
 from consolidation_scope import *  # noqa: F401,F403
 
 def _search_eis(
@@ -70,7 +71,7 @@ def _search_eis(
                 break
             for field, total_key in (("eis_ecu", "eis"), ("million_tokens", "tokens"), ("ml_node_ecu", "ml")):
                 daily_sum = sum(float(v or 0) for v in (data.get(field) or []))
-                tolerance = max(0.02, abs(authoritative[total_key]) * 0.001)
+                tolerance = max(ECHO_TOLERANCE_GB_DAY, abs(authoritative[total_key]) * ECHO_TOLERANCE_SHARE)
                 if abs(daily_sum - authoritative[total_key]) > tolerance:
                     daily_complete = False
                     break

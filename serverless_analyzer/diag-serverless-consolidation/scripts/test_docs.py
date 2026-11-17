@@ -20,9 +20,12 @@ RETIRED = (
     "measured month",
     "at the measured month",
     "month 36",
+    "month-36",
     "1 month",
-    "_Serverless_",
+    "cb254",
     "0.60",
+    "serverless-consolidation-plan",
+    "serverless_analyzer/diag_artifacts",
 )
 
 
@@ -80,7 +83,10 @@ class DocLintTests(unittest.TestCase):
     def test_retired_phrases_are_gone(self):
         hits = []
         for path in DOCS:
-            text = path.read_text().lower()
+            raw = path.read_text()
+            if "_Serverless_" in raw:
+                hits.append(f"{path.name}: _Serverless_")
+            text = raw.lower()
             for phrase in RETIRED:
                 if phrase.lower() in text:
                     hits.append(f"{path.name}: {phrase}")

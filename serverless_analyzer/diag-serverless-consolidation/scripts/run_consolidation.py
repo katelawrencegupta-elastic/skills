@@ -264,7 +264,9 @@ def consolidation_brief(acc: dict) -> dict:
         "contract_rate": cons.get("contract_rate"),
         "ech_scope": cons.get("ech_scope"),
         "ech_recent_months": cons.get("ech_recent_months"),
+        "ech_recent_months_priced": _priced_months_brief(cons.get("ech_recent_months_priced")),
         "estimate_months": cons.get("estimate_months"),
+        "draft": bool(m.get("draft")),
         "notes": _ordered_notes(cons, sz),
         "limits": list(((sz.get("diagnostics") or {}).get("estimation_limits")) or []),
         "region_matches": _region_matches(est_in),
@@ -297,15 +299,35 @@ def consolidation_brief(acc: dict) -> dict:
     return out
 
 
+def _priced_months_brief(block) -> dict | None:
+    """The page-1 comparison when deployment billing is unavailable."""
+    if not isinstance(block, dict):
+        return None
+    return {
+        "months": block.get("months") or [],
+        "average": block.get("average"),
+        "comparison": block.get("comparison"),
+        "comparison_basis": block.get("comparison_basis"),
+        "stable": block.get("stable"),
+    }
+
+
 def chat_lines(brief: dict) -> list[str]:
     """At most six lines: the headline, failed checks, the top limits, and links."""
     lines: list[str] = []
     savings = brief.get("savings") or {}
     monthly = savings.get("serverless_mo")
-    checks = ((brief.get("integrity") or {}).get("checks")) or []
-    failed = [str(row.get("name")) for row in checks if isinstance(row, dict) and row.get("passed") is False and row.get("name")]
-    draft = bool(((brief.get("method") or {}).get("uncommitted_changes")) or ((brief.get("method") or {}).get("draft")))
-    if monthly is None or failed or draft:
+    integrity = brief.get("integrity") or {}
+    failed = [
+        str(row.get("check"))
+        for row in (integrity.get("failed") or [])
+        if isinstance(row, dict) and row.get("check")
+    ]
+    draft = bool(
+        brief.get("draft")
+        or ((brief.get("method") or {}).get("uncommitted_changes"))
+    )
+    if monthly is None or integrity.get("passed") is False or failed or draft:
         lines.append("not verified")
     else:
         lines.append(f"Serverless ${float(monthly):,.0f}/mo")
@@ -351,15 +373,6 @@ def quote_pdf_jobs(account: dict, diagnostic: dict | None, extras: list[tuple[di
     return _with_appendix(docs)
 
 
-def _load_quote(path: str | None) -> dict | None:
-    if not path or not Path(path).is_file():
-        return None
-    doc = json.loads(Path(path).read_text())
-    if (doc.get("consolidation") or {}).get("error"):
-        return None
-    return doc
-
-
 def _quote_block(acc: dict) -> dict:
     cons = acc.get("consolidation") or {}
     return {
@@ -388,129 +401,6 @@ def _money_note(diag_mo, k360_mo) -> str:
         f"The K360 backup, stored GB ÷ assumed retention, prices it at ${float(k360_mo):,.0f}/mo. "
         "K360 does not provide a raw ingest total, so those two figures are not interchangeable."
     )
-
-
-def _compression_totals(acc: dict) -> tuple[float, float | None, float]:
-    """Observability, Security, and Search: raw bulk, and that bulk kept at 60%."""
-    from admin_diags import COMPRESSION_RATIO
-
-    con = (acc.get("sizing") or {}).get("consolidated") or {}
-    bulk = 0.0
-    has_workload = False
-    for sol in ("observability", "security", "search"):
-        blk = con.get(sol) or {}
-        bulk += float(blk.get("bulk_gb_day") or 0)
-        if (blk.get("stored_gb") or 0) or (blk.get("bulk_gb_day") or 0) or (blk.get("daily_raw_gb") or 0):
-            has_workload = True
-    if not has_workload:
-        return 0.0, None, 0.0
-    return round(bulk, 3), COMPRESSION_RATIO, round(bulk * COMPRESSION_RATIO, 3)
-
-
-def _stamp_compression(acc: dict, *, scenario: str) -> tuple[float, float | None, float]:
-    from diag_account import COMPRESSIONCALC
-
-    bulk, ratio, accounted = _compression_totals(acc)
-    cons = acc.setdefault("consolidation", {})
-    cons["ingest_basis"] = COMPRESSIONCALC
-    cons["bulk_gb_day"] = bulk
-    cons["compression_ratio"] = ratio
-    cons[COMPRESSIONCALC] = accounted
-    cons["retention_scenario"] = scenario
-    return bulk, ratio, accounted
-
-
-def _run_compressioncalc(diag: dict, diag_path: Path, infra: dict, py: Path, args, *, size_sheets: bool) -> None:
-    """Price Observability and Security on compressioncalc_accounted_for. The bulk quote stays put."""
-    from diag_account import COMPRESSIONCALC, compressioncalc_account
-
-    comp = compressioncalc_account(diag)
-    bulk, ratio, accounted = _compression_totals(comp)
-    path = diag_path.with_name(diag_path.stem + "_compressioncalc_accounted_for.json")
-    seal_text(path, json.dumps(comp, indent=2))
-    block = {
-        "bulk_gb_day": bulk,
-        "compression_ratio": ratio,
-        "gb_day": accounted,
-        "account": str(path),
-        "formula": (
-            "compressioncalc_accounted_for = bulk GB/day × 0.60. "
-            "On-disk bytes are not used."
-        ),
-    }
-    diag[COMPRESSIONCALC] = block
-    if ratio is None or not size_sheets or not py.is_file():
-        if ratio is None:
-            block["status"] = "not priced — no workload to compress"
-        elif not py.is_file():
-            block["status"] = "measured only — Sheets venv missing"
-        else:
-            block["status"] = "measured only — the bulk quote did not finish"
-        return
-    flags: list[str] = []
-    if args.xlsx:
-        flags.append("--xlsx")
-    if args.always_copy:
-        flags.append("--always-copy")
-    if args.fresh:
-        flags.append("--fresh")
-    try:
-        _run([
-            str(py), str(HERE / "size_serverless.py"),
-            "--account-json", str(path),
-            "--name-suffix", COMPRESSIONCALC,
-            "--sizing-json", "sizing_compressioncalc_accounted_for.json",
-            *flags,
-        ])
-        comp = json.loads(path.read_text())
-        comp["consolidation"] = build_consolidation(comp, infra)
-        _stamp_compression(comp, scenario="rounded")
-        seal_text(path, json.dumps(comp, indent=2))
-        if (comp.get("consolidation") or {}).get("architecture", {}).get("per_region") and not (comp.get("consolidation") or {}).get("error"):
-            try:
-                _run([
-                    str(py), str(HERE / "size_serverless.py"),
-                    "--account-json", str(path),
-                    "--projects",
-                    "--name-suffix", COMPRESSIONCALC,
-                    "--sizing-json", "sizing_compressioncalc_accounted_for.json",
-                    *flags,
-                ])
-                comp = json.loads(path.read_text())
-                comp["consolidation"] = build_consolidation(comp, infra)
-                _stamp_compression(comp, scenario="rounded")
-                seal_text(path, json.dumps(comp, indent=2))
-            except subprocess.CalledProcessError as e:
-                if not getattr(args, "allow_partial", False):
-                    print(f"ERROR: compressioncalc_accounted_for regional sizing failed ({e}). The run stopped.", file=sys.stderr)
-                    raise SystemExit(2) from e
-                print(f"WARN: compressioncalc_accounted_for regional sizing failed ({e})", file=sys.stderr)
-                block["regional_status"] = f"consolidated read-back kept ({e})"
-    except subprocess.CalledProcessError as e:
-        print(f"WARN: compressioncalc_accounted_for sizing failed ({e})", file=sys.stderr)
-        block["status"] = f"not priced ({e})"
-        diag.setdefault("consolidation", {}).setdefault("notes", []).append(
-            f"compressioncalc_accounted_for was not priced ({e})."
-        )
-        return
-    except Exception as ex:
-        print(f"WARN: compressioncalc_accounted_for quote failed ({ex!r})", file=sys.stderr)
-        block["status"] = f"not priced ({ex!r})"
-        diag.setdefault("consolidation", {}).setdefault("notes", []).append(
-            f"compressioncalc_accounted_for was not priced ({ex!r})."
-        )
-        return
-    if (comp.get("consolidation") or {}).get("error"):
-        block["status"] = "not priced — consolidation failed"
-        return
-    monthly = ((comp.get("consolidation") or {}).get("savings") or {}).get("serverless_mo")
-    block["monthly"] = monthly
-    block["quotes"] = ((comp.get("consolidation") or {}).get("reconciliation") or {}).get("quotes") or []
-    block["account"] = str(path)
-    diag["compressioncalc_account"] = str(path)
-    folder = (comp.get("sizing") or {}).get("drive_folder") or {}
-    if folder.get("id"):
-        diag.setdefault("sizing", {})["drive_folder_compressioncalc"] = folder
 
 
 def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args) -> dict | None:
@@ -901,7 +791,7 @@ def main() -> None:
         sz = acc.setdefault("sizing", {})
         for key in (
             "estimators", "consolidated", "notes", "diagnostics", "drive_folder", "drive_root",
-            "drive_folder_compressioncalc", "sized_at", "source_precedence",
+            "sized_at", "source_precedence",
         ):
             if dsz.get(key) not in (None, {}, []):
                 sz[key] = dsz[key]
@@ -916,10 +806,6 @@ def main() -> None:
         for key in ("quote_lookback_requested", "quote_lookback_days", "quote_daily_avg", "quote_monthly_ecu", "quote_usage_factor", "quote_ingest_factor"):
             if key in (diag_acc.get("ecu") or {}):
                 acc.setdefault("ecu", {})[key] = diag_acc["ecu"][key]
-        if diag_acc.get("compressioncalc_accounted_for"):
-            acc["compressioncalc_accounted_for"] = diag_acc["compressioncalc_accounted_for"]
-        if diag_acc.get("compressioncalc_account"):
-            acc["compressioncalc_account"] = diag_acc["compressioncalc_account"]
         cost = (diag_acc.get("analysis") or {}).get("cost")
         if cost:
             acc.setdefault("analysis", {})["cost"] = cost
@@ -948,7 +834,6 @@ def main() -> None:
             k360_doc = k360_for_pdf if k360_for_pdf and (k360_for_pdf.get("consolidation") or {}).get("source") == "k360" and not (k360_for_pdf.get("consolidation") or {}).get("error") else None
             if diag_acc is not None and not (diag_acc.get("consolidation") or {}).get("error"):
                 jobs = quote_pdf_jobs(acc, diag_acc, [
-                    (_load_quote(diag_acc.get("compressioncalc_account")), "consolidation_compressioncalc"),
                     (k360_doc, "consolidation_k360"),
                 ])
             else:

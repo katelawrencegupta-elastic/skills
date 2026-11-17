@@ -12,7 +12,7 @@ A script finds the other two skills beside its own folder, then in `~/.claude/sk
 | 2 | [k360-account-analysis](k360-account-analysis/SKILL.md) | One customer's footprint, ECU, storage, burndown, and projections | Diagnostic bundles and a Serverless price |
 | 3 | [diag-serverless-consolidation](diag-serverless-consolidation/SKILL.md) | A Serverless quote from diagnostic bulk and measured retention | Using stored GB ÷ assumed retention as the quoted ingest |
 
-Run each command from the project that holds `.env`. Reports and diagnostic bundles land in `serverless_analyzer/diag_artifacts/<customer>_<date>/`. `--artifacts-root` overrides that directory.
+Run each command from the project that holds `.env`. Reports and diagnostic bundles land in `~/serverless_analyzer_artifacts/<customer>_<date>/`. `SERVERLESS_ANALYZER_ARTIFACTS` or `--artifacts-root` overrides that directory.
 
 The K360 fetch, Sheets sign-in, and org report are `k360-org-report` in this folder. `.env` stays in the project you run from. The installer finds that file in the current directory, then in a parent directory.
 
@@ -59,7 +59,7 @@ References: `setup.md` is the machine setup. `output-schema.md` is the account J
 
 ## diag-serverless-consolidation
 
-Prices Observability and Security from Elasticsearch diagnostic bundles. Daily GB is bulk on the write indices. Retention is the measured age, written as a whole month. Search disk is local store, and Search ingest stays the K360 rate scaled by that store. The estimator read-back is the dollar. Bulk is measured after ingest pipelines and before compression, so it is written to the estimators as metered ingest: Observability through the Option 1 cells, Security as bulk ÷ the sheet's expansion factor. The earlier compression-applied set (bulk × 0.60) is retired.
+Prices Observability and Security from Elasticsearch diagnostic bundles. Daily GB is bulk on the write indices. Retention is the measured age, written as a whole month. Search disk is local store, and Search ingest stays the K360 rate scaled by that store. The estimator read-back is the dollar. Bulk is measured after ingest pipelines and before compression, so it is written to the estimators as metered ingest: Observability through the Option 1 cells, Security as bulk ÷ the sheet's expansion factor. The earlier compression-applied set is retired.
 
 `python <skill>/scripts/run_consolidation.py --org "ORG NAME" --reuse <org_report.json> --diags-dir <bundles>`
 
@@ -75,7 +75,7 @@ Prices Observability and Security from Elasticsearch diagnostic bundles. Daily G
 | `consolidation.py` | Builds the savings, deployment-count plan, per-cluster cost table, metered rates, and quote integrity from the read-backs |
 | `quote_checks.py` | Checks the estimator layout before a write, the sheet echo, coverage, retention, unrated ingest, and published totals. No network |
 | `diag_inputs.py` | Prints 2–5 project packs and per-deployment inputs. It does not quote dollars |
-| `privacy.py` | Sets private file modes and warns when `.env` or `diag_artifacts/` would be committed |
+| `privacy.py` | Sets private file modes and warns when `.env` or an in-repo `diag_artifacts/` folder would be committed |
 | `test_diag_quote.py` | Offline unit tests. No Google account and no sheets |
 | `skill_paths.py` | Finds `k360-org-report` and `k360-account-analysis` for this run. The same file is in the other two skills |
 
@@ -97,4 +97,4 @@ References: `calculations.md` is the arithmetic. `sizing-cells.md` is the estima
 
 ## How a quote is assembled
 
-`k360-org-report` writes `<customer>_<date>_org_report.json`. `k360-account-analysis` can reuse that file for the summary. `diag-serverless-consolidation` reuses it again, then replaces ingest and retention with the diagnostic measurements. Observability monthly is D38. Security monthly is E74, or the sheet's month 36 when retention is above 12 months. Search is the es3 performant profile. Every PDF is in the customer folder root: the account PDF, the appendix, and the consolidation PDF. Estimate sheets are directly in `generated_estimates/`, and plan sheets in `generated_estimates/plan_sheets/`. There are no `full_retention` or `30d` folders, and no 30-day read.
+`k360-org-report` writes `<customer>_<date>_org_report.json`. `k360-account-analysis` can reuse that file for the summary. `diag-serverless-consolidation` reuses it again, then replaces ingest and retention with the diagnostic measurements. Observability monthly is D38. Security monthly is E74. Search is the es3 performant profile. Every PDF is in the customer folder root: the account PDF, the appendix, and the consolidation PDF. Estimate sheets are directly in `generated_estimates/`, and plan sheets in `generated_estimates/plan_sheets/`. There are no `full_retention` or `30d` folders, and no 30-day read.

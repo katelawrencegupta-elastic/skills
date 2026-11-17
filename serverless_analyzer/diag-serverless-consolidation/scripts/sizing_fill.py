@@ -153,24 +153,6 @@ def region_options(sheets, sid: str) -> list[str]:
     return opts
 
 
-# ----------------------------------------------------------------------------- region match
-def _norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
-
-
-def _azure_aliases(region: str) -> set[str]:
-    """eastus2 ⇄ us-east-2, westeurope ⇄ europe-west, …"""
-    r = _norm(region)
-    out = {r}
-    m = re.match(r"^(east|west|north|south|central|southeast|northeast)(us|europe|asia|india|australia|uk|japan|brazil|canada|germany|france|norway|sweden|switzerland|uae|korea|africa|qatar|poland|italy|israel|spain)(\d*)$", r)
-    if m:
-        out.add(f"{m.group(2)}{m.group(1)}{m.group(3)}")
-    m = re.match(r"^(us|europe|asia|india|australia|uk|japan|brazil|canada|germany|france|norway|sweden|switzerland|uae|korea|africa|qatar|poland|italy|israel|spain)(east|west|north|south|central|southeast|northeast)(\d*)$", r)
-    if m:
-        out.add(f"{m.group(2)}{m.group(1)}{m.group(3)}")
-    return out
-
-
 def es3_python() -> Path | None:
     env = os.environ.get("ES3_ESTIMATOR_PY")
     candidates = [Path(env)] if env else []
@@ -186,63 +168,6 @@ def es3_python() -> Path | None:
     return None
 
 
-def _md_cell(value) -> str:
-    if value is None or value == "":
-        return "—"
-    return str(value)
-
-
-def search_markdown(customer: str, when: str, se: dict, provider, region, result: dict) -> str:
-    wl = (se.get("workload") or {}).get("search") or {}
-    ing = (se.get("workload") or {}).get("ingest") or {}
-    lines = [
-        f"# {customer} — Search Serverless estimate — {when}",
-        "",
-        "Priced with the es3-estimator library (`estimate_serverless_pricing`), the same function the Jupyter notebook runs.",
-        "Performant is the profile this skill quotes. The es3-estimator README says more than 98% of customers run Performant, so it is the setting the model has the most data for. On-demand and high availability are shown beside it; the README says on-demand can come out too high and high availability too low because of the training data.",
-        "",
-        "## Consolidated Search slice (from K360)",
-        f"- Deployments: {se.get('deployments')}",
-        f"- ECU (lookback): {se.get('ecu_lookback', 0):,.0f} · monthly avg {se.get('ecu_monthly_avg', 0):,.0f}",
-        f"- Stored GB: {se.get('stored_gb', 0):,.0f}" + (" (estimated from ECU share — no telemetry)" if se.get("gb_estimated_from_ecu_share") else ""),
-        f"- Provider / region: {provider} / {region}",
-        "",
-        "## Workload sent to the estimator",
-        f"- Peak QPS {wl.get('peak', {}).get('qps')} · {wl.get('peak', {}).get('complexity_ms')} ms · {wl.get('peak', {}).get('pct_hours_mo')}% of hours",
-        f"- Non-peak QPS {wl.get('nonpeak', {}).get('qps')} · {wl.get('nonpeak', {}).get('complexity_ms')} ms · {wl.get('nonpeak', {}).get('pct_hours_mo')}% of hours",
-        f"- Idle {wl.get('idle_pct_hours_mo')}% of hours (billed by the estimator as the hours left in a 730 h month)",
-        f"- Ingest {ing.get('docs_per_sec')} docs/s · avg doc {ing.get('avg_doc_bytes')} B · active {ing.get('active_hours_mo')} h/mo",
-        "",
-    ]
-    inputs = result.get("inputs") or {}
-    if inputs:
-        lines.append(f"- Mapped to {inputs.get('provider')} {inputs.get('region')}, support {inputs.get('support_level')}, stored {inputs.get('stored_gb')} GB")
-        lines.append("")
-    profiles = result.get("profiles") or []
-    if profiles:
-        header = ["Search Power", "Total $/mo", "Search $/mo", "Ingest $/mo", "Storage $/mo", "Support $/mo", "Search VCU/h", "Idle VCU/h", "Limitation"]
-        keys = ["Search Power Setting", "Total $/month", "Search $/month", "Ingest $/month", "Storage $/month", "Support $/month", "Provisioned Search VCU/h", "Idle Search VCU/h", "Profile Limitation"]
-        lines.append("## Profiles")
-        lines.append("| " + " | ".join(header) + " |")
-        lines.append("| " + " | ".join("---" for _ in header) + " |")
-        for row in profiles:
-            lines.append("| " + " | ".join(_md_cell(row.get(key)) for key in keys) + " |")
-        lines.append("")
-    assumptions = result.get("assumptions") or []
-    if assumptions:
-        lines.append("## Assumptions")
-        lines.extend(f"- {item}" for item in assumptions)
-        lines.append("")
-    if result.get("error"):
-        lines.append(f"Estimator error: {result['error']}")
-        lines.append("")
-    return "\n".join(lines)
-
-
-# Set from --allow-nearest-region. The default refuses any other region.
-_ALLOW_NEAREST = False
-
-
 def run_es3(payload: dict) -> dict:
     py = es3_python()
     if py is None:
@@ -252,7 +177,8 @@ def run_es3(payload: dict) -> dict:
         }
     script = Path(__file__).resolve().parent / "es3_estimate.py"
     body = dict(payload)
-    if _ALLOW_NEAREST:
+    import sizing_shared
+    if sizing_shared._ALLOW_NEAREST:
         body["allow_nearest_region"] = True
     try:
         proc = subprocess.run(
@@ -311,8 +237,9 @@ def match_region(provider: str | None, region: str | None, options: list[str]) -
     """
     from estimator_layout import match_region as _shared
 
+    import sizing_shared
     option, how = _shared(provider, region, options)
-    if option is not None or not _ALLOW_NEAREST:
+    if option is not None or not sizing_shared._ALLOW_NEAREST:
         return option, how
     nearest = _nearest_same_provider(provider, region, options)
     if nearest is None:

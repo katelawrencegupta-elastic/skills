@@ -102,7 +102,6 @@ SEC_READBACK = {
 
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 FOLDER_MIME = "application/vnd.google-apps.folder"
-GDOC_MIME = "application/vnd.google-apps.document"
 GSHEET_MIME = "application/vnd.google-apps.spreadsheet"
 _REGION_OPT = re.compile(r"^(AWS|AZURE|GCP)\s*:?\s*([a-z0-9\-]+)", re.IGNORECASE)
 
@@ -252,14 +251,6 @@ def copy_template(drive, template_id: str, title: str, parent_id: str, *, reuse:
     return _sheet_record(meta), False
 
 
-# Exit status when an estimator copy does not have the layout this skill writes.
-TEMPLATE_MISMATCH_EXIT = 3
-
-
-class TemplateMismatch(RuntimeError):
-    """The estimator copy is not the layout these cell addresses were written for."""
-
-
 def verify_template(sheets, sid: str, kind: str, tab: str) -> dict:
     """Read the labels beside every cell the skill uses, and the sheet's version.
 
@@ -360,20 +351,6 @@ def write_search_sheet(drive, local_dir: Path, parent_id: str, title: str, resul
     seal_text(path, csv_text)
     uploaded = upload_csv_as_sheet(drive, path, parent_id, title)
     return {"local": str(path), "url": uploaded["url"], "spreadsheet_id": uploaded["id"]}
-
-
-def upload_text_as_doc(drive, local: Path, parent_id: str, title: str) -> dict:
-    from googleapiclient.http import MediaFileUpload
-
-    parent_id = require_customer_parent(parent_id)
-    media = MediaFileUpload(str(local), mimetype="text/plain", resumable=False)
-    existing = find_in_folder(drive, parent_id, title)
-    if existing:
-        assert_not_template(existing["id"])
-        meta = _execute(lambda: drive.files().update(fileId=existing["id"], media_body=media, fields="id,name,webViewLink"))
-    else:
-        meta = _execute(lambda: drive.files().create(body={"name": title, "parents": [parent_id], "mimeType": GDOC_MIME}, media_body=media, fields="id,name,webViewLink"))
-    return {"id": meta["id"], "name": meta["name"], "url": meta.get("webViewLink") or f"https://docs.google.com/document/d/{meta['id']}/edit"}
 
 
 def _execute(build, attempts: int = 6):

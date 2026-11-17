@@ -103,8 +103,6 @@ XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 
-GDOC_MIME = "application/vnd.google-apps.document"
-
 GSHEET_MIME = "application/vnd.google-apps.spreadsheet"
 
 _REGION_OPT = re.compile(r"^(AWS|AZURE|GCP)\s*:?\s*([a-z0-9\-]+)", re.IGNORECASE)

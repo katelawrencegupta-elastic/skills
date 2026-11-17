@@ -61,11 +61,11 @@ def artifacts_root() -> Path:
     """Parent of <customer>_<date>/ run folders.
 
     SERVERLESS_ANALYZER_ARTIFACTS overrides this. The default is
-    serverless_analyzer/diag_artifacts, beside the three skill folders.
+    ~/serverless_analyzer_artifacts, outside the git checkout.
     CLOUD_TRACKER_ARTIFACTS_ROOT is honored only when the new variable is unset.
     """
     for name in ("SERVERLESS_ANALYZER_ARTIFACTS", "CLOUD_TRACKER_ARTIFACTS_ROOT"):
         env = os.environ.get(name)
         if env:
             return Path(env).expanduser()
-    return Path(__file__).resolve().parents[2] / "diag_artifacts"
+    return Path.home() / "serverless_analyzer_artifacts"

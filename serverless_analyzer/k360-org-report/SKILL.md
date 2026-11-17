@@ -40,7 +40,7 @@ python <skill>/scripts/run_org_report.py --org "ORG_NAME" --report full
 
 # Same fetch, other flavor. The pipeline prints this path as "reuse":
 python <skill>/scripts/run_org_report.py --org "ORG_NAME" --report full \
-  --reuse serverless_analyzer/diag_artifacts/<customer>_<date>/<customer>_<date>_org_report.json
+  --reuse ~/serverless_analyzer_artifacts/<customer>_<date>/<customer>_<date>_org_report.json
 ```
 
 `.env`: `KIBANA_URL` (https, no username or password in it), `ELASTIC_API_KEY`. Other flags: `--org-id ID` (repeat when one customer name covers several cloud orgs) · `--skip-pdf` · `--skip-push` · `--skip-workload` · `--days N`.
@@ -49,7 +49,7 @@ python <skill>/scripts/run_org_report.py --org "ORG_NAME" --report full \
 
 `--reuse` takes the org JSON in that customer's artifacts folder. The run stops when the file's organization name is not `--org` and does not start with it, or when `--org-id` is not in the file. A file fetched more than 7 days ago prints a warning with its fetch date. The fetch writes to a private temporary folder and the pipeline copies it into the artifacts folder. There is no shared `/tmp` file.
 
-**Pipeline:** fetch → `serverless_analyzer/diag_artifacts/<customer>_<date>/` → slim JSON → Observability estimator copy (Drive+xlsx) → HTML+PDF (named by `--report`) → Drive PDF upload. When Chrome is missing, the HTML file is the report and the PDF upload is skipped. Folders are mode 0700 and files 0600.
+**Pipeline:** fetch → `~/serverless_analyzer_artifacts/<customer>_<date>/` → slim JSON → Observability estimator copy (Drive+xlsx) → HTML+PDF (named by `--report`) → Drive PDF upload. When Chrome is missing, the HTML file is the report and the PDF upload is skipped. Folders are mode 0700 and files 0600.
 
 ## After the script (agent only)
 1. Open the matching child doc (`exec-report.md` or `full-report.md`).
@@ -63,7 +63,7 @@ python <skill>/scripts/run_org_report.py --org "ORG_NAME" --report full \
 - `truncated` lists any aggregation that held more than 300 deployments. Say so when it is not empty: totals are low.
 
 ## Artifacts (same folder for both)
-`serverless_analyzer/diag_artifacts/<customer>_<date>/` holds the Observability estimator copy, chosen `*_Exec_report` or `*_Full_report` PDF, HTML, org JSON, canvas/offload/summary, `artifacts.json`. Both PDFs may coexist in the folder. `--artifacts-root` overrides that directory.
+`~/serverless_analyzer_artifacts/<customer>_<date>/` holds the Observability estimator copy, chosen `*_Exec_report` or `*_Full_report` PDF, HTML, org JSON, canvas/offload/summary, `artifacts.json`. Both PDFs may coexist in the folder. `SERVERLESS_ANALYZER_ARTIFACTS` or `--artifacts-root` overrides that directory.
 
 The Observability copy is checked against `estimator_layout.py` before any cell is written. Its region cell is written only when the copy lists an option for the org's own provider and region; otherwise the copy keeps the template's region and `artifacts.json` records `region_match: "none"`. The Search (ES3) estimator is **not filled**: no ES3 layout is recorded in `estimator_layout.py`, so a copy cannot be checked. `artifacts.json` → `es3_not_filled` says so. The Search price in §10 is the Python model.
 

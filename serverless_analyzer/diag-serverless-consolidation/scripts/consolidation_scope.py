@@ -28,7 +28,7 @@ from quote_checks import (
 )
 from skill_paths import find_skill
 
-from constants import DAYS_PER_MONTH, ESTIMATE_MONTHS
+from constants import DAYS_PER_MONTH, ESTIMATE_MONTHS, O11Y_METER_FACTOR
 MAX_LOOKBACK_DAYS = 365
 _INGEST_KEYS = (
     "daily_raw_gb", "logs_gb_day", "metrics_gb_day", "siem_gb_day",
@@ -219,7 +219,7 @@ except Exception:  # fallback mirror of Estimator_Reference v1.19 ladders
                 break
         return cost
 
-    def price_o11y_serverless(daily_raw_gb: float, retention_months: float, *, meter_factor: float = 1.595, support_uplift: float = 0.15) -> dict:
+    def price_o11y_serverless(daily_raw_gb: float, retention_months: float, *, meter_factor: float = O11Y_METER_FACTOR, support_uplift: float = 0.15) -> dict:
         metered = daily_raw_gb * meter_factor
         ingest_mo = _tiered_cost(metered, _O11Y_INGEST_EDGES, _O11Y_INGEST_PRICES) * DAYS_PER_MONTH
         retained = metered * DAYS_PER_MONTH * retention_months
@@ -235,7 +235,6 @@ except Exception:  # fallback mirror of Estimator_Reference v1.19 ladders
     price_es3_search = None  # type: ignore
 
 
-O11Y_METER_FACTOR = 1.595
 
 ECH_SCOPES = ("priced", "all")
 MIN_PRICED_ECU_PCT = 90.0

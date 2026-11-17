@@ -99,7 +99,7 @@ def _prune(node, path, seen):
 _URL = re.compile(r"https?://[^\s\"'<>]*google[^\s\"'<>]*", re.IGNORECASE)
 _HOME = re.compile(r"/Users/[^\s\"'<>]*")
 _HEX_ID = re.compile(r"\b[0-9a-f]{32}\b", re.IGNORECASE)
-_ACCT = re.compile(r"acct-[abc](?:_[A-Za-z0-9][A-Za-z0-9_\-]*|[A-Za-z][A-Za-z0-9_\-]*)")
+_ACCT = re.compile(r"acct-[abc][A-Za-z0-9_\- ,\.]*")
 _DROP_KEYS = {"ARR"}
 
 

@@ -21,7 +21,7 @@ from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 
-MONTHLY_HOURS = 730
+from constants import HOURS_PER_MONTH as MONTHLY_HOURS
 # The search-power setting whose total is the Search quote. The estimator's README
 # says more than 98% of customers run performant, so its model has the most data
 # for it. The other settings are reported beside it and are never the quote.
@@ -66,23 +66,6 @@ def estimator_dir() -> Path:
 
 def _norm(value: str) -> str:
     return "".join(ch for ch in (value or "").lower() if ch.isalnum())
-
-
-def _azure_aliases(region: str) -> set[str]:
-    r = _norm(region)
-    out = {r}
-    # eastus2 ⇄ useast2, and a leading provider token (azureeastus2) stripped by the caller
-    for compass in ("east", "west", "north", "south", "central", "southeast", "northeast"):
-        for geo in (
-            "us", "europe", "asia", "india", "australia", "uk", "japan", "brazil",
-            "canada", "germany", "france", "norway", "sweden", "switzerland",
-            "uae", "korea", "africa", "qatar", "poland", "italy", "israel", "spain",
-        ):
-            if r.startswith(compass + geo):
-                out.add(geo + compass + r[len(compass + geo):])
-            if r.startswith(geo + compass):
-                out.add(compass + geo + r[len(geo + compass):])
-    return out
 
 
 def match_provider(raw: str | None, pricing: dict) -> str | None:

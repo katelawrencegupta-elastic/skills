@@ -15,15 +15,14 @@ from estimator_layout import (  # noqa: E402,F401
     TEMPLATE_ANCHORS, cell_range, check_value_ranges, layout_ranges, template_check, template_version,
 )
 from constants import (  # noqa: E402
-    BILLING_WINDOW_MIN_SHARE, COUNTER_AGE_MAX_SHARE, PLAN_HEADLINE_SHARE, PLAN_HEADLINE_USD,
-    RATE_WINDOW_MAX_SHARE,
+    BILLING_WINDOW_MIN_SHARE, COUNTER_AGE_MAX_SHARE, ECHO_TOLERANCE_GB_DAY, ECHO_TOLERANCE_SHARE,
+    PLAN_HEADLINE_SHARE, PLAN_HEADLINE_USD, RATE_WINDOW_MAX_SHARE,
 )
 
 # The sheet echo has to match the GB/day written. The sheet rounds a little, so there is a floor,
 # and a large rate gets a share of itself. It was a flat 0.51 GB/day, which no sheet under 0.51
 # GB/day could ever fail and which let a 5% error through at 10 GB/day.
-ECHO_TOLERANCE_FLOOR_GB_DAY = 0.02
-ECHO_TOLERANCE_SHARE = 0.001
+ECHO_TOLERANCE_FLOOR_GB_DAY = ECHO_TOLERANCE_GB_DAY
 
 
 def echo_tolerance(written) -> float:
@@ -644,10 +643,6 @@ def e73_blocks_quote(value) -> bool:
     return abs(amount) > 0.005
 
 
-# Above this many months, month 12 on the Security sheet has not finished filling retention.
-SECURITY_MONTH12_STEADY_MAX = 12
-
-
 def security_readback(readback: dict, retention_months) -> dict:
     """Security read-back with the steady month and the add-on lines made explicit.
 
@@ -671,10 +666,7 @@ def security_readback(readback: dict, retention_months) -> dict:
             out["cps_addon_e73"] = out.get("cps_addon_monthly")
             out["cps_addon_monthly"] = round(cps + other, 2)
             out["addon_note"] = f"Security add-on lines E63 to E72 total ${other:,.2f}/mo on the sheet."
-    try:
-        months = float(retention_months)
-    except (TypeError, ValueError):
-        months = None
+    del retention_months
     out["steady_basis"] = "month 12 (E74)"
     return out
 

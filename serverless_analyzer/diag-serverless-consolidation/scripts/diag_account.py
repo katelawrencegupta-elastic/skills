@@ -30,13 +30,6 @@ from diag_inputs import ESTIMATE_MONTHS, whole_months
 from constants import DAYS_PER_MONTH
 RETENTION_MIN = 1.0
 RETENTION_MAX = 36.0
-COMPRESSIONCALC = "compressioncalc_accounted_for"
-COMPRESSION_FORMULA = (
-    "compressioncalc_accounted_for is write-index bulk GB/day multiplied by 0.60. "
-    "On-disk bytes are not used for that GB/day. "
-    "Observability and Security write this ingest. "
-    "Search re-estimates local store multiplied by 0.60."
-)
 
 
 def _norm(name: str) -> str:
@@ -72,26 +65,6 @@ def _dep_bulk_gb(dep: dict) -> float:
     if dep.get("bulk_gb_day_raw") is not None:
         return float(dep.get("bulk_gb_day_raw") or 0)
     return float(dep.get("daily_raw_gb") or 0)
-
-
-def _accounted_from_bulk(bulk: float) -> tuple[float, float | None]:
-    """Second estimate: keep 60% of bulk. On-disk bytes are not used."""
-    from admin_diags import COMPRESSION_RATIO
-
-    if bulk <= 0:
-        return 0.0, None
-    return round(float(bulk) * COMPRESSION_RATIO, 3), COMPRESSION_RATIO
-
-
-def _compression_fields(group: list[dict]) -> dict:
-    """Bulk and compressioncalc_accounted_for. The ratio is 0.60 whenever bulk is above 0."""
-    raw = sum(_dep_bulk_gb(dep) for dep in group)
-    accounted, ratio = _accounted_from_bulk(raw)
-    return {
-        "bulk_gb_day": round(raw, 3),
-        COMPRESSIONCALC: accounted,
-        "compression_ratio": ratio,
-    }
 
 
 MIX_KEYS = ("logs_gb_day", "k8s_logs_gb_day", "metrics_gb_day", "traces_gb_day")
@@ -192,7 +165,9 @@ def _rollup_solutions(out: dict, clamped_notes: list[str]) -> None:
         blk["gb_estimated_from_ecu_share"] = False
         blk["has_workload"] = bool(stored > 0 or daily != 0 or (blk.get("ecu_lookback") or 0))
         blk["ingest_source"] = "diagnostics"
-        blk.update(_compression_fields(group))
+        blk["bulk_gb_day"] = round(sum(_dep_bulk_gb(dep) for dep in group), 3)
+        blk.pop("compressioncalc_accounted_for", None)
+        blk.pop("compression_ratio", None)
         if sol == "observability":
             try:
                 mix = observability_mix(group)
@@ -225,41 +200,6 @@ def _rollup_solutions(out: dict, clamped_notes: list[str]) -> None:
                 totals[sol]["deployments"] = len(group)
         con[sol] = blk
     sz["consolidated"] = con
-
-
-def compressioncalc_account(acc: dict) -> dict:
-    """Copy whose Observability and Security ingest is compressioncalc_accounted_for.
-
-    That figure is bulk GB/day × 0.60. On-disk bytes are not used for that GB/day.
-    Search keeps its measured store on this copy. The compression sizing multiplies
-    that store by 0.60 when it re-estimates Search.
-    """
-    out = copy.deepcopy(acc)
-    for dep in (out.get("solutions") or {}).get("by_deployment") or []:
-        if dep.get("platform") == "serverless" or dep.get("ingest_source") == "inactive":
-            continue
-        if (dep.get("solution") or "search") == "search":
-            continue
-        raw = float(dep.get("daily_raw_gb") or 0)
-        dep["bulk_gb_day_raw"] = round(raw, 3)
-        dep["daily_raw_gb"] = round(float(dep.get(COMPRESSIONCALC) or 0), 3)
-    clamped: list[str] = []
-    _rollup_solutions(out, clamped)
-    sz = out.setdefault("sizing", {})
-    sz["ingest_basis"] = COMPRESSIONCALC
-    prior = (acc.get("sizing") or {}).get("estimators") or {}
-    kept = [p for p in (prior.get("projects") or []) if p.get("solution") == "search"]
-    estimators = {"projects": kept}
-    if prior.get("search"):
-        estimators["search"] = copy.deepcopy(prior["search"])
-    sz["estimators"] = estimators
-    out.pop("consolidation", None)
-    stale = ("written to the estimator", "sheet is not filled")
-    notes = [n for n in (sz.get("notes") or []) if not any(phrase in n for phrase in stale)]
-    notes.insert(0, COMPRESSION_FORMULA)
-    notes.extend(clamped)
-    sz["notes"] = notes
-    return out
 
 
 UNMEASURED_MODES = ("exclude", "fail")
@@ -338,9 +278,8 @@ def apply_diagnostics(
             matched += 1
             dep["gb"] = round(float(hit.get("store_gb") or 0), 2)
             dep["daily_raw_gb"] = round(float(hit.get("bulk_gb_day") or 0), 3)
-            accounted, ratio = _accounted_from_bulk(float(dep["daily_raw_gb"]))
-            dep["compression_ratio"] = ratio
-            dep[COMPRESSIONCALC] = accounted
+            dep.pop("compression_ratio", None)
+            dep.pop("compressioncalc_accounted_for", None)
             snapshot_gb += float(hit.get("snapshot_gb") or 0)
             split = hit.get("bulk_mix")
             for key in MIX_KEYS:
@@ -481,7 +420,6 @@ def apply_diagnostics(
         for r in active_rows if r.get("retention_basis") in ("assumed", "blended")
     ]
     bulk_sum = sum(float(r.get("bulk_gb_day") or 0) for r in active_rows)
-    accounted_sum, share = _accounted_from_bulk(bulk_sum)
     active_store = sum(float(r.get("store_gb") or 0) for r in active_rows)
     unrated_rows.sort(key=lambda row: -(row["store_gb"] or 0))
     unrated_store = round(sum(row["store_gb"] for row in unrated_rows), 2)
@@ -505,8 +443,6 @@ def apply_diagnostics(
         "unmatched_diagnostics": unmatched_diags[:12],
         "short_uptime": short,
         "bulk_gb_day": round(bulk_sum, 2),
-        COMPRESSIONCALC: round(accounted_sum, 3),
-        "compression_ratio": None if share is None else round(share, 3),
         "store_gb": round(sum(float(r.get("store_gb") or 0) for r in rows if r.get("name") in used and r.get("name") not in inactive_bundles), 2),
         "snapshot_gb": round(snapshot_gb, 2),
         "retention_unmeasured": no_age,

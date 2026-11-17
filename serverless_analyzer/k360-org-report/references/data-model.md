@@ -135,7 +135,7 @@ Also:
   - `es3.layout` is `null`: no ES3 layout is recorded, so the block is not filled. `o11y.layout` is `1.22`.
   - `es3.hour_mix`: `{peak_pct, nonpeak_pct, idle_pct, assumed}`, the mix the Python price used. `es3.assumed` is true when any cell is an assumption. `es3.assumed_cells` and `unmeasured_cells` name them. `o11y.unmeasured_cells` names `G23` / `G25` when there is no Observability slice.
   - Every cell has a value. Not measured is 0.
-- `estimator_artifacts` (after push): local + Drive folder `serverless_analyzer/diag_artifacts/<customer>_<date>/`;
+- `estimator_artifacts` (after push): local + Drive folder `~/serverless_analyzer_artifacts/<customer>_<date>/`;
   copy named `<customer>_<date>_Observability` (+ `.xlsx` export);
   PDF = `<customer>_<date>_Exec_report.pdf` in that **same** folder (local + Drive).
   - `artifacts[]`: each filled copy with `region_match` (`exact`, `alias`, `none`), `region_option`, `region_wanted`.

@@ -29,24 +29,6 @@ from estimate_paths import *  # noqa: F401,F403
 from sizing_fill import *  # noqa: F401,F403
 from plan_sizing import *  # noqa: F401,F403
 
-# Tests patch names on this module. The moved functions have to look those names
-# up here, or a patch on size_serverless never reaches the callee.
-import sys as _sys
-import types as _types
-
-_here = _sys.modules[__name__].__dict__
-_ours = {"sheets_io", "estimate_paths", "sizing_fill", "plan_sizing"}
-for _name, _value in list(_here.items()):
-    if isinstance(_value, _types.FunctionType) and _value.__module__ in _ours:
-        _rebound = _types.FunctionType(_value.__code__, _here, _value.__name__, _value.__defaults__, _value.__closure__)
-        _rebound.__module__ = _value.__module__
-        _rebound.__doc__ = _value.__doc__
-        _rebound.__annotations__ = getattr(_value, "__annotations__", {})
-        _rebound.__kwdefaults__ = _value.__kwdefaults__
-        _here[_name] = _rebound
-        _sys.modules[_value.__module__].__dict__[_name] = _rebound
-del _name, _value, _rebound, _here
-
 def _checkpoint_sizing(local_dir: Path, sizing_name: str, sz: dict, estimators: dict) -> None:
     """Write sizing.json after a solution so a later timeout keeps the read-backs already priced."""
     sz["estimators"] = estimators
@@ -74,8 +56,8 @@ def main() -> None:
     ap.add_argument("--deployment-plan", action="store_true", help="Price the deployment-count bars from one project per ECH deployment down to one project per feature per region")
     ap.add_argument("--allow-nearest-region", action="store_true", help="Write the nearest same-provider region when the deployment's region is not on the estimator list. The quote stays unverified.")
     args = ap.parse_args()
-    global _ALLOW_NEAREST
-    _ALLOW_NEAREST = bool(args.allow_nearest_region)
+    import sizing_shared
+    sizing_shared._ALLOW_NEAREST = bool(args.allow_nearest_region)
     args.skip_xlsx = not args.xlsx
 
     acc_path = Path(args.account_json)
@@ -222,7 +204,7 @@ def main() -> None:
         lines.append(plan.get("error") or f"Deployment plan → {len(plan.get('bars') or [])} bars")
         print("\n".join(lines))
         return
-    estimators: dict = {}
+    estimators: dict = dict(sz.get("estimators") or {})
 
     # ---------------- Observability
     o = con["observability"]
@@ -246,10 +228,13 @@ def main() -> None:
         reg, how = match_region(provider, o_scope or region, opts)
         if how == "none" or not reg:
             reason = _region_rejected(o_scope or region)
+            try:
+                trash_file(drive, copied["id"])
+            except Exception:  # noqa: BLE001
+                pass
             estimators["observability"] = {
-                "kind": "observability", "title": copied["name"], "spreadsheet_id": copied["id"],
-                "url": copied["url"], "region_match": "none", "readback_rejected": reason,
-                "readback": {}, "status": "unquoted",
+                "kind": "observability", "title": title_o, "region_match": "none",
+                "readback_rejected": reason, "readback": {}, "status": "unquoted",
             }
             lines.append(f"Observability → {reason}")
         else:
@@ -283,6 +268,17 @@ def main() -> None:
                     entry["local_xlsx_error"] = str(ex)
             estimators["observability"] = entry
             lines.append(f"Observability → {copied['url']}  ({n} cells; Y1 {rb.get('annual_year1')}, monthly {rb.get('monthly_steady_state')}; region {reg} [{how}])")
+            extra = fleet_measured_copy({
+                "solution": "observability", "region": o_scope or region, "title": title_o,
+                "stored_gb": float(o.get("stored_gb") or 0), "parent_id": folder["id"],
+                "local_dir": str(estimate_dir), "provider": provider, "support": support,
+                "feature_tier": (acc.get("sizing") or {}).get("feature_tier"), "skip_xlsx": True,
+                "reuse": True, "basis": basis, "template_id": args.o11y_id, "tab": O11Y_TAB,
+                "readback": O11Y_READBACK, "retention": o_months, "daily": daily,
+                "mix": o_mix, "measured": o.get("retention_months_measured"),
+            })
+            if extra:
+                estimators.setdefault("projects", []).append(extra)
 
     _checkpoint_sizing(local_dir, sizing_name, sz, estimators)
 
@@ -308,10 +304,13 @@ def main() -> None:
         reg, how = match_region(provider, s_scope or region, opts)
         if how == "none" or not reg:
             reason = _region_rejected(s_scope or region)
+            try:
+                trash_file(drive, copied["id"])
+            except Exception:  # noqa: BLE001
+                pass
             estimators["security"] = {
-                "kind": "security", "title": copied["name"], "spreadsheet_id": copied["id"],
-                "url": copied["url"], "region_match": "none", "readback_rejected": reason,
-                "readback": {}, "status": "unquoted",
+                "kind": "security", "title": title_s, "region_match": "none",
+                "readback_rejected": reason, "readback": {}, "status": "unquoted",
             }
             lines.append(f"Security → {reason}")
         else:
@@ -332,6 +331,17 @@ def main() -> None:
                     entry["local_xlsx_error"] = str(ex)
             estimators["security"] = entry
             lines.append(f"Security → {copied['url']}  ({n} cells; Y1 {rb.get('annual_year1')}; region {reg} [{how}])")
+            extra = fleet_measured_copy({
+                "solution": "security", "region": s_scope or region, "title": title_s,
+                "stored_gb": float(s.get("stored_gb") or 0), "parent_id": folder["id"],
+                "local_dir": str(estimate_dir), "provider": provider, "support": support,
+                "feature_tier": (acc.get("sizing") or {}).get("feature_tier"), "skip_xlsx": True,
+                "reuse": True, "basis": basis, "template_id": args.security_id, "tab": SEC_TAB,
+                "readback": SEC_READBACK, "retention": s_months, "daily": s_daily,
+                "measured": s.get("retention_months_measured"),
+            })
+            if extra:
+                estimators.setdefault("projects", []).append(extra)
 
     _checkpoint_sizing(local_dir, sizing_name, sz, estimators)
 
@@ -406,11 +416,12 @@ def main() -> None:
         local_dir=estimate_dir, customer=meta["customer"], when=meta["date"], name_suffix=suffix,
         only=project_only, force_months=args.force_months,
     )
+    kept_measured = [p for p in (estimators.get("projects") or []) if p.get("role") == "measured_retention"]
     if args.skip_search:
-        kept = [p for p in ((sz.get("estimators") or {}).get("projects") or []) if p.get("solution") == "search"]
-        estimators["projects"] = fresh_projects + kept
+        kept = [p for p in ((sz.get("estimators") or {}).get("projects") or []) if p.get("solution") == "search" and p.get("role") != "measured_retention"]
+        estimators["projects"] = kept_measured + fresh_projects + kept
     else:
-        estimators["projects"] = fresh_projects
+        estimators["projects"] = kept_measured + fresh_projects
     prefer_regional_estimators(estimators)
 
     sz["folder"] = str(local_dir)

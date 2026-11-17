@@ -45,23 +45,6 @@ from consolidation_scope import *  # noqa: F401,F403
 from consolidation_regional import *  # noqa: F401,F403
 from consolidation_eis import *  # noqa: F401,F403
 
-# Tests patch names on this module. Moved functions look those names up here.
-import sys as _sys
-import types as _types
-
-_here = _sys.modules[__name__].__dict__
-_ours = {"consolidation_scope", "consolidation_regional", "consolidation_eis"}
-for _name, _value in list(_here.items()):
-    if isinstance(_value, _types.FunctionType) and _value.__module__ in _ours:
-        _rebound = _types.FunctionType(_value.__code__, _here, _value.__name__, _value.__defaults__, _value.__closure__)
-        _rebound.__module__ = _value.__module__
-        _rebound.__doc__ = _value.__doc__
-        _rebound.__annotations__ = getattr(_value, "__annotations__", {})
-        _rebound.__kwdefaults__ = _value.__kwdefaults__
-        _here[_name] = _rebound
-        _sys.modules[_value.__module__].__dict__[_name] = _rebound
-del _name, _value, _rebound, _here, _ours
-
 def build_consolidation(acc: dict, infra: dict | None) -> dict:
     sz = acc.get("sizing") or {}
     e = acc.get("ecu") or {}

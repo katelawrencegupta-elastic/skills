@@ -1942,7 +1942,7 @@ def metered_rate_section(acc: dict) -> str:
     mid = (len(rates) + 1) // 2
     left, right = rates[:mid], rates[mid:]
     if accounted:
-        rate_lead = "The GB/day in this table is compressioncalc_accounted_for, bulk multiplied by 0.60. Metered GB/day is that figure × 1.595. Logs are 90% and metrics are 10%. Each stream walks the Observability ingest bands on its own. The rate is that deployment's blended dollars per metered GB when it is its own project."
+        rate_lead = "The GB/day in this table is the write-phase bulk rate. Metered GB/day is that figure × 1.595. Logs are 90% and metrics are 10%. Each stream walks the Observability ingest bands on its own. The rate is that deployment's blended dollars per metered GB when it is its own project."
     elif expansion == 1:
         rate_lead = "Diagnostic bulk is the metered GB/day: it is measured after ingest pipelines and before compression, so no expansion factor is applied. Logs are taken as 90% and metrics as 10% in this band walk. Each stream walks the Observability ingest bands on its own. The rate is that deployment's blended dollars per metered GB when it is its own project."
     else:
@@ -2340,8 +2340,6 @@ def _bulk_rows(acc: dict) -> list[list]:
                 "Diagnostic local store",
                 f"{_formula_num(stored, 3)} GB",
             ])
-        elif name != "search" and _compression_on(acc):
-            pass
         elif daily not in (None, "") and float(daily or 0) != 0:
             if factor is not None:
                 formula = (
@@ -2398,28 +2396,6 @@ def _scale_rows(acc: dict) -> list[list]:
     compressed = _compression_on(acc)
     thirty = c.get("retention_set_days") == 30
     if compressed:
-        ratio = c.get("compression_ratio")
-        if ratio is None:
-            ratio = 0.60
-        bulk = c.get("bulk_gb_day")
-        accounted = c.get("compressioncalc_accounted_for")
-        inputs = (
-            "The priced ratio is 0.60 whenever a solution has a workload. "
-            "It is not esdiag bulk.compression_ratio (bulk bytes ÷ store bytes) or bulk.storage_ratio (store bytes ÷ bulk bytes). "
-            "The indexing rate uses primaries.store.size_in_bytes and is not this figure."
-        )
-        if _formula_num(bulk, 3):
-            inputs = f"Bulk {_formula_num(bulk, 3)} GB/day. " + inputs
-        if accounted not in (None, ""):
-            label, result = "Compression-applied GB/day", f"{_formula_num(accounted, 3)} GB/day"
-        else:
-            label, result = "Compression ratio", _formula_num(ratio, 2)
-        rows.append([
-            label,
-            "compressioncalc_accounted_for = bulk GB/day × 0.60. That bulk is Σ write-index primaries.bulk.est_bytes_per_day ÷ 1e9, and est_bytes_per_day = primaries.bulk.total_size_in_bytes × 86,400 ÷ write_phase_sec. On-disk bytes do not change the 0.60.",
-            inputs,
-            result,
-        ])
         for name, blk, _priced in _solution_measured(acc):
             if name == "search":
                 continue
@@ -2453,8 +2429,6 @@ def _scale_rows(acc: dict) -> list[list]:
         parts = ["Full-retention bulk leaves the measured store unchanged."]
         if thirty:
             parts.append("A 30-day sheet multiplies disk by 1 ÷ written months.")
-        if compressed:
-            parts.append("A compression-applied sheet multiplies disk by 0.60.")
         parts.append("Org store uses the same scale, so the ingest share stays put. Query rate does not scale.")
         inputs = f"Written month {_formula_num(written, 2)}." if written is not None else "Measured store."
         if thirty:
@@ -2839,7 +2813,6 @@ def _metered_expansion(acc: dict) -> float:
     except (TypeError, ValueError):
         return METERED_EXPANSION
 SHORT_UPTIME_DAYS = 2.0
-COMPRESSION_RATIO = 0.60
 
 
 def raw_ingest_by_deployment(acc: dict) -> dict:
@@ -2847,8 +2820,7 @@ def raw_ingest_by_deployment(acc: dict) -> dict:
 
     `quoted` is what the estimators receive. `measured` is the Σ est_bytes_per_day
     from the bundle. The two are equal on a diagnostic run. They differ only on an
-    account whose ingest was scaled by a pace factor. The compression-applied run stores bulk × 0.60 in daily_raw_gb, so
-    the bulk is recovered from compressioncalc_accounted_for ÷ its ratio.
+    account whose ingest was scaled by a pace factor.
     """
     factor = _ingest_factor(acc)
     rows = []
@@ -2859,12 +2831,7 @@ def raw_ingest_by_deployment(acc: dict) -> dict:
         # here put the deployment and by-solution counts one above the cover.
         if dep.get("platform") == "serverless":
             continue
-        ratio = dep.get("compression_ratio")
-        accounted = dep.get("compressioncalc_accounted_for")
-        if ratio and accounted is not None:
-            quoted = float(accounted) / float(ratio)
-        else:
-            quoted = float(dep.get("daily_raw_gb") or 0)
+        quoted = float(dep.get("daily_raw_gb") or 0)
         measured = quoted / factor if factor else quoted
         stored = dep.get("gb")
         stored = float(stored) if stored not in (None, "") else None
@@ -2909,7 +2876,7 @@ def raw_ingest_chart(data: dict, *, width: int = 1060, accounted: bool = False) 
     rows = [r for r in data["rows"] if r["quoted"] > 0]
     if not rows:
         return ""
-    scale = COMPRESSION_RATIO if accounted else 1.0
+    scale = 1.0
     named = [r["name"] for r in rows[:6]]
     colors = {n: PALETTE[i % len(PALETTE)] for i, n in enumerate(named)}
     other_color = "#C5CBD6"
@@ -2986,15 +2953,12 @@ def raw_ingest_section(acc: dict, *, new_page: bool = True) -> str:
         return "—" if v is None else f"{v:,.{places}f}"
 
     def line(r: dict) -> list:
-        q = r["quoted"] * (COMPRESSION_RATIO if accounted else 1)
         cells = [
             r["name"],
             (r["solution"] or "").title(),
             "no bundle" if r["source"] in ("active_no_bundle", "k360_fallback") else "decommissioned" if r["source"] == "decommissioned" else fmt(r["measured"]),
             "no bundle" if r["source"] == "active_no_bundle" else "decommissioned" if r["source"] == "decommissioned" else (fmt(r["quoted"]) + " from K360" if r["source"] == "k360_fallback" else fmt(r["quoted"])),
         ]
-        if accounted:
-            cells.append(fmt(q))
         cells += [
             f"{r['share'] * 100:.1f}%",
             fmt(r["stored_gb"], 0),
@@ -3006,9 +2970,6 @@ def raw_ingest_section(acc: dict, *, new_page: bool = True) -> str:
 
     headers = ["Deployment", "Solution", "Bundle GB/d", "Quoted GB/d"]
     align = ["left", "left", "right", "right"]
-    if accounted:
-        headers.append("Accounted GB/d")
-        align.append("right")
     headers += ["Share", "Stored GB", "Retention d", "Uptime d", "Days in store"]
     align += ["right"] * 5
     tones = ["warning" if (r["uptime_days"] is not None and r["uptime_days"] < SHORT_UPTIME_DAYS and r["quoted"] > 0) else None for r in shown]
@@ -3020,14 +2981,10 @@ def raw_ingest_section(acc: dict, *, new_page: bool = True) -> str:
         rest_q = sum(r["quoted"] for r in rest)
         rest_m = sum(r["measured"] for r in rest)
         pad = [f"{len(rest)} other deployments", "", fmt(rest_m), fmt(rest_q)]
-        if accounted:
-            pad.append(fmt(rest_q * COMPRESSION_RATIO))
         pad += [f"{(rest_q / data['total_quoted'] * 100):.1f}%", "", "", "", ""]
         table_rows.append(pad)
         tones.append(None)
     total = ["Total", "", fmt(data["total_measured"]), fmt(data["total_quoted"])]
-    if accounted:
-        total.append(fmt(data["total_quoted"] * COMPRESSION_RATIO))
     total += ["100.0%", "", "", "", ""]
     table_rows.append(total)
     tones.append(None)
@@ -3109,13 +3066,6 @@ def raw_ingest_section(acc: dict, *, new_page: bool = True) -> str:
             ),
             f"{fmt(obs.get('bulk_gb_day'))} × {_metered_expansion(acc):g}",
             f"{fmt(float(obs.get('bulk_gb_day') or 0) * _metered_expansion(acc))} metered GB/day",
-        ])
-    if accounted:
-        calc.append([
-            "7. Compression-applied",
-            "Accounted GB/day = quoted bulk × 0.60. It prices the same way and does not replace the bulk quote.",
-            f"{fmt(data['total_quoted'])} × 0.60",
-            f"{fmt(data['total_quoted'] * COMPRESSION_RATIO)} GB/day",
         ])
     calc.append([
         "Days in store",
@@ -3812,13 +3762,9 @@ def render_consolidation_html(acc: dict) -> str:
     if scope_note:
         cover_notes.insert(1, scope_note)
     if diag and c.get("ingest_basis") == "compressioncalc_accounted_for":
-        ratio = c.get("compression_ratio")
-        ratio_bit = "unset" if ratio is None else str(ratio)
         cover_notes.append(
-            f"Ingest is compressioncalc_accounted_for: {c.get('compressioncalc_accounted_for')} GB/day. "
-            f"That is bulk {c.get('bulk_gb_day')} GB/day multiplied by 0.60. "
-            f"The ratio is {ratio_bit}. On-disk bytes are not used. "
-            "The diagnostic bulk quote is a separate estimate. Search disk on this set is measured store × 0.60."
+            f"Ingest is the write-phase bulk rate: {c.get('bulk_gb_day')} GB/day. "
+            "On-disk bytes are not a second ingest figure. Search disk is the measured store."
         )
         thirty = c.get("thirty_day") or {}
         if c.get("retention_set_days") == 30:

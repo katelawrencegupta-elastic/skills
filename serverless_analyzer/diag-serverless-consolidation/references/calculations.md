@@ -54,7 +54,7 @@ months = weighted_days / 30.416
 
 Every estimate is a one-year estimate: the sheet retention is `diag_inputs.ESTIMATE_MONTHS`, 12, for every solution that has bulk, on the fleet sheet, each regional sheet, and each deployment-plan sheet. The measured age (size-weighted ILM delete age, or the oldest index) is still computed from rows with `retention_days` above 0 and kept as `retention_months_measured`, and a note says when it differs from 12. It does not enter the price, so bulk with no measured age is still priced. A solution with no bulk is skipped. Security monthly at 12 months is E74.
 
-Every consolidation run writes one PDF: `<key>_full retention_bulk` plus the consolidation-plan suffix, with every sheet at 12 months of retention. There is no 30-day read. Search disk is the measured local store on every sheet and every plan bar.
+Every consolidation run writes one PDF: `<key>_full retention_bulk_serverless_consolidation_plan`, with every sheet at 12 months of retention. There is no 30-day read. Search disk is the measured local store on every sheet and every plan bar.
 
 The quote window is `--lookback-days`, default 90, maximum 365. ECH monthly ECU is the total of those billed days ÷ the number of days × 30.416. Billed days run from the org's first positive day in the fetch to its last: days before the first bill and days after the last one are not billed days. An org with fewer billed days than the window asks for is priced on the days it has, and the roster follows the same days. `ecu.quote_lookback_requested` is what was asked and `ecu.quote_lookback_days` is what was priced. With no daily series there is no window: `quote_lookback_days` is null, ECH is the complete-month average, and there is no `ech_scope`. The consolidation run stops on an org report with no daily series (one fetched at week grain by `run_org_report.py`).
 
@@ -80,7 +80,7 @@ An index is aged by its ILM delete phase, else its data stream's retention. An i
 
 ## Bulk rate after a restart
 
-The bulk counter starts at zero when a primary shard starts on a node, and the write phase runs from the index's creation, so a shard that restarted or moved has counted fewer bytes than the write phase's length implies. `analyze_bundle` reads each index's latest primary recovery start from `recovery.json`. Where the counter is younger than 90% of the write phase, it adds what the rate would be if the same bytes were spread over the counter's own age: `bulk_restart_gb_day` on the row and `diagnostics.bulk_restart_gb_day` on the quote. The quoted `bulk_gb_day` stays esdiag's figure. The notes say so when the extra is more than 5% of the quoted bulk. Replica copies count bytes too, so this is an estimate of the size of the effect and not a corrected rate.
+The bulk counter starts at zero when a primary shard starts on a node, and the write phase runs from the index's creation, so a shard that restarted or moved has counted fewer bytes than the write phase's length implies. `analyze_bundle` reads each index's latest primary recovery start from `recovery.json`. Where the counter is younger than 90% of the write phase, it adds what the rate would be if the same bytes were spread over the counter's own age: `bulk_restart_gb_day` on the row and `diagnostics.bulk_restart_gb_day` on the quote. The quoted `bulk_gb_day` stays the write-phase rate. The notes say so when the extra is more than 5% of the quoted bulk. Replica copies count bytes too, so this is an estimate of the size of the effect and not a corrected rate.
 
 ## Unrated ingest
 
@@ -114,7 +114,7 @@ Bulk already carries the metadata overhead: the shipper's fields and the pipelin
 
 ## Compression-applied set (retired)
 
-The compression-applied quote path is retired. Bulk goes into the metered cells directly. `compressioncalc_accounted_for` is absent from the brief, and no `compression_applied` folders or `compression-applied` file names are written.
+The compression-applied quote path is retired. Bulk goes into the metered cells directly. No `compression_applied` folders or `compression-applied` file names are written, and a new bundle does not carry a second ingest field.
 
 ## Which estimator
 

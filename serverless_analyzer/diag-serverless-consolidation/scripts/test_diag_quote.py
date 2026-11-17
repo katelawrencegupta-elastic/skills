@@ -29,7 +29,7 @@ from admin_diags import (  # noqa: E402
     parse_diagnostics, pull_diagnostics, quoted_index_bytes, safe_id,
 )
 from consolidation import _deployment_groups, _replicate_by_region, apply_quote_lookback, build_consolidation, regional_quote  # noqa: E402
-from diag_account import _sheet_months, apply_diagnostics, compressioncalc_account  # noqa: E402
+from diag_account import _sheet_months, apply_diagnostics  # noqa: E402
 from diag_inputs import summarize, whole_months  # noqa: E402
 from k360_infra import es_base_and_key  # noqa: E402
 from privacy import seal_dir, seal_text, unignored_secret_warnings  # noqa: E402
@@ -37,7 +37,7 @@ from quote_checks import (  # noqa: E402
     TEMPLATE_ANCHORS, addon_off_value, e73_blocks_quote, echo_gate, integrity_score, money,
     template_check, template_version,
 )
-from run_consolidation import _apply_diagnostic_report_view, _compression_totals, _estimator_flags, consolidation_brief, method_stamp, quote_pdf_jobs  # noqa: E402
+from run_consolidation import _apply_diagnostic_report_view, _estimator_flags, consolidation_brief, method_stamp, quote_pdf_jobs  # noqa: E402
 from render_pdf import consolidation_pdf_stem, deployment_plan_section, export_documents, render_appendix_html, render_consolidation_html, retire_legacy_pdf_folders, search_power_section, stat  # noqa: E402
 from size_serverless import (  # noqa: E402
     COMPRESSION_FOLDER_NAME, DEFAULT_O11Y, DEFAULT_SECURITY, PLAN_FOLDER_NAME, _sheet_retention,
@@ -212,8 +212,8 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(row["store_gb"], 30.0)
         self.assertEqual(row["snapshot_gb"], 110.0)
         self.assertAlmostEqual(row["retention_days"], 40.014, places=3)
-        self.assertIsNone(row["compression_ratio"])
-        self.assertEqual(row["compressioncalc_accounted_for"], 0.0)
+        self.assertNotIn("compression_ratio", row)
+        self.assertNotIn("compressioncalc_accounted_for", row)
 
 
 class RetentionTests(unittest.TestCase):
@@ -623,8 +623,7 @@ class EstimateFolderTests(unittest.TestCase):
         self.assertEqual(_search_volume_scale(None), 1.0)
         self.assertEqual(_search_volume_scale("_30d"), 1.0)
         self.assertEqual(_search_volume_scale("from_k360"), 1.0)
-        # Only a title from the retired compression-applied set still carries its 0.60.
-        self.assertAlmostEqual(_search_volume_scale("compressioncalc_accounted_for"), 0.6)
+        self.assertEqual(_search_volume_scale("compressioncalc_accounted_for"), 1.0)
 
     def test_one_project_ceiling_is_labeled_ceiling(self):
         rows = [{"name": "o", "solution": "observability", "region": "east", "provider": "aws", "bulk_gb_day": 10, "store_gb": 100, "retention_days": 30}]
@@ -868,9 +867,8 @@ class CompressionCalcTests(unittest.TestCase):
             }},
         })
         self.assertEqual(row["bulk_gb_day"], 105.0)
-        self.assertEqual(row["compressioncalc_accounted_for"], 63.0)
-        self.assertEqual(row["compression_ratio"], 0.6)
-        self.assertEqual(row["bulk_gb_day"] * 0.60, row["compressioncalc_accounted_for"])
+        self.assertNotIn("compressioncalc_accounted_for", row)
+        self.assertNotIn("compression_ratio", row)
 
     def test_system_write_index_stays_in_the_compression_sums(self):
         created, rolled = _write_phase(1, age_days=3)
@@ -891,10 +889,10 @@ class CompressionCalcTests(unittest.TestCase):
         })
         self.assertEqual(row["store_gb"], 20.0)
         self.assertEqual(row["bulk_gb_day"], 150.0)
-        self.assertEqual(row["compressioncalc_accounted_for"], 90.0)
-        self.assertEqual(row["compression_ratio"], 0.6)
+        self.assertNotIn("compressioncalc_accounted_for", row)
+        self.assertNotIn("compression_ratio", row)
 
-    def test_on_disk_above_bulk_still_keeps_sixty_percent(self):
+    def test_on_disk_above_bulk_does_not_change_the_rate(self):
         created, rolled = _write_phase(1, age_days=3)
         row = _analyze({
             "diag/nodes_stats.json": {"nodes": {"n1": {"timestamp": COLLECTION_MS}}},
@@ -912,8 +910,8 @@ class CompressionCalcTests(unittest.TestCase):
             }},
         })
         self.assertEqual(row["bulk_gb_day"], 20.0)
-        self.assertEqual(row["compression_ratio"], 0.6)
-        self.assertEqual(row["compressioncalc_accounted_for"], 12.0)
+        self.assertNotIn("compression_ratio", row)
+        self.assertNotIn("compressioncalc_accounted_for", row)
 
     def test_compression_account_swaps_only_observability_and_security(self):
         acc = {
@@ -938,43 +936,11 @@ class CompressionCalcTests(unittest.TestCase):
         self.assertEqual(observability["daily_raw_gb"], 110.0)
         self.assertEqual(observability["logs_gb_day"], 99.0)
         self.assertEqual(observability["metrics_gb_day"], 11.0)
-        self.assertEqual(observability["compressioncalc_accounted_for"], 66.0)
-        self.assertEqual(observability["compression_ratio"], 0.6)
+        self.assertEqual(observability["bulk_gb_day"], 110.0)
+        self.assertNotIn("compressioncalc_accounted_for", observability)
+        self.assertNotIn("compression_ratio", observability)
         self.assertEqual(quoted["sizing"]["consolidated"]["search"]["daily_raw_gb"], 8.0)
-        quoted["sizing"]["estimators"] = {
-            "search": {"kind": "search", "readback": {"monthly_steady_state": 12}},
-            "observability": {"kind": "observability", "readback": {"monthly_steady_state": 99}},
-            "projects": [
-                {"solution": "search", "region": "aws-us-east-1"},
-                {"solution": "observability", "region": "aws-us-east-1"},
-            ],
-        }
-        priced = compressioncalc_account(quoted)
-        self.assertEqual(quoted["sizing"]["consolidated"]["observability"]["daily_raw_gb"], 110.0)
-        swapped = priced["sizing"]["consolidated"]["observability"]
-        security = priced["sizing"]["consolidated"]["security"]
-        search = priced["sizing"]["consolidated"]["search"]
-        self.assertEqual(priced["sizing"]["ingest_basis"], "compressioncalc_accounted_for")
-        self.assertEqual(swapped["daily_raw_gb"], 66.0)
-        self.assertEqual(swapped["logs_gb_day"], 59.4)
-        self.assertEqual(swapped["metrics_gb_day"], 6.6)
-        self.assertEqual(swapped["bulk_gb_day"], 110.0)
-        self.assertEqual(swapped["compression_ratio"], 0.6)
-        self.assertEqual(swapped["retention_months"], 12)
-        self.assertEqual(security["daily_raw_gb"], 6.0)
-        self.assertEqual(security["bulk_gb_day"], 10.0)
-        self.assertEqual(security["compression_ratio"], 0.6)
-        self.assertEqual(security["retention_months"], 12)
-        self.assertEqual(search["daily_raw_gb"], 8.0)
-        self.assertEqual(priced["sizing"]["estimators"]["search"]["readback"]["monthly_steady_state"], 12)
-        self.assertNotIn("observability", priced["sizing"]["estimators"])
-        self.assertEqual([p["solution"] for p in priced["sizing"]["estimators"]["projects"]], ["search"])
-        self.assertNotIn("consolidation", priced)
-        self.assertTrue(priced["sizing"]["notes"][0].startswith("compressioncalc_accounted_for"))
-        bulk, ratio, accounted = _compression_totals(priced)
-        self.assertEqual(bulk, 128.0)
-        self.assertEqual(accounted, 76.8)
-        self.assertEqual(ratio, 0.6)
+        self.assertEqual(quoted["sizing"]["consolidated"]["security"]["daily_raw_gb"], 10.0)
 
 
 class RegionalQuoteTests(unittest.TestCase):
@@ -1461,16 +1427,10 @@ class ConsolidationLayoutTests(unittest.TestCase):
         flat_html = raw_ingest_section(unscaled)
         self.assertIn("The billing window does not scale it.", flat_html)
         self.assertNotIn("1.250000", flat_html)
-        # compression-applied run: daily_raw_gb is already × 0.60, bulk comes back from the ratio
         comp = json.loads(json.dumps(acc))
-        for dep in comp["solutions"]["by_deployment"]:
-            raw = float(dep.get("daily_raw_gb") or 0)
-            dep["compression_ratio"] = 0.6
-            dep["compressioncalc_accounted_for"] = raw * 0.6
-            dep["daily_raw_gb"] = raw * 0.6
         comp["consolidation"] = {"ingest_basis": "compressioncalc_accounted_for"}
         self.assertAlmostEqual(raw_ingest_by_deployment(comp)["total_quoted"], 125.0)
-        self.assertIn("Accounted GB/day", raw_ingest_section(comp))
+        self.assertNotIn("× 0.60", raw_ingest_section(comp))
         self.assertEqual(raw_ingest_section({"solutions": {"by_deployment": []}}), "")
 
     def test_appendix_b_prints_formulas_and_skips_an_unpriced_solution(self):
@@ -1496,15 +1456,13 @@ class ConsolidationLayoutTests(unittest.TestCase):
         acc["sizing"]["ingest_basis"] = "compressioncalc_accounted_for"
         acc["consolidation"] = build_consolidation(acc, None)
         acc["consolidation"]["ingest_basis"] = "compressioncalc_accounted_for"
-        acc["consolidation"]["compression_ratio"] = 0.6
         html = render_appendix_html(acc)
         appendix_b = html.split("<h2>Appendix B</h2>", 1)[1]
         self.assertIn("Σ Δsearch_total ÷ 86,400", appendix_b)
         self.assertIn("percent ÷ 100 × 730", appendix_b)
-        self.assertIn("× 0.60", appendix_b)
+        self.assertNotIn("0.60", appendix_b)
         self.assertIn("primaries.bulk.total_size_in_bytes", appendix_b)
         self.assertIn("primaries.store.size_in_bytes and is not this figure", appendix_b)
-        self.assertIn("not esdiag bulk.compression_ratio", appendix_b)
         self.assertIn("12.5 QPS", appendix_b)
         self.assertNotIn("Security bulk", appendix_b)
         self.assertNotIn("Security monthly", appendix_b)
@@ -2156,15 +2114,16 @@ class TemplateGuardTests(unittest.TestCase):
         self.assertIsNone(template_version([]))
 
     def test_a_fresh_copy_is_trashed_when_its_layout_does_not_match(self):
+        import sheets_io
         import size_serverless as ss
 
         trashed = []
         copied = {"id": "copy-1", "name": "t", "url": "u"}
         for reused, expect in ((False, ["copy-1"]), (True, [])):
             trashed.clear()
-            with mock.patch.object(ss, "copy_template", return_value=(copied, reused)), \
-                 mock.patch.object(ss, "verify_template", side_effect=ss.TemplateMismatch("bad layout")), \
-                 mock.patch.object(ss, "trash_file", side_effect=lambda _drive, fid: trashed.append(fid)):
+            with mock.patch.object(sheets_io, "copy_template", return_value=(copied, reused)), \
+                 mock.patch.object(sheets_io, "verify_template", side_effect=ss.TemplateMismatch("bad layout")), \
+                 mock.patch.object(sheets_io, "trash_file", side_effect=lambda _drive, fid: trashed.append(fid)):
                 with self.assertRaises(ss.TemplateMismatch):
                     ss.copy_verified(None, None, "tpl", "t", "parent", reuse=True, kind="observability", tab=ss.O11Y_TAB)
             self.assertEqual(trashed, expect)
@@ -2493,6 +2452,7 @@ class MeasuredMixTests(unittest.TestCase):
         self.assertIn("ML-node ECU", " ".join(cons["notes"]))
 
     def test_security_g4_is_measured_gb_over_the_sheet_expansion(self):
+        import sizing_fill
         import size_serverless as ss
         cells = ss.security_input_cells({}, "Premium", "r", 12, 166.0, expansion=1.66)
         self.assertEqual(cells["G4"], 100.0)
@@ -2502,9 +2462,9 @@ class MeasuredMixTests(unittest.TestCase):
             {"monthly_steady_state": 115.0, "cps_addon_monthly": 0, "ingest_monthly": 70.0, "retention_monthly": 30.0,
              "support_monthly": 15.0, "steady_total": 115.0, "metered_gb_day": 250.0},
         ])
-        with mock.patch.object(ss, "read_cells", side_effect=lambda *_a, **_k: next(reads)), \
-             mock.patch.object(ss, "clear_security_addons", return_value={}), \
-             mock.patch.object(ss, "push_cells", return_value=6) as pushed:
+        with mock.patch.object(sizing_fill, "read_cells", side_effect=lambda *_a, **_k: next(reads)), \
+             mock.patch.object(sizing_fill, "clear_security_addons", return_value={}), \
+             mock.patch.object(sizing_fill, "push_cells", return_value=6) as pushed:
             cells, n, rb, gate = ss.fill_security(None, "copy", {}, "Premium", "r", 12, 250.0, [], "metered")
         self.assertAlmostEqual(cells["G4"], round(250.0 / 1.66, 4))
         self.assertEqual(pushed.call_args.args[3]["G4"], cells["G4"])
@@ -2515,13 +2475,13 @@ class MeasuredMixTests(unittest.TestCase):
             {"raw": 0, "metered": 0, "reference": 1.66},         # G4 was 0 on the copy: the reference cell is used
             {"monthly_steady_state": 115.0, "cps_addon_monthly": 0, "metered_gb_day": 400.0},
         ])
-        with mock.patch.object(ss, "read_cells", side_effect=lambda *_a, **_k: next(reads)), \
-             mock.patch.object(ss, "clear_security_addons", return_value={}), \
-             mock.patch.object(ss, "push_cells", return_value=6):
+        with mock.patch.object(sizing_fill, "read_cells", side_effect=lambda *_a, **_k: next(reads)), \
+             mock.patch.object(sizing_fill, "clear_security_addons", return_value={}), \
+             mock.patch.object(sizing_fill, "push_cells", return_value=6):
             _cells, _n, rb, gate = ss.fill_security(None, "copy", {}, "Premium", "r", 12, 250.0, [], "metered")
         self.assertFalse(gate["accepted"])
         self.assertIsNone(rb["monthly_steady_state"])
-        with mock.patch.object(ss, "read_cells", return_value={"raw": 0, "metered": 0, "reference": None}):
+        with mock.patch.object(sizing_fill, "read_cells", return_value={"raw": 0, "metered": 0, "reference": None}):
             with self.assertRaises(RuntimeError):
                 ss.security_expansion(None, "copy")
 
@@ -2633,6 +2593,7 @@ class SearchTelemetryShareTests(unittest.TestCase):
         }
 
     def test_the_plan_and_regional_sheets_pass_org_store_and_unscaled_telemetry(self):
+        import plan_sizing
         import size_serverless as ss
         seen = []
 
@@ -2641,7 +2602,7 @@ class SearchTelemetryShareTests(unittest.TestCase):
             return {"readback": {"monthly_steady_state": 10}}
 
         acc = self._account()
-        with mock.patch.object(ss, "run_es3", side_effect=fake_es3):
+        with mock.patch.object(plan_sizing, "run_es3", side_effect=fake_es3):
             plan = ss.size_deployment_plan(
                 acc, None, None, {"id": "folder"}, o11y_id="o", security_id="s", support="Premium",
                 provider="aws", force_months=12, name_suffix="", fresh=False,
@@ -2658,10 +2619,10 @@ class SearchTelemetryShareTests(unittest.TestCase):
             {"solution": "search", "region": "east", "stored_gb": 20, "daily_raw_gb": 0},
             {"solution": "search", "region": "west", "stored_gb": 20, "daily_raw_gb": 0},
         ]}}
-        with mock.patch.object(ss, "run_es3", side_effect=fake_es3), \
-             mock.patch.object(ss, "load_sheet_creds", return_value=None), \
-             mock.patch.object(ss, "services_from", return_value=(None, None)), \
-             mock.patch.object(ss, "sheet_workers", return_value=1):
+        with mock.patch.object(plan_sizing, "run_es3", side_effect=fake_es3), \
+             mock.patch.object(plan_sizing, "load_sheet_creds", return_value=None), \
+             mock.patch.object(plan_sizing, "services_from", return_value=(None, None)), \
+             mock.patch.object(plan_sizing, "sheet_workers", return_value=1):
             ss.size_regional_projects(
                 acc, None, None, {"id": "folder"}, o11y_id="o", security_id="s", support="Premium",
                 provider="aws", skip_xlsx=True, fresh=False, local_dir=HERE, customer="Acme", when="2026-11-16",
@@ -2683,7 +2644,7 @@ class SearchTelemetryShareTests(unittest.TestCase):
             {"solution": "search", "region": "west", "stored_gb": 20, "daily_raw_gb": 0, "deployments": ["west"]},
         ]
         by_solution = {"search": {"pricing": "es3-estimator performant (quotable)", "total_mo": 50, "stored_gb": 40}}
-        with mock.patch("consolidation._es3_region", side_effect=fake_region):
+        with mock.patch("consolidation_regional._es3_region", side_effect=fake_region):
             _replicate_by_region(acc, by_solution, groups, [])
         self.assertEqual(len(captured), 2)
         for payload in captured:
@@ -2708,6 +2669,7 @@ class SearchPlanSeriesTests(unittest.TestCase):
                  "bulk_gb_day": b, "retention_days": d} for n, st, b, d in self.ROWS]
 
     def _bars(self, force):
+        import plan_sizing
         import size_serverless as ss
         seen = []
 
@@ -2716,7 +2678,7 @@ class SearchPlanSeriesTests(unittest.TestCase):
             # Linear in disk plus a fixed per-project ingest floor, like the es3 model at this size.
             return {"readback": {"monthly_steady_state": 620 + 2.3 * payload["stored_gb"]}}
 
-        with mock.patch.object(ss, "run_es3", side_effect=fake_es3):
+        with mock.patch.object(plan_sizing, "run_es3", side_effect=fake_es3):
             specs, _jobs, err, _floor = plan_sheet_jobs(
                 self._rows(), run_key="Acme", name_suffix="", force_months=force, o11y_id="o", security_id="s",
                 parent_id="p", reuse=True, provider="aws", region_name="us-east-1", support="Premium",
@@ -3619,9 +3581,11 @@ class FixtureCrossCheckTests(unittest.TestCase):
         from pathlib import Path
         import re
         root = Path(__file__).resolve().parent / "tests" / "fixtures"
-        banned = re.compile(r"docs\.google\.com|drive\.google\.com|/Users/|acct-[abc][_A-Za-z]|\"ARR\"")
+        banned = re.compile(r"docs\.google\.com|drive\.google\.com|/Users/|acct-[abc](?:_[A-Za-z0-9]|[A-Za-z]|[, ])|\"ARR\"")
         hex_id = re.compile(r"\b[0-9a-f]{32}\b")
-        for path in root.rglob("*.json"):
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix not in {".json", ".html", ".md"}:
+                continue
             text = path.read_text()
             self.assertIsNone(banned.search(text), path.name)
             self.assertIsNone(hex_id.search(text), path.name)
@@ -3898,6 +3862,90 @@ class PhaseGuardTests(unittest.TestCase):
                     rc.main()
         self.assertEqual(caught.exception.code, 2)
         self.assertIn("not in a git checkout", err.getvalue())
+
+
+class ReviewV4Tests(unittest.TestCase):
+    def test_a_failed_quote_is_not_announced_as_a_price(self):
+        from run_consolidation import chat_lines
+
+        brief = {
+            "savings": {"serverless_mo": 76608},
+            "integrity": {"passed": False, "failed": [{"check": "Rated ingest", "detail": "33%"}]},
+            "limits": [{"code": "unrated_ingest", "detail": "unrated store is 33% of local store", "severity": "high"}],
+            "draft": False,
+        }
+        lines = chat_lines(brief)
+        self.assertEqual(lines[0], "not verified")
+        self.assertIn("Rated ingest", lines[1])
+        self.assertIn("unrated store is 33%", lines[2])
+
+    def test_skill_paths_are_the_same_file_in_each_skill(self):
+        root = HERE.parents[1]
+        paths = [
+            root / "diag-serverless-consolidation" / "scripts" / "skill_paths.py",
+            root / "k360-account-analysis" / "scripts" / "skill_paths.py",
+            root / "k360-org-report" / "scripts" / "skill_paths.py",
+        ]
+        text = paths[0].read_bytes()
+        for path in paths[1:]:
+            self.assertEqual(path.read_bytes(), text)
+
+    def test_the_documented_title_is_the_one_the_code_writes(self):
+        from estimate_paths import estimate_title
+
+        from render_pdf import consolidation_pdf_stem
+
+        title = estimate_title("Acme_2026-11-16", "observability", "", "us-east-1")
+        pdf = consolidation_pdf_stem("Acme_2026-11-16", "consolidation")
+        doc = (HERE.parent / "references" / "sizing-cells.md").read_text()
+        skill = (HERE.parent / "SKILL.md").read_text()
+        self.assertTrue(title.endswith("_observability_full retention_bulk_us-east-1_serverless_estimate"))
+        self.assertIn("_full retention_<bulk>_<region>_serverless_estimate", doc)
+        self.assertTrue(pdf.endswith("_full retention_bulk_serverless_consolidation_plan"))
+        self.assertIn("_full retention_bulk_serverless_consolidation_plan", doc)
+        self.assertIn("~/serverless_analyzer_artifacts/", skill)
+        self.assertIn("~/serverless_analyzer_artifacts/", doc)
+
+    def test_a_name_suffix_after_the_account_token_is_scrubbed(self):
+        from strip_fixture import scrub_fixture
+
+        cleaned = scrub_fixture({"customer": "acct-c, Inc.", "cluster": "acct-c Non-Prod"}, "ref-c")
+        self.assertNotIn("acct-c", json.dumps(cleaned))
+
+    def test_an_admin_redirect_is_refused(self):
+        import admin_diags
+
+        with self.assertRaises(RuntimeError):
+            admin_diags._RefuseRedirect().redirect_request(None, None, 302, "found", {}, "https://other.example/")
+
+    def test_manifests_from_three_orgs_merge_by_deployment_id(self):
+        import admin_diags
+
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            admin_diags._merge_manifest(folder, [{"id": "a", "name": "one"}, {"id": "b", "name": "two"}])
+            merged = admin_diags._merge_manifest(folder, [{"id": "b", "name": "two-b"}, {"id": "c", "name": "three"}])
+        self.assertEqual(sorted(row["id"] for row in merged), ["a", "b", "c"])
+        self.assertEqual(next(row for row in merged if row["id"] == "b")["name"], "two-b")
+
+    def test_a_row_without_a_solution_stops_the_pack(self):
+        import diag_inputs
+
+        with self.assertRaises(SystemExit):
+            diag_inputs._join_solution_region([{"name": "cluster", "bulk_gb_day": 1}], None)
+
+    def test_a_twelve_month_age_does_not_add_a_second_sheet(self):
+        from plan_sizing import fleet_measured_copy
+
+        self.assertIsNone(fleet_measured_copy({
+            "solution": "observability", "measured": 12, "retention": 12, "title": "t",
+        }))
+
+    def test_zero_days_and_effective_retention_are_measured(self):
+        import admin_diags
+
+        self.assertEqual(admin_diags._parse_age("0d"), 0.0)
+        self.assertEqual(admin_diags._parse_age("10d"), 10.0)
 
 
 if __name__ == "__main__":
