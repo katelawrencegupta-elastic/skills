@@ -775,9 +775,9 @@ def _deployment_groups(acc: dict, infra: dict | None, months: float) -> list[dic
             if g["retention_bulk"] > 0:
                 row["retention_months_measured"] = round((g["retention_weighted"] / g["retention_bulk"]) / DAYS_PER_MONTH, 6)
             if g["daily_raw_gb"]:
-                # One-year estimate: every project with bulk is written at 12 months, measured or not.
+                # Default is one year. --retention-days writes another whole month, measured or not.
                 from diag_inputs import ESTIMATE_MONTHS
-                row["retention_months"] = ESTIMATE_MONTHS
+                row["retention_months"] = int((acc.get("meta") or {}).get("estimate_months") or ESTIMATE_MONTHS)
         groups.append(row)
     order = {"search": 0, "observability": 1, "security": 2}
     groups.sort(key=lambda g: (order.get(g["solution"], 9), -g["ech_ecu_mo"]))

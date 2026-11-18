@@ -255,6 +255,7 @@ def parse_args(argv=None, description: str | None = None):
     ap.add_argument("--artifacts-root", default=None, help="Parent of <customer>_<date>/ (default serverless_analyzer/diag_artifacts)")
     ap.add_argument("--date", default=None, help="YYYY-MM-DD for the run key (default today UTC)")
     ap.add_argument("--retention-months", type=float, default=3.0, help="Assumed retention for the K360 backup (stored GB ÷ retention). K360 has no raw ingest total")
+    ap.add_argument("--retention-days", type=int, default=None, help="Diagnostic quote only: write this retention instead of the index average. The estimator stores whole months, rounded up.")
     ap.add_argument("--security-retention-months", type=float, default=None, help="Override for the Security estimator (default = --retention-months)")
     ap.add_argument("--skip-sizing", action="store_true", help="Never run the ECH>50%% estimator step")
     ap.add_argument("--force-sizing", action="store_true", help="Run sizing even if ECH <= 50%%")
@@ -275,7 +276,7 @@ def parse_args(argv=None, description: str | None = None):
     ap.add_argument("--skip-deployment-plan", action="store_true", help="Skip the Observability 0/25/50/75/100%% deployment-count sheets. The headline quote still runs")
     ap.add_argument("--allow-dirty", action="store_true", help="Run even when serverless_analyzer has uncommitted changes. The PDF is marked DRAFT.")
     ap.add_argument("--allow-partial", action="store_true", help="Keep going when a sizing step fails. The PDF is DRAFT and shows no saving.")
-    ap.add_argument("--allow-nearest-region", action="store_true", help="Price a region that is not on the estimator list with the nearest same-provider option. Integrity still fails.")
+    ap.add_argument("--allow-nearest-region", action="store_true", help="When the provider default is also absent, price the nearest same-provider region. A region that is not listed is otherwise priced as AWS us-east-1, Azure eastus, or GCP us-east1. Integrity still fails.")
     args = ap.parse_args(argv)
     if not 1 <= int(args.lookback_days) <= 365:
         ap.error("--lookback-days must be from 1 to 365")
@@ -459,6 +460,14 @@ def prepare_account(args):
         acc["meta"]["run_key"] = acc["meta"]["run_key"] + run_key_suffix(excluded)
     acc["storage"]["size_gaps"] = size_gaps(base, key, acc)
     run_key = acc["meta"]["run_key"]
+    estimate_months = getattr(args, "estimate_months", None)
+    retention_days = getattr(args, "retention_days", None)
+    if estimate_months and int(estimate_months) != 12:
+        acc["meta"]["estimate_months"] = int(estimate_months)
+        if retention_days:
+            acc["meta"]["retention_days"] = int(retention_days)
+            run_key = f"{run_key}_{int(retention_days)}d"
+            acc["meta"]["run_key"] = run_key
     root = Path(args.artifacts_root) if args.artifacts_root else artifacts_root()
     folder = root / run_key
     seal_dir(root)

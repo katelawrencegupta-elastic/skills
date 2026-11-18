@@ -30,7 +30,7 @@ from admin_diags import (  # noqa: E402
 )
 from consolidation import _deployment_groups, _replicate_by_region, apply_quote_lookback, build_consolidation, regional_quote  # noqa: E402
 from diag_account import _sheet_months, apply_diagnostics  # noqa: E402
-from diag_inputs import summarize, whole_months  # noqa: E402
+from diag_inputs import index_retention_months, summarize, whole_months  # noqa: E402
 from k360_infra import es_base_and_key  # noqa: E402
 from privacy import seal_dir, seal_text, unignored_secret_warnings  # noqa: E402
 from quote_checks import (  # noqa: E402
@@ -240,6 +240,49 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(whole_months(61 / 30.416), 3)
         self.assertEqual(_sheet_retention(30 / 30.416), 1)
 
+    def test_index_average_rounds_up_and_is_written(self):
+        # 1,000 indexes at 15 days and 10 at 365 days. Across indexes that is
+        # 18.5 days, which rounds up to 1 month. Averaging the two deployments
+        # would be 190 days and 7 months.
+        self.assertEqual(index_retention_months([
+            {"retention_index_count": 1000, "retention_index_days_sum": 15 * 1000},
+            {"retention_index_count": 10, "retention_index_days_sum": 365 * 10},
+        ]), 1)
+        self.assertEqual(index_retention_months([
+            {"retention_index_count": 4, "retention_index_days_sum": 45 * 4},
+        ]), 2)
+        self.assertEqual(index_retention_months([
+            {"retention_index_count": 6292, "retention_index_days_sum": 27.605 * 6292},
+        ]), 1)
+        self.assertIsNone(index_retention_months([{"retention_days": 45}]))
+        acc = {
+            "deployments": {"active": {"month": "2026-10", "names": ["alpha", "beta"], "partial": False}},
+            "solutions": {"by_deployment": [
+                {"name": "alpha", "platform": "ech", "solution": "observability", "gb": 100, "ecu": 1},
+                {"name": "beta", "platform": "ech", "solution": "security", "gb": 20, "ecu": 1},
+            ], "totals": {"observability": {}, "security": {}, "search": {}}},
+            "sizing": {"consolidated": {"observability": {}, "security": {}, "search": {}}},
+            "storage": {"by_deployment": []},
+        }
+        rows = [
+            {"name": "alpha", "bulk_gb_day": 10, "retention_days": 15, "store_gb": 5,
+             "retention_index_count": 1000, "retention_index_days_sum": 15 * 1000},
+            {"name": "beta", "bulk_gb_day": 2, "retention_days": 365, "store_gb": 4,
+             "retention_index_count": 10, "retention_index_days_sum": 365 * 10},
+        ]
+        out = apply_diagnostics(acc, rows)
+        self.assertEqual(out["meta"]["estimate_months"], 1)
+        self.assertEqual(out["meta"]["retention_index_count"], 1010)
+        self.assertEqual(out["sizing"]["consolidated"]["observability"]["retention_months"], 1)
+        self.assertEqual(out["sizing"]["consolidated"]["security"]["retention_months"], 1)
+        self.assertTrue(any("prices 1 month" in note for note in out["sizing"]["notes"]))
+        # An explicit --retention-days month stays, and the index average does not replace it.
+        acc["meta"] = {"estimate_months": 2, "retention_days": 60}
+        held = apply_diagnostics(acc, rows)
+        self.assertEqual(held["meta"]["estimate_months"], 2)
+        self.assertEqual(held["sizing"]["consolidated"]["observability"]["retention_months"], 2)
+        self.assertIsNone(held["meta"].get("retention_index_count"))
+
     def test_account_weight_uses_measured_rows_only(self):
         acc = {
             "deployments": {"active": {"month": "2026-10", "names": ["alpha", "beta", "gamma"], "partial": False}},
@@ -264,7 +307,7 @@ class RetentionTests(unittest.TestCase):
         observability = out["sizing"]["consolidated"]["observability"]
         search = out["sizing"]["consolidated"]["search"]
         security = out["sizing"]["consolidated"]["security"]
-        self.assertEqual(observability["retention_months"], 12)   # one-year estimate, not the measured age
+        self.assertEqual(observability["retention_months"], 12)   # no index counts: stay at 12, not the measured age
         self.assertEqual(observability["stored_gb"], 9.0)
         self.assertEqual(out["sizing"]["diagnostics"]["retention_unmeasured"], [
             {"name": "beta", "bulk_gb_day": 10.0},
@@ -1839,6 +1882,25 @@ class EstimateDedupeTests(unittest.TestCase):
         self.assertEqual(sorted(drive.trashed), ["a1", "a3"])
         self.assertTrue(all(r["kept"] == "a2" for r in removed))
 
+    def test_a_measured_retention_copy_is_trashed(self):
+        import size_serverless as z
+        sheet = z.GSHEET_MIME
+        quote = "X_observability_full retention_bulk_us-central1_serverless_estimate"
+        files = [
+            {"id": "q", "name": quote, "mimeType": sheet, "parent": "root", "createdTime": "2026-11-18T15"},
+            {"id": "m", "name": quote + " measured retention", "mimeType": sheet, "parent": "root", "createdTime": "2026-11-18T15"},
+        ]
+        drive = _FakeDrive(files)
+        orig_exec, orig_assert = z._execute, z.assert_not_template
+        z._execute = lambda build, attempts=6: build().execute()
+        z.assert_not_template = lambda _id: None
+        try:
+            removed = z.dedupe_estimates(drive, "root")
+        finally:
+            z._execute, z.assert_not_template = orig_exec, orig_assert
+        self.assertEqual([r["id"] for r in removed], ["m"])
+        self.assertEqual(drive.trashed, ["m"])
+
 
 class DiagDownloadTests(unittest.TestCase):
     def _zip(self, path: Path, ok: bool = True) -> None:
@@ -3293,6 +3355,8 @@ class RetentionAndRestartTests(unittest.TestCase):
             row = analyze_bundle(path, captured=self.CAPTURED)
         # 1 GB at the 30-day policy and 3 GB at the 30-day default.
         self.assertAlmostEqual(row["retention_days"], 30.0, places=1)
+        self.assertEqual(row["retention_index_count"], 2)
+        self.assertAlmostEqual(row["retention_index_days_sum"], 60.0, places=3)
         self.assertEqual(row["retention_basis"], "blended")
         self.assertAlmostEqual(row["retention_known_share"], 0.25, places=3)
         self.assertIn("assumed", row["retention_label"])
@@ -3610,12 +3674,30 @@ class PhaseGuardTests(unittest.TestCase):
         )
         subprocess.check_call([py, "-c", script, *[str(path) for path in files]])
 
-    def test_us_east_2_is_not_rewritten_to_us_east_1(self):
+    def test_a_region_off_the_list_uses_the_provider_default(self):
         from size_serverless import match_region
-        options = ["AWS: us-east-1 (N. Virginia)", "AWS: us-west-2 (Oregon)", "AZURE: eastus (Virginia)"]
+        options = ["AWS: us-east-1 (N. Virginia)", "AWS: us-west-2 (Oregon)", "AZURE: eastus (Virginia)", "GCP: us-east1 (South Carolina)"]
         option, how = match_region("aws", "us-east-2", options)
-        self.assertIsNone(option)
-        self.assertEqual(how, "none")
+        self.assertEqual((option, how), ("AWS: us-east-1 (N. Virginia)", "provider_default"))
+        option, how = match_region("azure", "francecentral", options)
+        self.assertEqual((option, how), ("AZURE: eastus (Virginia)", "provider_default"))
+        option, how = match_region("gcp", "asia-east1", options)
+        self.assertEqual((option, how), ("GCP: us-east1 (South Carolina)", "provider_default"))
+        security = ["AZURE: us-east-1 (Virginia)", "GCP: us-east-1 (S. Carolina)"]
+        option, how = match_region("azure", "uksouth", security)
+        self.assertEqual((option, how), ("AZURE: us-east-1 (Virginia)", "provider_default"))
+        option, how = match_region("gcp", "asia-east1", security)
+        self.assertEqual((option, how), ("GCP: us-east-1 (S. Carolina)", "provider_default"))
+        listed, how = match_region("aws", "us-west-2", options)
+        self.assertEqual((listed, how), ("AWS: us-west-2 (Oregon)", "exact"))
+
+    def test_search_uses_the_same_provider_default(self):
+        from es3_estimate import match_region
+        pricing = {"AWS": {"us-east-1": {}, "eu-west-1": {}}, "Azure": {"eastus": {}}, "GCP": {"us-east1": {}}}
+        self.assertEqual(match_region("AWS", "us-east-2", pricing), ("us-east-1", "provider_default"))
+        self.assertEqual(match_region("Azure", "southcentralus", pricing), ("eastus", "provider_default"))
+        self.assertEqual(match_region("GCP", "asia-east1", pricing), ("us-east1", "provider_default"))
+        self.assertEqual(match_region("AWS", "eu-west-1", pricing), ("eu-west-1", "exact"))
 
     def test_an_aws_region_does_not_resolve_to_azure(self):
         from size_serverless import match_region
@@ -3680,22 +3762,35 @@ class PhaseGuardTests(unittest.TestCase):
             {"name": "only", "solution": "observability", "platform": "ech", "gb": 10, "daily_raw_gb": 8, "ecu": 1, **mix},
             {"name": "other", "solution": "observability", "platform": "ech", "gb": 4, "daily_raw_gb": 2, "ecu": 1, **mix},
         ]
-        acc["sizing"]["estimators"]["projects"] = [{
-            "solution": "observability",
-            "region": "southcentralus",
-            "region_match": "AZURE: eastus (Virginia) (provider_default)",
-            "readback": {"monthly_steady_state": 200, "total_raw_gb_day": 8, "annual_year1": 2400},
-            "echo_gate": {"accepted": True, "written_bulk": 8, "sheet_gb_day": 8},
-        }]
+        acc["sizing"]["estimators"]["projects"] = [
+            {
+                "solution": "observability",
+                "region": "southcentralus",
+                "region_match": "AZURE: eastus (Virginia) (provider_default; wanted southcentralus)",
+                "readback": {"monthly_steady_state": 200, "total_raw_gb_day": 8, "annual_year1": 2400, "annual_steady_state": 2400},
+                "echo_gate": {"accepted": True, "written_bulk": 8, "sheet_gb_day": 8},
+            },
+            {
+                "solution": "observability",
+                "region": "eastus",
+                "region_match": "AZURE: eastus (Virginia) (exact)",
+                "readback": {"monthly_steady_state": 50, "total_raw_gb_day": 2, "annual_year1": 600, "annual_steady_state": 600},
+                "echo_gate": {"accepted": True, "written_bulk": 2, "sheet_gb_day": 2},
+            },
+        ]
         acc["sizing"]["architecture"] = {"per_region": True}
         cons = build_consolidation(acc, {"by_deployment": acc["cloud"]["by_deployment"]})
-        self.assertIsNone(cons["savings"]["serverless_mo"])
+        block = cons["serverless"]["by_solution"]["observability"]
+        self.assertEqual(block["total_mo"], 250.0)
+        self.assertIn("quotable", str(block.get("pricing") or ""))
+        self.assertEqual(cons["savings"]["serverless_mo"], 250.0)
         self.assertFalse(cons["integrity"]["passed"])
         names = {row["check"]: row for row in cons["integrity"]["checks"]}
         self.assertFalse(names["Region fidelity"]["passed"])
-        self.assertFalse(names["Quote present"]["passed"])
+        self.assertTrue(names["Quote present"]["passed"])
+        self.assertTrue(any("priced as" in note for note in cons["notes"]))
 
-    def test_one_off_list_search_region_drops_the_solution(self):
+    def test_one_off_list_search_region_is_priced_at_the_provider_default(self):
         acc = _quote_account(g28=10, e73=0)
         acc["sizing"]["consolidated"]["observability"] = {"stored_gb": 0, "daily_raw_gb": 0, "deployments": 0}
         acc["sizing"]["consolidated"]["security"] = {"stored_gb": 0, "daily_raw_gb": 0, "deployments": 0}
@@ -3716,16 +3811,22 @@ class PhaseGuardTests(unittest.TestCase):
         acc["sizing"]["estimators"]["projects"] = [
             {"solution": "search", "region": "us-central1", "region_match": "GCP us-central1 (exact)",
              "readback": {"monthly_steady_state": 300, "annual_year1": 3600}},
-            {"solution": "search", "region": "asia-east1", "region_match": "GCP us-central1 (provider_default)",
-             "readback": {"monthly_steady_state": 200, "annual_year1": 2400}},
+            {"solution": "search", "region": "asia-east1", "region_match": "GCP us-east1 (provider_default; wanted asia-east1)",
+             "readback": {"monthly_steady_state": 200, "annual_year1": 2400, "annual_steady_state": 2400}},
         ]
         acc["sizing"]["architecture"] = {"per_region": True}
         cons = build_consolidation(acc, {"by_deployment": acc["cloud"]["by_deployment"]})
-        self.assertIsNone(cons["savings"]["serverless_mo"])
-        self.assertNotIn("quotable", str(cons["serverless"]["by_solution"]["search"].get("pricing") or ""))
+        block = cons["serverless"]["by_solution"]["search"]
+        self.assertEqual(block["total_mo"], 500.0)
+        self.assertIn("quotable", str(block.get("pricing") or ""))
+        self.assertEqual(cons["savings"]["serverless_mo"], 500.0)
+        priced = {row["region"]: row["monthly"] for row in block["by_region"]}
+        self.assertEqual(priced, {"us-central1": 300.0, "asia-east1": 200.0})
+        names = {row["check"]: row for row in cons["integrity"]["checks"]}
+        self.assertFalse(names["Region fidelity"]["passed"])
         left_out = {row["name"] for row in (cons.get("ech_recent_months_priced") or {}).get("unpriced") or []}
-        self.assertIn("dropped", left_out)
-        self.assertIn("kept", left_out)
+        self.assertNotIn("dropped", left_out)
+        self.assertNotIn("kept", left_out)
 
     def test_an_unstable_bill_compares_the_latest_month(self):
         from consolidation import recent_ech_months_priced
@@ -3825,6 +3926,86 @@ class PhaseGuardTests(unittest.TestCase):
         ok = next(item for item in matched["checks"] if item["check"] == "Plan consistency")
         self.assertTrue(ok["passed"])
 
+    def test_a_short_window_or_a_restarted_counter_warns_and_keeps_the_quote(self):
+        over = integrity_score({"coverage": {
+            "bulk_gb_day": 100,
+            "bulk_short_window_gb_day": 60,
+            "bulk_restart_gb_day": 40,
+        }})
+        self.assertTrue(over["passed"])
+        rows = {row["check"]: row for row in over["checks"]}
+        self.assertTrue(rows["Rate window"]["warning"])
+        self.assertTrue(rows["Rate window"]["passed"])
+        self.assertIn("rated over a short window", rows["Rate window"]["detail"])
+        self.assertIn("still produced", rows["Rate window"]["detail"])
+        self.assertTrue(rows["Counter age"]["warning"])
+        self.assertTrue(rows["Counter age"]["passed"])
+        self.assertIn("restarted bulk counter", rows["Counter age"]["detail"])
+        under = integrity_score({"coverage": {
+            "bulk_gb_day": 100,
+            "bulk_short_window_gb_day": 10,
+            "bulk_restart_gb_day": 10,
+        }})
+        quiet = {row["check"]: row for row in under["checks"]}
+        self.assertTrue(under["passed"])
+        self.assertNotIn("warning", quiet["Rate window"])
+        self.assertNotIn("warning", quiet["Counter age"])
+        blocked = integrity_score({
+            "coverage": {"bulk_gb_day": 100, "bulk_short_window_gb_day": 60, "bulk_restart_gb_day": 0},
+            "priced": {"status": "unavailable", "reason": "unreconciled"},
+        })
+        self.assertFalse(blocked["passed"])
+        still = {row["check"]: row for row in blocked["checks"]}
+        self.assertTrue(still["Rate window"]["warning"])
+        self.assertFalse(still["Priced share"]["passed"])
+        account = _quote_account(g28=10, e73=0)
+        account["sizing"]["diagnostics"] = {
+            "bulk_gb_day": 100,
+            "bulk_short_window_gb_day": 60,
+            "bulk_restart_gb_day": 40,
+            "matched": 1,
+            "active_deployments": 1,
+        }
+        quoted = build_consolidation(account, None)
+        names = {row["check"]: row for row in quoted["integrity"]["checks"]}
+        self.assertTrue(names["Rate window"]["warning"])
+        self.assertTrue(names["Counter age"]["warning"])
+        self.assertTrue(any("rated over a short window" in note and "still produced" in note for note in quoted["notes"]))
+        self.assertTrue(any("restarted bulk counter" in note for note in quoted["notes"]))
+
+    def test_the_quote_page_warns_and_still_shows_the_price(self):
+        acc = {
+            "meta": {"customer": "Example", "date": "2026-11-16"},
+            "cloud": {"summary": {}},
+            "consolidation": {
+                "savings": {"serverless_mo": 250, "list_mo": 100, "ech_list_mo": 350, "list_pct": 28.6, "cost_mo": 100},
+                "ech_scope": {"status": "complete"},
+                "integrity": {"passed": True, "checks": [{
+                    "check": "Rate window",
+                    "score": 0.4,
+                    "passed": True,
+                    "warning": True,
+                    "detail": "60.000 GB/day of 100.000 is rated over a short window (60.0%). The bar is 25%. The quote is still produced.",
+                }, {
+                    "check": "Counter age",
+                    "score": 0.6,
+                    "passed": True,
+                    "warning": True,
+                    "detail": "40.000 GB/day of 100.000 is from a restarted bulk counter (40.0%). The bar is 25%. The quote is still produced.",
+                }]},
+                "serverless": {"dominant_solution": "search", "by_solution": {"search": {"total_mo": 250, "pricing": "es3-estimator performant (quotable)"}}},
+                "basis": {},
+                "notes": ["Warning: 60.000 GB/day of 100.000 is rated over a short window (60.0%). The bar is 25%. The quote is still produced."],
+                "sensitivity": {"fleet": [{"scenario": "Complete-month average", "ech_ecu_mo": 350, "serverless_mo": 250, "scale": 1}], "retention": []},
+            },
+        }
+        html = render_consolidation_html(acc)
+        self.assertIn(">Warning<", html)
+        self.assertIn("rated over a short window", html)
+        self.assertIn("restarted bulk counter", html)
+        self.assertNotIn(">Unverified<", html)
+        self.assertIn("$250", html)
+
     def test_retention_basis_is_informational(self):
         recorded = integrity_score({"coverage": {"bulk_gb_day": 10, "retention_policy_bulk_gb_day": 4}})
         row = next(item for item in recorded["checks"] if item["check"] == "Retention basis")
@@ -3878,6 +4059,22 @@ class ReviewV4Tests(unittest.TestCase):
         self.assertEqual(lines[0], "not verified")
         self.assertIn("Rated ingest", lines[1])
         self.assertIn("unrated store is 33%", lines[2])
+        warned = chat_lines({
+            "savings": {"serverless_mo": 250},
+            "integrity": {
+                "passed": True,
+                "failed": [],
+                "warnings": [
+                    {"check": "Rate window", "detail": "60% rated over a short window"},
+                    {"check": "Counter age", "detail": "40% from a restarted bulk counter"},
+                ],
+            },
+            "draft": False,
+        })
+        self.assertEqual(warned[0], "Serverless $250/mo")
+        self.assertIn("Rate window", warned[1])
+        self.assertIn("Counter age", warned[1])
+        self.assertNotIn("not verified", warned[0])
 
     def test_skill_paths_are_the_same_file_in_each_skill(self):
         root = HERE.parents[1]
@@ -3934,11 +4131,14 @@ class ReviewV4Tests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             diag_inputs._join_solution_region([{"name": "cluster", "bulk_gb_day": 1}], None)
 
-    def test_a_twelve_month_age_does_not_add_a_second_sheet(self):
+    def test_a_measured_age_does_not_add_a_second_sheet(self):
         from plan_sizing import fleet_measured_copy
 
         self.assertIsNone(fleet_measured_copy({
             "solution": "observability", "measured": 12, "retention": 12, "title": "t",
+        }))
+        self.assertIsNone(fleet_measured_copy({
+            "solution": "observability", "measured": 1.3, "retention": 12, "title": "t",
         }))
 
     def test_zero_days_and_effective_retention_are_measured(self):

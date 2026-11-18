@@ -1972,8 +1972,11 @@ def _integrity_block(acc: dict) -> str:
         headline = "Quote integrity was not scored."
     else:
         flagged = [row.get("check") for row in checks if row.get("score") is not None and row.get("passed") is False]
+        warned = [row.get("check") for row in checks if row.get("warning")]
         mark = "Pass" if passed else "Fail"
         headline = f"Quote integrity {float(score):.3f} — {mark}."
+        if warned:
+            headline += " Warning: " + ", ".join(str(name) for name in warned) + "."
         if passed and flagged:
             headline += " Flagged: " + ", ".join(str(name) for name in flagged) + "."
     rows = []
@@ -1981,7 +1984,10 @@ def _integrity_block(acc: dict) -> str:
     for row in checks:
         value = row.get("score")
         flag = row.get("passed")
-        if value is None:
+        if row.get("warning"):
+            shown = "—" if value is None else f"{float(value):.3f}"
+            word, tone = "Warning", "warning"
+        elif value is None:
             shown, word, tone = "—", "n/a", None
         else:
             shown = f"{float(value):.3f}"
@@ -2126,8 +2132,8 @@ _INTEGRITY_FORMULA = {
     "Region fidelity": "1 when every written sheet is an exact or same-number alias match.",
     "Quote present": "1 when every solution with a workload has a serverless monthly price.",
     "Plan consistency": "1 when the Floor bar is within 1% plus $5 of the headline.",
-    "Rate window": "1 when short-window bulk is 25% of bulk or less.",
-    "Counter age": "1 when restarted-counter bulk is 25% of bulk or less.",
+    "Rate window": "1 when short-window bulk is 25% of bulk or less. Above that is a warning. The quote is still produced.",
+    "Counter age": "1 when restarted-counter bulk is 25% of bulk or less. Above that is a warning. The quote is still produced.",
     "Billing window": "1 when every priced month is at least half the latest priced month. The comparison is then the latest month, and the earlier months are not averaged.",
     "Rated ingest": "1 − (store in indices that took bulk writes and have no rate ÷ local store). Those indices are not a data stream, a write alias, or an ILM rollover, or their write index has no write phase. Passes at 5% or less.",
     "Priced share": "Billed cost of the ECH deployments that got a serverless price ÷ billed cost of every ECH deployment on the roster, over the quote window. Passes at the --min-priced-ecu-pct bar, 90% unless set.",
@@ -2726,7 +2732,9 @@ def _integrity_rows(acc: dict) -> list[list]:
             result = "n/a"
         else:
             result = f"{float(score):.3f}"
-            if row.get("passed") is True:
+            if row.get("warning"):
+                result += " warning"
+            elif row.get("passed") is True:
                 result += " pass"
             elif row.get("passed") is False:
                 result += " fail"
@@ -3126,10 +3134,9 @@ def deployment_spend_block(c: dict) -> str:
         rows.append(row)
         oh = r.get("overhead_pct")
         tones.append("warning" if oh is not None and float(oh) > 50 else None)
-    title = "Where ECH spend sits"
+    body = table(headers, rows, ["left", "left"] + ["right"] * (len(headers) - 2), tones)
     if len(per_all) > len(per):
-        title += f" (top {len(per)} by ECU)"
-    body = f"<h3>{title}</h3>" + table(headers, rows, ["left", "left"] + ["right"] * (len(headers) - 2), tones)
+        body += caption(f"Top {len(per)} deployments by ECU.")
     if any(tones):
         body += caption("Shaded rows are fixed overhead above 50% of that deployment's ECU.")
     return body
@@ -3153,7 +3160,20 @@ def deployment_plan_body(c: dict, sv: dict, *, alongside: str = "", width: int =
     if c.get("retention_set_days") == 30:
         plan_ret = "Observability on every serverless bar is 30 days, written as 1 month. Search disk is the measured store scaled to 1 month."
     else:
-        plan_ret = "Retention on each serverless project is 12 months. The measured age is kept as a record."
+        kept_months = int(c.get("estimate_months") or 12)
+        kept_days = c.get("retention_days")
+        index_count = c.get("retention_index_count")
+        index_days = c.get("retention_index_days")
+        if kept_days and kept_months != 12:
+            plan_ret = f"Retention on each serverless project is {int(kept_days)} days, written as {kept_months} months. The measured age is kept as a record."
+        elif index_count:
+            unit = "month" if kept_months == 1 else "months"
+            plan_ret = (
+                f"Retention on each serverless project is the average across {int(index_count):,} indexes, "
+                f"{float(index_days):.1f} days, written as {kept_months} {unit}."
+            )
+        else:
+            plan_ret = "Retention on each serverless project is 12 months. The measured age is kept as a record."
     n = _plan_n(plan)
     n_bit = f" N = {n}." if n is not None else ""
     chart = plan_hbar(rows, width=width, ech=ech, compact=True)
@@ -3498,7 +3518,14 @@ def render_consolidation_html(acc: dict) -> str:
             bits.append("Search at full retention")
         headline += " — " + (", ".join(bits) if bits else "retention 30 days")
     elif scenario == "rounded":
-        headline += " — one-year (12-month retention) estimate"
+        if c.get("retention_days") and est_months != 12:
+            headline += f" — {int(c.get('retention_days'))}-day ({est_months}-month) retention estimate"
+        elif c.get("retention_index_count"):
+            headline += f" — {est_months}-month retention estimate, the index average rounded up"
+        elif est_months == 12:
+            headline += " — one-year (12-month retention) estimate"
+        else:
+            headline += f" — {est_months}-month retention estimate"
     if c.get("ingest_basis") == "compressioncalc_accounted_for":
         headline += " — compressioncalc_accounted_for"
     source_bit = " · ingest and retention from Elasticsearch diagnostics" if diag else " · K360 backup: stored GB ÷ assumed retention"
@@ -3532,6 +3559,12 @@ def render_consolidation_html(acc: dict) -> str:
             + ("" if failed_names else ""),
             "danger",
         ))
+    warned = [
+        row for row in (integrity.get("checks") or [])
+        if isinstance(row, dict) and row.get("warning") and row.get("detail")
+    ]
+    if warned:
+        B.append(callout("Warning", " ".join(str(row["detail"]) for row in warned), "warning"))
     rc = c.get("reconciliation") or {}
     project_n = _priced_project_count(svl)
     _scope = c.get("ech_scope") or {}
@@ -3558,7 +3591,7 @@ def render_consolidation_html(acc: dict) -> str:
         list_mo = float(sv.get("serverless_mo") or 0)
         ech_c = float(sv.get("ech_contract_mo") or 0)
         ech_stat = "Monthly ECH cost at the contract rate" + (f", {window}" if window else "")
-        svl_stat = "Estimated monthly serverless cost at list, 12-month retention" + (f", {window}" if window else "")
+        svl_stat = f"Estimated monthly serverless cost at list, {est_months}-month retention" + (f", {window}" if window else "")
         word = _delta_word(sv.get("cost_mo"), neutral=hide_saving_words)
         save_stat = f"Estimated monthly {word} at the contract rate" + (f", {window}" if window else "")
         pct_stat = f"Estimated {word} at the contract rate" + (f", {window}" if window else "")
@@ -3604,7 +3637,7 @@ def render_consolidation_html(acc: dict) -> str:
             chart_cats = []
             chart_series = []
         elif cover_delta is None and sv.get("list_mo") is None:
-            svl_stat = "Estimated monthly serverless cost, 12-month retention" + (f", {window}" if window else "")
+            svl_stat = f"Estimated monthly serverless cost, {est_months}-month retention" + (f", {window}" if window else "")
             stats = [
                 stat(usd(svl_total), svl_stat, "success", tag="estimate", estimate=True),
             ]
@@ -3612,7 +3645,7 @@ def render_consolidation_html(acc: dict) -> str:
             chart_series = [(ech_cat, [0.0, 0.0]), (svl_cat, [0.0, float(svl_total or 0)])]
         else:
             ech_stat = "Monthly ECH billed cost (K360)" + (f", {window}" if window else "")
-            svl_stat = "Estimated monthly serverless cost, 12-month retention" + (f", {window}" if window else "")
+            svl_stat = f"Estimated monthly serverless cost, {est_months}-month retention" + (f", {window}" if window else "")
             word = _delta_word(sv.get("list_mo"), neutral=hide_saving_words)
             save_stat = f"Estimated monthly {word} versus ECH billed cost" + (f", {window}" if window else "")
             pct_stat = f"Estimated {word} versus ECH billed cost" + (f", {window}" if window else "")
@@ -3669,8 +3702,13 @@ def render_consolidation_html(acc: dict) -> str:
                 if scope_unavailable else ""
             )
         B.append(caption(
-            f"ECH months are complete calendar months of billed cost. The serverless figure is the estimator's monthly price with retention written as {est_months} months "
-            f"(a one-year estimate), the total reported by the spreadsheet or notebook."
+            f"ECH months are complete calendar months of billed cost. The serverless figure is the estimator's monthly price with retention written as {est_months} months"
+            + (
+                f" (the average across {int(c.get('retention_index_count')):,} indexes, rounded up)"
+                if c.get("retention_index_count") and not c.get("retention_days")
+                else (" (a one-year estimate)" if est_months == 12 else "")
+            )
+            + ", the total reported by the spreadsheet or notebook."
             + (f" The comparison covers {usd(sv.get('ech_list_mo'))}/mo of the account's billing; the rest is named below as not compared." if _scope_is_partial(c) else "")
             + month_note))
         unpriced_rows = priced_block.get("unpriced") or []

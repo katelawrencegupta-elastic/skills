@@ -169,7 +169,7 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
             saved_search = sol == "search" and _money(saved_rb.get("monthly_steady_state")) is not None
             if sol == "search" and g["stored_gb"] > 0 and (str(blk.get("pricing") or "").startswith("es3-estimator") or saved_search):
                 search_how = region_match_how(saved_hit.get("region_match"))
-                if saved_rb and search_how in {"provider_default", "nearest", "none", "unknown"}:
+                if saved_rb and search_how in {"nearest", "none", "unknown"}:
                     notes.append(f"Search {g['region']} is not on the estimator list, so that region was not quoted.")
                     classified.append({
                         "region": g["region"], "stored_gb": g["stored_gb"], "kind": "rejected",
@@ -211,7 +211,7 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                 continue
             gate = saved_hit.get("echo_gate") or saved_hit.get("g28_gate") or saved_hit.get("g26_gate") or {}
             how = region_match_how(saved_hit.get("region_match"))
-            if saved_hit.get("readback") and how in {"provider_default", "nearest", "none", "unknown"}:
+            if saved_hit.get("readback") and how in {"nearest", "none", "unknown"}:
                 notes.append(
                     f"{sol.title()} {g['region']} is not on the estimator list, so that region was not quoted."
                 )

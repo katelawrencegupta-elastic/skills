@@ -452,7 +452,7 @@ def consolidation_section(acc: dict) -> list[str]:
             [[
                 row.get("check") or "",
                 "—" if row.get("score") is None else f"{float(row['score']):.3f}",
-                "n/a" if row.get("score") is None else ("Pass" if row.get("passed") else "Fail"),
+                "Warning" if row.get("warning") else ("n/a" if row.get("score") is None else ("Pass" if row.get("passed") else "Fail")),
                 row.get("detail") or "",
             ] for row in integrity["checks"]],
         ))

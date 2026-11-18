@@ -25,7 +25,7 @@ import math
 import re
 from pathlib import Path
 
-from diag_inputs import ESTIMATE_MONTHS, whole_months
+from diag_inputs import ESTIMATE_MONTHS, index_retention_months, whole_months
 
 from constants import DAYS_PER_MONTH
 RETENTION_MIN = 1.0
@@ -129,6 +129,19 @@ def _rollup_solutions(out: dict, clamped_notes: list[str]) -> None:
     use_active = bool(active_info.get("month")) and bool(active_info.get("names"))
     ech = _ech_rows(out)
     totals = (out.get("solutions") or {}).get("totals") or {}
+    explicit_days = (out.get("meta") or {}).get("retention_days")
+    index_months = None if explicit_days else index_retention_months(ech)
+    if index_months is not None:
+        count = sum(int(d.get("retention_index_count") or 0) for d in ech)
+        days = sum(float(d.get("retention_index_days_sum") or 0) for d in ech) / count
+        meta = out.setdefault("meta", {})
+        meta["estimate_months"] = index_months
+        meta["retention_index_days"] = round(days, 3)
+        meta["retention_index_count"] = count
+        unit = "month" if index_months == 1 else "months"
+        clamped_notes.append(
+            f"Average retention across {count:,} indexes is {days:.1f} days. The estimate prices {index_months} {unit}."
+        )
     for sol in ("observability", "security", "search"):
         blk = dict(con.get(sol) or {})
         group = [d for d in ech if (d.get("solution") or "search") == sol]
@@ -142,10 +155,19 @@ def _rollup_solutions(out: dict, clamped_notes: list[str]) -> None:
         weight_bulk = sum(rate for rate, _days in weighed)
         weighted = sum(rate * days for rate, days in weighed)
         measured = (weighted / weight_bulk / DAYS_PER_MONTH) if weight_bulk else None
-        # Every estimate is a one-year estimate. The measured age is kept for the record only.
-        written = ESTIMATE_MONTHS if daily != 0 else None
-        if measured is not None and abs(ESTIMATE_MONTHS - measured) > 0.05:
-            clamped_notes.append(f"{sol} retention measures {measured:.1f} months. The estimate is a one-year estimate, so {ESTIMATE_MONTHS} is written to the estimator.")
+        # Index average, rounded up, unless --retention-days named a month. Otherwise 12.
+        if explicit_days:
+            written_months = int((out.get("meta") or {}).get("estimate_months") or ESTIMATE_MONTHS)
+        elif index_months is not None:
+            written_months = index_months
+        else:
+            written_months = ESTIMATE_MONTHS
+        written = written_months if daily != 0 else None
+        if index_months is None and measured is not None and abs(written_months - measured) > 0.05:
+            if written_months == ESTIMATE_MONTHS:
+                clamped_notes.append(f"{sol} retention measures {measured:.1f} months. The estimate is a one-year estimate, so {ESTIMATE_MONTHS} is written to the estimator.")
+            else:
+                clamped_notes.append(f"{sol} retention measures {measured:.1f} months. The estimate prices {written_months} months.")
         blk["deployments"] = len(group)
         # Deployments that were actually sized: a matched bundle, or priced from K360 on request.
         blk["sized_deployments"] = sum(1 for d in group if d.get("ingest_source") == "diagnostics")
@@ -321,6 +343,9 @@ def apply_diagnostics(
             else:
                 dep.pop("retention_unmeasured", None)
                 dep["retention_days"] = round(days, 3)
+            if hit.get("retention_index_count"):
+                dep["retention_index_count"] = int(hit.get("retention_index_count") or 0)
+                dep["retention_index_days_sum"] = float(hit.get("retention_index_days_sum") or 0)
             dep["retention_basis"] = hit.get("retention_basis")
             dep["retention_label"] = hit.get("retention_label")
             dep["ingest_source"] = "diagnostics"
@@ -514,7 +539,7 @@ def apply_diagnostics(
     coverage["estimation_limits"] = limitations
     notes = [
         "Ingest GB/day is the write-index sum of index.primaries.bulk.est_bytes_per_day from the Elasticsearch diagnostic bundle. "
-        "Retention is the size-weighted ILM delete age on local primary store, or an explicit 30-day assumption for store without a delete policy or data-stream retention, rounded up to a whole month for the estimator. "
+        "The month written to the estimator is the unweighted average retention across indexes with local primary store, rounded up to a whole month. Each index is aged by its ILM delete policy, else its data-stream retention, else 30 days. The size-weighted age stays a record and is not the written month. "
         "Those two are summed by solution and by region. Search disk and the Search ingest-share denominator use diagnostic local store only; K360 stored sizes are excluded from the diagnostic estimate. "
         "Search query rates use exact-window Cloud Tracker index telemetry. ECH ECU stays the K360 bill.",
     ]

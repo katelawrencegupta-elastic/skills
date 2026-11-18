@@ -253,8 +253,8 @@ def _retention_row(coverage: dict | None) -> dict:
     """Share of bulk whose age comes from a configured policy. Informational.
 
     An assumed 30-day default is not configured retention, so it does not count.
-    The check does not pass or fail the quote: under the one-year headline,
-    retention does not change the price. The share is reported on the sensitivity row.
+    The check does not pass or fail the quote. The written month is the index
+    average rounded up. This share is reported and is not that month.
     """
     if not coverage:
         return _integrity_row("Retention basis", None, None, "This run has no diagnostic coverage.")
@@ -574,7 +574,7 @@ def _billing_window_row(window: dict | None) -> dict:
     )
 
 
-def _share_limit_row(name: str, coverage: dict | None, key: str, limit: float, noun: str) -> dict:
+def _share_limit_row(name: str, coverage: dict | None, key: str, limit: float, noun: str, *, blocks_quote: bool = True) -> dict:
     if not coverage or not float(coverage.get("bulk_gb_day") or 0):
         return _integrity_row(name, None, None, "No bulk to compare.")
     if coverage.get(key) is None:
@@ -583,23 +583,26 @@ def _share_limit_row(name: str, coverage: dict | None, key: str, limit: float, n
     part = float(coverage.get(key) or 0)
     share = part / bulk if bulk else 0.0
     passed = share <= limit
-    return _integrity_row(
-        name,
-        round(max(0.0, 1.0 - min(share, 1.0)), 3),
-        passed,
-        f"{part:.3f} GB/day of {bulk:.3f} is {noun} ({share * 100:.1f}%). The bar is {limit * 100:.0f}%.",
-    )
+    detail = f"{part:.3f} GB/day of {bulk:.3f} is {noun} ({share * 100:.1f}%). The bar is {limit * 100:.0f}%."
+    row = _integrity_row(name, round(max(0.0, 1.0 - min(share, 1.0)), 3), passed, detail)
+    if not blocks_quote and passed is False:
+        row["passed"] = True
+        row["warning"] = True
+        row["detail"] = detail + " The quote is still produced."
+    return row
 
 
 def integrity_score(facts: dict) -> dict:
     """Quote integrity, 0 to 1. The mean skips a check that does not apply.
 
     The quote passes only when every scored check passes its own bar: 100% of
-    the checks, whatever the mean is. One failed check fails the quote. The
-    score is the mean and is reported beside that verdict. It does not decide
-    it, because a check can pass its bar and score under 1 (an echo gap inside
-    the tolerance, or unrated store under 5%). A check with no pass/fail
-    (retention basis) is reported and left out of the mean. This is not a serverless bill.
+    the checks, whatever the mean is. One failed check fails the quote. Rate
+    window and Counter age warn when their share is above 25% and do not fail
+    the quote. The score is the mean and is reported beside that verdict. It
+    does not decide it, because a check can pass its bar and score under 1
+    (an echo gap inside the tolerance, or unrated store under 5%). A check
+    with no pass/fail (retention basis) is reported and left out of the mean.
+    This is not a serverless bill.
     """
     coverage = facts.get("coverage")
     checks = [
@@ -616,8 +619,8 @@ def integrity_score(facts: dict) -> dict:
         _region_fidelity_row(list(facts.get("written_regions") or [])),
         _quote_present_row(list(facts.get("solutions") or [])),
         _plan_consistency_row(facts.get("plan_consistency")),
-        _share_limit_row("Rate window", coverage, "bulk_short_window_gb_day", RATE_WINDOW_MAX_SHARE, "rated over a short window"),
-        _share_limit_row("Counter age", coverage, "bulk_restart_gb_day", COUNTER_AGE_MAX_SHARE, "from a restarted bulk counter"),
+        _share_limit_row("Rate window", coverage, "bulk_short_window_gb_day", RATE_WINDOW_MAX_SHARE, "rated over a short window", blocks_quote=False),
+        _share_limit_row("Counter age", coverage, "bulk_restart_gb_day", COUNTER_AGE_MAX_SHARE, "from a restarted bulk counter", blocks_quote=False),
         _billing_window_row(facts.get("billing_window")),
     ]
     applicable = [row for row in checks if row.get("passed") is not None]
@@ -646,8 +649,7 @@ def e73_blocks_quote(value) -> bool:
 def security_readback(readback: dict, retention_months) -> dict:
     """Security read-back with the steady month and the add-on lines made explicit.
 
-    E74 is the sheet's month-12 statement and the monthly quote. The headline
-    writes 12 months, so E74 is the steady month.
+    E74 is the sheet's steady monthly total and the monthly quote.
 
     E74 also sums the endpoint, cloud, workflow, LLM, and SOAR lines. Whatever
     E74 holds beyond ingest, retention, support, and E73 is `other_addons_monthly`.

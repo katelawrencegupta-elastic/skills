@@ -821,6 +821,8 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
     dataset = 0.0
     snapshot = 0.0
     blended_bytes = 0.0       # store with no configured retention, priced at the 30-day default
+    index_days_sum = 0.0
+    index_count = 0
     for ix, body in stats.items():
         store = ((body.get("primaries") or {}).get("store") or {})
         measured = quoted_index_bytes(ix, store)
@@ -846,6 +848,8 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
             age = default_age
         else:
             by_age[round(age, 3)] += nbytes
+        index_days_sum += float(age)
+        index_count += 1
         if age is not None and ingest_kind(series_of.get(ix) or ix, index_mode.get(ix)) == "metrics":
             metrics_age_bytes += age * nbytes
             metrics_bytes += nbytes
@@ -874,6 +878,8 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         "bulk_gb_day": round(gb_day, 3),
         "uptime_days_min": round(min(hot_up), 1) if hot_up else None,
         "retention_days": round(days, 3) if days else None,
+        "retention_index_count": index_count,
+        "retention_index_days_sum": round(index_days_sum, 3),
         # Size-weighted delete age of the metrics indices alone, for the TSDS retention row.
         "retention_days_metrics": round(metrics_age_bytes / metrics_bytes, 3) if metrics_bytes > 0 else None,
         "retention_basis": basis,

@@ -104,17 +104,30 @@ def _nearest_name(provider: str, region: str | None, names: list[str]) -> str | 
     return best
 
 
-def match_region(provider: str, region: str | None, pricing: dict, *, allow_nearest: bool = False) -> tuple[str | None, str]:
-    """Same rule as the sheet matcher: no other region and no other cloud.
+def _option_name(option: str) -> str:
+    return option.split(":", 1)[-1].strip().split(" (", 1)[0].strip()
 
-    A missing match does not pick the first priced region. Nearest is opt-in and stays same-provider.
+
+def match_region(provider: str, region: str | None, pricing: dict, *, allow_nearest: bool = False) -> tuple[str | None, str]:
+    """Same rule as the sheet matcher. A miss uses that cloud's default region.
+
+    AWS us-east-1, Azure eastus, GCP us-east1. Nearest is only used when that
+    default is also absent from the price table. Another cloud is never used.
     """
     names = list((pricing or {}).get(provider) or [])
     options = [f"{provider}: {name} ({name})" for name in names]
     option, how = _shared_match()(provider, region, options)
     if option is not None:
-        matched = option.split(":", 1)[-1].strip().split(" (", 1)[0].strip()
-        return matched, how
+        return _option_name(option), how
+    if str(region or "").strip() and str(provider or "").strip():
+        org = Path(__file__).resolve().parents[2] / "k360-org-report" / "scripts"
+        if str(org) not in sys.path:
+            sys.path.insert(0, str(org))
+        from estimator_layout import provider_fallback_option
+
+        fallback = provider_fallback_option(provider, options)
+        if fallback is not None:
+            return _option_name(fallback), "provider_default"
     if allow_nearest:
         nearest = _nearest_name(provider, region, names)
         if nearest is not None:
@@ -261,6 +274,10 @@ def build_user_info(payload: dict, pricing: dict, support_matrix: dict) -> tuple
     )
     if how == "none" or not region:
         raise ValueError(f"region {payload.get('region')} is not on the estimator list")
+    if how == "provider_default":
+        assumptions.append(
+            f"Region {payload.get('region')!r} is not on the estimator list. It is priced as {region}."
+        )
     if how == "nearest":
         assumptions.append(
             f"Region {payload.get('region')!r} is not on the estimator list. Nearest same-provider option {region} was written."
@@ -282,7 +299,10 @@ def build_user_info(payload: dict, pricing: dict, support_matrix: dict) -> tuple
         "TS_CONFIG": {"ingest_per_day_gb": 0, "boost_window_days": 0, "retention_days": 0},
         "REFRESH_MULT": 1.0,
     }
-    return user_info, f"{provider} {region} ({how})", assumptions
+    label = f"{provider} {region} ({how})"
+    if how in {"provider_default", "nearest"}:
+        label = f"{provider} {region} ({how}; wanted {payload.get('region')})"
+    return user_info, label, assumptions
 
 
 def _num(value):

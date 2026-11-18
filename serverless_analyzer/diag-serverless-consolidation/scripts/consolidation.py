@@ -546,8 +546,9 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
     measured_ages = [float(g["retention_months_measured"]) for g in region_groups if g.get("retention_months_measured") is not None]
     if measured_ages:
         shown = round(sum(measured_ages) / len(measured_ages), 1)
-        if abs(shown - ESTIMATE_MONTHS) > 0.05:
-            notes.append(f"Retention measured at {shown:g} months; the estimate prices {ESTIMATE_MONTHS}.")
+        written_months = int((acc.get("meta") or {}).get("estimate_months") or ESTIMATE_MONTHS)
+        if not (acc.get("meta") or {}).get("retention_index_count") and abs(shown - written_months) > 0.05:
+            notes.append(f"Retention measured at {shown:g} months; the estimate prices {written_months}.")
     measured_projects = [
         p for p in ((sz.get("estimators") or {}).get("projects") or [])
         if isinstance(p, dict) and p.get("role") == "measured_retention"
@@ -620,6 +621,9 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
                 line["annual_year1"] = line["annual_steady_state"] = round(float(line["monthly"]) * 12, 2)
     recon = {"kind": "readbacks", "quotes": quotes, "total_mo": round(svls_total_mo, 2), "quotable": "estimator read-backs"} if quotes else None
     integrity = _integrity(acc, sz, by_solution, quotes, svls_total_mo, scope, priced_months)
+    for row in integrity.get("checks") or []:
+        if row.get("warning") and row.get("detail"):
+            notes.append(f"Warning: {row['detail']}")
 
     callouts: list[dict] = []
     if per:
@@ -692,7 +696,10 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         "savings": savings,
         "ech_recent_months": recent_ech_months(acc),
         "ech_recent_months_priced": priced_months,
-        "estimate_months": 12,
+        "estimate_months": int((acc.get("meta") or {}).get("estimate_months") or 12),
+        "retention_days": (acc.get("meta") or {}).get("retention_days"),
+        "retention_index_days": (acc.get("meta") or {}).get("retention_index_days"),
+        "retention_index_count": (acc.get("meta") or {}).get("retention_index_count"),
         "ech_scope": scope,
         "ladder": [] if quoted else (_ladder_walk(metered) if metered else []),
         "metered_expansion": 1.0 if sz.get("ingest_source") == "diagnostics" else O11Y_METER_FACTOR,

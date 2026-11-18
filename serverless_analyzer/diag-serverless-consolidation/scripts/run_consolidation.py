@@ -10,7 +10,7 @@ is a separate document.
 
 The quote window is the last 90 billed days (--lookback-days, maximum 365). The account fetch stays a year.
 ECH dollars are the K360 billing cost field for that window, as a month. One consolidation PDF is
-written, as a one-year (12-month retention) estimate.
+written at the average index retention, rounded up to a whole month.
 
 Run from the project root that holds `.env` (KIBANA_URL, ELASTIC_API_KEY, FOUND_ADMIN_API_KEY).
 The account summary stays on run_account_analysis.py --skip-diags --skip-sizing.
@@ -67,7 +67,18 @@ def _run(cmd: list[str]) -> None:
         raise
 
 
-def method_stamp(lookback_days: int, *, diagnostic: bool = True) -> dict:
+def _retention_label(diagnostic: bool, retention_months: int, retention_days: int | None, *, index_average: bool = False) -> str:
+    if not diagnostic:
+        return "assumed month"
+    if index_average:
+        unit = "month" if int(retention_months) == 1 else "months"
+        return f"index average rounded up to {int(retention_months)} {unit}"
+    if retention_days and int(retention_months) != 12:
+        return f"{int(retention_days)} days ({int(retention_months)} months)"
+    return "one year (12 months)"
+
+
+def method_stamp(lookback_days: int, *, diagnostic: bool = True, retention_months: int = 12, retention_days: int | None = None, index_average: bool = False) -> dict:
     """Which code and which rules produced this run.
 
     Two runs of one customer can only be compared when they carry the same stamp.
@@ -91,7 +102,7 @@ def method_stamp(lookback_days: int, *, diagnostic: bool = True) -> dict:
         "ingest_basis": "metered diagnostic bulk" if diagnostic else "K360 stored GB ÷ assumed retention",
         "ech_dollars": "k360_cost",
         "quote_window_days": int(lookback_days),
-        "retention": "one year (12 months)" if diagnostic else "assumed month",
+        "retention": _retention_label(diagnostic, retention_months, retention_days, index_average=index_average),
         "integrity_pass": "every check",
     }
 
@@ -162,7 +173,12 @@ def _integrity_brief(block: dict | None) -> dict | None:
         for row in (block.get("checks") or [])
         if row.get("passed") is False
     ]
-    return {"score": block.get("score"), "passed": block.get("passed"), "failed": failed}
+    warnings = [
+        {"check": row.get("check"), "detail": row.get("detail"), "score": row.get("score")}
+        for row in (block.get("checks") or [])
+        if row.get("warning")
+    ]
+    return {"score": block.get("score"), "passed": block.get("passed"), "failed": failed, "warnings": warnings}
 
 
 def _plan_brief(plan) -> list[dict]:
@@ -211,7 +227,7 @@ def _region_matches(estimators: dict) -> list[dict]:
                 "readback_rejected": entry.get("readback_rejected"),
             })
     for entry in (estimators or {}).get("projects") or []:
-        if isinstance(entry, dict) and (entry.get("region_match") or entry.get("readback_rejected")):
+        if isinstance(entry, dict) and entry.get("role") != "measured_retention" and (entry.get("region_match") or entry.get("readback_rejected")):
             rows.append({
                 "solution": entry.get("solution"),
                 "region": entry.get("region"),
@@ -313,7 +329,7 @@ def _priced_months_brief(block) -> dict | None:
 
 
 def chat_lines(brief: dict) -> list[str]:
-    """At most six lines: the headline, failed checks, the top limits, and links."""
+    """At most six lines: the headline, warnings, failed checks, the top limits, and links."""
     lines: list[str] = []
     savings = brief.get("savings") or {}
     monthly = savings.get("serverless_mo")
@@ -331,6 +347,13 @@ def chat_lines(brief: dict) -> list[str]:
         lines.append("not verified")
     else:
         lines.append(f"Serverless ${float(monthly):,.0f}/mo")
+    warnings = [
+        str(row.get("check"))
+        for row in (integrity.get("warnings") or [])
+        if isinstance(row, dict) and row.get("check")
+    ]
+    if warnings:
+        lines.append("Warning: " + ", ".join(warnings) + " exceeded. The quote is still produced.")
     if failed:
         lines.append("Failed checks: " + ", ".join(failed))
     limits = [row for row in (brief.get("limits") or []) if isinstance(row, dict)]
@@ -511,7 +534,12 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
             "--unmeasured fail stops the run. Collect the diagnostic bundles or pass --unmeasured exclude."
         )
     diag["sizing"]["quote_options"] = options
-    diag.setdefault("meta", {})["method"] = method_stamp(args.lookback_days)
+    diag.setdefault("meta", {})["method"] = method_stamp(
+        args.lookback_days,
+        retention_months=int((diag.get("meta") or {}).get("estimate_months") or ESTIMATE_MONTHS),
+        retention_days=(diag.get("meta") or {}).get("retention_days"),
+        index_average=bool((diag.get("meta") or {}).get("retention_index_count")),
+    )
     if download_failed:
         diag["sizing"].setdefault("diagnostics", {})["download_failed"] = download_failed
     apply_quote_lookback(diag, args.lookback_days)
@@ -567,8 +595,9 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
     seal_text(diag_path, json.dumps(diag, indent=2))
     py = _sheets_py()
     sizing_ran = False
-    # Every serverless estimate is a one-year estimate: retention is written as 12 months.
-    extra = ["--sizing-json", "sizing.json", "--force-months", str(ESTIMATE_MONTHS)]
+    # The written month is the index average rounded up. --retention-days replaces it.
+    written_months = int((diag.get("meta") or {}).get("estimate_months") or getattr(args, "estimate_months", None) or ESTIMATE_MONTHS)
+    extra = ["--sizing-json", "sizing.json", "--force-months", str(written_months)]
     if args.fresh:
         extra.append("--fresh")
     if py.is_file():
@@ -648,6 +677,14 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
 
 def main() -> None:
     args = parse_args(description=__doc__)
+    from diag_inputs import whole_months
+    from constants import DAYS_PER_MONTH
+    if getattr(args, "retention_days", None):
+        if not 1 <= int(args.retention_days) <= 1095:
+            raise SystemExit("--retention-days must be from 1 to 1095")
+        args.estimate_months = whole_months(int(args.retention_days) / DAYS_PER_MONTH)
+    else:
+        args.estimate_months = ESTIMATE_MONTHS
     stamp = method_stamp(int(args.lookback_days))
     if not getattr(args, "allow_dirty", False):
         state = stamp.get("uncommitted_changes")

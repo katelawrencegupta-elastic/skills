@@ -45,6 +45,33 @@ def load_rows(path: Path) -> list[dict]:
 
 
 
+def index_retention_months(rows: list[dict]) -> int | None:
+    """Unweighted mean of index retention ages, rounded up to a whole month.
+
+    Each index with local primary store counts once. Its age is the ILM delete
+    age, else the data-stream retention, else the 30-day default. A deployment
+    carries the day-sum and the count so the mean is across indexes. None when
+    no index was counted.
+    """
+    total_days = 0.0
+    count = 0
+    for row in rows:
+        try:
+            n = int(row.get("retention_index_count") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n <= 0:
+            continue
+        try:
+            total_days += float(row.get("retention_index_days_sum") or 0)
+        except (TypeError, ValueError):
+            continue
+        count += n
+    if count <= 0:
+        return None
+    return whole_months((total_days / count) / DAYS_PER_MONTH)
+
+
 def whole_months(months: float) -> int:
     """Estimator retention is an integer 1–36. Round up.
 

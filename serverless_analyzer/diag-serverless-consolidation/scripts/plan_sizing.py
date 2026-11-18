@@ -62,7 +62,7 @@ def _fill_regional_job(job: dict, creds) -> dict:
             "region_match": "none", "readback_rejected": _region_rejected(job.get("region")),
             "readback": {}, "status": "unquoted", "error": _region_rejected(job.get("region")),
         }
-    match_text = f"{reg} (nearest; wanted {job.get('region')})" if how == "nearest" else f"{reg} ({how})"
+    match_text = region_match_text(reg, how, job.get("region"))
     basis = job.get("basis") or "raw"
     account = {"sizing": {"feature_tier": job.get("feature_tier")}}
     gate = None
@@ -177,16 +177,6 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
             else:
                 continue
             jobs.append(job)
-            measured = g.get("retention_months_measured")
-            if sol != "search" and measured is not None and retention is not None:
-                from diag_inputs import whole_months
-                measured_months = whole_months(float(measured))
-                if measured_months != int(retention):
-                    extra = dict(job)
-                    extra["retention"] = measured_months
-                    extra["title"] = f"{title} measured retention"
-                    extra["role"] = "measured_retention"
-                    jobs.append(extra)
     if not jobs:
         return []
     creds = load_sheet_creds()
@@ -621,25 +611,9 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
 
 
 def fleet_measured_copy(job: dict) -> dict | None:
-    """A second Observability or Security sheet at the recorded age.
-
-    The headline sheet stays at the written month. This copy is not the quote.
-    """
-    from diag_inputs import whole_months
-
-    measured = job.get("measured")
-    written = job.get("retention")
-    if measured is None or written is None or job.get("solution") == "search":
-        return None
-    months = whole_months(float(measured))
-    if months == int(written):
-        return None
-    extra = dict(job)
-    extra["retention"] = months
-    extra["title"] = f"{job['title']} measured retention"
-    extra["role"] = "measured_retention"
-    extra["forced"] = True
-    return _fill_regional_job(extra, load_sheet_creds())
+    """No second sheet. The quote is the 12-month workbook; the measured age is a note."""
+    del job
+    return None
 
 
 def org_store_gb(acc: dict) -> float:

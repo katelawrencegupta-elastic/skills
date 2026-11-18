@@ -12,7 +12,7 @@ Estimate sheets go directly in generated_estimates. There is no full_retention o
 Deployment-plan sheets stay in generated_estimates/plan_sheets.
 Each solution with a workload gets one sheet per region. A solution with no workload is skipped.
   <solution>_full retention_bulk
-Observability and Security write GB/day at 12 months. The recorded age is `retention_months_measured`.
+Observability and Security write GB/day at the average index retention, rounded up to a whole month. The size-weighted age is `retention_months_measured`.
 Search disk is the measured local store. It is not scaled by a retention month.
 Sheet titles are
   <customer>_<date>_<search|observability|security>_full retention_<bulk|k360>_<region>_serverless_estimate
@@ -54,7 +54,7 @@ def main() -> None:
     ap.add_argument("--dedupe", action="store_true", help="Trash all but the newest sheet for each estimate title under this run's Drive folder, then exit")
     ap.add_argument("--dedupe-dry-run", action="store_true", help="With --dedupe: list the duplicates and trash nothing")
     ap.add_argument("--deployment-plan", action="store_true", help="Price the deployment-count bars from one project per ECH deployment down to one project per feature per region")
-    ap.add_argument("--allow-nearest-region", action="store_true", help="Write the nearest same-provider region when the deployment's region is not on the estimator list. The quote stays unverified.")
+    ap.add_argument("--allow-nearest-region", action="store_true", help="When the provider default is also absent, write the nearest same-provider region. A region that is not listed is otherwise priced as AWS us-east-1, Azure eastus, or GCP us-east1. The quote stays unverified.")
     args = ap.parse_args()
     import sizing_shared
     sizing_shared._ALLOW_NEAREST = bool(args.allow_nearest_region)
@@ -239,7 +239,7 @@ def main() -> None:
             lines.append(f"Observability → {reason}")
         else:
             daily = float(o.get("daily_raw_gb") or 0)
-            match_text = f"{reg} (nearest; wanted {o_scope or region})" if how == "nearest" else f"{reg} ({how})"
+            match_text = region_match_text(reg, how, o_scope or region)
             o_mix = None
             if o.get("mix_basis"):
                 o_mix = {
@@ -268,17 +268,6 @@ def main() -> None:
                     entry["local_xlsx_error"] = str(ex)
             estimators["observability"] = entry
             lines.append(f"Observability → {copied['url']}  ({n} cells; Y1 {rb.get('annual_year1')}, monthly {rb.get('monthly_steady_state')}; region {reg} [{how}])")
-            extra = fleet_measured_copy({
-                "solution": "observability", "region": o_scope or region, "title": title_o,
-                "stored_gb": float(o.get("stored_gb") or 0), "parent_id": folder["id"],
-                "local_dir": str(estimate_dir), "provider": provider, "support": support,
-                "feature_tier": (acc.get("sizing") or {}).get("feature_tier"), "skip_xlsx": True,
-                "reuse": True, "basis": basis, "template_id": args.o11y_id, "tab": O11Y_TAB,
-                "readback": O11Y_READBACK, "retention": o_months, "daily": daily,
-                "mix": o_mix, "measured": o.get("retention_months_measured"),
-            })
-            if extra:
-                estimators.setdefault("projects", []).append(extra)
 
     _checkpoint_sizing(local_dir, sizing_name, sz, estimators)
 
@@ -316,7 +305,7 @@ def main() -> None:
         else:
             s_daily = float(s.get("siem_gb_day") if s.get("siem_gb_day") is not None else s.get("daily_raw_gb") or 0)
             cells, n, rb, s_gate = fill_security(sheets, copied["id"], acc, support, reg, s_months, s_daily, opts, basis)
-            match_text = f"{reg} (nearest; wanted {s_scope or region})" if how == "nearest" else f"{reg} ({how})"
+            match_text = region_match_text(reg, how, s_scope or region)
             entry = {"kind": "security", "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.security_id, "reused_existing_copy": reused, "tab": SEC_TAB, "cells": cells, "cells_written": n, "region_match": match_text, "readback": rb, "status": "filled", "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"]}
             entry["ingest_basis"] = basis
             if s_gate is not None:
@@ -331,17 +320,6 @@ def main() -> None:
                     entry["local_xlsx_error"] = str(ex)
             estimators["security"] = entry
             lines.append(f"Security → {copied['url']}  ({n} cells; Y1 {rb.get('annual_year1')}; region {reg} [{how}])")
-            extra = fleet_measured_copy({
-                "solution": "security", "region": s_scope or region, "title": title_s,
-                "stored_gb": float(s.get("stored_gb") or 0), "parent_id": folder["id"],
-                "local_dir": str(estimate_dir), "provider": provider, "support": support,
-                "feature_tier": (acc.get("sizing") or {}).get("feature_tier"), "skip_xlsx": True,
-                "reuse": True, "basis": basis, "template_id": args.security_id, "tab": SEC_TAB,
-                "readback": SEC_READBACK, "retention": s_months, "daily": s_daily,
-                "measured": s.get("retention_months_measured"),
-            })
-            if extra:
-                estimators.setdefault("projects", []).append(extra)
 
     _checkpoint_sizing(local_dir, sizing_name, sz, estimators)
 
@@ -416,12 +394,11 @@ def main() -> None:
         local_dir=estimate_dir, customer=meta["customer"], when=meta["date"], name_suffix=suffix,
         only=project_only, force_months=args.force_months,
     )
-    kept_measured = [p for p in (estimators.get("projects") or []) if p.get("role") == "measured_retention"]
     if args.skip_search:
         kept = [p for p in ((sz.get("estimators") or {}).get("projects") or []) if p.get("solution") == "search" and p.get("role") != "measured_retention"]
-        estimators["projects"] = kept_measured + fresh_projects + kept
+        estimators["projects"] = fresh_projects + kept
     else:
-        estimators["projects"] = kept_measured + fresh_projects
+        estimators["projects"] = fresh_projects
     prefer_regional_estimators(estimators)
 
     sz["folder"] = str(local_dir)

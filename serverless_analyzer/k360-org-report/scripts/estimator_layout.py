@@ -183,6 +183,15 @@ def region_options(values) -> list[str]:
     return out
 
 
+# Priced when the deployment's own region is not on the list. Security writes
+# Azure eastus and GCP us-east1 as us-east-1, so each default has both spellings.
+PROVIDER_FALLBACK = {
+    "AWS": ("us-east-1",),
+    "AZURE": ("eastus", "us-east-1"),
+    "GCP": ("us-east1", "us-east-1"),
+}
+
+
 def match_region(provider, region, options) -> tuple[str | None, str]:
     """→ (option, how). how is exact, alias, or none.
 
@@ -204,6 +213,20 @@ def match_region(provider, region, options) -> tuple[str | None, str]:
         if token in want:
             return option, "exact" if token == plain else "alias"
     return None, "none"
+
+
+def provider_fallback_option(provider, options) -> str | None:
+    """Same-provider default for a region that is not on the list.
+
+    AWS us-east-1, Azure eastus, GCP us-east1. The second spelling is the
+    Security dropdown's name for that same region. Another cloud is never used.
+    """
+    prov = str(provider or "").strip().upper()
+    for candidate in PROVIDER_FALLBACK.get(prov, ()):
+        option, _how = match_region(provider, candidate, options)
+        if option is not None:
+            return option
+    return None
 
 
 # Input cells on the Observability estimator, v1.22.

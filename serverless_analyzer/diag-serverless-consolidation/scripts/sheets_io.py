@@ -222,6 +222,13 @@ def dedupe_estimates(drive, root_id: str, *, dry_run: bool = False) -> list[dict
     walk(root_id, "")
     removed = []
     for name, group in seen.items():
+        # A "measured retention" workbook is a second copy of the 12-month quote.
+        if name.endswith(" measured retention"):
+            for f in group:
+                if not dry_run:
+                    trash_file(drive, f["id"])
+                removed.append({"name": name, "id": f["id"], "path": f["path"], "kept": None})
+            continue
         if len(group) < 2:
             continue
         group.sort(key=lambda f: f.get("createdTime") or "", reverse=True)

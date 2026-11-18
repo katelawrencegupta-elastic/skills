@@ -231,20 +231,35 @@ def _nearest_same_provider(provider: str | None, region: str | None, options: li
 
 
 def match_region(provider: str | None, region: str | None, options: list[str]) -> tuple[str | None, str]:
-    """Shared matcher. No other region and no other cloud. Nearest is opt-in.
+    """Shared matcher. Same cloud only.
 
-    how is exact, alias, nearest, or none. A missing match does not write a region cell.
+    how is exact, alias, provider_default, nearest, or none. A region that is
+    not listed is priced as AWS us-east-1, Azure eastus, or GCP us-east1.
+    Nearest is only used when that default is also absent.
     """
     from estimator_layout import match_region as _shared
+    from estimator_layout import provider_fallback_option
 
     import sizing_shared
     option, how = _shared(provider, region, options)
-    if option is not None or not sizing_shared._ALLOW_NEAREST:
+    if option is not None or not str(region or "").strip() or not str(provider or "").strip():
         return option, how
+    fallback = provider_fallback_option(provider, options)
+    if fallback is not None:
+        return fallback, "provider_default"
+    if not sizing_shared._ALLOW_NEAREST:
+        return None, "none"
     nearest = _nearest_same_provider(provider, region, options)
     if nearest is None:
         return None, "none"
     return nearest, "nearest"
+
+
+def region_match_text(option: str, how: str, wanted: str | None) -> str:
+    """The string stored on the sheet. A substitute names the region that was asked for."""
+    if how in {"nearest", "provider_default"}:
+        return f"{option} ({how}; wanted {wanted})"
+    return f"{option} ({how})"
 
 
 def _region_rejected(region: str | None) -> str:
