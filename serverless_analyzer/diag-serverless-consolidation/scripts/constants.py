@@ -9,6 +9,10 @@ ESTIMATE_MONTHS = 12
 SECURITY_EXPANSION = 1.66
 O11Y_METER_FACTOR = 1.595
 RATE_WINDOW_MAX_SHARE = 0.25
+# Share of local store that may sit in indices that took bulk writes and have no rate.
+# Above it the quote carries a warning: a long-lived index written by name has no write
+# phase in the bundle, which is a limit of the measurement, not a fault in this run.
+UNRATED_STORE_MAX_SHARE = 0.10
 COUNTER_AGE_MAX_SHARE = 0.25
 PLAN_HEADLINE_SHARE = 0.01
 PLAN_HEADLINE_USD = 5.0

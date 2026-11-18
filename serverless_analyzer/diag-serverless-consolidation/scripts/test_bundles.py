@@ -271,13 +271,36 @@ class UnratedIngestTests(unittest.TestCase):
             result = integrity_score({"coverage": cov})
             return next(row for row in result["checks"] if row["check"] == "Rated ingest")
 
+        # 20% of store unrated: a warning that names the deployment, and never a failure.
         flagged = rated({"unrated": unrated})
-        self.assertEqual((flagged["score"], flagged["passed"]), (0.8, False))
+        self.assertEqual((flagged["score"], flagged["passed"]), (0.8, True))
+        self.assertTrue(flagged["warning"])
         self.assertIn("a (20 GB)", flagged["detail"])
+        self.assertIn("still produced", flagged["detail"])
+        # Inside the 10% bar: no warning at all.
         small = rated({"unrated": {"indices": 1, "store_gb": 4, "share_of_store": 0.04, "deployments": []}})
         self.assertEqual((small["score"], small["passed"]), (0.96, True))
+        self.assertNotIn("warning", small)
+        edge = rated({"unrated": {"indices": 1, "store_gb": 10, "share_of_store": 0.10, "deployments": []}})
+        self.assertNotIn("warning", edge)
+        over = rated({"unrated": {"indices": 1, "store_gb": 11, "share_of_store": 0.1001, "deployments": []}})
+        self.assertTrue(over["warning"])
         clean = rated({"unrated": {"indices": 0, "store_gb": 0, "share_of_store": 0.0, "deployments": []}})
         self.assertEqual((clean["score"], clean["passed"]), (1.0, True))
+        self.assertNotIn("warning", clean)
+        # Unrated indices with no store to compare them with still cannot block a quote.
+        blind = rated({"unrated": {"indices": 3, "store_gb": 0, "share_of_store": None, "deployments": []}})
+        self.assertTrue(blind["passed"])
+        self.assertTrue(blind["warning"])
+
+    def test_unrated_ingest_never_fails_a_quote(self):
+        """It reports what the rate did not see; it says nothing about the bulk that was rated."""
+        result = integrity_score({"coverage": {"unrated": {
+            "indices": 27, "store_gb": 9576.2, "share_of_store": 0.334, "deployments": [],
+        }}})
+        row = next(r for r in result["checks"] if r["check"] == "Rated ingest")
+        self.assertTrue(row["passed"])
+        self.assertNotIn("Rated ingest", [r["check"] for r in result["checks"] if r.get("passed") is False])
 
     def test_rows_parsed_before_the_count_existed_leave_the_check_out(self):
         acc = {

@@ -17,6 +17,7 @@ from estimator_layout import (  # noqa: E402,F401
 from constants import (  # noqa: E402
     BILLING_WINDOW_MIN_SHARE, COUNTER_AGE_MAX_SHARE, ECHO_TOLERANCE_GB_DAY, ECHO_TOLERANCE_SHARE,
     PLAN_HEADLINE_SHARE, PLAN_HEADLINE_USD, RATE_WINDOW_MAX_SHARE, RETENTION_ASSUMED_MAX_SHARE,
+    UNRATED_STORE_MAX_SHARE,
 )
 
 # The sheet echo has to match the GB/day written. The sheet rounds a little, so there is a floor,
@@ -324,12 +325,17 @@ def _retention_month_row(retention: dict | None) -> dict:
     return row
 
 
-# Share of local store that may sit in unrated indices before the check is flagged.
-UNRATED_STORE_PASS = 0.05
-
-
 def _rated_row(coverage: dict | None) -> dict:
-    """Store in indices that took bulk writes and have no rate, as a share of local store."""
+    """Store in indices that took bulk writes and have no rate, as a share of local store.
+
+    A warning, not a failure. An index that is not in a data stream, has no write
+    alias and was never rolled over has no write phase in the bundle, so its bulk
+    counter cannot be turned into a rate. That is a limit of the measurement, and
+    it is the usual shape of a long-lived index written by name. Failing the quote
+    on it withheld every quote on fleets that are built that way, and said nothing
+    about whether the bulk that *was* rated is right. Above
+    `UNRATED_STORE_MAX_SHARE` the quote says how much ingest the rate did not see.
+    """
     unrated = (coverage or {}).get("unrated")
     if not coverage or unrated is None:
         return _integrity_row("Rated ingest", None, None, "The bundles were parsed without the unrated-index count.")
@@ -338,20 +344,29 @@ def _rated_row(coverage: dict | None) -> dict:
     share = unrated.get("share_of_store")
     if count == 0:
         return _integrity_row("Rated ingest", 1.0, True, "Every index that took bulk writes is rated or is a rolled generation.")
+    tail = " The quote is still produced, and the bulk that was rated is unchanged."
     if share is None:
-        return _integrity_row(
-            "Rated ingest", 0.0, False,
-            f"{count} indices took bulk writes and have no rate, and there is no local store to compare them with.",
+        row = _integrity_row(
+            "Rated ingest", 0.0, True,
+            f"{count} indices took bulk writes and have no rate, and there is no local store to "
+            f"compare them with.{tail}",
         )
+        row["warning"] = True
+        return row
     share = min(max(float(share), 0.0), 1.0)
     detail = (
         f"{count} indices took bulk writes and have no rate. They hold {store:,.1f} GB, "
-        f"{share * 100:.1f}% of local store. Their ingest is not in bulk GB/day."
+        f"{share * 100:.1f}% of local store. Their ingest is not in bulk GB/day. "
+        f"The bar is {UNRATED_STORE_MAX_SHARE * 100:.0f}%."
     )
     names = [f"{row.get('name')} ({float(row.get('store_gb') or 0):,.0f} GB)" for row in (unrated.get("deployments") or [])[:6] if row.get("name")]
     if names:
         detail += " Largest: " + ", ".join(names) + "."
-    return _integrity_row("Rated ingest", 1.0 - share, share <= UNRATED_STORE_PASS, detail)
+    if share <= UNRATED_STORE_MAX_SHARE:
+        return _integrity_row("Rated ingest", 1.0 - share, True, detail)
+    row = _integrity_row("Rated ingest", 1.0 - share, True, detail + tail)
+    row["warning"] = True
+    return row
 
 
 def _priced_row(priced: dict | None) -> dict:
@@ -701,10 +716,12 @@ def integrity_score(facts: dict) -> dict:
 
     The quote passes only when every scored check passes its own bar: 100% of
     the checks, whatever the mean is. One failed check fails the quote. Rate
-    window, Counter age, Retention basis, and Retention month warn and do not
-    fail the quote: the first two when their share is above 25%, the third when
-    more than 10% of bulk sits at the 30-day assumed age, the last when the
-    written month is the default rather than the index average.
+    window, Counter age, Rated ingest, Retention basis, and Retention month warn
+    and do not fail the quote: the first two when their share is above 25%,
+    Rated ingest when unrated store is above 10%, Retention basis when more than
+    10% of bulk sits at the 30-day assumed age, and Retention month when the
+    written month is the default rather than the index average. Each says how
+    well the fleet could be measured, not that a dollar read back is wrong.
     The score is the mean and is reported beside that verdict. It
     does not decide it, because a check can pass its bar and score under 1
     (an echo gap inside the tolerance, or unrated store under 5%).
