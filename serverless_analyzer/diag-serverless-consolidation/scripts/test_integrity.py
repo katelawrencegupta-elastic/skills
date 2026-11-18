@@ -84,13 +84,14 @@ class RegionAliasTests(unittest.TestCase):
         from quote_checks import _alias_same_number
         self.assertFalse(_alias_same_number("ap-southeast-2", "AWS: ap-southeast-1 (Singapore) "))
 
-    def test_a_sheet_on_another_cloud_fails_region_fidelity(self):
+    def test_a_sheet_on_another_cloud_is_flagged_first(self):
         from quote_checks import _region_fidelity_row
         row = _region_fidelity_row([{
             "solution": "security", "region": "us-east-2", "provider": "aws",
             "region_match": "AZURE: us-east-2 (Virginia) (alias)",
         }])
-        self.assertFalse(row["passed"])
+        self.assertTrue(row["passed"])       # a mismatch flags, it does not withhold the quote
+        self.assertTrue(row["warning"])
         self.assertIn("another cloud", row["detail"])
 
     def test_the_same_cloud_passes(self):
@@ -150,10 +151,10 @@ class FixtureCrossCheckTests(unittest.TestCase):
             for row in cons["integrity"]["checks"]:
                 if row["check"] != "Region fidelity":
                     continue
-                if row["passed"] is False:
-                    self.assertIn(row["passed"], (False, None))
-                if row["passed"] is True:
-                    self.assertNotIn("provider_default", row.get("detail") or "")
+                # Never a failure. A substitute region is named instead.
+                self.assertIn(row["passed"], (True, None))
+                if "provider_default" in (row.get("detail") or ""):
+                    self.assertTrue(row.get("warning"), name)
 
     def test_page_one_ech_and_serverless_cover_the_same_deployments(self):
         from consolidation import unpriced_reason

@@ -545,7 +545,8 @@ class PhaseGuardTests(unittest.TestCase):
         self.assertEqual(by_label["Mid"]["monthly"], 40)
         self.assertTrue(by_label["Floor"].get("gap"))
 
-    def test_a_region_off_the_estimator_list_is_not_a_quote(self):
+    def test_a_region_off_the_estimator_list_is_quoted_and_flagged(self):
+        """Priced at the same provider's default, named on the cover, and never withheld."""
         acc = _quote_account(g28=10, e73=0)
         acc["sizing"]["consolidated"]["security"] = {"stored_gb": 0, "daily_raw_gb": 0, "deployments": 0}
         acc["sizing"]["consolidated"]["search"] = {"stored_gb": 0, "daily_raw_gb": 0, "deployments": 0}
@@ -582,9 +583,10 @@ class PhaseGuardTests(unittest.TestCase):
         self.assertEqual(block["total_mo"], 250.0)
         self.assertIn("quotable", str(block.get("pricing") or ""))
         self.assertEqual(cons["savings"]["serverless_mo"], 250.0)
-        self.assertFalse(cons["integrity"]["passed"])
         names = {row["check"]: row for row in cons["integrity"]["checks"]}
-        self.assertFalse(names["Region fidelity"]["passed"])
+        self.assertTrue(names["Region fidelity"]["passed"])
+        self.assertTrue(names["Region fidelity"]["warning"])
+        self.assertIn("provider_default", names["Region fidelity"]["detail"])
         self.assertTrue(names["Quote present"]["passed"])
         self.assertTrue(any("priced as" in note for note in cons["notes"]))
 
@@ -621,7 +623,8 @@ class PhaseGuardTests(unittest.TestCase):
         priced = {row["region"]: row["monthly"] for row in block["by_region"]}
         self.assertEqual(priced, {"us-central1": 300.0, "asia-east1": 200.0})
         names = {row["check"]: row for row in cons["integrity"]["checks"]}
-        self.assertFalse(names["Region fidelity"]["passed"])
+        self.assertTrue(names["Region fidelity"]["passed"])
+        self.assertTrue(names["Region fidelity"]["warning"])
         left_out = {row["name"] for row in (cons.get("ech_recent_months_priced") or {}).get("unpriced") or []}
         self.assertNotIn("dropped", left_out)
         self.assertNotIn("kept", left_out)
@@ -885,7 +888,7 @@ class PhaseGuardTests(unittest.TestCase):
     def test_an_alias_with_no_region_recorded_says_so(self):
         from quote_checks import _region_fidelity_row
         row = _region_fidelity_row([{"solution": "security", "region": None, "region_match": "AZURE: us-east-2 (alias)"}])
-        self.assertFalse(row["passed"])
+        self.assertTrue(row["warning"])
         self.assertIn("alias match and no region", row["detail"])
         self.assertNotIn("different region number", row["detail"])
 

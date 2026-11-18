@@ -553,7 +553,16 @@ def _quote_present_row(solutions: list[dict]) -> dict:
 
 
 def _region_fidelity_row(sheets: list[dict]) -> dict:
-    """Every written sheet is an exact or alias match, same provider and same region number."""
+    """Where each sheet was written, against the region it was meant for.
+
+    A warning, not a failure. A region that is not on the estimator list is
+    priced at the same provider's default (AWS us-east-1, Azure eastus, GCP
+    us-east1) and that read-back is a real dollar, so withholding the whole
+    quote over it leaves the fleet with nothing. The substitute is named here,
+    on the cover and in the notes, because the price is for that region and not
+    the one the deployments run in. Written to another cloud, or with no region
+    recorded, is reported first: those are the ones worth acting on.
+    """
     written = [row for row in sheets if row.get("region_match") or row.get("readback_rejected")]
     if not written:
         return _integrity_row("Region fidelity", None, None, "No region was written to an estimator.")
@@ -575,12 +584,21 @@ def _region_fidelity_row(sheets: list[dict]) -> dict:
         if not alias_provider_matches(str(row.get("region_match") or ""), row.get("provider")):
             bad.append(f"{region or 'a region'} (written to another cloud)")
     if bad:
-        return _integrity_row(
+        # Another cloud, or a region nobody recorded, first: a substitute on the same cloud is
+        # a deliberate fallback, those two are not.
+        serious = [item for item in bad if "another cloud" in item or "no region" in item]
+        rest = [item for item in bad if item not in serious]
+        row = _integrity_row(
             "Region fidelity",
-            0.0,
-            False,
-            "A written region is not an exact or same-number alias: " + "; ".join(bad) + ".",
+            round(1.0 - len(bad) / len(written), 3),
+            True,
+            f"{len(bad)} of {len(written)} written regions are not an exact or same-region alias: "
+            + "; ".join(serious + rest)
+            + ". Each is priced at that read-back, for the region named, not the one the "
+            "deployments run in. The quote is still produced.",
         )
+        row["warning"] = True
+        return row
     return _integrity_row("Region fidelity", 1.0, True, f"{len(written)} written regions match the estimator list.")
 
 
@@ -716,12 +734,14 @@ def integrity_score(facts: dict) -> dict:
 
     The quote passes only when every scored check passes its own bar: 100% of
     the checks, whatever the mean is. One failed check fails the quote. Rate
-    window, Counter age, Rated ingest, Retention basis, and Retention month warn
-    and do not fail the quote: the first two when their share is above 25%,
-    Rated ingest when unrated store is above 10%, Retention basis when more than
-    10% of bulk sits at the 30-day assumed age, and Retention month when the
-    written month is the default rather than the index average. Each says how
-    well the fleet could be measured, not that a dollar read back is wrong.
+    window, Counter age, Rated ingest, Region fidelity, Retention basis, and
+    Retention month warn and do not fail the quote: the first two when their
+    share is above 25%, Rated ingest when unrated store is above 10%, Region
+    fidelity when a sheet was written to a substitute region, Retention basis
+    when more than 10% of bulk sits at the 30-day assumed age, and Retention
+    month when the written month is the default rather than the index average.
+    Each names a weakness in the inputs or in where a sheet was written, not a
+    dollar that was read back wrong.
     The score is the mean and is reported beside that verdict. It
     does not decide it, because a check can pass its bar and score under 1
     (an echo gap inside the tolerance, or unrated store under 5%).

@@ -58,8 +58,8 @@ Confirm these from the brief. Do not open the sheet.
 - Observability is quoted only when `estimators.observability.echo_gate.accepted` is true. The monthly is D38.
 - Security is quoted only when E73 is 0 and `readback.other_addons_monthly` is 0. The monthly is E74.
 - Search stays on the quote when EIS is incomplete. The cover says Search is quoted without EIS, and inference billed on ECH is context, not a price.
-- A rejected region drops that whole solution, including Search.
-- `integrity.passed` is false when any scored check fails. Do not call a failed quote verified. Rate window, Counter age, Rated ingest, Retention basis and Retention month are warnings: they do not fail the quote, and `chat_lines` names them on their own line.
+- A rejected region drops that whole solution, including Search. A region that is merely not on the estimator list is not rejected: it is priced at that provider's default and flagged, and `region_matches` in the brief says which region each sheet was written to.
+- `integrity.passed` is false when any scored check fails. Do not call a failed quote verified. Rate window, Counter age, Rated ingest, Region fidelity, Retention basis and Retention month are warnings: they do not fail the quote, and `chat_lines` names them on their own line.
 - `ech_ml_exclusion.monthly` is ML-node ECU taken off the ECH side, because no serverless project bills an ML node. `status` `incomplete` means none was taken off and the saving is understated.
 - When the billing window is unstable, the comparison is the latest complete month. Do not call it a 3-month average.
 - When no serverless price came back, show the ECH bill and say there is no comparison.
