@@ -1997,6 +1997,7 @@ def _integrity_block(acc: dict) -> str:
         tones.append(tone)
     return (
         "<h3>Quote integrity</h3>"
+        + _confidence_block(block)
         + bullets([
             headline,
             "The score is the mean of the checks that apply. A check that does not apply is n/a and stays out of the mean.",
@@ -2004,6 +2005,90 @@ def _integrity_block(acc: dict) -> str:
             "This scores whether the written inputs, the sheet echo, and the published totals agree. It is not a serverless bill.",
         ])
         + table(["Check", "Score", "Pass", "Measured"], rows, ["left", "right", "left", "left"], tones)
+    )
+
+
+_CONFIDENCE_TONE = {"High": "success", "Moderate": "warning", "Low": "danger"}
+
+
+def _confidence_cover(integrity: dict) -> str:
+    """The confidence band on page 1, with the reason it is not High.
+
+    The appendix carries the full weighted table. Here it is one sentence, because
+    the reader of page 1 is deciding whether to put this number in front of a
+    customer and needs to know what it rests on.
+    """
+    conf = (integrity or {}).get("confidence") or {}
+    band, score = conf.get("band"), conf.get("score")
+    if not band or score is None:
+        return ""
+    drivers = [row for row in (conf.get("drivers") or []) if isinstance(row, dict)]
+    body = "How much of this estimate rests on measurement rather than assumption, weighted by what moves the price. It is not the same question as the integrity checks, which ask whether the quote adds up."
+    if band != "High" and drivers:
+        named = ", ".join(str(row.get("check")) for row in drivers[:2])
+        more = len(drivers) - min(2, len(drivers))
+        body += f" Held down mainly by: {named}{f', and {more} more' if more else ''}. Appendix A lists each one and what it costs."
+    elif band == "High":
+        body += " Every weighted input was measured or stated."
+    return callout(
+        f"Confidence {band} · {float(score):.2f}",
+        esc(body),
+        _CONFIDENCE_TONE.get(str(band), "neutral"),
+    )
+
+
+def _confidence_block(block: dict) -> str:
+    """How much of the quoted price was measured, and what is holding it back.
+
+    Separate from Pass and Fail, which say whether the quote assembled correctly.
+    A quote can be correctly assembled from inputs that were largely assumed, and
+    the reader has to be able to tell those apart.
+    """
+    conf = (block or {}).get("confidence") or {}
+    band, score = conf.get("band"), conf.get("score")
+    if not band or score is None:
+        return ""
+    tone = _CONFIDENCE_TONE.get(str(band), "neutral")
+    lead = (
+        callout(
+            f"Confidence {band} · {float(score):.2f}",
+            esc(
+                "How much of this price rests on measurement rather than assumption. That is not the "
+                "question Pass or Fail answers below: a quote can add up perfectly and still be built "
+                "on a retention month nobody measured."
+            ),
+            tone,
+        )
+    )
+    drivers = [row for row in (conf.get("drivers") or []) if isinstance(row, dict)]
+    if not drivers:
+        return lead + bullets(["Every evidence check scored full marks. Nothing is holding the confidence down."])
+    rows = [
+        [
+            str(row.get("check") or ""),
+            f"{float(row.get('score') or 0):.3f}",
+            f"×{int(row.get('weight') or 0)}",
+            f"−{float(row.get('cost') or 0) * 100:.1f} pts",
+            str(row.get("detail") or ""),
+        ]
+        for row in drivers
+    ]
+    return (
+        lead
+        + bullets([
+            "Weighted mean of the evidence checks: what the bundles could measure, how much of the "
+            "fleet they cover, and where a sheet had to be written. A check is weighted by how much "
+            "it moves the dollar — retention and coverage ×3, ingest, region, EIS and the measurement "
+            "windows ×2, a flag beside a measured figure ×1.",
+            "High is 0.85 and up, Moderate 0.60 and up, Low below that. The band is the figure to "
+            "quote: two decimals of a weighted mean imply a precision these inputs do not have.",
+            "The rows below are in the order worth acting on. Cost is what each one takes off the score.",
+        ])
+        + table(
+            ["Holding confidence down", "Score", "Weight", "Cost", "Why"],
+            rows, ["left", "right", "right", "right", "left"],
+            [_CONFIDENCE_TONE.get(str(band), "neutral")] * len(rows),
+        )
     )
 
 
@@ -3565,6 +3650,9 @@ def render_consolidation_html(acc: dict) -> str:
     ]
     if warned:
         B.append(callout("Warning", " ".join(str(row["detail"]) for row in warned), "warning"))
+    # How much of this price was measured, beside the price itself. Pass and Fail answer a
+    # different question, and a quote can pass every check on inputs that were largely assumed.
+    B.append(_confidence_cover(integrity))
     rc = c.get("reconciliation") or {}
     project_n = _priced_project_count(svl)
     _scope = c.get("ech_scope") or {}

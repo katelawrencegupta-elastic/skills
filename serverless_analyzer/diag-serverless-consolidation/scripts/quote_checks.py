@@ -16,6 +16,7 @@ from estimator_layout import (  # noqa: E402,F401
 )
 from constants import (  # noqa: E402
     BILLING_WINDOW_MIN_SHARE, COUNTER_AGE_MAX_SHARE, ECHO_TOLERANCE_GB_DAY, ECHO_TOLERANCE_SHARE,
+    CONFIDENCE_HIGH, CONFIDENCE_MODERATE, CONFIDENCE_WEIGHTS,
     PLAN_HEADLINE_SHARE, PLAN_HEADLINE_USD, RATE_WINDOW_MAX_SHARE, RETENTION_ASSUMED_MAX_SHARE,
     UNRATED_STORE_MAX_SHARE,
 )
@@ -729,6 +730,55 @@ def _share_limit_row(name: str, coverage: dict | None, key: str, limit: float, n
     return row
 
 
+def confidence(checks: list[dict]) -> dict:
+    """How much of the quoted price rests on measurement rather than assumption.
+
+    A separate question from whether the quote assembled correctly, which is what
+    `passed` answers. The mean of every scored check answered both at once, so the
+    one check that undermines a headline was averaged away by the many that pass
+    trivially: a fleet priced at an unmeasured retention month scored 0.869 next
+    to the same fleet priced at a stated one.
+
+    This is the weighted mean of the evidence checks alone, weighted by how much
+    each moves the dollar (`CONFIDENCE_WEIGHTS`). `drivers` names what is costing
+    the most, heaviest and lowest-scoring first, so the band can be explained
+    rather than just printed. A check that does not apply is left out.
+    """
+    scored = [
+        row for row in checks
+        if row.get("check") in CONFIDENCE_WEIGHTS
+        and row.get("score") is not None
+        and row.get("passed") is not None
+    ]
+    if not scored:
+        return {"score": None, "band": None, "drivers": [], "basis": "no evidence check applies"}
+    weight = sum(CONFIDENCE_WEIGHTS[row["check"]] for row in scored)
+    value = sum(CONFIDENCE_WEIGHTS[row["check"]] * float(row["score"]) for row in scored) / weight
+    band = "High" if value >= CONFIDENCE_HIGH else "Moderate" if value >= CONFIDENCE_MODERATE else "Low"
+    drivers = [
+        {
+            "check": row["check"],
+            "score": row["score"],
+            "weight": CONFIDENCE_WEIGHTS[row["check"]],
+            # What this check costs the weighted mean. The order to act in.
+            "cost": round(CONFIDENCE_WEIGHTS[row["check"]] * (1.0 - float(row["score"])) / weight, 4),
+            "detail": row.get("detail"),
+        }
+        for row in scored if float(row["score"]) < 1.0
+    ]
+    drivers.sort(key=lambda row: (-row["cost"], row["check"]))
+    return {
+        "score": round(value, 3),
+        "band": band,
+        "drivers": drivers[:4],
+        "checks_counted": len(scored),
+        "basis": (
+            f"weighted mean of {len(scored)} evidence checks; High is {CONFIDENCE_HIGH:.0%} "
+            f"and up, Moderate {CONFIDENCE_MODERATE:.0%} and up"
+        ),
+    }
+
+
 def integrity_score(facts: dict) -> dict:
     """Quote integrity, 0 to 1. The mean skips a check that does not apply.
 
@@ -774,6 +824,9 @@ def integrity_score(facts: dict) -> dict:
     return {
         "score": score,
         "passed": passed,
+        # Whether the quote assembled correctly (`passed`) and how much of its price was
+        # measured (`confidence`) are different questions. One number answered both.
+        "confidence": confidence(checks),
         "checks": checks,
     }
 

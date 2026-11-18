@@ -36,7 +36,9 @@ def _check_names() -> set[str]:
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        if not isinstance(func, ast.Name) or func.id != "_integrity_row":
+        # _share_limit_row takes the check name as its first argument, so a check built that
+        # way is just as real as one with the literal inline.
+        if not isinstance(func, ast.Name) or func.id not in {"_integrity_row", "_share_limit_row"}:
             continue
         if node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
             names.add(node.args[0].value)
@@ -168,6 +170,19 @@ class DocLintTests(unittest.TestCase):
                 if phrase.lower() in text:
                     hits.append(f"{path.name}: {phrase}")
         self.assertEqual(hits, [])
+
+    def test_every_weighted_check_is_real_and_documented(self):
+        """A weight on a name no check emits would silently never count."""
+        import sys
+        if str(HERE) not in sys.path:
+            sys.path.insert(0, str(HERE))
+        from constants import CONFIDENCE_WEIGHTS
+        emitted = _check_names()
+        self.assertEqual(sorted(set(CONFIDENCE_WEIGHTS) - emitted), [])
+        self.assertEqual(sorted(set(CONFIDENCE_WEIGHTS) - _table_checks()), [])
+        text = (SKILL / "references" / "calculations.md").read_text()
+        for name in CONFIDENCE_WEIGHTS:
+            self.assertIn(name, text)
 
     def test_every_integrity_check_is_in_the_table(self):
         missing = _check_names() - _table_checks()

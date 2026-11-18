@@ -347,7 +347,13 @@ def _integrity_brief(block: dict | None) -> dict | None:
         for row in (block.get("checks") or [])
         if row.get("warning")
     ]
-    return {"score": block.get("score"), "passed": block.get("passed"), "failed": failed, "warnings": warnings}
+    return {
+        "score": block.get("score"),
+        "passed": block.get("passed"),
+        "confidence": block.get("confidence"),
+        "failed": failed,
+        "warnings": warnings,
+    }
 
 
 def _plan_brief(plan) -> list[dict]:
@@ -499,8 +505,13 @@ def _priced_months_brief(block) -> dict | None:
 
 
 def chat_lines(brief: dict) -> list[str]:
-    """At most six lines: the headline, warnings, failed checks, the top limits, and links."""
-    lines: list[str] = []
+    """At most six lines: the headline, why confidence is held back, failed checks, limits, links.
+
+    The links are the one line the reader cannot reconstruct, so they are kept and
+    the limits give up their place first. The confidence line replaces the generic
+    warning list, because every warning check is a weighted confidence driver and
+    the drivers are already in the order worth acting on.
+    """
     savings = brief.get("savings") or {}
     monthly = savings.get("serverless_mo")
     integrity = brief.get("integrity") or {}
@@ -509,36 +520,47 @@ def chat_lines(brief: dict) -> list[str]:
         for row in (integrity.get("failed") or [])
         if isinstance(row, dict) and row.get("check")
     ]
-    draft = bool(
-        brief.get("draft")
-        or ((brief.get("method") or {}).get("uncommitted_changes"))
-    )
+    draft = bool(brief.get("draft") or ((brief.get("method") or {}).get("uncommitted_changes")))
+    conf = integrity.get("confidence") or {}
+    band = conf.get("band")
+
+    head: list[str] = []
     if monthly is None or integrity.get("passed") is False or failed or draft:
-        lines.append("not verified")
+        head.append("not verified")
+    elif band:
+        head.append(f"Serverless ${float(monthly):,.0f}/mo · confidence {band} ({conf.get('score')})")
     else:
-        lines.append(f"Serverless ${float(monthly):,.0f}/mo")
+        head.append(f"Serverless ${float(monthly):,.0f}/mo")
+
+    drivers = [row for row in (conf.get("drivers") or []) if isinstance(row, dict)]
     warnings = [
         str(row.get("check"))
         for row in (integrity.get("warnings") or [])
         if isinstance(row, dict) and row.get("check")
     ]
-    if warnings:
-        lines.append("Warning: " + ", ".join(warnings) + ". The quote is still produced.")
+    if band and band != "High" and drivers:
+        named = [str(row.get("check")) for row in drivers[:2]]
+        more = len(drivers) - len(named)
+        tail = f", and {more} more" if more > 0 else ""
+        head.append(f"Confidence {band} mainly on: {', '.join(named)}{tail}. The quote is still produced.")
+    elif warnings:
+        head.append("Warning: " + ", ".join(warnings) + ". The quote is still produced.")
     if failed:
-        lines.append("Failed checks: " + ", ".join(failed))
-    limits = [row for row in (brief.get("limits") or []) if isinstance(row, dict)]
-    rank = {"high": 0, "medium": 1, "low": 2}
-    limits.sort(key=lambda row: rank.get(str(row.get("severity") or "low"), 3))
-    for row in limits[:3]:
-        lines.append(str(row.get("detail") or row.get("code") or "limit"))
+        head.append("Failed checks: " + ", ".join(failed))
+
     links = brief.get("links") or {}
     shown = [links.get("drive")] if links.get("drive") else []
     for entry in (links.get("pdfs") or {}).values():
         if isinstance(entry, dict) and entry.get("drive_url"):
             shown.append(entry["drive_url"])
-    if shown:
-        lines.append("Links: " + " ".join(shown[:2]))
-    return lines[:6]
+    tail_lines = ["Links: " + " ".join(shown[:2])] if shown else []
+
+    limits = [row for row in (brief.get("limits") or []) if isinstance(row, dict)]
+    rank = {"high": 0, "medium": 1, "low": 2}
+    limits.sort(key=lambda row: rank.get(str(row.get("severity") or "low"), 3))
+    room = max(0, 6 - len(head) - len(tail_lines))
+    middle = [str(row.get("detail") or row.get("code") or "limit") for row in limits[:room]]
+    return (head + middle + tail_lines)[:6]
 
 
 def _with_appendix(docs: list[tuple[dict, str]]) -> list[tuple[dict, str]]:

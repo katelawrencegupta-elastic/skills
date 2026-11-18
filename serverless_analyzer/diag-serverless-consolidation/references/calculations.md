@@ -230,6 +230,28 @@ A deployment whose logs stream and metrics stream are both inside the first 50 G
 
 On-demand, performant, and high availability are priced with the es3 estimator when Search was estimated. High availability is the notebook's third search-power band. Show monthly and steady annual (monthly × 12) for each. When Search was not estimated, `search_power` is absent and the Appendix does not include the chart. These dollars stay at estimator list and are not added to D38 or E74. When the quoted solution is Search, the quote stays the performant read-back. The chart, when present, is in Appendix A of serverless_consolidation_analysis_appendix, after the input arithmetic and the metered-rate tables. The quote integrity table follows it. Appendix B follows Appendix A in that same document.
 
+## Confidence
+
+Two different questions were answered by one number. `integrity.passed` says whether the quote assembled correctly. `integrity.score`, the unweighted mean of every scored check, was also carrying how well the fleet could be measured — and a mean is the wrong instrument for that, because the one check that undermines a headline is averaged away by the many that pass trivially. A fleet priced at an unmeasured 12-month default scored 0.869 next to the same fleet priced at a month that was stated.
+
+`integrity.confidence` is that second question on its own: how much of the quoted price rests on measurement rather than assumption. It is the weighted mean of the evidence checks, each weighted by how much it moves the dollar (`CONFIDENCE_WEIGHTS`). The correctness checks are not in it — the sheet echo, the line and year totals, plan consistency and the rest say a number is wrong, which is a pass or a fail and not a degree.
+
+| Weight | Checks | Why |
+|---|---|---|
+| 3 | Retention month, Retention basis, Bundle coverage, Priced share | Sets the price. Retention drives the estimator's retained-data ladder; coverage and priced share decide how much of the fleet the quote represents at all |
+| 2 | Rated ingest, Region fidelity, Search EIS data, Rate window, Billing window | Changes the price by a bounded amount: ingest the rate did not see, a substitute region's differential, an EIS line, the window a rate or a comparison was measured over |
+| 1 | Counter age | A flag beside a figure that was still measured |
+
+```
+confidence = Σ (weight × score) / Σ weight     over the evidence checks that apply
+```
+
+`band` is **High** at 0.85 and up, **Moderate** at 0.6 and up, **Low** below that. The band is the figure to quote: two decimals of a weighted mean imply a precision these inputs do not have. A check that does not apply is left out of both sums, so a fleet with no Search is not marked down for having no EIS.
+
+`drivers` lists what is holding the band down, heaviest and lowest-scoring first, with the `cost` each one takes off the score. That is the order worth acting on. The chat line names the top two, the consolidation PDF prints the whole table above the check list, and both say that confidence is not the same question as Pass or Fail.
+
+A quote can pass every check and still be Moderate. That is the point: it means the arithmetic is right and the inputs were thin.
+
 ## Quote integrity
 
 The score is the mean of the checks that apply. A check with no inputs is n/a and stays out of the mean. Pass is every scored check passing its own bar, 100% of them. The score does not decide it. This is not a serverless bill.

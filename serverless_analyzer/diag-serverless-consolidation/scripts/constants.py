@@ -26,3 +26,29 @@ ECHO_TOLERANCE_GB_DAY = 0.02
 # size_serverless.py exits with this status when an estimator copy does not have the
 # layout its cell addresses were written for. run_consolidation.py stops the run on it.
 TEMPLATE_MISMATCH_EXIT = 3
+
+
+# How much each evidence check moves the quoted dollar. Confidence is their weighted mean,
+# so a check that drives the price counts for more than a flag beside a rate that was still
+# measured. The correctness checks — the sheet echo, the line and year totals, plan
+# consistency — are not here: they say a number is wrong, which is a pass/fail, not a degree.
+#   3  sets the price directly. Retention drives the estimator's retained-data ladder; the
+#      coverage and priced share decide how much of the fleet the quote even represents.
+#   2  changes the price by a bounded amount: ingest the rate did not see, a substitute
+#      region's differential, an EIS line, the window a rate or a comparison was measured over.
+#   1  a flag beside a figure that was still measured.
+CONFIDENCE_WEIGHTS = {
+    "Retention month": 3,
+    "Retention basis": 3,
+    "Bundle coverage": 3,
+    "Priced share": 3,
+    "Rated ingest": 2,
+    "Region fidelity": 2,
+    "Search EIS data": 2,
+    "Rate window": 2,
+    "Billing window": 2,
+    "Counter age": 1,
+}
+# A band, not a decimal: three decimals imply a precision these inputs do not have.
+CONFIDENCE_HIGH = 0.85
+CONFIDENCE_MODERATE = 0.60

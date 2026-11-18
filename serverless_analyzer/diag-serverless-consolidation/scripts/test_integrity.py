@@ -721,3 +721,68 @@ class ReviewV4Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConfidenceTests(unittest.TestCase):
+    """How much of the price was measured, as a question of its own."""
+
+    @staticmethod
+    def _conf(**scores):
+        from quote_checks import confidence
+        return confidence([
+            {"check": name, "score": value, "passed": True} for name, value in scores.items()
+        ])
+
+    def test_everything_measured_is_high(self):
+        row = self._conf(**{"Retention month": 1.0, "Bundle coverage": 1.0, "Rated ingest": 1.0})
+        self.assertEqual((row["score"], row["band"]), (1.0, "High"))
+        self.assertEqual(row["drivers"], [])
+
+    def test_weight_follows_price_leverage(self):
+        """Retention drives the ladder; a counter-age flag sits beside a measured rate."""
+        heavy = self._conf(**{"Retention month": 0.0, "Counter age": 1.0})
+        light = self._conf(**{"Retention month": 1.0, "Counter age": 0.0})
+        self.assertLess(heavy["score"], light["score"])
+        self.assertEqual(heavy["score"], 0.25)   # weights 3 and 1
+        self.assertEqual(light["score"], 0.75)
+
+    def test_an_unmeasured_retention_month_drops_the_band(self):
+        """The case the unweighted mean hid: correct arithmetic on an assumed month."""
+        row = self._conf(**{
+            "Retention month": 0.0, "Retention basis": 1.0, "Bundle coverage": 1.0,
+            "Priced share": 1.0, "Rated ingest": 1.0, "Counter age": 1.0,
+        })
+        self.assertEqual(row["band"], "Moderate")
+        self.assertEqual(row["drivers"][0]["check"], "Retention month")
+
+    def test_drivers_are_ordered_by_what_they_cost(self):
+        row = self._conf(**{"Counter age": 0.0, "Priced share": 0.5, "Rated ingest": 0.9})
+        self.assertEqual([d["check"] for d in row["drivers"]], ["Priced share", "Counter age", "Rated ingest"])
+        self.assertGreater(row["drivers"][0]["cost"], row["drivers"][-1]["cost"])
+
+    def test_a_check_that_does_not_apply_is_left_out(self):
+        """A fleet with no Search is not marked down for having no EIS."""
+        from quote_checks import confidence
+        row = confidence([
+            {"check": "Retention month", "score": 1.0, "passed": True},
+            {"check": "Search EIS data", "score": None, "passed": None},
+        ])
+        self.assertEqual(row["checks_counted"], 1)
+        self.assertEqual(row["band"], "High")
+
+    def test_correctness_checks_are_not_in_the_confidence(self):
+        from quote_checks import confidence
+        row = confidence([{"check": "Line agreement", "score": 0.0, "passed": False}])
+        self.assertIsNone(row["score"])
+        self.assertIsNone(row["band"])
+
+    def test_a_quote_can_pass_every_check_and_still_not_be_high(self):
+        """Nothing failed, and none of the retention was measured. Both are true at once."""
+        from quote_checks import integrity_score
+        recorded = integrity_score({"coverage": {
+            "bulk_gb_day": 10, "retention_policy_bulk_gb_day": 0,
+            "unrated": {"indices": 0, "store_gb": 0, "share_of_store": 0.0, "deployments": []},
+        }})
+        self.assertNotIn(False, [r["passed"] for r in recorded["checks"]])
+        self.assertEqual(recorded["confidence"]["band"], "Low")
+        self.assertEqual(recorded["confidence"]["drivers"][0]["check"], "Retention basis")
