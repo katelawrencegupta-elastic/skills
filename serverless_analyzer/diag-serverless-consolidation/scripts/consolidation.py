@@ -29,21 +29,273 @@ from quote_checks import (
 from skill_paths import find_skill
 
 from constants import DAYS_PER_MONTH, ESTIMATE_MONTHS
-MAX_LOOKBACK_DAYS = 365
-_INGEST_KEYS = (
-    "daily_raw_gb", "logs_gb_day", "metrics_gb_day", "siem_gb_day",
-    "bulk_gb_day", "compressioncalc_accounted_for",
+from consolidation_scope import (
+    FIXED_TIERS, O11Y_METER_FACTOR, PRICING_SOURCE, RETENTION_SCENARIOS, TAIL_SHARE_PCT, TOP_N,
+    _apply_eis_to_plan, _apply_search_estimator, _apply_sheet_readback, _deployment_bars,
+    _deployment_groups, _ladder_walk, _omit_unquoted, _price_slice, _search_power,
+    _solution_has_regional_readback, comparison_deployment_names, ech_scope,
+    observability_metered_rates, per_cluster_plan,
 )
-TAIL_SHARE_PCT = 1.0          # "small" deployment = < 1 % of lookback ECU (same as cost rec)
-TOP_N = 15
-RETENTION_SCENARIOS = (1, 3, 6, 12)
-FIXED_TIERS = {"master", "kibana", "coordinating", "integrations server", "enterprise search", "apm"}
+from consolidation_regional import (
+    _align_primary_cost_rec, _eis_billed_context, _integrity, _priced_search_names,
+    _replicate_by_region, _sync_plan_to_quote, recent_ech_months, recent_ech_months_priced,
+)
+from consolidation_eis import _apply_search_eis, _search_eis, ml_node_ecu
 
-ORG_SKILL = find_skill("k360-org-report", Path(__file__).resolve().parent)
+# consolidation.py is also the façade the runner, the renderers and the tests import from.
+# These names are re-exported on purpose, so `__all__` records that decision rather than
+# leaving it to whatever a star import happened to drag in.
+from consolidation_scope import apply_quote_lookback, billed_series, quote_options, quote_lookback_days, unpriced_reason
+from consolidation_regional import _has_workload, regional_quote
 
-from consolidation_scope import *  # noqa: F401,F403
-from consolidation_regional import *  # noqa: F401,F403
-from consolidation_eis import *  # noqa: F401,F403
+__all__ = [
+    "build_consolidation", "attach", "apply_quote_lookback", "billed_series",
+    "quote_options", "quote_lookback_days", "ech_scope", "comparison_deployment_names",
+    "unpriced_reason", "observability_metered_rates", "per_cluster_plan", "regional_quote",
+    "recent_ech_months", "recent_ech_months_priced", "ml_node_ecu",
+    "_deployment_groups", "_replicate_by_region", "_priced_search_names", "_search_eis",
+    "_has_workload", "_integrity", "PRICING_SOURCE",
+]
+
+def _ech_composition(acc: dict, infra: dict | None, months: float, ecu_total: float, notes: list[str]) -> tuple[dict, dict]:
+    """Where the ECH bill sits by node role, as a month, plus each deployment's tiers.
+
+    Fixed overhead is the roles a serverless project does not bill: master, Kibana,
+    coordinating, integrations, enterprise search and APM.
+    """
+    deps_infra = (infra or {}).get("by_deployment") or []
+    fixed = ml = data_tiers = 0.0
+    tiers_by_name: dict[str, dict] = {}
+    for d in deps_infra:
+        t = d.get("tiers") or {}
+        tiers_by_name[d["name"]] = d
+        fixed += sum(v for k, v in t.items() if k in FIXED_TIERS)
+        ml += float(t.get("ml") or 0)
+        data_tiers += sum(v for k, v in t.items() if str(k).startswith("data"))
+    non_cap = float((acc.get("cloud") or {}).get("non_capacity_ecu") or 0)
+    if not deps_infra:
+        notes.append("infra.json missing — ECH composition (fixed overhead / ML / data tiers) unavailable")
+    return {
+        "data_tiers_mo": round(data_tiers / months, 2),
+        "fixed_overhead_mo": round(fixed / months, 2),
+        "ml_nodes_mo": round(ml / months, 2),
+        "non_capacity_mo": round(non_cap / months, 2),
+        "fixed_overhead_pct": round(100 * fixed / ecu_total, 1) if ecu_total else None,
+        "ml_pct": round(100 * ml / ecu_total, 1) if ecu_total else None,
+        "non_capacity_pct": round(100 * non_cap / ecu_total, 1) if ecu_total else None,
+    }, tiers_by_name
+
+
+def _tail_and_buckets(per: list[dict], ecu_total: float, stored_gb: float, months: float) -> tuple[dict, list[dict], list[dict]]:
+    """The long tail, the fixed-overhead share by size bucket, and the worst offenders.
+
+    A pure function of the per-deployment rows: the tail is every deployment under
+    `TAIL_SHARE_PCT` of lookback ECU, and the buckets split the same rows by size.
+    """
+    thr = ecu_total * TAIL_SHARE_PCT / 100
+    tail = [r for r in per if r["ech_ecu_lookback"] < thr]
+    tail_gb = sum(r["stored_gb"] for r in tail)
+    tail_ecu_mo = sum(r["ech_ecu_mo"] for r in tail)
+    tail_block = {
+        "n": len(tail),
+        "stored_gb": round(tail_gb, 1),
+        "ech_ecu_mo": round(tail_ecu_mo, 2),
+        "ech_share_pct": round(100 * sum(r["ech_ecu_lookback"] for r in tail) / ecu_total, 1) if ecu_total else None,
+        "fixed_overhead_ecu_mo": round(sum(r["fixed_overhead_ecu_mo"] or 0 for r in tail), 2),
+        "ech_consolidation_saving_mo": round(0.25 * tail_ecu_mo, 2),
+        "data_share_pct": round(100 * tail_gb / stored_gb, 1) if stored_gb else None,
+        "note": "ECH consolidation assumes 25 % overhead removal (cost-rec rule). The tail is not given its own serverless price.",
+    }
+
+    # Edges in order, with the tail threshold inserted wherever it falls. A fixed list put the
+    # threshold between 5k and 50k, so on an org whose 1% line sits under 5k the last two
+    # buckets overlapped the first two and counted the same deployments twice.
+    edges = sorted({0.0, 1_000.0, 5_000.0, 50_000.0, float(thr)})
+    buckets_def = []
+    for lo, hi in zip(edges, edges[1:] + [float("inf")]):
+        if hi <= lo:
+            continue
+        if hi == float("inf"):
+            label = f"> {lo / 1000:,.0f}k"
+        elif hi < 1_000:
+            label = f"< {hi:,.0f} ECU"
+        else:
+            label = f"{lo / 1000:,.1f}k – {hi / 1000:,.1f}k".replace(".0k", "k")
+        if abs(hi - thr) < 1e-9:
+            label += f" (< {TAIL_SHARE_PCT:g} %)"
+        buckets_def.append((lo, hi, label))
+    buckets = []
+    for lo, hi, label in buckets_def:
+        if hi <= lo:
+            continue
+        b = [r for r in per if lo <= r["ech_ecu_lookback"] < hi]
+        if not b:
+            continue
+        ecu_b = sum(r["ech_ecu_lookback"] for r in b)
+        fx_b = sum((r["fixed_overhead_ecu_mo"] or 0) for r in b) * months
+        buckets.append({"bucket": label, "deployments": len(b), "ecu_lookback": round(ecu_b, 2), "fixed_overhead_pct": round(100 * fx_b / ecu_b, 1) if ecu_b else None})
+    highest_overhead = sorted([r for r in per if r["fixed_overhead_ecu_mo"] and r["ech_ecu_mo"] > 0], key=lambda r: -(r["fixed_overhead_ecu_mo"] / r["ech_ecu_mo"]))[:5]
+    return tail_block, buckets, highest_overhead
+
+
+def _callouts(per: list[dict], fragmentation: dict, tail_block: dict, composition: dict,
+              ecu: dict, sz: dict) -> list[dict]:
+    """The three page-1 callouts: the largest deployment, fixed overhead, and the tail."""
+    e = ecu
+    callouts: list[dict] = []
+    if per:
+        top = per[0]
+        oh = f"{top['overhead_pct']}% fixed overhead" if top.get("overhead_pct") is not None else "fixed overhead not available"
+        gb_bit = f"{top['stored_gb']:,.0f} GB" if top["gb_known"] else (f"its size now reports under {top['size_now_on']}" if top.get("size_now_on") else "no current size")
+        callouts.append({"tone": "info", "title": f"Largest deployment: {top['name']}", "detail": f"{top['ech_ecu_mo']:,.0f} ECU/mo, {gb_bit}, {oh}. Deployments are not priced alone. The estimate is one project per solution in each region."})
+    active_fixed = fragmentation.get("fixed_overhead_ecu_mo") or 0
+    if active_fixed:
+        quote_days = int(e["quote_lookback_days"]) if e.get("quote_lookback_days") else None
+        pace = f" on the last {quote_days} billed days" if quote_days else ""
+        inactive_n = (sz.get("diagnostics") or {}).get("inactive_excluded") or 0
+        year_fixed = composition.get("fixed_overhead_mo")
+        year_bit = ""
+        if year_fixed and abs(float(year_fixed) - float(active_fixed)) > 1:
+            year_bit = f" The full lookback is {float(year_fixed):,.0f} ECU/mo, {composition.get('fixed_overhead_pct')}% of that year."
+            if inactive_n:
+                word = "deployment" if int(inactive_n) == 1 else "deployments"
+                year_bit = year_bit[:-1] + f", including {int(inactive_n)} {word} with no bill in the quote window."
+        callouts.append({
+            "tone": "success",
+            "title": f"Fixed overhead is {active_fixed:,.0f} ECU/mo",
+            "detail": (
+                f"{fragmentation.get('fixed_overhead_pct')}% of the active deployments' ECU{pace}. "
+                f"That is Fixed ECU/mo added across all {fragmentation.get('n_deployments')} active deployments. "
+                "These are master, Kibana, coordinating, integrations, enterprise search, and APM. "
+                "A serverless project does not bill those roles."
+                + year_bit
+            ),
+        })
+    if tail_block["n"] >= 8:
+        callouts.append({
+            "tone": "info",
+            "title": f"{tail_block['n']} small deployments bill {tail_block['ech_ecu_mo']:,.0f} ECU/mo",
+            "detail": (
+                f"That is {tail_block['ech_share_pct']}% of ECU and {tail_block.get('data_share_pct')}% of stored data. "
+                "It is their whole bill, not the fixed-overhead figure. "
+                f"Fixed overhead on these {tail_block['n']} is {tail_block['fixed_overhead_ecu_mo']:,.0f} ECU/mo. "
+                f"Merging them, if a quarter of their bill goes away, recovers about {tail_block['ech_consolidation_saving_mo']:,.0f} ECU/mo."
+            ),
+        })
+
+    return callouts
+
+
+def _quote_lines(by_solution: dict, sz: dict) -> list[dict]:
+    """One line per priced solution, or per region when a solution is sized per region.
+
+    A Search line's monthly carries EIS, so its annual figures carry it too.
+    """
+    quotes = []
+    for sol in ("search", "observability", "security"):
+        blk = by_solution.get(sol) or {}
+        if "quotable" not in str(blk.get("pricing") or ""):
+            continue
+        est = (sz.get("estimators") or {}).get(sol) or {}
+        rb = est.get("readback") or {}
+        label = "Search Serverless, performant" if sol == "search" else f"{sol.title()} Serverless"
+        regions = blk.get("by_region") or []
+        if regions:
+            for r in regions:
+                monthly = r.get("monthly")
+                if r.get("annual_year1") is not None:
+                    annual = r.get("annual_year1")
+                    steady = r.get("annual_steady_state")
+                elif monthly is not None:
+                    annual = round(float(monthly) * 12, 2)
+                    steady = annual
+                else:
+                    annual = None
+                    steady = None
+                quotes.append({
+                    "solution": sol,
+                    "region": r.get("region"),
+                    "source": f"{label}, {r.get('region')}",
+                    "monthly": monthly,
+                    "monthly_unrounded": r.get("monthly_unrounded") if r.get("monthly_unrounded") is not None else r.get("own_monthly"),
+                    "annual_year1": annual,
+                    "annual_steady_state": steady,
+                    "retention_months": r.get("retention_months") if r.get("retention_months") is not None else blk.get("retention_months"),
+                    "url": r.get("url") or est.get("url"),
+                })
+        else:
+            quotes.append({
+                "solution": sol,
+                "source": label,
+                "monthly": blk.get("total_mo"),
+                "monthly_unrounded": _money(rb.get("monthly_steady_state")),
+                "annual_year1": _money(rb.get("annual_year1")),
+                "annual_steady_state": _money(rb.get("annual_steady_state")),
+                "retention_months": blk.get("retention_months"),
+                "url": est.get("url"),
+            })
+    # A Search line's monthly carries EIS. Its annual figures have to carry it too.
+    if (by_solution.get("search") or {}).get("eis_with_support_mo"):
+        for line in quotes:
+            if line["solution"] == "search" and line.get("monthly") is not None:
+                line["monthly_unrounded"] = float(line["monthly"])
+                line["annual_year1"] = line["annual_steady_state"] = round(float(line["monthly"]) * 12, 2)
+    return quotes
+
+
+def _sensitivity(acc: dict, sz: dict, by_solution: dict, dom: dict, dominant: str, con: dict,
+                 ecu: dict, stored_gb: float, ech_mo: float, ech_window_mo: float,
+                 svls_total_mo: float, ech_comparison_available: bool) -> tuple[list[dict], list[dict]]:
+    """Volume sensitivities. The estimator is not re-run: these rows scale one measurement."""
+    e = ecu
+    # ---- sensitivity: volume only. The quote is not re-run.
+    dom_gb = float(dom.get("stored_gb") or 0)
+    used_ret = float((con.get(dominant) or {}).get("retention_months") or 3.0)
+    retention_rows = []
+    for r in RETENTION_SCENARIOS:
+        raw = (dom_gb / (float(r) * DAYS_PER_MONTH)) if dom_gb > 0 else None
+        retention_rows.append({
+            "retention_months": r,
+            "used": abs(r - used_ret) < 1e-9,
+            "raw_gb_day": round(raw, 2) if raw is not None else None,
+            "stored_gb": round(dom_gb, 1),
+        })
+
+    fleet_rows = []
+    quote_days = e.get("quote_lookback_days")
+    if quote_days:
+        scen = [(f"{int(quote_days)}-day lookback (estimator basis)", 1.0)]
+    else:
+        scen = [("Lookback-average fleet (estimator basis)", 1.0)]
+    # Historical billing-pace sensitivities belong to the measured diagnostic quote only.
+    # They do not describe or scale the assumption-based K360 stored-GB scenario.
+    if sz.get("ingest_source") == "diagnostics":
+        low = e.get("monthly_low") or {}
+        if low.get("ecu") and ech_window_mo:
+            scen.append(("ECH billing pace applied to the estimate (illustrative)", float(low["ecu"]) / ech_window_mo))
+        complete = e.get("monthly_avg_complete_months")
+        if quote_days and complete and ech_window_mo and abs(float(complete) - ech_window_mo) > 1:
+            scen.append(("ECH billing pace applied to the estimate (illustrative)", float(complete) / ech_window_mo))
+        elif not quote_days and e.get("last_30d_daily_avg") and ech_window_mo:
+            scen.append(("Last 30 days run-rate", float(e["last_30d_daily_avg"]) * DAYS_PER_MONTH / ech_window_mo))
+    eis_full = float((by_solution.get("search") or {}).get("eis_with_support_mo") or 0)
+    eis_usage = float((by_solution.get("search") or {}).get("eis_mo") or 0)
+    for label, k in scen:
+        base = (svls_total_mo - eis_full) if svls_total_mo else 0.0
+        svl_k = round(base * k + eis_full, 2) if svls_total_mo else None
+        fleet_rows.append({
+            "scenario": label,
+            "scale": round(k, 3),
+            "stored_gb": round(stored_gb * k, 1),
+            "ech_ecu_mo": round(ech_mo * k, 2) if ech_comparison_available else None,
+            "serverless_mo": svl_k,
+            "eis_mo": round(eis_usage, 2) if eis_usage else None,
+            "save_vs_list_mo": round(ech_mo * k - svl_k, 2) if svl_k is not None and ech_comparison_available else None,
+            "note": "Bulk was measured once. This row only scales that measurement." if "illustrative" in label else None,
+        })
+
+    return retention_rows, fleet_rows
+
 
 def build_consolidation(acc: dict, infra: dict | None) -> dict:
     sz = acc.get("sizing") or {}
@@ -81,28 +333,7 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
             )
         )
 
-    # ---- ECH composition (per-deployment tiers from infra)
-    deps_infra = (infra or {}).get("by_deployment") or []
-    fixed = ml = data_tiers = 0.0
-    tiers_by_name: dict[str, dict] = {}
-    for d in deps_infra:
-        t = d.get("tiers") or {}
-        tiers_by_name[d["name"]] = d
-        fixed += sum(v for k, v in t.items() if k in FIXED_TIERS)
-        ml += float(t.get("ml") or 0)
-        data_tiers += sum(v for k, v in t.items() if str(k).startswith("data"))
-    non_cap = float((acc.get("cloud") or {}).get("non_capacity_ecu") or 0)
-    if not deps_infra:
-        notes.append("infra.json missing — ECH composition (fixed overhead / ML / data tiers) unavailable")
-    composition = {
-        "data_tiers_mo": round(data_tiers / months, 2),
-        "fixed_overhead_mo": round(fixed / months, 2),
-        "ml_nodes_mo": round(ml / months, 2),
-        "non_capacity_mo": round(non_cap / months, 2),
-        "fixed_overhead_pct": round(100 * fixed / ecu_total, 1) if ecu_total else None,
-        "ml_pct": round(100 * ml / ecu_total, 1) if ecu_total else None,
-        "non_capacity_pct": round(100 * non_cap / ecu_total, 1) if ecu_total else None,
-    }
+    composition, tiers_by_name = _ech_composition(acc, infra, months, ecu_total, notes)
 
     # ---- serverless: one project per solution (what the estimators price)
     by_solution: dict[str, dict] = {}
@@ -236,6 +467,17 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
     svls_total_mo = sum(float(p.get("total_mo") or 0) for p in by_solution.values())
     quoted = any("quotable" in str(p.get("pricing") or "") for p in by_solution.values()) and svls_total_mo > 0
     scope = ech_scope(acc, by_solution)
+    # Region groups were summed from the fetched year. Everything else on the page is the
+    # quote window, so put them on the same basis once the per-deployment window is known,
+    # and record which basis each group used.
+    window_mo = (scope or {}).get("by_deployment_mo") or {}
+    for group in region_groups:
+        names = group.get("deployments") or []
+        if (scope or {}).get("status") == "complete" and names and all(n in window_mo for n in names):
+            group["ech_ecu_mo"] = round(sum(float(window_mo[n] or 0) for n in names), 2)
+            group["ech_basis"] = "quote_window"
+        else:
+            group["ech_basis"] = "lookback_average"
     _apply_eis_to_plan(acc, float((by_solution.get("search") or {}).get("eis_with_support_mo") or 0))
     _sync_plan_to_quote(acc, by_solution)
     priced_months = recent_ech_months_priced(acc, by_solution)
@@ -292,16 +534,40 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
                     f"${scope['unpriced_mo']:,.0f}/mo ({names}{more}), so the saving is overstated by their bill."
                 )
             notes.append(lead)
-    ml_raw = (by_solution.get("search") or {}).get("ml_node_ecu_mo")
+    # No serverless project bills an ML node, so that capacity comes off the ECH side of the
+    # comparison. It is read over the deployments in the comparison, whatever solution they
+    # are, and whether or not Search returned a read-back. Telemetry that does not reconcile
+    # excludes nothing: an unverified deduction would overstate the saving.
+    ml_read = ml_node_ecu(acc, comparison_deployment_names(scope)) if ech_comparison_available else {
+        "status": "not_applicable", "reason": "the deployment-scoped ECH comparison is unavailable", "monthly": 0.0,
+    }
     ech_ml_excluded = None
-    if ml_raw is not None and ech_comparison_available:
-        ech_ml_excluded = round(float(ml_raw), 2)
+    if ech_comparison_available and ml_read.get("status") == "complete":
+        ech_ml_excluded = round(float(ml_read.get("monthly") or 0), 2)
         if ech_ml_excluded:
             ech_mo = round(max(0.0, float(ech_mo) - ech_ml_excluded), 2)
+            word = "deployment" if int(ml_read.get("deployments") or 0) == 1 else "deployments"
             notes.append(
-                f"The ECH comparison excludes ${ech_ml_excluded:,.2f}/mo of quote-window ML-node ECU. "
-                "That capacity stays out of the serverless total."
+                f"The ECH comparison excludes ${ech_ml_excluded:,.2f}/mo of quote-window ML-node ECU on "
+                f"{int(ml_read.get('deployments') or 0)} {word}. No serverless project bills an ML node, so that "
+                "capacity stays out of the serverless total. It is read across every deployment in the comparison, "
+                "not only the ones Search priced."
             )
+    elif ech_comparison_available and ml_read.get("status") == "incomplete":
+        notes.append(
+            "ML-node ECU could not be verified from complete, reconciled quote-window telemetry, so none was taken "
+            f"out of the ECH comparison: {ml_read.get('reason')}. If the fleet runs ML nodes, the saving is understated."
+        )
+        limits = sz.setdefault("diagnostics", {}).setdefault("estimation_limits", [])
+        if not any(row.get("code") == "ml_node_ecu_unverified" for row in limits):
+            limits.append({
+                "code": "ml_node_ecu_unverified",
+                "detail": (
+                    "ML-node ECU was not taken out of the ECH comparison because quote-window telemetry is "
+                    f"incomplete or does not reconcile: {ml_read.get('reason')}."
+                ),
+                "severity": "medium",
+            })
     if quoted:
         notes.append(
             "Every serverless dollar comes from a named estimator: Search Serverless performant, or the Observability or Security Serverless estimator. "
@@ -436,81 +702,12 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         else:
             notes.append(f"{len(per) - n_with_gb} deployment(s) have no stored GB: not sized, or no storage row. They stay in the roster ECU totals and out of the stored-GB total, and they are not given a serverless price.")
 
-    # ---- long tail (< 1 % of spend each)
-    thr = ecu_total * TAIL_SHARE_PCT / 100
-    tail = [r for r in per if r["ech_ecu_lookback"] < thr]
-    tail_gb = sum(r["stored_gb"] for r in tail)
-    tail_ecu_mo = sum(r["ech_ecu_mo"] for r in tail)
-    tail_block = {
-        "n": len(tail),
-        "stored_gb": round(tail_gb, 1),
-        "ech_ecu_mo": round(tail_ecu_mo, 2),
-        "ech_share_pct": round(100 * sum(r["ech_ecu_lookback"] for r in tail) / ecu_total, 1) if ecu_total else None,
-        "fixed_overhead_ecu_mo": round(sum(r["fixed_overhead_ecu_mo"] or 0 for r in tail), 2),
-        "ech_consolidation_saving_mo": round(0.25 * tail_ecu_mo, 2),
-        "data_share_pct": round(100 * tail_gb / stored_gb, 1) if stored_gb else None,
-        "note": "ECH consolidation assumes 25 % overhead removal (cost-rec rule). The tail is not given its own serverless price.",
-    }
+    tail_block, buckets, highest_overhead = _tail_and_buckets(per, ecu_total, stored_gb, months)
 
-    # ---- fixed-overhead share by size bucket
-    buckets_def = [(0, 1_000, "< 1k ECU"), (1_000, 5_000, "1k – 5k"), (5_000, thr, f"5k – {thr / 1000:,.1f}k (< {TAIL_SHARE_PCT:g} %)"), (thr, 50_000, f"{thr / 1000:,.1f}k – 50k"), (50_000, float("inf"), "> 50k")]
-    buckets = []
-    for lo, hi, label in buckets_def:
-        if hi <= lo:
-            continue
-        b = [r for r in per if lo <= r["ech_ecu_lookback"] < hi]
-        if not b:
-            continue
-        ecu_b = sum(r["ech_ecu_lookback"] for r in b)
-        fx_b = sum((r["fixed_overhead_ecu_mo"] or 0) for r in b) * months
-        buckets.append({"bucket": label, "deployments": len(b), "ecu_lookback": round(ecu_b, 2), "fixed_overhead_pct": round(100 * fx_b / ecu_b, 1) if ecu_b else None})
-    highest_overhead = sorted([r for r in per if r["fixed_overhead_ecu_mo"] and r["ech_ecu_mo"] > 0], key=lambda r: -(r["fixed_overhead_ecu_mo"] / r["ech_ecu_mo"]))[:5]
-
-    # ---- sensitivity: volume only. The quote is not re-run.
-    dom_gb = float(dom.get("stored_gb") or 0)
-    used_ret = float((con.get(dominant) or {}).get("retention_months") or 3.0)
-    retention_rows = []
-    for r in RETENTION_SCENARIOS:
-        raw = (dom_gb / (float(r) * DAYS_PER_MONTH)) if dom_gb > 0 else None
-        retention_rows.append({
-            "retention_months": r,
-            "used": abs(r - used_ret) < 1e-9,
-            "raw_gb_day": round(raw, 2) if raw is not None else None,
-            "stored_gb": round(dom_gb, 1),
-        })
-
-    fleet_rows = []
-    quote_days = e.get("quote_lookback_days")
-    if quote_days:
-        scen = [(f"{int(quote_days)}-day lookback (estimator basis)", 1.0)]
-    else:
-        scen = [("Lookback-average fleet (estimator basis)", 1.0)]
-    # Historical billing-pace sensitivities belong to the measured diagnostic quote only.
-    # They do not describe or scale the assumption-based K360 stored-GB scenario.
-    if sz.get("ingest_source") == "diagnostics":
-        low = e.get("monthly_low") or {}
-        if low.get("ecu") and ech_window_mo:
-            scen.append(("ECH billing pace applied to the estimate (illustrative)", float(low["ecu"]) / ech_window_mo))
-        complete = e.get("monthly_avg_complete_months")
-        if quote_days and complete and ech_window_mo and abs(float(complete) - ech_window_mo) > 1:
-            scen.append(("ECH billing pace applied to the estimate (illustrative)", float(complete) / ech_window_mo))
-        elif not quote_days and e.get("last_30d_daily_avg") and ech_window_mo:
-            scen.append(("Last 30 days run-rate", float(e["last_30d_daily_avg"]) * DAYS_PER_MONTH / ech_window_mo))
-    eis_full = float((by_solution.get("search") or {}).get("eis_with_support_mo") or 0)
-    eis_usage = float((by_solution.get("search") or {}).get("eis_mo") or 0)
-    for label, k in scen:
-        base = (svls_total_mo - eis_full) if svls_total_mo else 0.0
-        svl_k = round(base * k + eis_full, 2) if svls_total_mo else None
-        fleet_rows.append({
-            "scenario": label,
-            "scale": round(k, 3),
-            "stored_gb": round(stored_gb * k, 1),
-            "ech_ecu_mo": round(ech_mo * k, 2) if ech_comparison_available else None,
-            "serverless_mo": svl_k,
-            "eis_mo": round(eis_usage, 2) if eis_usage else None,
-            "save_vs_list_mo": round(ech_mo * k - svl_k, 2) if svl_k is not None and ech_comparison_available else None,
-            "note": "Bulk was measured once. This row only scales that measurement." if "illustrative" in label else None,
-        })
+    retention_rows, fleet_rows = _sensitivity(
+        acc, sz, by_solution, dom, dominant, con, e, stored_gb, ech_mo, ech_window_mo,
+        svls_total_mo, ech_comparison_available,
+    )
 
     # ---- architecture: one serverless project per solution per region
     priced = {}
@@ -549,122 +746,18 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         written_months = int((acc.get("meta") or {}).get("estimate_months") or ESTIMATE_MONTHS)
         if not (acc.get("meta") or {}).get("retention_index_count") and abs(shown - written_months) > 0.05:
             notes.append(f"Retention measured at {shown:g} months; the estimate prices {written_months}.")
-    measured_projects = [
-        p for p in ((sz.get("estimators") or {}).get("projects") or [])
-        if isinstance(p, dict) and p.get("role") == "measured_retention"
-    ]
-    if measured_projects:
-        monthly = 0.0
-        priced_extra = True
-        for project in measured_projects:
-            value = ((project.get("readback") or {}).get("monthly_steady_state"))
-            if value is None:
-                priced_extra = False
-                break
-            monthly += float(value)
-        if priced_extra:
-            retention_rows.append({
-                "retention_months": round(sum(measured_ages) / len(measured_ages), 1) if measured_ages else None,
-                "label": "At measured retention",
-                "serverless_mo": round(monthly, 2),
-                "used": False,
-            })
+    # No "At measured retention" row: the measured-retention copy is retired (SKILL.md hard
+    # rule 4, one sheet per solution per region), so nothing prices that month any more.
+    # The size-weighted age stays on `retention_months_measured` as a record.
 
-    quotes = []
-    for sol in ("search", "observability", "security"):
-        blk = by_solution.get(sol) or {}
-        if "quotable" not in str(blk.get("pricing") or ""):
-            continue
-        est = (sz.get("estimators") or {}).get(sol) or {}
-        rb = est.get("readback") or {}
-        label = "Search Serverless, performant" if sol == "search" else f"{sol.title()} Serverless"
-        regions = blk.get("by_region") or []
-        if regions:
-            for r in regions:
-                monthly = r.get("monthly")
-                if r.get("annual_year1") is not None:
-                    annual = r.get("annual_year1")
-                    steady = r.get("annual_steady_state")
-                elif monthly is not None:
-                    annual = round(float(monthly) * 12, 2)
-                    steady = annual
-                else:
-                    annual = None
-                    steady = None
-                quotes.append({
-                    "solution": sol,
-                    "region": r.get("region"),
-                    "source": f"{label}, {r.get('region')}",
-                    "monthly": monthly,
-                    "monthly_unrounded": r.get("monthly_unrounded") if r.get("monthly_unrounded") is not None else r.get("own_monthly"),
-                    "annual_year1": annual,
-                    "annual_steady_state": steady,
-                    "retention_months": r.get("retention_months") if r.get("retention_months") is not None else blk.get("retention_months"),
-                    "url": r.get("url") or est.get("url"),
-                })
-        else:
-            quotes.append({
-                "solution": sol,
-                "source": label,
-                "monthly": blk.get("total_mo"),
-                "monthly_unrounded": _money(rb.get("monthly_steady_state")),
-                "annual_year1": _money(rb.get("annual_year1")),
-                "annual_steady_state": _money(rb.get("annual_steady_state")),
-                "retention_months": blk.get("retention_months"),
-                "url": est.get("url"),
-            })
-    # A Search line's monthly carries EIS. Its annual figures have to carry it too.
-    if (by_solution.get("search") or {}).get("eis_with_support_mo"):
-        for line in quotes:
-            if line["solution"] == "search" and line.get("monthly") is not None:
-                line["monthly_unrounded"] = float(line["monthly"])
-                line["annual_year1"] = line["annual_steady_state"] = round(float(line["monthly"]) * 12, 2)
+    quotes = _quote_lines(by_solution, sz)
     recon = {"kind": "readbacks", "quotes": quotes, "total_mo": round(svls_total_mo, 2), "quotable": "estimator read-backs"} if quotes else None
     integrity = _integrity(acc, sz, by_solution, quotes, svls_total_mo, scope, priced_months)
     for row in integrity.get("checks") or []:
         if row.get("warning") and row.get("detail"):
             notes.append(f"Warning: {row['detail']}")
 
-    callouts: list[dict] = []
-    if per:
-        top = per[0]
-        oh = f"{top['overhead_pct']}% fixed overhead" if top.get("overhead_pct") is not None else "fixed overhead not available"
-        gb_bit = f"{top['stored_gb']:,.0f} GB" if top["gb_known"] else (f"its size now reports under {top['size_now_on']}" if top.get("size_now_on") else "no current size")
-        callouts.append({"tone": "info", "title": f"Largest deployment: {top['name']}", "detail": f"{top['ech_ecu_mo']:,.0f} ECU/mo, {gb_bit}, {oh}. Deployments are not priced alone. The estimate is one project per solution in each region."})
-    active_fixed = fragmentation.get("fixed_overhead_ecu_mo") or 0
-    if active_fixed:
-        quote_days = int(e["quote_lookback_days"]) if e.get("quote_lookback_days") else None
-        pace = f" on the last {quote_days} billed days" if quote_days else ""
-        inactive_n = (sz.get("diagnostics") or {}).get("inactive_excluded") or 0
-        year_fixed = composition.get("fixed_overhead_mo")
-        year_bit = ""
-        if year_fixed and abs(float(year_fixed) - float(active_fixed)) > 1:
-            year_bit = f" The full lookback is {float(year_fixed):,.0f} ECU/mo, {composition.get('fixed_overhead_pct')}% of that year."
-            if inactive_n:
-                word = "deployment" if int(inactive_n) == 1 else "deployments"
-                year_bit = year_bit[:-1] + f", including {int(inactive_n)} {word} with no bill in the quote window."
-        callouts.append({
-            "tone": "success",
-            "title": f"Fixed overhead is {active_fixed:,.0f} ECU/mo",
-            "detail": (
-                f"{fragmentation.get('fixed_overhead_pct')}% of the active deployments' ECU{pace}. "
-                f"That is Fixed ECU/mo added across all {fragmentation.get('n_deployments')} active deployments. "
-                "These are master, Kibana, coordinating, integrations, enterprise search, and APM. "
-                "A serverless project does not bill those roles."
-                + year_bit
-            ),
-        })
-    if tail_block["n"] >= 8:
-        callouts.append({
-            "tone": "info",
-            "title": f"{tail_block['n']} small deployments bill {tail_block['ech_ecu_mo']:,.0f} ECU/mo",
-            "detail": (
-                f"That is {tail_block['ech_share_pct']}% of ECU and {tail_block.get('data_share_pct')}% of stored data. "
-                "It is their whole bill, not the fixed-overhead figure. "
-                f"Fixed overhead on these {tail_block['n']} is {tail_block['fixed_overhead_ecu_mo']:,.0f} ECU/mo. "
-                f"Merging them, if a quarter of their bill goes away, recovers about {tail_block['ech_consolidation_saving_mo']:,.0f} ECU/mo."
-            ),
-        })
+    callouts = _callouts(per, fragmentation, tail_block, composition, e, sz)
 
     caveats = [
         "Serverless $ are usage-based: a burst month costs more than the steady-state figure",
@@ -701,6 +794,15 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         "retention_index_days": (acc.get("meta") or {}).get("retention_index_days"),
         "retention_index_count": (acc.get("meta") or {}).get("retention_index_count"),
         "ech_scope": scope,
+        # ML-node ECU taken off the ECH side, read over the comparison's deployments and
+        # independent of whether Search was quoted. `status` says whether any was excluded.
+        "ech_ml_exclusion": {
+            "status": ml_read.get("status"),
+            "reason": ml_read.get("reason"),
+            "monthly": ech_ml_excluded,
+            "deployments": ml_read.get("deployments"),
+            "by_deployment_mo": ml_read.get("by_deployment_mo") or {},
+        },
         "ladder": [] if quoted else (_ladder_walk(metered) if metered else []),
         "metered_expansion": 1.0 if sz.get("ingest_source") == "diagnostics" else O11Y_METER_FACTOR,
         "metered_rates": observability_metered_rates(((acc.get("solutions") or {}).get("by_deployment") or []), 1.0 if sz.get("ingest_source") == "diagnostics" else O11Y_METER_FACTOR) if (sz.get("ingest_source") == "diagnostics") else [],

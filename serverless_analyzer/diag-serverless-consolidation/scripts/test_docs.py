@@ -79,6 +79,83 @@ def _brief_keys() -> set[str]:
     return keys
 
 
+class ModuleBoundaryTests(unittest.TestCase):
+    """What a module publishes is a decision, not a side effect of a star import."""
+
+    SCRIPTS = sorted(
+        path for path in HERE.glob("*.py")
+        if not path.name.startswith("test_")
+    )
+
+    def test_no_module_star_imports_a_sibling(self):
+        offenders = [
+            f"{path.name}:{index + 1}"
+            for path in self.SCRIPTS
+            for index, line in enumerate(path.read_text().splitlines())
+            if line.startswith("from ") and line.rstrip().split("#")[0].rstrip().endswith("import *")
+        ]
+        self.assertEqual(
+            offenders, [],
+            "a star import re-exports every name it received, so which copy of a duplicated "
+            "constant wins depends on import order. Import the names you use.",
+        )
+
+    def test_no_module_computes_all_from_globals(self):
+        offenders = [
+            path.name for path in self.SCRIPTS
+            if "__all__ = [name for name in globals()" in path.read_text()
+        ]
+        self.assertEqual(offenders, [], "__all__ built from globals() re-exports imports and privates")
+
+    def test_no_module_re_exports_another_module(self):
+        import importlib
+        import sys
+        import types
+        if str(HERE) not in sys.path:
+            sys.path.insert(0, str(HERE))
+        leaked = {}
+        for path in self.SCRIPTS:
+            try:
+                module = importlib.import_module(path.stem)
+            except Exception:  # an entry point that needs credentials to import
+                continue
+            names = getattr(module, "__all__", None)
+            if names is None:
+                continue
+            found = sorted(n for n in names if isinstance(getattr(module, n, None), types.ModuleType))
+            if found:
+                leaked[path.name] = found
+        self.assertEqual(leaked, {}, "__all__ should not publish imported modules")
+
+    def test_a_constant_has_one_home(self):
+        import ast
+        import collections
+        seen = collections.defaultdict(list)
+        for path in self.SCRIPTS:
+            for node in ast.parse(path.read_text()).body:
+                targets = []
+                if isinstance(node, ast.Assign):
+                    targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+                elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                    targets = [node.target.id]
+                for name in targets:
+                    if name.lstrip("_").isupper() and len(name.lstrip("_")) > 2:
+                        seen[name].append(path.name)
+        # Per-module anchors, not shared values: HERE is each module's own directory, and
+        # ORG_SKILL resolves the same path once per import family (the families never merge).
+        # Path anchors each entry point resolves for itself. They are the same value, computed
+        # from the module's own location, and the trees that define them never merge.
+        local = {"HERE", "ORG_SKILL", "K360_SCRIPTS", "K360"}
+        duplicated = {
+            name: files for name, files in seen.items()
+            if len(files) > 1 and name not in local
+        }
+        self.assertEqual(
+            duplicated, {},
+            "a constant defined in two modules drifts silently; give it one home",
+        )
+
+
 class DocLintTests(unittest.TestCase):
     def test_retired_phrases_are_gone(self):
         hits = []

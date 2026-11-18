@@ -1,10 +1,22 @@
 """Regional jobs and the deployment-count plan."""
 from __future__ import annotations
 
-from sizing_shared import *  # noqa: F401,F403
-from sheets_io import *  # noqa: F401,F403
-from estimate_paths import *  # noqa: F401,F403
-from sizing_fill import *  # noqa: F401,F403
+import re
+from pathlib import Path
+
+from sizing_shared import (
+    O11Y_READBACK, O11Y_TAB, SEC_READBACK, SEC_TAB, TemplateMismatch, e73_blocks_quote, echo_gate,
+    observability_echo_gate, observability_readback, sheet_money,
+)
+from sheets_io import (
+    copy_verified, export_xlsx, load_sheet_creds, map_in_order, push_cells, read_cells,
+    services_from, trash_file, write_search_sheet,
+)
+from estimate_paths import _months_for_sheet, _search_volume_scale, estimate_title
+from sizing_fill import (
+    _region_rejected, fill_security, ingest_basis, match_region, observability_fill,
+    region_match_text, region_options, run_es3,
+)
 
 def _fill_regional_job(job: dict, creds) -> dict:
     """One regional project. The worker builds its own Sheets and Drive clients."""
@@ -610,12 +622,6 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
     return built
 
 
-def fleet_measured_copy(job: dict) -> dict | None:
-    """No second sheet. The quote is the 12-month workbook; the measured age is a note."""
-    del job
-    return None
-
-
 def org_store_gb(acc: dict) -> float:
     """Org store behind the Search telemetry share.
 
@@ -626,4 +632,3 @@ def org_store_gb(acc: dict) -> float:
     return float(st.get("ingest_share_store_gb") or st.get("data_stored_gb") or 0)
 
 
-__all__ = [name for name in globals() if not name.startswith('__')]

@@ -107,7 +107,6 @@ GSHEET_MIME = "application/vnd.google-apps.spreadsheet"
 
 _REGION_OPT = re.compile(r"^(AWS|AZURE|GCP)\s*:?\s*([a-z0-9\-]+)", re.IGNORECASE)
 
-TEMPLATE_MISMATCH_EXIT = 3
 
 class TemplateMismatch(RuntimeError):
     """The estimator copy is not the layout these cell addresses were written for."""
@@ -136,5 +135,3 @@ LEGACY_RETENTION_FOLDERS = ("full_retention", "30d")
 LEGACY_ESTIMATE_DIRS = tuple(
     prefix + (name,) for prefix in ((), (COMPRESSION_FOLDER_NAME,)) for name in LEGACY_RETENTION_FOLDERS
 )
-
-__all__ = [name for name in globals() if not name.startswith('__')]

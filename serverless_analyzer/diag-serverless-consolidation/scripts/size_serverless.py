@@ -23,11 +23,49 @@ Never mutates the golden templates.
 """
 from __future__ import annotations
 
-from sizing_shared import *  # noqa: F401,F403
-from sheets_io import *  # noqa: F401,F403
-from estimate_paths import *  # noqa: F401,F403
-from sizing_fill import *  # noqa: F401,F403
-from plan_sizing import *  # noqa: F401,F403
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import sizing_shared
+from constants import TEMPLATE_MISMATCH_EXIT
+from sizing_shared import (
+    DAYS_PER_MONTH, DEFAULT_O11Y, DEFAULT_SECURITY, O11Y_READBACK, O11Y_TAB, PLAN_FOLDER_NAME,
+    SEC_TAB, TemplateMismatch, echo_gate, observability_echo_gate,
+    observability_readback, seal_dir, seal_text,
+)
+from sheets_io import (
+    copy_verified, dedupe_estimates, ensure_drive_folder, export_xlsx, push_cells, read_cells,
+    services, sheet_id, trash_file, write_search_sheet,
+)
+from estimate_paths import (
+    _fill_missing_doc_bytes, _months_for_sheet, _search_volume_scale, _suffix, architecture_regions,
+    estimate_title, estimator_skip, fleet_sheet_region, open_estimate_place, prefer_regional_estimators,
+)
+from sizing_fill import (
+    _region_rejected, fill_security, ingest_basis, match_region, observability_fill,
+    observability_input_cells, region_match_text, region_options, run_es3, security_expansion,
+    security_input_cells,
+)
+from plan_sizing import (
+    assemble_plan_bars, org_store_gb, plan_roster, plan_sheet_jobs, size_deployment_plan,
+    size_regional_projects,
+)
+
+# size_serverless.py is the CLI the sizing family is driven through, and the tests reach the
+# steps by importing them from here. These re-exports are deliberate.
+from sizing_shared import COMPRESSION_FOLDER_NAME, FOLDER_MIME, GSHEET_MIME
+from sheets_io import (
+    _execute, assert_not_template, cell_input_mode, copy_template, find_in_folder,
+    map_in_order, partition_cells, require_customer_parent,
+)
+from estimate_paths import (
+    _sheet_retention, drive_children, estimate_folder_name, estimate_subfolder,
+    relocate_drive_estimates, relocate_local_estimates,
+)
 
 def _checkpoint_sizing(local_dir: Path, sizing_name: str, sz: dict, estimators: dict) -> None:
     """Write sizing.json after a solution so a later timeout keeps the read-backs already priced."""
@@ -146,6 +184,7 @@ def main() -> None:
             }) if (se.get("stored_gb") or 0) > 0 else {}
             published = write_search_sheet(drive, estimate_dir, folder["id"], title_se, result) if result.get("report_csv") else {"error": result.get("error") or "no report"}
             entry = dict(estimators.get("search") or {"kind": "search", "title": title_se})
+            entry["region"] = search_scope or region
             entry.pop("doc_id", None)
             entry.update({
                 "status": result.get("status") or "error",
@@ -233,7 +272,7 @@ def main() -> None:
             except Exception:  # noqa: BLE001
                 pass
             estimators["observability"] = {
-                "kind": "observability", "title": title_o, "region_match": "none",
+                "kind": "observability", "title": title_o, "region": o_scope or region, "region_match": "none",
                 "readback_rejected": reason, "readback": {}, "status": "unquoted",
             }
             lines.append(f"Observability → {reason}")
@@ -255,7 +294,7 @@ def main() -> None:
                 )
             n = push_cells(sheets, copied["id"], O11Y_TAB, cells, allowed_text=set(opts))
             rb = observability_readback(read_cells(sheets, copied["id"], O11Y_TAB, O11Y_READBACK), basis)
-            entry = {"kind": "observability", "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.o11y_id, "reused_existing_copy": reused, "tab": O11Y_TAB, "cells": cells, "cells_written": n, "region_match": match_text, "readback": rb, "status": "filled", "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"]}
+            entry = {"kind": "observability", "region": o_scope or region, "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.o11y_id, "reused_existing_copy": reused, "tab": O11Y_TAB, "cells": cells, "cells_written": n, "region_match": match_text, "readback": rb, "status": "filled", "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"]}
             entry["ingest_basis"] = basis
             entry["echo_gate"] = observability_echo_gate(o_mix or o, rb) if basis == "metered" else echo_gate(daily, rb.get("echo_gb_day"))
             if not entry["echo_gate"]["accepted"]:
@@ -298,7 +337,7 @@ def main() -> None:
             except Exception:  # noqa: BLE001
                 pass
             estimators["security"] = {
-                "kind": "security", "title": title_s, "region_match": "none",
+                "kind": "security", "title": title_s, "region": s_scope or region, "region_match": "none",
                 "readback_rejected": reason, "readback": {}, "status": "unquoted",
             }
             lines.append(f"Security → {reason}")
@@ -306,7 +345,7 @@ def main() -> None:
             s_daily = float(s.get("siem_gb_day") if s.get("siem_gb_day") is not None else s.get("daily_raw_gb") or 0)
             cells, n, rb, s_gate = fill_security(sheets, copied["id"], acc, support, reg, s_months, s_daily, opts, basis)
             match_text = region_match_text(reg, how, s_scope or region)
-            entry = {"kind": "security", "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.security_id, "reused_existing_copy": reused, "tab": SEC_TAB, "cells": cells, "cells_written": n, "region_match": match_text, "readback": rb, "status": "filled", "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"]}
+            entry = {"kind": "security", "region": s_scope or region, "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.security_id, "reused_existing_copy": reused, "tab": SEC_TAB, "cells": cells, "cells_written": n, "region_match": match_text, "readback": rb, "status": "filled", "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"]}
             entry["ingest_basis"] = basis
             if s_gate is not None:
                 entry["echo_gate"] = s_gate
@@ -359,6 +398,7 @@ def main() -> None:
                 published = {"error": str(ex)}
         entry = {
             "kind": "search",
+            "region": search_scope or region,
             "status": result.get("status") or "error",
             "title": title_se,
             "local": published.get("local"),

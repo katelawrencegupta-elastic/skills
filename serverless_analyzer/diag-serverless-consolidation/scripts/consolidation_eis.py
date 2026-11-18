@@ -1,42 +1,42 @@
-"""Search EIS read for the consolidation quote."""
+"""Search EIS and ML-node ECU reads for the consolidation quote.
+
+One completeness gate (`_ai_ml_window`) serves both. The EIS line is a Search
+price; the ML-node figure the ECH comparison takes out is not, and must not
+depend on whether Search happened to return a read-back.
+"""
 from __future__ import annotations
 
 from constants import ECHO_TOLERANCE_GB_DAY, ECHO_TOLERANCE_SHARE
-from consolidation_scope import *  # noqa: F401,F403
+from consolidation_scope import DAYS_PER_MONTH, billed_series
 
-def _search_eis(
-    acc: dict,
-    months: float,
-    *,
-    usage_factor: float = 1.0,
-    eligible_names: set[str] | None = None,
-) -> dict:
-    """Price EIS only from complete source totals, preferring reconciled daily data."""
-    region = {
-        d.get("name"): d.get("region")
-        for d in ((acc.get("cloud") or {}).get("by_deployment") or [])
-        if d.get("region")
-    }
-    eligible_names = eligible_names or set()
+
+def _ai_ml_window(acc: dict, names: set[str]) -> dict:
+    """Quote-window AI/ML billing for `names`, only from complete, reconciled daily data.
+
+    The composite total query is the authoritative source for fetched-period
+    totals. Missing data is never read as a zero-cost deployment, and a daily
+    series is used only when it covers the exact window and reconciles to those
+    totals. `by_name` carries each deployment's window sums; `scale` turns a
+    window total into a month.
+    """
     ai_ml = acc.get("ai_ml") or {}
-    deployment_rows = {d.get("name"): d for d in ai_ml.get("by_deployment") or [] if d.get("name")}
     source_totals = ai_ml.get("billing_by_deployment") or {}
-    totals_complete = bool(ai_ml.get("billing_by_deployment_complete"))
     daily_usage = ai_ml.get("daily_usage_by_deployment") or {}
     e = acc.get("ecu") or {}
     quote_days = int(e.get("quote_lookback_days") or 0)
     daily_labels, _daily_totals = billed_series(e)
     window_labels = daily_labels[-quote_days:] if quote_days and daily_labels else []
-    if not eligible_names:
-        return {"status": "not_applicable", "reason": "no priced Search deployments are eligible for EIS"}
 
-    # The composite total query is the authoritative source for fetched-period
-    # totals. Missing data must not be interpreted as a zero-cost deployment.
-    if not totals_complete:
-        return {
-            "status": "incomplete",
-            "reason": (ai_ml.get("billing_by_deployment_status") or {}).get("reason") or "complete filtered deployment totals are unavailable",
-        }
+    def short(reason: str) -> dict:
+        return {"status": "incomplete", "reason": reason, "window_labels": [], "by_name": {}, "scale": None}
+
+    if not names:
+        return {"status": "not_applicable", "reason": "no deployments to read", "window_labels": [], "by_name": {}, "scale": None}
+    if not bool(ai_ml.get("billing_by_deployment_complete")):
+        return short(
+            (ai_ml.get("billing_by_deployment_status") or {}).get("reason")
+            or "complete filtered deployment totals are unavailable"
+        )
 
     def total_for(name: str) -> dict | None:
         raw = source_totals.get(name)
@@ -53,78 +53,144 @@ def _search_eis(
         except (KeyError, TypeError, ValueError):
             return None
 
-    if any(total_for(name) is None for name in eligible_names):
-        return {"status": "incomplete", "reason": "a deployment total is missing a required filtered billing metric"}
+    totals = {name: total_for(name) for name in names}
+    if any(value is None for value in totals.values()):
+        return short("a deployment total is missing a required filtered billing metric")
+    if not (bool(ai_ml.get("daily_usage_complete")) and window_labels):
+        return short(
+            "complete daily EIS and ML-node telemetry for the exact quote window is unavailable "
+            "or does not reconcile to fetched-period totals"
+        )
+    # A completed composite with a zero total and no daily row is a deployment with no AI/ML
+    # billing at all, not missing telemetry. Reading it as zero is the same convention
+    # `total_for` already uses for an absent bucket, and it is what lets this gate run over
+    # every deployment in the comparison rather than only the ones with inference activity.
+    silent = {
+        name for name in names
+        if not (daily_usage.get(name) or {}).get("days")
+        and not any(abs(totals[name][key]) > 0 for key in ("eis", "tokens", "ml"))
+    }
+    for name in names - silent:
+        data = daily_usage.get(name) or {}
+        days = list(data.get("days") or [])
+        fields = ("eis_ecu", "million_tokens", "ml_node_ecu", "models")
+        if any(len(data.get(field) or []) != len(days) for field in fields) or any(day not in days for day in window_labels):
+            return short(
+                "complete daily EIS and ML-node telemetry for the exact quote window is unavailable "
+                "or does not reconcile to fetched-period totals"
+            )
+        for field, total_key in (("eis_ecu", "eis"), ("million_tokens", "tokens"), ("ml_node_ecu", "ml")):
+            daily_sum = sum(float(value or 0) for value in (data.get(field) or []))
+            tolerance = max(ECHO_TOLERANCE_GB_DAY, abs(totals[name][total_key]) * ECHO_TOLERANCE_SHARE)
+            if abs(daily_sum - totals[name][total_key]) > tolerance:
+                return short(
+                    "complete daily EIS and ML-node telemetry for the exact quote window is unavailable "
+                    "or does not reconcile to fetched-period totals"
+                )
 
-    daily_complete = bool(ai_ml.get("daily_usage_complete")) and bool(window_labels)
-    if daily_complete:
-        for name in eligible_names:
-            data = daily_usage.get(name) or {}
-            days = list(data.get("days") or [])
-            fields = ("eis_ecu", "million_tokens", "ml_node_ecu", "models")
-            if any(len(data.get(field) or []) != len(days) for field in fields) or any(day not in days for day in window_labels):
-                daily_complete = False
-                break
-            authoritative = total_for(name)
-            if authoritative is None:
-                daily_complete = False
-                break
-            for field, total_key in (("eis_ecu", "eis"), ("million_tokens", "tokens"), ("ml_node_ecu", "ml")):
-                daily_sum = sum(float(v or 0) for v in (data.get(field) or []))
-                tolerance = max(ECHO_TOLERANCE_GB_DAY, abs(authoritative[total_key]) * ECHO_TOLERANCE_SHARE)
-                if abs(daily_sum - authoritative[total_key]) > tolerance:
-                    daily_complete = False
-                    break
-            if not daily_complete:
-                break
+    by_name: dict[str, dict] = {}
+    for name in silent:
+        by_name[name] = {"eis": 0.0, "tokens": 0.0, "ml": 0.0, "models": []}
+    for name in names - silent:
+        data = daily_usage.get(name) or {}
+        indices = {day: index for index, day in enumerate(data.get("days") or [])}
 
-    if not daily_complete:
-        return {
-            "status": "incomplete",
-            "reason": "complete daily EIS and ML-node telemetry for the exact quote window is unavailable or does not reconcile to fetched-period totals",
+        def sum_window(field: str, _data=data, _indices=indices) -> float:
+            values = _data.get(field) or []
+            return sum(float(values[_indices[day]] or 0) for day in window_labels if day in _indices)
+
+        models_by_day = data.get("models") or []
+        by_name[name] = {
+            "eis": sum_window("eis_ecu"),
+            "tokens": sum_window("million_tokens"),
+            "ml": sum_window("ml_node_ecu"),
+            "models": sorted({
+                str(model) for day in window_labels if day in indices
+                for model in (models_by_day[indices[day]] or []) if model
+            }),
         }
+    return {
+        "status": "complete",
+        "reason": None,
+        "window_labels": window_labels,
+        "by_name": by_name,
+        "scale": DAYS_PER_MONTH / len(window_labels),
+    }
 
-    exact = daily_complete
-    scale = DAYS_PER_MONTH / len(window_labels)
+
+def ml_node_ecu(acc: dict, names) -> dict:
+    """Quote-window ML-node ECU as a month, over the deployments in the ECH comparison.
+
+    No serverless project bills an ML node, so that capacity comes out of the ECH
+    side of the comparison. That is true of an Observability or Security fleet as
+    much as a Search one, so this read does not depend on a Search read-back.
+    Incomplete or unreconciled telemetry excludes nothing: an unverified deduction
+    would overstate the saving.
+    """
+    names = {str(name) for name in (names or set()) if name}
+    if not names:
+        return {"status": "not_applicable", "reason": "no deployments are in the ECH comparison", "monthly": 0.0, "deployments": 0}
+    window = _ai_ml_window(acc, names)
+    if window["status"] != "complete":
+        return {"status": window["status"], "reason": window.get("reason"), "monthly": 0.0, "deployments": 0}
+    scale = window["scale"]
+    found = {name: row["ml"] for name, row in window["by_name"].items() if row["ml"] > 0}
+    return {
+        "status": "complete",
+        "reason": None,
+        "monthly": round(sum(found.values()) * scale, 2),
+        "window_ecu": round(sum(found.values()), 2),
+        "deployments": len(found),
+        "usage_days": len(window["window_labels"]),
+        "by_deployment_mo": {
+            name: round(value * scale, 2)
+            for name, value in sorted(found.items(), key=lambda item: -item[1])
+        },
+    }
+
+
+def _search_eis(
+    acc: dict,
+    months: float,
+    *,
+    usage_factor: float = 1.0,
+    eligible_names: set[str] | None = None,
+) -> dict:
+    """Price EIS only from complete source totals and reconciled daily data."""
+    del months, usage_factor
+    region = {
+        d.get("name"): d.get("region")
+        for d in ((acc.get("cloud") or {}).get("by_deployment") or [])
+        if d.get("region")
+    }
+    eligible_names = eligible_names or set()
+    if not eligible_names:
+        return {"status": "not_applicable", "reason": "no priced Search deployments are eligible for EIS"}
+    window = _ai_ml_window(acc, eligible_names)
+    if window["status"] != "complete":
+        return {"status": "incomplete", "reason": window.get("reason")}
+
+    ai_ml = acc.get("ai_ml") or {}
+    deployment_rows = {d.get("name"): d for d in ai_ml.get("by_deployment") or [] if d.get("name")}
+    window_labels = window["window_labels"]
+    scale = window["scale"]
     rows = []
     for name in eligible_names:
         d = deployment_rows.get(name) or {}
-        if not name or name not in eligible_names:
-            continue
-        if exact:
-            data = daily_usage.get(name) or {}
-            indices = {day: i for i, day in enumerate(data.get("days") or [])}
-            def sum_window(field: str) -> float:
-                values = data.get(field) or []
-                return sum(float(values[indices[day]] or 0) for day in window_labels if day in indices)
-            models_by_day = data.get("models") or []
-            models = sorted({str(model) for day in window_labels if day in indices
-                             for model in (models_by_day[indices[day]] or []) if model})
-            labels = dict(zip(d.get("models") or [], d.get("model_labels") or []))
-            row = {
-                "name": name, "region": region.get(name) or "unknown region",
-                "ml": sum_window("ml_node_ecu"),
-                "eis": sum_window("eis_ecu"), "million_tokens": sum_window("million_tokens"),
-                "models": models, "model_labels": [labels.get(model, model) for model in models],
-                "elser": any("elser" in model.lower() for model in models),
-            }
-        else:
-            models = list(d.get("models") or [])
-            totals = total_for(name)
-            ml = totals["ml"]
-            row = {
-                "name": name,
-                "region": region.get(name) or "unknown region",
-                "ml": ml,
-                "eis": totals["eis"],
-                "million_tokens": totals["tokens"],
-                "models": models,
-                "model_labels": list(d.get("model_labels") or []),
-                "elser": bool(d.get("elser")),
-            }
+        measured = window["by_name"][name]
+        models = measured["models"]
+        labels = dict(zip(d.get("models") or [], d.get("model_labels") or []))
+        row = {
+            "name": name, "region": region.get(name) or "unknown region",
+            "ml": measured["ml"],
+            "eis": measured["eis"], "million_tokens": measured["tokens"],
+            "models": models, "model_labels": [labels.get(model, model) for model in models],
+            "elser": any("elser" in model.lower() for model in models),
+        }
         if row["ml"] <= 0 and row["eis"] <= 0 and not row["elser"] and not row["models"]:
             continue
         rows.append(row)
+    exact = True
     if not rows:
         return {
             "status": "complete",
@@ -202,7 +268,6 @@ def _apply_search_eis(
     usage = float(eis["monthly"] or 0)
     blk["eis_mo"] = usage
     blk["eis_models"] = eis["models"]
-    blk["ml_node_ecu_mo"] = eis["ml_node_ecu_mo"]
     blk["ml_node_ecu"] = eis.get("ml_node_ecu")
     blk["ml_node_ecu_mo"] = eis.get("ml_node_ecu_mo")
     blk["eis_workloads"] = eis["workloads"]
@@ -237,9 +302,9 @@ def _apply_search_eis(
     notes.append(
         f"The Search EIS line includes activity found on {eis['deployments']} sized ECH Search deployment(s). "
         f"{pace_text}. EIS is ${usage:,.2f}/mo before support, based on billed inference ECU and tokens. "
-        f"ML-node ECU is tracked separately (${eis['ml_node_ecu_mo']:,.2f}/mo after normalization) and is not attributed to EIS."
+        f"ML-node ECU on those deployments (${eis['ml_node_ecu_mo']:,.2f}/mo) is not attributed to EIS. "
+        "The ECH comparison's ML-node exclusion is read separately, across every deployment in the comparison."
     )
 
 
 
-__all__ = [name for name in globals() if not name.startswith('__')]

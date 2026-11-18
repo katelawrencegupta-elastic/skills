@@ -18,10 +18,12 @@ The account summary stays on run_account_analysis.py --skip-diags --skip-sizing.
 from __future__ import annotations
 
 import copy
+import datetime as dt
 import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -49,9 +51,7 @@ from run_account_analysis import (  # noqa: E402
 )
 
 
-# size_serverless.py exits with this status when an estimator copy does not have
-# the layout its cell addresses were written for.
-TEMPLATE_MISMATCH_EXIT = 3
+from constants import TEMPLATE_MISMATCH_EXIT  # noqa: E402
 
 
 def _run(cmd: list[str]) -> None:
@@ -65,6 +65,29 @@ def _run(cmd: list[str]) -> None:
                 "The run stopped before a quote was written."
             ) from exc
         raise
+
+
+def note_limit(acc_or_sz: dict, code: str, detail: str, severity: str = "high") -> None:
+    """Record a degraded step on the quote, not only on stderr.
+
+    A warning that changes what the quote contains has to reach the artifact: the
+    brief's `limits`, the chat bullets and the PDF all read
+    `sizing.diagnostics.estimation_limits`. A message that only went to stderr is
+    invisible to anyone reading the run afterwards, which is how a sizing step
+    that never ran can look like a finished quote.
+    """
+    sz = acc_or_sz.get("sizing") if isinstance(acc_or_sz.get("sizing"), dict) else acc_or_sz
+    limits = sz.setdefault("diagnostics", {}).setdefault("estimation_limits", [])
+    if any(isinstance(row, dict) and row.get("code") == code for row in limits):
+        return
+    limits.append({"code": code, "detail": detail, "severity": severity})
+
+
+def warn(acc_or_sz: dict | None, code: str, detail: str, severity: str = "high") -> None:
+    """Print a degradation to stderr and record it on the quote."""
+    print(f"WARN: {detail}", file=sys.stderr)
+    if acc_or_sz is not None:
+        note_limit(acc_or_sz, code, detail, severity)
 
 
 def _retention_label(diagnostic: bool, retention_months: int, retention_days: int | None, *, index_average: bool = False) -> str:
@@ -83,8 +106,12 @@ def method_stamp(lookback_days: int, *, diagnostic: bool = True, retention_month
 
     Two runs of one customer can only be compared when they carry the same stamp.
     `commit` is the checkout the scripts ran from. `uncommitted_changes` is true
-    when that checkout had edits under serverless_analyzer that no commit records.
-    Both are None when the scripts are not in a git checkout.
+    when that checkout held a change that could alter what the scripts do: a
+    modification to a tracked file, or an untracked `.py` under a skill's
+    `scripts/`, which an import can pick up. An untracked file that cannot change
+    behaviour — a review note, a scratch document — is listed in
+    `untracked_ignored` instead of blocking the run. Both are None when the
+    scripts are not in a git checkout.
     """
     root = HERE.parent.parent
 
@@ -95,15 +122,158 @@ def method_stamp(lookback_days: int, *, diagnostic: bool = True, retention_month
             return None
         return out.stdout.strip() if out.returncode == 0 else None
 
-    status = git("status", "--porcelain", "--", ".")
+    tracked = git("status", "--porcelain", "--untracked-files=no", "--", ".")
+    everything = git("status", "--porcelain", "--untracked-files=all", "--", ".")
+    untracked = [
+        line[3:].strip() for line in (everything or "").splitlines()
+        if line.startswith("?? ")
+    ]
+    importable = sorted(name for name in untracked if name.endswith(".py") and "/scripts/" in f"/{name}")
+    ignored = sorted(name for name in untracked if name not in importable)
+    dirty = None if tracked is None else bool(tracked) or bool(importable)
     return {
         "commit": git("rev-parse", "--short", "HEAD") or None,
-        "uncommitted_changes": None if status is None else bool(status),
+        "uncommitted_changes": dirty,
+        "untracked_importable": importable,
+        "untracked_ignored": ignored,
         "ingest_basis": "metered diagnostic bulk" if diagnostic else "K360 stored GB ÷ assumed retention",
         "ech_dollars": "k360_cost",
         "quote_window_days": int(lookback_days),
         "retention": _retention_label(diagnostic, retention_months, retention_days, index_average=index_average),
         "integrity_pass": "every check",
+    }
+
+
+def preflight(args, *, network: bool = True) -> list[dict]:
+    """Check everything a run needs, before it downloads anything.
+
+    Each of these used to surface one at a time, mid-run, as a stderr line after
+    minutes of work: a missing Sheets venv only showed up once there was a quote
+    to fill, and a missing es3 interpreter only when a Search region came to be
+    priced. Rows are `{check, ok, detail}`; `ok` None is "could not tell".
+    """
+    rows: list[dict] = []
+
+    def row(check: str, ok: bool | None, detail: str) -> None:
+        rows.append({"check": check, "ok": ok, "detail": detail})
+
+    stamp = method_stamp(int(getattr(args, "lookback_days", 90) or 90))
+    dirty = stamp.get("uncommitted_changes")
+    if dirty is None:
+        row("git checkout", None, "not a git checkout, so the tree cannot be proven clean")
+    elif dirty:
+        extra = stamp.get("untracked_importable") or []
+        row("git checkout", False, "uncommitted changes" + (f", including untracked scripts: {', '.join(extra)}" if extra else ""))
+    else:
+        ignored = stamp.get("untracked_ignored") or []
+        note = f" ({len(ignored)} untracked file(s) that cannot change behaviour)" if ignored else ""
+        row("git checkout", True, f"clean at {stamp.get('commit')}{note}")
+
+    env_path = Path(getattr(args, "env", ".env") or ".env")
+    env: dict[str, str] = {}
+    if not env_path.is_file():
+        row(".env", False, f"not found at {env_path.resolve()}")
+    else:
+        try:
+            from fetch_org import load_env
+            env = load_env(env_path)
+        except Exception as exc:  # noqa: BLE001
+            row(".env", False, f"could not be read ({exc!r})")
+        else:
+            missing = [
+                name for name, alts in (
+                    ("KIBANA_URL", ("KIBANA_URL", "ELASTIC_KIBANA_URL")),
+                    ("ELASTIC_API_KEY", ("ELASTIC_API_KEY", "ES_API_KEY")),
+                    ("FOUND_ADMIN_API_KEY", ("FOUND_ADMIN_API_KEY",)),
+                ) if not any(env.get(alt) for alt in alts)
+            ]
+            row(".env", not missing, f"missing {', '.join(missing)}" if missing else f"{env_path} has the keys a run needs")
+
+    py = _sheets_py()
+    row("Sheets venv", py.is_file(), str(py) if py.is_file() else f"missing at {py} — no estimator copy can be filled (references/setup.md)")
+
+    from consolidation_regional import es3_estimator_missing, es3_estimator_python
+    gone = es3_estimator_missing()
+    row("es3 estimator", gone is None, es3_estimator_python() if gone is None else f"missing at {gone} — Search regions cannot be re-estimated")
+
+    reuse = getattr(args, "reuse", None)
+    if reuse:
+        path = Path(reuse)
+        if not path.is_file():
+            row("org report", False, f"--reuse not found: {path}")
+        else:
+            try:
+                daily = (json.loads(path.read_text()).get("ecu") or {}).get("daily_totals")
+            except Exception as exc:  # noqa: BLE001
+                row("org report", False, f"could not be read ({exc!r})")
+            else:
+                row("org report", bool(daily), f"{len(daily)} daily billing days" if daily else "no daily billing series: fetched at week grain, so there is no quote window")
+
+    if network and env and not getattr(args, "skip_vpn_check", False):
+        try:
+            from urllib.parse import urlsplit
+            from admin_diags import admin_base
+            from vpn_check import aviatrix_status
+            host = urlsplit(admin_base(env)).hostname or "admin.found.no"
+            up, detail = aviatrix_status(host)
+            row("admin access", bool(up), detail or host)
+        except Exception as exc:  # noqa: BLE001
+            row("admin access", None, f"could not be checked ({exc!r})")
+    return rows
+
+
+def print_preflight(rows: list[dict]) -> bool:
+    """Print the table. True when nothing failed."""
+    mark = {True: "ok  ", False: "FAIL", None: "?   "}
+    width = max((len(r["check"]) for r in rows), default=10)
+    for r in rows:
+        print(f"  {mark[r['ok']]} {r['check']:<{width}}  {r['detail']}")
+    failed = [r["check"] for r in rows if r["ok"] is False]
+    print(f"preflight: {len(rows) - len(failed)}/{len(rows)} ok" + (f" — failed: {', '.join(failed)}" if failed else ""))
+    return not failed
+
+
+def run_manifest(args, acc: dict, started: float, *, preflight_rows: list[dict] | None = None) -> dict:
+    """What this run was, in one file, so a finished batch can be audited.
+
+    Reading a background run used to mean inferring from file timestamps and the
+    wording of a note which code produced which artifact. This records it.
+    """
+    sz = acc.get("sizing") or {}
+    meta = acc.get("meta") or {}
+    cons = acc.get("consolidation") or {}
+    integrity = cons.get("integrity") or {}
+    org = meta.get("org") or {}
+    redacted = {"env", "reuse", "diags_dir", "artifacts_root", "org"}
+    return {
+        "run_key": meta.get("run_key"),
+        "started": dt.datetime.fromtimestamp(started, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "elapsed_sec": round(time.time() - started, 1),
+        "command": Path(sys.argv[0]).name,
+        # Paths and the customer name stay out: the flags that shape the quote do not.
+        "options": {
+            key: value for key, value in sorted(vars(args).items())
+            if key not in redacted and not key.startswith("_") and value not in (None, False)
+        },
+        "organization_ids": [str(i) for i in (org.get("ids") or []) if i],
+        "method": meta.get("method"),
+        "draft": bool(meta.get("draft")),
+        "ingest_source": sz.get("ingest_source"),
+        "diagnostics_status": sz.get("diagnostics_status"),
+        "preflight": preflight_rows or [],
+        "limits": [
+            {"code": row.get("code"), "severity": row.get("severity")}
+            for row in ((sz.get("diagnostics") or {}).get("estimation_limits") or [])
+            if isinstance(row, dict)
+        ],
+        "integrity": {
+            "passed": integrity.get("passed"),
+            "score": integrity.get("score"),
+            "failed": [r.get("check") for r in (integrity.get("checks") or []) if r.get("passed") is False],
+            "warnings": [r.get("check") for r in (integrity.get("checks") or []) if r.get("warning")],
+        },
+        "savings": cons.get("savings"),
+        "exports": sorted((acc.get("exports") or {}).keys()),
     }
 
 
@@ -353,7 +523,7 @@ def chat_lines(brief: dict) -> list[str]:
         if isinstance(row, dict) and row.get("check")
     ]
     if warnings:
-        lines.append("Warning: " + ", ".join(warnings) + " exceeded. The quote is still produced.")
+        lines.append("Warning: " + ", ".join(warnings) + ". The quote is still produced.")
     if failed:
         lines.append("Failed checks: " + ", ".join(failed))
     limits = [row for row in (brief.get("limits") or []) if isinstance(row, dict)]
@@ -445,6 +615,14 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
         org_ids = [str(org_id)]
     when = (acc.get("meta") or {}).get("date")
     download_failed: list[dict] = []
+    # apply_diagnostics rebuilds sizing.diagnostics from the bundles, so a limit recorded
+    # before that call is discarded. Stage these and replay them onto the diagnostic account.
+    pending: list[dict] = []
+
+    def stage(code: str, detail: str, severity: str = "high") -> None:
+        print(f"WARN: {detail}", file=sys.stderr)
+        pending.append({"code": code, "detail": detail, "severity": severity})
+
     if args.diags_dir:
         out_dir = Path(args.diags_dir)
         if not out_dir.is_dir():
@@ -473,7 +651,11 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
                 if not any(out_dir.glob("*.zip")):
                     sz["diagnostics_status"] = vpn_detail
                     return None
-                print("WARN: parsing diagnostic zips already on disk", file=sys.stderr)
+                stage(
+                    "stale_diagnostic_bundles",
+                    f"no fresh diagnostics could be pulled ({vpn_detail}), so the quote was measured from the "
+                    f"diagnostic zips already in {out_dir}. Those bundles may predate the quote window.",
+                )
                 pull = False
         if pull:
             errors = []
@@ -486,7 +668,7 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
                     )
                 except Exception as ex:
                     errors.append(f"{oid}: {ex!r}")
-                    print(f"WARN: diagnostic pull failed for {oid} ({ex!r})", file=sys.stderr)
+                    stage("diagnostic_pull_failed", f"diagnostic pull failed for {oid} ({ex!r}). Deployments in that organization may have no bundle.")
             if download_failed and not getattr(args, "allow_missing_diags", False):
                 names = ", ".join(str(r["name"]) for r in download_failed)
                 raise SystemExit(
@@ -521,7 +703,12 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
             names.update(str(x.get("name")) for x in list_deployments(base, key, oid) if x.get("name"))
         admin_names = names or None
     except Exception as ex:
-        print(f"WARN: admin deployment list unavailable ({ex!r}); unmatched deployments stay 'missing diagnostic'", file=sys.stderr)
+        stage(
+            "admin_list_unavailable",
+            f"the admin deployment list could not be read ({ex!r}), so a billed deployment with no bundle is "
+            "counted as missing a diagnostic rather than decommissioned. Bundle coverage and priced share are "
+            "understated by any deployment that no longer exists.",
+        )
     options = quote_options_from(args)
     diag = apply_diagnostics(
         acc, rows, admin_names,
@@ -533,6 +720,8 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
             f"ERROR: {len(missing)} active deployment(s) have no diagnostic bundle: {', '.join(str(n) for n in missing)}. "
             "--unmeasured fail stops the run. Collect the diagnostic bundles or pass --unmeasured exclude."
         )
+    for row in pending:
+        note_limit(diag, **row)
     diag["sizing"]["quote_options"] = options
     diag.setdefault("meta", {})["method"] = method_stamp(
         args.lookback_days,
@@ -542,6 +731,12 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
     )
     if download_failed:
         diag["sizing"].setdefault("diagnostics", {})["download_failed"] = download_failed
+        names = ", ".join(str(row.get("name")) for row in download_failed)
+        note_limit(
+            diag, "diagnostic_download_failed",
+            f"{len(download_failed)} diagnostic download(s) failed after retries and the run continued with "
+            f"--allow-missing-diags: {names}. Those deployments add no ingest and no stored GB.",
+        )
     apply_quote_lookback(diag, args.lookback_days)
     # Refresh only workload telemetry for the exact billed quote window. The
     # account report's usual 21-day workload sample cannot stand in for a
@@ -616,14 +811,14 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
             if not getattr(args, "allow_partial", False):
                 print(f"ERROR: diagnostics sizing failed ({e}). The run stopped.", file=sys.stderr)
                 raise SystemExit(2) from e
-            print(f"WARN: diagnostics sizing failed ({e}); the diagnostics document keeps the measured inputs", file=sys.stderr)
+            warn(diag, "sizing_step_failed", f"the estimator sizing step failed ({e}), so no sheet read-back was collected. The document keeps the measured inputs and is a draft.")
             diag.setdefault("meta", {})["draft"] = True
     else:
-        print(f"WARN: Sheets venv missing at {py} — diagnostics document has no estimator read-backs", file=sys.stderr)
+        warn(diag, "sheets_venv_missing", f"the Sheets virtualenv is missing at {py}, so no estimator copy was filled and the quote has no sheet read-back. See references/setup.md.")
     try:
         diag["consolidation"] = build_consolidation(diag, infra)
     except Exception as ex:
-        print(f"WARN: diagnostics consolidation failed ({ex!r})", file=sys.stderr)
+        warn(diag, "consolidation_failed", f"building the consolidation failed ({ex!r}). No quote was produced.")
         diag["consolidation"] = {"triggered": True, "source": "diagnostics", "error": repr(ex)}
     seal_text(diag_path, json.dumps(diag, indent=2))
     if sizing_ran and (diag.get("consolidation") or {}).get("architecture", {}).get("per_region") and not (diag.get("consolidation") or {}).get("error"):
@@ -639,7 +834,7 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
             if not getattr(args, "allow_partial", False):
                 print(f"ERROR: diagnostics regional sizing failed ({e}). The run stopped.", file=sys.stderr)
                 raise SystemExit(2) from e
-            print(f"WARN: diagnostics regional sizing failed ({e}); document uses the consolidated read-backs", file=sys.stderr)
+            warn(diag, "regional_sizing_failed", f"per-region sizing failed ({e}), so each region is a stored-GB share of one fleet read-back instead of its own. The document is a draft.")
             diag.setdefault("meta", {})["draft"] = True
     if sizing_ran and py.is_file() and not (diag.get("consolidation") or {}).get("error"):
         if not args.skip_deployment_plan:
@@ -653,6 +848,7 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
                     print(f"ERROR: deployment-count plan failed ({e}). The run stopped.", file=sys.stderr)
                     raise SystemExit(2) from e
                 diag = json.loads(diag_path.read_text())
+                warn(diag, "deployment_plan_failed", f"the deployment-count plan was not priced ({e}), so the quote has no consolidation bars and no per-cluster split. The document is a draft.")
                 diag.setdefault("meta", {})["draft"] = True
                 diag.setdefault("sizing", {})["deployment_plan"] = {
                     "bars": [],
@@ -663,7 +859,7 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
             try:
                 diag["consolidation"] = build_consolidation(diag, infra)
             except Exception as ex:
-                print(f"WARN: deployment-plan consolidation failed ({ex!r})", file=sys.stderr)
+                warn(diag, "consolidation_failed", f"rebuilding the consolidation after the deployment plan failed ({ex!r}). No quote was produced.")
                 diag["consolidation"] = {"triggered": True, "source": "diagnostics", "error": repr(ex)}
         if not (diag.get("consolidation") or {}).get("error"):
             diag.setdefault("consolidation", {})["retention_scenario"] = "rounded"
@@ -676,6 +872,7 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
 
 
 def main() -> None:
+    started = time.time()
     args = parse_args(description=__doc__)
     from diag_inputs import whole_months
     from constants import DAYS_PER_MONTH
@@ -685,6 +882,8 @@ def main() -> None:
         args.estimate_months = whole_months(int(args.retention_days) / DAYS_PER_MONTH)
     else:
         args.estimate_months = ESTIMATE_MONTHS
+    if getattr(args, "preflight", False):
+        raise SystemExit(0 if print_preflight(preflight(args)) else 2)
     stamp = method_stamp(int(args.lookback_days))
     if not getattr(args, "allow_dirty", False):
         state = stamp.get("uncommitted_changes")
@@ -696,16 +895,28 @@ def main() -> None:
             )
             raise SystemExit(2)
         if state:
+            extra = stamp.get("untracked_importable") or []
+            detail = f" Untracked scripts an import could pick up: {', '.join(extra)}." if extra else ""
             print(
-                "ERROR: uncommitted changes under serverless_analyzer. "
-                "Commit them, or pass --allow-dirty to mark the PDF DRAFT.",
+                "ERROR: uncommitted changes under serverless_analyzer."
+                f"{detail} Commit them, or pass --allow-dirty to mark the PDF DRAFT.",
                 file=sys.stderr,
             )
             raise SystemExit(2)
-    if not 1 <= int(args.lookback_days) <= 365:
-        raise SystemExit("--lookback-days must be from 1 to 365")
-    if not 0 <= float(args.min_priced_ecu_pct) <= 100:
-        raise SystemExit("--min-priced-ecu-pct must be from 0 to 100")
+    if stamp.get("untracked_ignored"):
+        print(
+            f"NOTE: {len(stamp['untracked_ignored'])} untracked file(s) under serverless_analyzer cannot "
+            "change what the scripts do, so they do not mark the run dirty. They are listed on the method stamp.",
+            file=sys.stderr,
+        )
+    # --lookback-days and --min-priced-ecu-pct are validated by parse_args, which reports
+    # them through argparse. A second copy here was unreachable and drifted out of step.
+    checks = preflight(args, network=False)
+    for row in checks:
+        if row["ok"] is False and row["check"] in {".env", "org report"}:
+            raise SystemExit(f"ERROR: {row['check']}: {row['detail']}")
+        if row["ok"] is False and row["check"] in {"Sheets venv", "es3 estimator"}:
+            print(f"WARN: {row['check']}: {row['detail']}", file=sys.stderr)
     if args.keep_serverless_spend and args.ech_scope == "priced":
         print("NOTE: --keep-serverless-spend has no effect with --ech-scope priced; only priced deployments are compared.", file=sys.stderr)
     # A consolidation run leaves stack-monitoring clusters out. The account summary does not.
@@ -729,7 +940,7 @@ def main() -> None:
         try:
             diag_acc = _diagnostics_document(acc, infra, folder, env, args)
         except Exception as ex:
-            print(f"WARN: diagnostics consolidation failed ({ex!r})", file=sys.stderr)
+            warn(acc, "diagnostics_unavailable", f"the diagnostic consolidation failed ({ex!r}). No measured quote was produced.")
             acc["sizing"]["diagnostics_status"] = f"diagnostics consolidation failed ({ex!r})"
             diag_acc = None
     seal_text(acc_path, json.dumps(acc, indent=2))
@@ -746,7 +957,7 @@ def main() -> None:
         sizing_ran = False
         py = _sheets_py()
         if not py.is_file():
-            print(f"WARN: Sheets venv missing at {py} — skipping estimator copies (see references/setup.md)", file=sys.stderr)
+            warn(acc, "sheets_venv_missing", f"the Sheets virtualenv is missing at {py}, so no estimator copy was filled. See references/setup.md.")
             acc["sizing"]["estimators"] = {"error": f"sheets venv missing: {py}"}
             seal_text(acc_path, json.dumps(acc, indent=2))
         else:
@@ -765,14 +976,14 @@ def main() -> None:
                 if not getattr(args, "allow_partial", False):
                     print(f"ERROR: K360 sizing step failed ({e}). The run stopped.", file=sys.stderr)
                     raise SystemExit(2) from e
-                print(f"WARN: K360 sizing step failed ({e}); report still generated", file=sys.stderr)
+                warn(acc, "sizing_step_failed", f"the K360 backup sizing step failed ({e}), so it has no sheet read-back. The report is a draft.")
                 acc.setdefault("meta", {})["draft"] = True
                 acc["sizing"]["estimators"] = {"error": f"size_serverless.py exit {e.returncode}"}
                 seal_text(acc_path, json.dumps(acc, indent=2))
         try:
             acc["consolidation"] = build_consolidation(acc, infra)
         except Exception as ex:
-            print(f"WARN: K360 consolidation failed ({ex!r})", file=sys.stderr)
+            warn(acc, "consolidation_failed", f"building the K360 backup consolidation failed ({ex!r}).")
             acc["consolidation"] = {"triggered": True, "source": "k360", "error": repr(ex)}
         if diag_acc is None:
             why = (acc.get("sizing") or {}).get("diagnostics_status") or "diagnostic bundles were not available"
@@ -795,7 +1006,7 @@ def main() -> None:
                 if not getattr(args, "allow_partial", False):
                     print(f"ERROR: regional project sizing failed ({e}). The run stopped.", file=sys.stderr)
                     raise SystemExit(2) from e
-                print(f"WARN: regional project sizing failed ({e}); report uses the consolidated read-backs", file=sys.stderr)
+                warn(acc, "regional_sizing_failed", f"per-region sizing failed ({e}), so each region is a stored-GB share of one fleet read-back. The report is a draft.")
                 acc.setdefault("meta", {})["draft"] = True
         if backup:
             acc["k360_ingest"] = _quote_block(acc)
@@ -858,7 +1069,7 @@ def main() -> None:
         try:
             _run([str(dedupe_py), str(HERE / "size_serverless.py"), "--account-json", str(dedupe_src), "--dedupe"])
         except subprocess.CalledProcessError as e:
-            print(f"WARN: estimate dedupe failed ({e}); check the Drive folder for repeated titles", file=sys.stderr)
+            warn(acc, "estimate_dedupe_failed", f"removing older same-titled estimates failed ({e}). The Drive folder may hold more than one copy of a title.", "low")
 
     # 5. report
     run_key = acc["meta"]["run_key"]
@@ -884,7 +1095,7 @@ def main() -> None:
                 else:
                     print(f"{kind} → {e.get('error') if isinstance(e, dict) else e}", flush=True)
         except Exception as ex:
-            print(f"WARN: PDF export failed ({ex!r})", file=sys.stderr)
+            warn(acc, "pdf_export_failed", f"the PDF export failed ({ex!r}).", "medium")
             acc["exports"] = {"error": repr(ex)}
         seal_text(acc_path, json.dumps(acc, indent=2))
         py = _sheets_py()
@@ -893,7 +1104,7 @@ def main() -> None:
                 _run([str(py), str(K360_SCRIPTS / "upload_pdfs.py"), "--account-json", str(acc_path)])
                 acc = json.loads(acc_path.read_text())
             except subprocess.CalledProcessError as e:
-                print(f"WARN: PDF upload failed ({e}); PDFs kept local", file=sys.stderr)
+                warn(acc, "pdf_upload_failed", f"the PDF upload to Drive failed ({e}). The PDFs are on disk only.", "low")
 
     brief = agent_brief(acc)
     brief_path = folder / f"{run_key}_brief.json"
@@ -916,7 +1127,10 @@ def main() -> None:
         "ingest_source": brief.get("ingest_source"),
         "k360_ingest": brief.get("k360_ingest"),
     }, separators=(",", ":")))
+    manifest_path = folder / f"{run_key}_run.json"
+    seal_text(manifest_path, json.dumps(run_manifest(args, acc, started, preflight_rows=checks), indent=2))
     print(f"brief {printed}", flush=True)
+    print(f"run {manifest_path}", flush=True)
 
 
 if __name__ == "__main__":

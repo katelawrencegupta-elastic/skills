@@ -16,7 +16,7 @@ from estimator_layout import (  # noqa: E402,F401
 )
 from constants import (  # noqa: E402
     BILLING_WINDOW_MIN_SHARE, COUNTER_AGE_MAX_SHARE, ECHO_TOLERANCE_GB_DAY, ECHO_TOLERANCE_SHARE,
-    PLAN_HEADLINE_SHARE, PLAN_HEADLINE_USD, RATE_WINDOW_MAX_SHARE,
+    PLAN_HEADLINE_SHARE, PLAN_HEADLINE_USD, RATE_WINDOW_MAX_SHARE, RETENTION_ASSUMED_MAX_SHARE,
 )
 
 # The sheet echo has to match the GB/day written. The sheet rounds a little, so there is a floor,
@@ -250,11 +250,14 @@ def _eis_completeness_row(eis: dict | None) -> dict:
 
 
 def _retention_row(coverage: dict | None) -> dict:
-    """Share of bulk whose age comes from a configured policy. Informational.
+    """Share of bulk a configured delete policy or data-stream retention ages.
 
-    An assumed 30-day default is not configured retention, so it does not count.
-    The check does not pass or fail the quote. The written month is the index
-    average rounded up. This share is reported and is not that month.
+    A deployment counts while the store it leaves at the 30-day default is inside
+    `RETENTION_ASSUMED_MAX_SHARE`, so one unconfigured index does not drop a
+    configured cluster's whole bulk to zero. Past that share the deployment is
+    blended or assumed and contributes nothing. More than that share of fleet
+    bulk on an assumed age is a warning: the quote is still produced, because
+    the written month is the index average, not this share.
     """
     if not coverage:
         return _integrity_row("Retention basis", None, None, "This run has no diagnostic coverage.")
@@ -263,15 +266,62 @@ def _retention_row(coverage: dict | None) -> dict:
         return _integrity_row("Retention basis", None, None, "No bulk to weight.")
     if coverage.get("retention_policy_bulk_gb_day") is None:
         return _integrity_row("Retention basis", None, None, "Configured retention was not recorded for this run.")
+    limit = float(coverage.get("retention_assumed_max_share") or RETENTION_ASSUMED_MAX_SHARE)
     policy = max(0.0, float(coverage.get("retention_policy_bulk_gb_day") or 0))
     score = min(policy / bulk, 1.0)
-    return _integrity_row(
-        "Retention basis",
-        score,
-        None,
-        f"{policy:.3f} GB/day of {bulk:.3f} has a configured retention policy. "
-        "Assumed 30-day store is not counted as measured. Retention does not change the headline.",
+    partial = float(coverage.get("retention_policy_within_threshold_gb_day") or 0)
+    detail = (
+        f"{policy:.3f} GB/day of {bulk:.3f} ({score * 100:.1f}%) is on deployments a delete policy or "
+        f"data-stream retention ages, allowing up to {limit * 100:.0f}% of a deployment's store at the "
+        f"30-day default. The bar is {(1 - limit) * 100:.0f}%."
     )
+    if partial > 0:
+        detail += f" {partial:.3f} GB/day of that is on deployments inside the threshold, not fully configured."
+    if score >= 1 - limit:
+        return _integrity_row("Retention basis", score, True, detail)
+    row = _integrity_row(
+        "Retention basis", score, True,
+        detail + f" More than {limit * 100:.0f}% of bulk is priced at the 30-day assumed default. "
+        "The quote is still produced.",
+    )
+    row["warning"] = True
+    return row
+
+
+def _retention_month_row(retention: dict | None) -> dict:
+    """The month written to every sheet: the index average, or the default.
+
+    The month sets the estimator's retained-data ladder, so a month nobody
+    measured is a warning beside the quote. It does not fail the quote, the way
+    Rate window and Counter age do not.
+    """
+    retention = retention or {}
+    months = retention.get("months")
+    if months is None or not retention.get("has_bulk"):
+        return _integrity_row("Retention month", None, None, "No Observability or Security month was written.")
+    months = int(months)
+    explicit = retention.get("explicit_days")
+    if explicit:
+        return _integrity_row(
+            "Retention month", 1.0, True,
+            f"{months} months was set by --retention-days ({int(explicit)} days).",
+        )
+    count = retention.get("index_count")
+    if count:
+        days = retention.get("index_days")
+        measured = f", {float(days):,.1f} days across {int(count):,} indexes" if days is not None else f" across {int(count):,} indexes"
+        return _integrity_row(
+            "Retention month", 1.0, True,
+            f"{months} months is the average retention across indexes, rounded up{measured}.",
+        )
+    row = _integrity_row(
+        "Retention month", 0.0, True,
+        f"No index retention age was counted, so every sheet was written at the {months}-month default "
+        "instead of the index average. Retention sets the estimator's retained-data ladder. "
+        "The quote is still produced.",
+    )
+    row["warning"] = True
+    return row
 
 
 # Share of local store that may sit in unrated indices before the check is flagged.
@@ -495,12 +545,20 @@ def _region_fidelity_row(sheets: list[dict]) -> dict:
     bad = []
     for row in written:
         how = region_match_how(row.get("region_match"))
-        region = str(row.get("region") or "a region")
+        region = str(row.get("region") or "").strip()
         if how not in {"exact", "alias"}:
-            bad.append(f"{region} ({how or 'none'})")
+            bad.append(f"{region or 'a region'} ({how or 'none'})")
             continue
-        if how == "alias" and not _alias_same_number(region, str(row.get("region_match") or "")):
-            bad.append(f"{region} (alias of a different region number)")
+        if how == "alias":
+            # An alias is only checkable against the region the sheet was scoped to. Say that
+            # the region is missing rather than reporting a region-number mismatch that was
+            # never measured.
+            if not region:
+                bad.append(f"{str(row.get('solution') or 'a sheet')} recorded an alias match and no region")
+            elif not _alias_same_number(region, str(row.get("region_match") or "")):
+                bad.append(f"{region} (alias of a different region)")
+        if not alias_provider_matches(str(row.get("region_match") or ""), row.get("provider")):
+            bad.append(f"{region or 'a region'} (written to another cloud)")
     if bad:
         return _integrity_row(
             "Region fidelity",
@@ -511,12 +569,58 @@ def _region_fidelity_row(sheets: list[dict]) -> dict:
     return _integrity_row("Region fidelity", 1.0, True, f"{len(written)} written regions match the estimator list.")
 
 
+_ALIAS_SPLIT = re.compile(r"[^a-z0-9]+")
+_GEO_WORDS = {
+    "us": "us", "usa": "us", "united": "us",
+    "eu": "eu", "europe": "eu",
+    "ap": "ap", "apac": "ap", "asia": "ap",
+    "ca": "ca", "canada": "ca",
+    "sa": "sa", "me": "me", "af": "af", "il": "il",
+    "north": "north", "south": "south", "east": "east", "west": "west", "central": "central",
+    "northeast": "northeast", "northwest": "northwest",
+    "southeast": "southeast", "southwest": "southwest",
+}
+
+
+def _region_shape(text: str) -> tuple[frozenset[str], list[str]]:
+    """Geography words and digits in a region name, however the name is spelled.
+
+    `us-east-1`, `us-east1` and `useast1` are the same place. `ap-southeast-1`
+    and `ap-northeast-1` are not: they share a number and differ in a direction.
+    """
+    parts = [p for p in _ALIAS_SPLIT.split(str(text or "").lower()) if p]
+    words, digits = set(), []
+    for part in parts:
+        for chunk in re.findall(r"[a-z]+|\d+", part):
+            if chunk.isdigit():
+                digits.append(chunk)
+            elif chunk in _GEO_WORDS:
+                words.add(_GEO_WORDS[chunk])
+    return frozenset(words), digits
+
+
 def _alias_same_number(region: str, recorded: str) -> bool:
-    """An alias may reorder the name. It may not change the region number or the provider."""
-    want = re.findall(r"\d+", region or "")
+    """An alias may respell the name. It may not change the place, the number or the provider."""
     option = recorded.split("(")[0]
-    got = re.findall(r"\d+", option)
-    return want == got
+    want_words, want_digits = _region_shape(region)
+    got_words, got_digits = _region_shape(option)
+    if want_digits != got_digits:
+        return False
+    # The provider prefix only appears on the recorded side ("AWS: us-east-1"), so compare
+    # the geography the two sides do share rather than requiring identical word sets.
+    if want_words and got_words and not want_words <= got_words:
+        return False
+    return True
+
+
+def alias_provider_matches(region_match: str, provider: str | None) -> bool:
+    """The cloud named on the sheet is the cloud the deployments run on. Unknown passes."""
+    named = re.match(r"\s*(AWS|AZURE|GCP)\b", str(region_match or ""), re.IGNORECASE)
+    if not named or not provider:
+        return True
+    want = str(provider).strip().lower()
+    alias = {"gcp": "gcp", "google": "gcp", "aws": "aws", "amazon": "aws", "azure": "azure", "microsoft": "azure"}
+    return alias.get(want, want) == named.group(1).lower()
 
 
 def _plan_consistency_row(block: dict | None) -> dict:
@@ -597,11 +701,13 @@ def integrity_score(facts: dict) -> dict:
 
     The quote passes only when every scored check passes its own bar: 100% of
     the checks, whatever the mean is. One failed check fails the quote. Rate
-    window and Counter age warn when their share is above 25% and do not fail
-    the quote. The score is the mean and is reported beside that verdict. It
+    window, Counter age, Retention basis, and Retention month warn and do not
+    fail the quote: the first two when their share is above 25%, the third when
+    more than 10% of bulk sits at the 30-day assumed age, the last when the
+    written month is the default rather than the index average.
+    The score is the mean and is reported beside that verdict. It
     does not decide it, because a check can pass its bar and score under 1
-    (an echo gap inside the tolerance, or unrated store under 5%). A check
-    with no pass/fail (retention basis) is reported and left out of the mean.
+    (an echo gap inside the tolerance, or unrated store under 5%).
     This is not a serverless bill.
     """
     coverage = facts.get("coverage")
@@ -609,6 +715,7 @@ def integrity_score(facts: dict) -> dict:
         _sheet_echo(facts.get("observability") or {}, facts.get("security") or {}, list(facts.get("regional_sheets") or [])),
         _coverage_row(coverage),
         _retention_row(coverage),
+        _retention_month_row(facts.get("retention_month")),
         _rated_row(coverage),
         _priced_row(facts.get("priced")),
         _plan_row(facts.get("plan")),

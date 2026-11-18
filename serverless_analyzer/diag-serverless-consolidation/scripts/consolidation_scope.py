@@ -381,6 +381,21 @@ def ech_scope(acc: dict, by_solution: dict) -> dict | None:
     }
 
 
+def comparison_deployment_names(scope: dict | None) -> set[str]:
+    """ECH deployments whose billed cost is on the ECH side of the comparison.
+
+    Under `--ech-scope priced` that is the priced set; under `all` it is every ECH
+    deployment on the roster. Existing serverless projects are never in it. An
+    unavailable scope has no comparison, so the set is empty.
+    """
+    if not scope or scope.get("status") != "complete":
+        return set()
+    names = {str(name) for name in (scope.get("by_deployment_mo") or {})}
+    if scope.get("scope") == "priced":
+        names -= {str(row.get("name")) for row in (scope.get("unpriced") or []) if row.get("name")}
+    return names
+
+
 def _product_split(row: dict) -> tuple[float, float] | None:
     """Logs plus traces, and metrics, from a measured product mix.
 
@@ -595,6 +610,12 @@ def _apply_eis_to_plan(acc: dict, eis_with_support: float) -> None:
     plan = (acc.get("sizing") or {}).get("deployment_plan") or {}
     if plan.get("error"):
         return
+    # build_consolidation runs more than once per run. This adds to the bars, so a second
+    # pass over the same plan would price EIS twice. Today each pass re-reads the account
+    # from disk, which hides it; the mark makes the function safe on its own.
+    if plan.get("eis_applied"):
+        return
+    plan["eis_applied"] = amount
     by_name = {
         d.get("name"): d
         for d in ((acc.get("solutions") or {}).get("by_deployment") or [])
@@ -782,5 +803,3 @@ def _deployment_groups(acc: dict, infra: dict | None, months: float) -> list[dic
     order = {"search": 0, "observability": 1, "security": 2}
     groups.sort(key=lambda g: (order.get(g["solution"], 9), -g["ech_ecu_mo"]))
     return groups
-
-__all__ = [name for name in globals() if not name.startswith('__')]

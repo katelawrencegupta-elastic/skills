@@ -274,6 +274,7 @@ def parse_args(argv=None, description: str | None = None):
     ap.add_argument("--exclude-deployment", action="append", default=None, metavar="ID", help="Leave this deployment out of the whole run (billing, bundles, plan, estimates). Repeat, or pass a comma list. 32-character deployment id")
     ap.add_argument("--keep-monitoring", action="store_true", help="Consolidation only: keep stack-monitoring deployments (names containing 'monitoring'). They are left out by default")
     ap.add_argument("--skip-deployment-plan", action="store_true", help="Skip the Observability 0/25/50/75/100%% deployment-count sheets. The headline quote still runs")
+    ap.add_argument("--preflight", action="store_true", help="Consolidation only: check .env, the Sheets and es3 virtualenvs, admin access, and the git state, then stop without running anything")
     ap.add_argument("--allow-dirty", action="store_true", help="Run even when serverless_analyzer has uncommitted changes. The PDF is marked DRAFT.")
     ap.add_argument("--allow-partial", action="store_true", help="Keep going when a sizing step fails. The PDF is DRAFT and shows no saving.")
     ap.add_argument("--allow-nearest-region", action="store_true", help="When the provider default is also absent, price the nearest same-provider region. A region that is not listed is otherwise priced as AWS us-east-1, Azure eastus, or GCP us-east1. Integrity still fails.")

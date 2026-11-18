@@ -1,24 +1,63 @@
 """Regional read-backs and integrity for one consolidation quote."""
 from __future__ import annotations
 
-from consolidation_scope import *  # noqa: F401,F403
+import json
+import os
+import subprocess
+from pathlib import Path
 
-def _es3_region(payload: dict) -> dict | None:
-    py = os.environ.get("ES3_ESTIMATOR_PY") or str(Path.home() / ".config/es3-estimator/venv/bin/python")
+from consolidation_scope import (
+    BILLING_WINDOW_MIN_SHARE, ESTIMATE_MONTHS, _clear_components, _money, _stash_model,
+    e73_blocks_quote, ingest_echo, integrity_score, region_match_how, unpriced_reason,
+)
+
+def es3_estimator_python() -> str:
+    """Interpreter the es3 notebook library runs under."""
+    return os.environ.get("ES3_ESTIMATOR_PY") or str(Path.home() / ".config/es3-estimator/venv/bin/python")
+
+
+def es3_estimator_missing() -> str | None:
+    """The path, when the es3 interpreter is not installed. None when it is."""
+    py = es3_estimator_python()
+    return None if Path(py).is_file() else py
+
+
+def _es3_region(payload: dict, failures: list[dict] | None = None) -> dict | None:
+    """Re-estimate one region on es3. `failures` collects why a region went unpriced.
+
+    A missing interpreter and an estimator that ran and failed both left this
+    returning None, so a region could go unpriced for an environment reason that
+    never reached the quote. The reason is now recorded.
+    """
+    def failed(code: str, detail: str) -> None:
+        if failures is not None and not any(row.get("code") == code for row in failures):
+            failures.append({"code": code, "detail": detail})
+
+    py = es3_estimator_python()
     if not Path(py).is_file():
+        failed(
+            "es3_estimator_missing",
+            f"the es3 estimator interpreter is missing at {py}, so a Search region could not be re-estimated "
+            "and was priced as a stored-GB share or left unquoted. Set ES3_ESTIMATOR_PY or install it "
+            "(see references/setup.md).",
+        )
         return None
     try:
         proc = subprocess.run(
             [py, str(Path(__file__).with_name("es3_estimate.py"))],
             input=json.dumps(payload), text=True, capture_output=True, timeout=180,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        failed("es3_estimator_failed", f"the es3 estimator could not be run ({exc!r}), so a Search region was not re-estimated.")
         return None
     if proc.returncode != 0 or not proc.stdout.strip():
+        tail = (proc.stderr or "").strip().splitlines()[-1:] or [""]
+        failed("es3_estimator_failed", f"the es3 estimator exited {proc.returncode} for a Search region: {tail[0][:200]}")
         return None
     try:
         return json.loads(proc.stdout)
     except json.JSONDecodeError:
+        failed("es3_estimator_failed", "the es3 estimator returned output that is not JSON, so a Search region was not re-estimated.")
         return None
 
 
@@ -131,6 +170,7 @@ def regional_quote(
 def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes: list[str]) -> bool:
     """One serverless project per solution per region. Each project uses its own sizing when one was written.
     """
+    es3_failures: list[dict] = []
     spans = {}
     for g in groups:
         spans.setdefault(g["solution"], set()).add(g["region"])
@@ -184,7 +224,7 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                     "region": g["region"],
                     "support_tier": support,
                     "workload": workload,
-                })
+                }, es3_failures)
                 rb = (result or {}).get("readback") or {}
                 monthly = _money(rb.get("monthly_steady_state"))
                 classified.append({
@@ -353,6 +393,13 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
     if store_split:
         note += " Where a region had no read-back of its own, that solution keeps the consolidated total and every region is a stored-GB share of it."
     notes.append(note)
+    if es3_failures:
+        limits = (acc.setdefault("sizing", {}).setdefault("diagnostics", {})
+                  .setdefault("estimation_limits", []))
+        for row in es3_failures:
+            if not any(isinstance(item, dict) and item.get("code") == row["code"] for item in limits):
+                limits.append({**row, "severity": "high"})
+            notes.append(row["detail"])
     return regional_quoted
 
 
@@ -674,11 +721,22 @@ def _integrity(acc: dict, sz: dict, by_solution: dict, quotes: list[dict], headl
             "fallback_names": coverage.get("fallback_names") or [],
             "bulk_gb_day": coverage.get("bulk_gb_day"),
             "retention_policy_bulk_gb_day": coverage.get("retention_policy_bulk_gb_day"),
+            "retention_assumed_max_share": coverage.get("retention_assumed_max_share"),
+            "retention_policy_within_threshold_gb_day": coverage.get("retention_policy_within_threshold_gb_day"),
             "bulk_short_window_gb_day": coverage.get("bulk_short_window_gb_day"),
             "bulk_restart_gb_day": coverage.get("bulk_restart_gb_day"),
             "unmeasured_bulk": unmeasured,
             "unrated": coverage.get("unrated"),
             "estimation_limits": coverage.get("estimation_limits") or [],
+        },
+        # The month written to every Observability and Security sheet, and whether an index
+        # average set it. The K360 backup prices an assumed month by design, so it is n/a there.
+        "retention_month": None if sz.get("ingest_source") != "diagnostics" else {
+            "months": int((acc.get("meta") or {}).get("estimate_months") or ESTIMATE_MONTHS),
+            "index_count": (acc.get("meta") or {}).get("retention_index_count"),
+            "index_days": (acc.get("meta") or {}).get("retention_index_days"),
+            "explicit_days": (acc.get("meta") or {}).get("retention_days"),
+            "has_bulk": float((coverage or {}).get("bulk_gb_day") or 0) > 0,
         },
         "eis": (by_solution.get("search") or {}).get("eis_data_status"),
         "solutions": [
@@ -821,4 +879,3 @@ def recent_ech_months(acc: dict, n: int = 3) -> dict:
     avg = round(sum(r["cost"] for r in rows) / len(rows), 2) if rows else None
     return {"months": rows, "average": avg}
 
-__all__ = [name for name in globals() if not name.startswith('__')]

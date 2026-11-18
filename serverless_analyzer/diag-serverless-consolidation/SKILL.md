@@ -63,6 +63,7 @@ Confirm these from the brief. Do not open the sheet.
 - When the billing window is unstable, the comparison is the latest complete month. Do not call it a 3-month average.
 - When no serverless price came back, show the ECH bill and say there is no comparison.
 - Page 1 states the average retention across indexes and the whole month written to the estimator. That month is the headline.
+- When no index age was counted, the sheets take the 12-month default. The Retention month check warns, `limits` carries `retention_month_fallback`, and the month is an assumption. Say so rather than calling it measured.
 
 ## Hard rules
 

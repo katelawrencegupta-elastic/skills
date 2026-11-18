@@ -1,7 +1,18 @@
 """Drive and Sheets calls for one estimate."""
 from __future__ import annotations
 
-from sizing_shared import *  # noqa: F401,F403
+import io
+import os
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+from sizing_shared import (
+    DEFAULT_O11Y, DEFAULT_SECURITY, FOLDER_MIME, GSHEET_MIME, SEC_ADDON_CELLS, TemplateMismatch,
+    XLSX_MIME, _FORMULA_PREFIX, _NUMBER_TEXT, _SHEET_LABELS, addon_off_value, cell_range,
+    check_value_ranges, get_creds, layout_ranges, seal_file, seal_text,
+)
 
 def sheet_id(value: str) -> str:
     """Accept a bare spreadsheet id or a full docs.google.com URL."""
@@ -30,15 +41,6 @@ def require_customer_parent(parent_id: str) -> str:
     if not parent or sheet_id(parent) in template_ids():
         raise RuntimeError("upload parent must be the customer Drive folder for this run")
     return parent
-
-
-_SHEET_LABELS = frozenset({
-    "Complete", "Essentials", "Enterprise", "Standard", "Premium",
-    "Gold", "Platinum", "No", "Yes", "no", "N", "FALSE", "False",
-    "0%", "100%",
-})
-_NUMBER_TEXT = re.compile(r"\d+(\.\d+)?")
-_FORMULA_PREFIX = "=+-@"
 
 
 def cell_input_mode(value, *, allowed_text: set[str] | None = None) -> str:
@@ -70,41 +72,6 @@ def partition_cells(cells: dict, *, allowed_text: set[str] | None = None) -> tup
         else:
             entered.append(item)
     return raw, entered
-
-O11Y_TAB = "Observability Estimator"
-SEC_TAB = "Security Estimator"
-REF_TAB = "Estimator_Reference"
-
-# Read-back cells (see ../references/sizing-cells.md)
-O11Y_READBACK = {
-    "total_raw_gb_day": "G28",
-    "metered_gb_day": "G29",
-    # GB/day the two ingest ladders price. On the metered basis these are G19 and G20 turned back into GB/day.
-    "metered_ex_metrics_gb_day": "Estimator_Reference!C2",
-    "metered_metrics_gb_day": "Estimator_Reference-Metrics!C2",
-    "monthly_steady_state": "D38",
-    "annual_year1": "E38",
-    "annual_steady_state": "F38",
-}
-SEC_READBACK = {
-    "metered_gb_day": "G5",
-    "monthly_steady_state": "E74",
-    "annual_year1": "D36",
-    "annual_year2": "E36",
-    "annual_year3": "F36",
-    "annual_steady_state": "E36",
-    "cps_addon_monthly": "E73",
-    # The three lines a SIEM quote is made of, so any other line in E74 shows up.
-    "ingest_monthly": "E61",
-    "retention_monthly": "E62",
-    "support_monthly": "E69",
-}
-
-XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-FOLDER_MIME = "application/vnd.google-apps.folder"
-GSHEET_MIME = "application/vnd.google-apps.spreadsheet"
-_REGION_OPT = re.compile(r"^(AWS|AZURE|GCP)\s*:?\s*([a-z0-9\-]+)", re.IGNORECASE)
-
 
 # ----------------------------------------------------------------------------- google
 def sheet_workers() -> int:
@@ -406,12 +373,6 @@ def read_cells(sheets, sid: str, tab: str, cells: dict[str, str]) -> dict:
     return dict(zip(cells.keys(), vals))
 
 
-SEC_ADDON_CELLS = [
-    "G11", "G12", "G14", "G15", "G16", "G17", "G18", "G20",
-    "G23", "G24", "G25", "G27", "G28", "G29", "G30", "G31", "G32", "G33", "G34",
-]
-
-
 def clear_security_addons(sheets, sid: str, tab: str) -> dict:
     """Turn template add-ons off on a copy. The golden template is not written."""
     assert_not_template(sid)
@@ -442,4 +403,3 @@ def clear_security_addons(sheets, sid: str, tab: str) -> dict:
         push_cells(sheets, sid, tab, cells)
     return cells
 
-__all__ = [name for name in globals() if not name.startswith('__')]

@@ -76,7 +76,8 @@ Prices Observability and Security from Elasticsearch diagnostic bundles. Daily G
 | `quote_checks.py` | Checks the estimator layout before a write, the sheet echo, coverage, retention, unrated ingest, and published totals. No network |
 | `diag_inputs.py` | Prints 2–5 project packs and per-deployment inputs. It does not quote dollars |
 | `privacy.py` | Sets private file modes and warns when `.env` or an in-repo `diag_artifacts/` folder would be committed |
-| `test_diag_quote.py` | Offline unit tests. No Google account and no sheets |
+| `test_bundles.py`, `test_estimates.py`, `test_quote.py`, `test_integrity.py`, `test_operations.py`, `test_docs.py` | Offline unit tests, by area. No Google account and no sheets. Run them with `python3 -m unittest discover -s . -p 'test_*.py'` from `diag-serverless-consolidation/scripts` |
+| `_test_support.py` | Fixtures the suites share. The leading underscore keeps it out of discovery |
 | `skill_paths.py` | Finds `k360-org-report` and `k360-account-analysis` for this run. The same file is in the other two skills |
 
 Run options worth knowing:

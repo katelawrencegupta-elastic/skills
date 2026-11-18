@@ -32,6 +32,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from datetime import datetime, timezone
 from pathlib import Path
 
+from constants import RETENTION_ASSUMED_MAX_SHARE
 from privacy import seal_dir, seal_file, seal_text
 
 _ADMIN_HOST = "admin.found.no"
@@ -718,7 +719,7 @@ def series_rates(stats: dict, streams: list, alias: dict, explain: dict, created
         names.sort(key=lambda n: (int(born(n)), n))
         newest = names[-1]
         age = (collection - int(born(newest))) // 1000
-        if age <= 0 or age > DATED_FAMILY_MAX_AGE_SEC // 1:
+        if age <= 0 or age > DATED_FAMILY_MAX_AGE_SEC:
             continue
         generations = [(_bulk_bytes(stats, newest), int(age), True)]
         later = newest
@@ -862,17 +863,19 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
     if covered > 0:
         for age, nbytes in sorted(by_age.items(), key=lambda kv: -kv[1]):
             parts.append({"days": age, "pct": round(100 * nbytes / covered, 1)})
-    if weighted and known > 0 and blended_bytes > 0:
-        basis, days = "blended", weighted
-    elif weighted and known > 0:
-        basis, days = "policy", weighted
-    elif weighted and blended_bytes > 0:
+    # Share of local store priced at the 30-day assumed default. A deployment stays policy-aged
+    # while that share is inside RETENTION_ASSUMED_MAX_SHARE: one stray unconfigured index must
+    # not drop a configured cluster's whole bulk out of the measured-retention total.
+    assumed_share = (blended_bytes / local) if local > 0 else None
+    if not weighted:
+        basis, days = None, None
+    elif known <= 0:
         basis, days = "assumed", weighted
         parts = [{"days": round(weighted, 1), "pct": 100.0, "basis": "assumed"}]
-    elif weighted:
+    elif blended_bytes <= 0 or (assumed_share is not None and assumed_share <= RETENTION_ASSUMED_MAX_SHARE):
         basis, days = "policy", weighted
     else:
-        basis, days = None, None
+        basis, days = "blended", weighted
     return {
         "cluster": health.get("cluster_name"),
         "bulk_gb_day": round(gb_day, 3),
@@ -886,6 +889,9 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         # Share of local store whose age a delete policy or data stream sets. The rest is taken at
         # the 30-day default (assumed) because no retention policy covers it.
         "retention_known_share": None if known_share is None else round(known_share, 4),
+        # Store priced at the 30-day default, as a share. Above 0 on a `policy` row means the
+        # row was inside the threshold and still carries an assumption worth naming.
+        "retention_assumed_share": None if assumed_share is None else round(assumed_share, 6),
         "retention_label": _retention_label(parts, basis),
         "store_gb": round(local / 1e9, 2),
         "dataset_gb": round((dataset + snapshot) / 1e9, 2),
