@@ -41,7 +41,7 @@ The command prints `brief <path>`. That file is `<run_key>_consolidation_brief.j
 
 Quote only when `ingest_source` is `diagnostics`.
 
-Read from the brief: `savings`, `quotes`, `fleet`, `contract_rate`, `ech_scope`, `ech_recent_months`, `ech_recent_months_priced`, `estimate_months`, `draft`, `notes`, `limits`, `region_matches`, `per_cluster_plan`, `diagnostics_coverage`, `excluded_deployments`, `method`, `deployment_plan`, `metered_rates`, `estimators`, `links`, `integrity`, `search_power`.
+Read from the brief: `savings`, `quotes`, `fleet`, `contract_rate`, `ech_scope`, `ech_ml_exclusion`, `ech_recent_months`, `ech_recent_months_priced`, `estimate_months`, `draft`, `notes`, `limits`, `region_matches`, `per_cluster_plan`, `diagnostics_coverage`, `excluded_deployments`, `method`, `deployment_plan`, `metered_rates`, `estimators`, `links`, `integrity`, `search_power`.
 
 When the scope is unavailable, page 1 compares `ech_recent_months_priced` (`comparison`, `comparison_basis`, `stable`), not the whole-org `ech_recent_months`. `draft` true means the run is not verified.
 
@@ -59,7 +59,8 @@ Confirm these from the brief. Do not open the sheet.
 - Security is quoted only when E73 is 0 and `readback.other_addons_monthly` is 0. The monthly is E74.
 - Search stays on the quote when EIS is incomplete. The cover says Search is quoted without EIS, and inference billed on ECH is context, not a price.
 - A rejected region drops that whole solution, including Search.
-- `integrity.passed` is false when any scored check fails. Do not call a failed quote verified.
+- `integrity.passed` is false when any scored check fails. Do not call a failed quote verified. Rate window, Counter age, Retention basis and Retention month are warnings: they do not fail the quote, and `chat_lines` names them on their own line.
+- `ech_ml_exclusion.monthly` is ML-node ECU taken off the ECH side, because no serverless project bills an ML node. `status` `incomplete` means none was taken off and the saving is understated.
 - When the billing window is unstable, the comparison is the latest complete month. Do not call it a 3-month average.
 - When no serverless price came back, show the ECH bill and say there is no comparison.
 - Page 1 states the average retention across indexes and the whole month written to the estimator. That month is the headline.

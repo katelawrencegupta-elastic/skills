@@ -14,19 +14,16 @@ Pure function of `account.json` + `infra.json`; no network.
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import json
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 from quote_checks import (
-    BILLING_WINDOW_MIN_SHARE,
-    e73_blocks_quote, echo_gate, ingest_echo, integrity_score, money as _money,
-    observability_echo_gate, region_match_how,
+    e73_blocks_quote,
+    echo_gate,
+    ingest_echo,
+    money as _money,
+    observability_echo_gate,
 )
-from skill_paths import find_skill
 
 from constants import DAYS_PER_MONTH, ESTIMATE_MONTHS
 from consolidation_scope import (
@@ -466,7 +463,8 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
                 notes.append(f"Inference billed on ECH, not priced on serverless: ${context:,.2f}/mo.")
     svls_total_mo = sum(float(p.get("total_mo") or 0) for p in by_solution.values())
     quoted = any("quotable" in str(p.get("pricing") or "") for p in by_solution.values()) and svls_total_mo > 0
-    scope = ech_scope(acc, by_solution)
+    # `scope` is still the one built above: the EIS pass adds dollars to the Search block and
+    # never changes a solution's `pricing`, which is all `unpriced_reason` reads.
     # Region groups were summed from the fetched year. Everything else on the page is the
     # quote window, so put them on the same basis once the per-deployment window is known,
     # and record which basis each group used.

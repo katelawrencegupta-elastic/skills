@@ -71,8 +71,17 @@ Prices Observability and Security from Elasticsearch diagnostic bundles. Daily G
 | `vpn_check.py` | Opens a TLS connection to the admin host before a pull. The API key is not sent |
 | `diag_account.py` | Builds the diagnostics copy of the account. Ingest and retention come from the bundles |
 | `size_serverless.py` | Copies the golden Observability and Security sheets, writes the cells, and reads the dollars back. Keeps one sheet per title and trashes older copies (`--dedupe`, `--dedupe-dry-run`) |
+| `sizing_shared.py` | The tab names, cell maps and read-back addresses every sizing step shares. One home for each |
+| `sheets_io.py` | The Drive and Sheets calls: copy, verify, push cells, read back, export |
+| `estimate_paths.py` | Estimate titles and where a sheet is filed, on disk and on Drive |
+| `sizing_fill.py` | The Observability, Security and Search fills, and the region match |
+| `plan_sizing.py` | The regional jobs and the deployment-count plan |
+| `constants.py` | Every shared number: the month, the tolerances, the thresholds, the exit status |
 | `es3_estimate.py` | Prices a Search slice with the es3-estimator library |
-| `consolidation.py` | Builds the savings, deployment-count plan, per-cluster cost table, metered rates, and quote integrity from the read-backs |
+| `consolidation.py` | Builds the savings, deployment-count plan, per-cluster cost table, metered rates, and quote integrity from the read-backs. Also the façade the runner and renderers import through |
+| `consolidation_scope.py` | The quote window, the billed series, which ECH deployments are on each side of the comparison, and the stand-in ladders |
+| `consolidation_regional.py` | One project per solution per region, the per-region read-backs, and the integrity facts |
+| `consolidation_eis.py` | Search EIS and ML-node ECU, behind one completeness gate. ML comes off the ECH side whether or not Search was quoted |
 | `quote_checks.py` | Checks the estimator layout before a write, the sheet echo, coverage, retention, unrated ingest, and published totals. No network |
 | `diag_inputs.py` | Prints 2–5 project packs and per-deployment inputs. It does not quote dollars |
 | `privacy.py` | Sets private file modes and warns when `.env` or an in-repo `diag_artifacts/` folder would be committed |
@@ -84,15 +93,21 @@ Run options worth knowing:
 
 - `--exclude-deployment <id>` (repeat or comma list) removes a deployment from the whole run. The run key gains `_excluding_<n>`, and page 1 names what was left out.
 - `--ech-scope priced|all` (default `priced`) sets the ECH side of the comparison: only deployments that got a serverless price, or the whole billing window. Page 1 names what was not compared.
-- `--unmeasured exclude|k360|fail` (default `exclude`) says what an active deployment with no bundle does: on neither side, priced from K360 stored GB and labelled, or a stop.
+- `--unmeasured exclude|fail` (default `exclude`) says what an active deployment with no bundle does: left off both sides of the comparison, or a stop that names every one of them. There is no K360 mode: a size that was never measured cannot enter a diagnostic estimate.
 - `--min-priced-ecu-pct N` (default 90) fails integrity when priced deployments carry less than that share of the ECH deployments' billed cost.
 - `--keep-serverless-spend` leaves existing serverless projects' cost in the ECH figure under `--ech-scope all`.
 - `--allow-missing-diags` continues when a diagnostic download still fails after its retries. Page 1 then lists the deployments that were not measured.
 - When serverless at list costs more than the ECH billed cost, page 1 reads "increase" with an up arrow instead of "reduction".
 - The consolidation PDF carries a per-cluster page after the deployment-count page: each cluster's serverless $/mo as its own project, then at every step down to the floor.
 - `--lookback-days` (default 90) is the billing window: the ECH month and the roster of active deployments. ECH dollars are the K360 billing `cost` field as billed. No ARR ÷ commit rate is applied.
-- Every run is stamped with the commit and rules that produced it (`meta.method`, `method` in the brief, and the last line of the PDF). Compare two runs of one customer only when the stamp matches.
-- Quote integrity passes only when every check passes. One failed check fails the quote.
+- `--retention-days N` replaces the measured month with a named age, still written as a whole month. Bulk GB/day stays the measured rate.
+- `--preflight` checks `.env`, the Sheets and es3 virtualenvs, admin access, the org report's daily series and the git state in one table, then stops. The local half of it runs at the start of every run, so a missing virtualenv is caught before the downloads rather than once there is a quote to fill.
+- Every run is stamped with the commit and rules that produced it (`meta.method`, `method` in the brief, and the last line of the PDF). Compare two runs of one customer only when the stamp matches. A run refuses to start on a tree with uncommitted changes, or with an untracked `.py` under a `scripts/` folder that an import could pick up; an untracked file that cannot change behaviour is listed on the stamp instead of blocking. `--allow-dirty` runs anyway and marks the PDF DRAFT.
+- Every run also writes `<run_key>_run.json`: the options, the method stamp, the preflight table, every limit, the integrity verdict and the timings. Paths and the customer name are left out of it.
+- A step that ran degraded records an `estimation_limits` entry, not just a line on the terminal, so the brief, the chat bullets and the PDF all carry it. A run marked DRAFT always says why.
+- Quote integrity passes only when every check passes. One failed check fails the quote. Rate window, Counter age, Retention basis and Retention month are warnings instead: they report a weakness and the quote is still produced.
+
+A note on the module layout: each module imports the names it uses and nothing more. There are no star imports between them, and no constant has two homes — `test_docs.py` enforces both, because 27 constants once lived in two files and agreed only by hand. `consolidation.py` and `size_serverless.py` carry an explicit `__all__` because they are the façades the runner, the renderers and the suites import through.
 
 References: `calculations.md` is the arithmetic. `sizing-cells.md` is the estimator cell map.
 

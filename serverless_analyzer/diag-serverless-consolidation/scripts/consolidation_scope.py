@@ -13,18 +13,17 @@ Pure function of `account.json` + `infra.json`; no network.
 """
 from __future__ import annotations
 
-import argparse
 import datetime as dt
-import json
-import os
-import subprocess
 import sys
 from pathlib import Path
 
 from quote_checks import (
     BILLING_WINDOW_MIN_SHARE,
-    e73_blocks_quote, echo_gate, ingest_echo, integrity_score, money as _money,
-    observability_echo_gate, region_match_how,
+    e73_blocks_quote,
+    ingest_echo,
+    integrity_score,
+    money as _money,
+    region_match_how,
 )
 from skill_paths import find_skill
 
@@ -76,9 +75,12 @@ def billed_series(ecu: dict) -> tuple[list[str], list[float]]:
     return (days[lead:] if days else []), totals[lead:]
 
 
-def _window_daily_avg(ecu: dict, days: int) -> float | None:
-    """Daily average over the last `days` billed days, or over all of them when there are fewer."""
-    _labels, totals = billed_series(ecu)
+def _window_daily_avg(ecu: dict, days: int, series: tuple[list[str], list[float]] | None = None) -> float | None:
+    """Daily average over the last `days` billed days, or over all of them when there are fewer.
+
+    `series` is the already-computed `billed_series`, so one caller does not rebuild it.
+    """
+    _labels, totals = series if series is not None else billed_series(ecu)
     if totals:
         window = totals[-days:]
         return sum(window) / len(window)
@@ -112,7 +114,10 @@ def apply_quote_lookback(acc: dict, days: int = 90) -> float:
     window = quote_lookback_days(days)
     ecu = acc.setdefault("ecu", {})
     measured = (acc.get("sizing") or {}).get("ingest_source") == "diagnostics"
-    daily = _window_daily_avg(ecu, window)
+    # The billed series is the same list for every use below. Build it once.
+    series = billed_series(ecu)
+    labels, totals = series
+    daily = _window_daily_avg(ecu, window, series)
     complete = ecu.get("monthly_avg_complete_months")
     if complete:
         base_daily = float(complete) / DAYS_PER_MONTH
@@ -141,7 +146,7 @@ def apply_quote_lookback(acc: dict, days: int = 90) -> float:
         ecu["quote_ingest_scaled"] = True
     # The window that was priced. Fewer billed days than asked for is a shorter window, and no
     # daily series at all is no window: the ECH month is then the complete-month average.
-    billed_days = len(billed_series(ecu)[1])
+    billed_days = len(totals)
     ecu["quote_lookback_requested"] = window
     ecu["quote_lookback_days"] = None if daily is None else (min(window, billed_days) if billed_days else window)
     ecu["quote_daily_avg"] = None if daily is None else round(daily, 2)
@@ -153,7 +158,6 @@ def apply_quote_lookback(acc: dict, days: int = 90) -> float:
     telemetry_days = int(workload.get("window_days") or 0)
     telemetry_start = workload.get("window_start")
     telemetry_end = workload.get("window_end")
-    labels, _ = billed_series(ecu)
     quote_labels = labels[-int(quote_days):] if quote_days and labels else []
     expected_start = None
     if quote_labels:
@@ -337,7 +341,10 @@ def ech_scope(acc: dict, by_solution: dict) -> dict | None:
     unpriced: list[dict] = []
     serverless = 0.0
     by_name: dict[str, float] = {}
-    window_indices = [labels.index(day) for day in window_labels]
+    # One map, not a scan per day. `.index` also silently picked the first of a repeated
+    # label, which would have mapped two window days onto one column.
+    position = {day: index for index, day in enumerate(labels)}
+    window_indices = [position[day] for day in window_labels]
 
     def window_ecu(name: str) -> float:
         series = by_dep.get(name) or []

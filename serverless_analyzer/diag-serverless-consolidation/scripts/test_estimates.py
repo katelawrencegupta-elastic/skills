@@ -3,14 +3,9 @@ from __future__ import annotations
 
 import json
 import os
-import re
-import subprocess
 import tempfile
-import time
 import unittest
 from unittest import mock
-import zipfile
-from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -22,38 +17,43 @@ from skill_paths import find_skill, scripts_dir  # noqa: E402
 K360 = scripts_dir(find_skill("k360-account-analysis", HERE))
 sys.path.insert(0, str(K360))
 
-from analyze import active_deployment_set  # noqa: E402
-from admin_diags import (  # noqa: E402
-    _parse_zip, _user_index, admin_base, analyze_bundle, capture_target, capture_url,
-    parse_diagnostics, pull_diagnostics, quoted_index_bytes, safe_id,
+from consolidation import (  # noqa: E402
+    _deployment_groups,
+    _replicate_by_region,
+    build_consolidation,
+    regional_quote,
 )
-from consolidation import _deployment_groups, _replicate_by_region, apply_quote_lookback, build_consolidation, regional_quote  # noqa: E402
-from diag_account import _sheet_months, apply_diagnostics  # noqa: E402
-from diag_inputs import index_retention_months, summarize, whole_months  # noqa: E402
-from k360_infra import es_base_and_key  # noqa: E402
-from privacy import seal_dir, seal_text, unignored_secret_warnings  # noqa: E402
+from diag_account import apply_diagnostics  # noqa: E402
 from quote_checks import (  # noqa: E402
     TEMPLATE_ANCHORS, addon_off_value, e73_blocks_quote, echo_gate, integrity_score, money,
     template_check, template_version,
 )
-from run_consolidation import _apply_diagnostic_report_view, _estimator_flags, consolidation_brief, method_stamp, quote_pdf_jobs  # noqa: E402
-from render_pdf import consolidation_pdf_stem, deployment_plan_section, export_documents, render_appendix_html, render_consolidation_html, retire_legacy_pdf_folders, search_power_section, stat  # noqa: E402
+from render_pdf import (  # noqa: E402
+    consolidation_pdf_stem,
+    export_documents,
+    retire_legacy_pdf_folders,
+    search_power_section,
+    stat,
+)
 from size_serverless import (  # noqa: E402
-    COMPRESSION_FOLDER_NAME, DEFAULT_O11Y, DEFAULT_SECURITY, PLAN_FOLDER_NAME, _sheet_retention,
-    plan_sheet_jobs,
-    assemble_plan_bars, assert_not_template, cell_input_mode, copy_template, estimate_folder_name,
-    architecture_regions, estimate_subfolder, estimate_title, estimator_skip, fleet_sheet_region,
-    prefer_regional_estimators,
-    map_in_order, partition_cells, push_cells,
+    COMPRESSION_FOLDER_NAME,
+    PLAN_FOLDER_NAME,
     _search_volume_scale,
-    relocate_local_estimates, require_customer_parent,
+    architecture_regions,
+    assemble_plan_bars,
+    assert_not_template,
+    copy_template,
+    estimate_folder_name,
+    estimate_subfolder,
+    estimate_title,
+    estimator_skip,
+    fleet_sheet_region,
+    plan_sheet_jobs,
+    prefer_regional_estimators,
+    relocate_local_estimates,
 )
-from vpn_check import tunnel_reaches  # noqa: E402
 
-from _test_support import (  # noqa: F401  shared fixtures
-    COLLECTION_MS, HERE, K360, _analyze, _guard_args, _quote_account, _stamp_reconciled_billing,
-    _stamp_search_eis, _write_phase, _SheetCall, scope_account,
-)
+from _test_support import HERE, K360, _quote_account, _stamp_reconciled_billing  # noqa: E402
 
 
 class GateTests(unittest.TestCase):

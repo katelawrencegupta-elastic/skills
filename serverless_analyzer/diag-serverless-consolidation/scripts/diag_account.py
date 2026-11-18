@@ -21,23 +21,16 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-import math
 import re
 from pathlib import Path
 
 from diag_inputs import ESTIMATE_MONTHS, index_retention_months, whole_months
 
 from constants import DAYS_PER_MONTH, RETENTION_ASSUMED_MAX_SHARE
-RETENTION_MIN = 1.0
-RETENTION_MAX = 36.0
 
 
 def _norm(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
-
-
-def _clamp_months(months: float) -> float:
-    return min(RETENTION_MAX, max(RETENTION_MIN, float(months)))
 
 
 _sheet_months = whole_months  # one shared rounding rule, defined in diag_inputs
