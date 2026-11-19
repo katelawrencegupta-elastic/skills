@@ -228,7 +228,7 @@ def _deployment_region_rows(acc: dict) -> list[dict]:
     rows: list[dict] = []
     seen: set[tuple[str, str]] = set()
     for dep in (acc.get("solutions") or {}).get("by_deployment") or []:
-        if dep.get("platform") == "serverless" or dep.get("ingest_source") == "inactive":
+        if dep.get("platform") == "serverless" or dep.get("ingest_source") in ("inactive", "unsupported_region"):
             continue
         solution = dep.get("solution") or "search"
         region = str(region_by_name.get(dep.get("name")) or "").strip()

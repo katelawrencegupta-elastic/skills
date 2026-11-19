@@ -2025,6 +2025,30 @@ def _integrity_block(acc: dict) -> str:
 _CONFIDENCE_TONE = {"High": "success", "Moderate": "warning", "Low": "danger"}
 
 
+def _stays_on_ech_cover(c: dict) -> str:
+    """The cover callout for workloads in a region Elastic Cloud Serverless is not offered in."""
+    support = (c or {}).get("region_support") or {}
+    rows = [r for r in (support.get("stays_on_ech") or []) if isinstance(r, dict)]
+    if not rows:
+        return ""
+    regions = sorted({f"{r.get('provider')} {r.get('region')}" for r in rows})
+    total = support.get("stays_on_ech_mo")
+    named = ", ".join(
+        f"{esc(r.get('name'))} ({esc(r.get('region'))}" + (f", {usd(r.get('ech_mo'))}/mo" if r.get("ech_mo") is not None else "") + ")"
+        for r in rows[:6]
+    ) + ("" if len(rows) <= 6 else f", and {len(rows) - 6} more")
+    many = len(rows) != 1
+    body = (
+        f"{len(rows)} ECH {'deployments run' if many else 'deployment runs'} in {', '.join(esc(x) for x in regions)}, "
+        f"where Elastic Cloud Serverless is not offered. No serverless price is quoted for {'them' if many else 'it'}: "
+        f"{'those workloads continue' if many else 'that workload continues'} on ECH"
+        + (f" at {usd(total)}/mo" if total is not None else "")
+        + f" and {'are' if many else 'is'} not in the comparison. {named}. "
+        f"Supported regions are the <a href='{esc(support.get('source'))}'>Serverless regions page</a>, read {esc(support.get('source_read'))}."
+    )
+    return callout("Stays on ECH: region not offered on Serverless", body, "warning")
+
+
 def _confidence_cover(integrity: dict) -> str:
     """The confidence band on page 1, with the reason it is not High.
 
@@ -3687,6 +3711,7 @@ def render_consolidation_html(acc: dict) -> str:
     # How much of this price was measured, beside the price itself. Pass and Fail answer a
     # different question, and a quote can pass every check on inputs that were largely assumed.
     B.append(_confidence_cover(integrity))
+    B.append(_stays_on_ech_cover(c))
     rc = c.get("reconciliation") or {}
     project_n = _priced_project_count(svl)
     _scope = c.get("ech_scope") or {}

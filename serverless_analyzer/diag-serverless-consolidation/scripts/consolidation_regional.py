@@ -761,7 +761,7 @@ def _integrity(acc: dict, sz: dict, by_solution: dict, quotes: list[dict], headl
             "priced": scope.get("priced_deployments"),
             "unpriced": scope.get("unpriced_deployments"),
             "unpriced_mo": scope.get("unpriced_mo"),
-            "names": [row["name"] for row in (scope.get("unpriced") or [])[:6]],
+            "names": [row["name"] for row in (scope.get("unpriced") or []) if not row.get("stays_on_ech")][:6],
         },
     })
 

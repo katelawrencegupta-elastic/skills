@@ -630,6 +630,77 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertIn("unvalidated and is not in the comparison", html)
         self.assertIn("ML capacity carried over", html)
 
+    def test_the_regions_page_is_the_source_of_truth(self):
+        from serverless_regions import SERVERLESS_REGIONS, serverless_supports
+        self.assertEqual({k: len(v) for k, v in SERVERLESS_REGIONS.items()}, {"aws": 10, "azure": 13, "gcp": 12})
+        self.assertIs(serverless_supports("AWS", "us-east-1"), True)
+        self.assertIs(serverless_supports("GCP", "us-central1"), True)
+        self.assertIs(serverless_supports("AZURE", "eastus"), True)
+        self.assertIs(serverless_supports("GCP", "asia-east1"), False)
+        self.assertIs(serverless_supports("AZURE", "southcentralus"), False)
+        # The right name on the wrong cloud is not supported, and an unknown region is not evidence.
+        self.assertIs(serverless_supports("AWS", "eastus"), False)
+        self.assertIsNone(serverless_supports("AWS", None))
+        self.assertIsNone(serverless_supports(None, "us-east-1"))
+
+    def test_a_deployment_in_an_unsupported_region_stays_on_ech(self):
+        acc = scope_account(ech_scope="priced", keep_serverless_spend=False)
+        for dep in acc["solutions"]["by_deployment"]:
+            if dep["name"] == "sec":
+                dep["ingest_source"] = "unsupported_region"
+                dep["daily_raw_gb"] = 0.0
+                dep["unsupported_region"] = {"provider": "GCP", "region": "asia-east1"}
+        cons = build_consolidation(acc, None)
+        scope = cons["ech_scope"]
+        row = next(r for r in scope["unpriced"] if r["name"] == "sec")
+        self.assertTrue(row["stays_on_ech"])
+        self.assertIn("not offered on Serverless", row["reason"])
+        # It is not a deployment the quote failed to price: counts and share leave it out.
+        self.assertEqual(scope["stays_on_ech_deployments"], 1)
+        self.assertEqual(scope["unpriced_deployments"], 1)
+        self.assertGreater(scope["stays_on_ech_mo"], 0)
+        share = next(c for c in cons["integrity"]["checks"] if c.get("check") == "Priced share")
+        self.assertNotIn("sec", share.get("detail", ""))
+        support = cons["region_support"]
+        self.assertEqual(support["stays_on_ech"][0]["name"], "sec")
+        self.assertEqual(support["stays_on_ech"][0]["region"], "asia-east1")
+        self.assertIn("elastic.co/docs/deploy-manage/deploy/elastic-cloud/regions", support["source"])
+        notes = " ".join(cons["notes"])
+        self.assertIn("continues on ECH", notes)
+        self.assertIn("not offered", notes)
+        # The pricing never sees it.
+        self.assertNotIn("sec", {n for g in cons["architecture"]["groups"] for n in g.get("deployments", [])})
+        # And the cover says so.
+        cover = render_consolidation_html({**acc, "consolidation": cons}).split("<section class='sec newpage'>", 1)[0]
+        self.assertIn("Stays on ECH: region not offered on Serverless", cover)
+        self.assertIn("asia-east1", cover)
+
+    def test_apply_diagnostics_leaves_an_unsupported_region_out_of_the_sizing(self):
+        acc = {
+            "deployments": {"active": {"month": "2026-10", "names": ["ok", "far"]}},
+            "cloud": {"by_deployment": [
+                {"name": "ok", "provider": "GCP", "region": "us-central1"},
+                {"name": "far", "provider": "GCP", "region": "asia-east1"},
+            ]},
+            "solutions": {"by_deployment": [
+                {"name": "ok", "solution": "observability", "platform": "ech", "gb": 10, "ecu": 1},
+                {"name": "far", "solution": "observability", "platform": "ech", "gb": 10, "ecu": 1},
+            ], "totals": {}},
+            "sizing": {"consolidated": {}}, "storage": {},
+        }
+        rows = [{"name": "ok", "bulk_gb_day": 5.0, "store_gb": 10.0, "retention_days": 30},
+                {"name": "far", "bulk_gb_day": 9.0, "store_gb": 20.0, "retention_days": 30}]
+        out = apply_diagnostics(acc, rows, {"ok", "far"})
+        far = next(d for d in out["solutions"]["by_deployment"] if d["name"] == "far")
+        self.assertEqual(far["ingest_source"], "unsupported_region")
+        self.assertEqual((far["gb"], far["daily_raw_gb"]), (0.0, 0.0))
+        cov = out["sizing"]["diagnostics"]
+        self.assertEqual(cov["unsupported_region"], [{"name": "far", "provider": "GCP", "region": "asia-east1"}])
+        # Only the supported deployment is measured, and the bundle that was not used is not "unmatched".
+        self.assertEqual(cov["matched"], 1)
+        self.assertEqual(cov["bulk_gb_day"], 5.0)
+        self.assertEqual(cov["unmatched_diagnostics"], [])
+
     def test_the_cover_names_the_whole_bill_and_the_compared_part(self):
         acc = scope_account(ech_scope="priced", keep_serverless_spend=False)
         cons = build_consolidation(acc, None)

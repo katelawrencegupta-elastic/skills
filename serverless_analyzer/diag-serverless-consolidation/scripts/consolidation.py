@@ -38,6 +38,7 @@ from consolidation_regional import (
     _replicate_by_region, _sync_plan_to_quote, recent_ech_months, recent_ech_months_priced,
 )
 from consolidation_eis import _apply_search_eis, _search_eis, ml_node_ecu
+from serverless_regions import SERVERLESS_REGIONS_READ, SERVERLESS_REGIONS_URL
 
 # consolidation.py is also the façade the runner, the renderers and the tests import from.
 # These names are re-exported on purpose, so `__all__` records that decision rather than
@@ -509,8 +510,9 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         )
     elif scope:
         ech_mo = float(scope["in_comparison_mo"])
-        names = ", ".join(f"{row['name']} ({row['reason']})" for row in scope["unpriced"][:6])
-        more = "" if len(scope["unpriced"]) <= 6 else f", and {len(scope['unpriced']) - 6} more"
+        not_priced = [row for row in scope["unpriced"] if not row.get("stays_on_ech")]
+        names = ", ".join(f"{row['name']} ({row['reason']})" for row in not_priced[:6])
+        more = "" if len(not_priced) <= 6 else f", and {len(not_priced) - 6} more"
         if scope["scope"] == "priced":
             lead = (
                 f"ECH in the comparison is ${ech_mo:,.0f}/mo: the {scope['priced_deployments']} deployments that got a serverless price. "
@@ -533,6 +535,57 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
                     f"${scope['unpriced_mo']:,.0f}/mo ({names}{more}), so the saving is overstated by their bill."
                 )
             notes.append(lead)
+    # Workloads in a region Elastic Cloud Serverless is not offered in stay on ECH. They are not quoted,
+    # not compared, and the quote says why. The region list is the Serverless regions page.
+    stay_rows = [
+        d for d in (acc.get("solutions") or {}).get("by_deployment") or []
+        if isinstance(d, dict) and d.get("ingest_source") == "unsupported_region"
+    ]
+    region_support = {
+        "source": SERVERLESS_REGIONS_URL,
+        "source_read": SERVERLESS_REGIONS_READ,
+        "stays_on_ech": [],
+        "stays_on_ech_mo": None,
+    }
+    if stay_rows:
+        month_by_name = (scope or {}).get("by_deployment_mo") or {}
+        stays = []
+        for d in stay_rows:
+            where = d.get("unsupported_region") or {}
+            mo = month_by_name.get(d["name"])
+            if mo is None:
+                mo = d.get("ecu_monthly_avg")
+            stays.append({
+                "name": d["name"], "solution": d.get("solution"), "provider": where.get("provider"),
+                "region": where.get("region"), "ech_mo": round(float(mo), 2) if mo is not None else None,
+            })
+        stays.sort(key=lambda row: -(row["ech_mo"] or 0))
+        known = [row["ech_mo"] for row in stays if row["ech_mo"] is not None]
+        region_support["stays_on_ech"] = stays
+        region_support["stays_on_ech_mo"] = round(sum(known), 2) if known else None
+        regions = sorted({f"{row['provider']} {row['region']}" for row in stays})
+        cost = f" Their ECH bill is ${region_support['stays_on_ech_mo']:,.0f}/mo." if region_support["stays_on_ech_mo"] is not None else ""
+        listed = ", ".join(f"{row['name']} ({row['region']}" + (f", ${row['ech_mo']:,.0f}/mo" if row["ech_mo"] is not None else "") + ")" for row in stays[:6])
+        notes.append(
+            f"{len(stays)} ECH {'deployment runs' if len(stays) == 1 else 'deployments run'} in "
+            f"{'a region' if len(regions) == 1 else 'regions'} Elastic Cloud Serverless is not offered in "
+            f"({', '.join(regions)}), so no serverless price is quoted for {'it' if len(stays) == 1 else 'them'}. "
+            f"{'That workload continues' if len(stays) == 1 else 'Those workloads continue'} on ECH and "
+            f"{'is' if len(stays) == 1 else 'are'} not in the comparison.{cost} "
+            f"{listed}{'' if len(stays) <= 6 else f', and {len(stays) - 6} more'}. "
+            f"Supported regions are those on the Serverless regions page ({SERVERLESS_REGIONS_URL}), read {SERVERLESS_REGIONS_READ}."
+        )
+        limits = sz.setdefault("diagnostics", {}).setdefault("estimation_limits", [])
+        if not any(row.get("code") == "region_not_on_serverless" for row in limits):
+            limits.append({
+                "code": "region_not_on_serverless",
+                "detail": (
+                    f"{len(stays)} ECH deployment(s) in {', '.join(regions)} stay on ECH: Elastic Cloud Serverless is not offered in "
+                    f"{'that region' if len(regions) == 1 else 'those regions'}."
+                    + (f" Their ECH bill is ${region_support['stays_on_ech_mo']:,.0f}/mo and is not in the comparison." if region_support["stays_on_ech_mo"] is not None else "")
+                ),
+                "severity": "medium",
+            })
     # No serverless project bills an ML node, so the ML capacity ECH was paying for is carried
     # to the serverless side as an EIS estimate instead of being dropped. It is read over the
     # deployments in the comparison, whatever solution they are, and whether or not Search
@@ -798,6 +851,7 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         "retention_index_days": (acc.get("meta") or {}).get("retention_index_days"),
         "retention_index_count": (acc.get("meta") or {}).get("retention_index_count"),
         "ech_scope": scope,
+        "region_support": region_support,
         # ML-node ECU carried to the serverless side as an EIS estimate, read over the comparison's
         # deployments and independent of whether Search was quoted. `status` says whether any was carried.
         "ml_eis_carryover": {

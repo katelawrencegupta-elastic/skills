@@ -73,6 +73,7 @@ Prices Observability and Security from Elasticsearch diagnostic bundles. Daily G
 | `size_serverless.py` | Copies the golden Observability and Security sheets, writes the cells, and reads the dollars back. Keeps one sheet per title and trashes older copies (`--dedupe`, `--dedupe-dry-run`) |
 | `sizing_shared.py` | The tab names, cell maps and read-back addresses every sizing step shares. One home for each |
 | `sheets_io.py` | The Drive and Sheets calls: copy, verify, push cells, read back, export |
+| `serverless_regions.py` | The regions Elastic Cloud Serverless is offered in, from the Serverless regions page. One home for that list |
 | `estimate_paths.py` | Estimate titles and where a sheet is filed, on disk and on Drive |
 | `sizing_fill.py` | The Observability, Security and Search fills, and the region match |
 | `plan_sizing.py` | The regional jobs and the deployment-count plan |

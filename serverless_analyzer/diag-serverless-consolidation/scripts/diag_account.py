@@ -27,6 +27,7 @@ from pathlib import Path
 from diag_inputs import ESTIMATE_MONTHS, index_retention_months, whole_months
 
 from constants import DAYS_PER_MONTH, RETENTION_ASSUMED_MAX_SHARE
+from serverless_regions import serverless_supports
 
 
 def _norm(name: str) -> str:
@@ -50,7 +51,7 @@ def _measured_days(value) -> float | None:
 def _ech_rows(out: dict) -> list[dict]:
     return [
         d for d in (out.get("solutions") or {}).get("by_deployment") or []
-        if d.get("platform") != "serverless" and d.get("ingest_source") != "inactive"
+        if d.get("platform") != "serverless" and d.get("ingest_source") not in ("inactive", "unsupported_region")
     ]
 
 
@@ -265,10 +266,37 @@ def apply_diagnostics(
     active_info = (out.get("deployments") or {}).get("active") or {}
     active_names = set(active_info.get("names") or [])
     use_active = bool(active_info.get("month")) and bool(active_names)
+    region_by_name = {
+        d.get("name"): (d.get("provider"), d.get("region"))
+        for d in ((out.get("cloud") or {}).get("by_deployment") or [])
+        if d.get("name")
+    }
+    unsupported_region: list[dict] = []
+    region_bundles: list[str] = []
     for dep in (out.get("solutions") or {}).get("by_deployment") or []:
         if dep.get("platform") == "serverless":
             continue
         name = dep.get("name") or ""
+        if not (use_active and name not in active_names):
+            prov, reg = region_by_name.get(name) or (None, None)
+            if serverless_supports(prov, reg) is False:
+                # Elastic Cloud Serverless is not offered in this region. The workload stays on ECH:
+                # no ingest and no stored GB go to the estimators, and the ECH bill is not compared.
+                hit = match(name)
+                if hit:
+                    region_bundles.append(hit["name"])
+                dep["k360_gb"] = dep.get("gb")
+                dep["gb"] = 0.0
+                dep["daily_raw_gb"] = 0.0
+                dep["ingest_source"] = "unsupported_region"
+                dep["unsupported_region"] = {"provider": str(prov), "region": str(reg)}
+                dep["field_sources"] = {
+                    "gb": "unsupported_region", "k360_gb": "cloud_tracker_telemetry",
+                    "daily_raw_gb": "unsupported_region", "ecu": "cloud_tracker_billing",
+                    "region": "cloud_tracker_infrastructure",
+                }
+                unsupported_region.append({"name": name, "provider": str(prov), "region": str(reg)})
+                continue
         if use_active and name not in active_names:
             inactive += 1
             dropped_gb += float(dep.get("gb") or 0)
@@ -427,12 +455,13 @@ def apply_diagnostics(
             row["data_stored_gb"] = src.get("gb")
             row["field_sources"]["data_stored_gb"] = "diagnostics"
     unmatched_diags = [r.get("name") for r in rows if r.get("name") not in used]
-    _known = [(float(r.get("store_gb") or 0), r.get("retention_known_share")) for r in rows if r.get("name") in used and r.get("name") not in inactive_bundles]
+    skipped_bundles = set(inactive_bundles) | set(region_bundles)
+    _known = [(float(r.get("store_gb") or 0), r.get("retention_known_share")) for r in rows if r.get("name") in used and r.get("name") not in skipped_bundles]
     _store = sum(gb for gb, _share in _known)
     blended_share = None
     if _store > 0 and all(share is not None for _gb, share in _known):
         blended_share = round(sum(gb * (1.0 - float(share)) for gb, share in _known) / _store, 4)
-    active_rows = [r for r in rows if r.get("name") in used and r.get("name") not in inactive_bundles]
+    active_rows = [r for r in rows if r.get("name") in used and r.get("name") not in skipped_bundles]
     # Every row with store at the 30-day default, including a `policy` row that stayed inside
     # the threshold. Counting it as policy-aged must not hide the assumption it still carries.
     assumed_retention_rows = [
@@ -465,12 +494,13 @@ def apply_diagnostics(
         "missing_diagnostics": fallback,
         "fallback_names": fallback_names[:12],
         "unmeasured_mode": unmeasured,
+        "unsupported_region": unsupported_region[:24],
         "decommissioned": len(decommissioned_names),
         "decommissioned_names": decommissioned_names[:12],
         "unmatched_diagnostics": unmatched_diags[:12],
         "short_uptime": short,
         "bulk_gb_day": round(bulk_sum, 2),
-        "store_gb": round(sum(float(r.get("store_gb") or 0) for r in rows if r.get("name") in used and r.get("name") not in inactive_bundles), 2),
+        "store_gb": round(sum(float(r.get("store_gb") or 0) for r in rows if r.get("name") in used and r.get("name") not in skipped_bundles), 2),
         "snapshot_gb": round(snapshot_gb, 2),
         "retention_unmeasured": no_age,
         "retention_30d_assumed": assumed_retention_rows[:12],
@@ -632,7 +662,7 @@ def apply_diagnostics(
             f"No index retention age was counted, so the estimate prices the {ESTIMATE_MONTHS}-month default. "
             "The written month is normally the unweighted average retention across indexes, rounded up to a whole month."
         )
-    restart_gb = sum(float(r.get("bulk_restart_gb_day") or 0) for r in rows if r.get("name") in used and r.get("name") not in inactive_bundles)
+    restart_gb = sum(float(r.get("bulk_restart_gb_day") or 0) for r in rows if r.get("name") in used and r.get("name") not in skipped_bundles)
     if restart_gb > 0 and bulk_sum > 0 and restart_gb / bulk_sum > 0.05:
         notes.append(
             f"Primary shards of write indices restarted or moved after those indices were created, so their bulk counter is younger than the "

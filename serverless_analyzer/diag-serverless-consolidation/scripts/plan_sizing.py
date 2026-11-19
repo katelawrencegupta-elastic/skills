@@ -532,7 +532,7 @@ def plan_roster(acc: dict) -> list[dict]:
     """
     measured = [
         dep for dep in (acc.get("solutions") or {}).get("by_deployment") or []
-        if dep.get("platform") != "serverless" and dep.get("ingest_source") != "inactive"
+        if dep.get("platform") != "serverless" and dep.get("ingest_source") not in ("inactive", "unsupported_region")
     ]
     cloud_rows = [
         dep for dep in ((acc.get("cloud") or {}).get("by_deployment") or [])

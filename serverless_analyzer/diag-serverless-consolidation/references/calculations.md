@@ -44,6 +44,14 @@ No serverless project bills an ML node, so the ML capacity ECH paid for is carri
 
 It uses the same gate as EIS: a complete filtered composite, and a daily series that covers the exact quote window and reconciles to the fetched-period totals, normalized by `30.416 / quote_window_days`. A deployment whose composite total is zero and that has no daily row billed no AI/ML in the fetched interval and counts as zero, the same way an absent composite bucket does. If the telemetry is incomplete or does not reconcile, nothing is carried, the notes say the serverless total is understated, and `estimation_limits` carries `ml_node_ecu_unverified`. A line that cannot be verified would invent a price, so none is added. The ML read needs the deployment-scoped ECH comparison, because that comparison names the deployments.
 
+## Regions Serverless is offered in
+
+The supported regions are the Elastic Cloud Serverless regions page, https://www.elastic.co/docs/deploy-manage/deploy/elastic-cloud/regions, kept as one table in `serverless_regions.py` with the date it was read. It lists a limited number of AWS, Azure and GCP regions and says more will follow, so refresh the table when the page changes.
+
+An ECH deployment whose provider and region are not on that page is not quoted on Serverless. `apply_diagnostics` marks it `ingest_source` `unsupported_region`: no ingest and no stored GB go to the estimators, it is not a serverless project in the plan or the per-region sheets, and its bundle is not counted as unmatched. Its workload continues on ECH. The comparison leaves its billed cost out under every `--ech-scope`, `ech_scope.unpriced` lists it with `stays_on_ech`, and `ech_scope.stays_on_ech_mo` and `stays_on_ech_deployments` report it on its own. It is not counted as a deployment the quote failed to price, so it does not lower Priced share and is not named in that check. The cover callout, the notes, `region_support` in the brief and the `region_not_on_serverless` limit say which deployments, which regions and what they bill on ECH. A deployment with no known provider or region is not treated as unsupported.
+
+A region the page lists but an estimator sheet does not is a different case. It is still priced at that provider's default and flagged by the Region fidelity check.
+
 ## Source precedence and estimation limits
 
 For deployments with a matched diagnostic bundle, diagnostics take precedence for local primary store, bulk GB/day, retention ages, product-derived Observability mix, and the aggregates derived from those fields. `field_sources` on deployment rows and `sizing.source_precedence` make the source choice explicit. Cloud Tracker remains authoritative for billed ECU/cost, the billing-window active roster, Search workload telemetry, cloud region/provider/tier metadata, and deployment classification. The Search ingest-share denominator is the sum of diagnostic local stores. Cloud Tracker stored GB on an unmeasured deployment is retained for context only and cannot change any diagnostic estimator input.
@@ -67,6 +75,7 @@ A step that ran degraded is a limit too, not a line on the terminal. `run_consol
 | `ml_node_ecu_unverified` | ML-node ECU was not carried to the serverless total |
 | `retention_month_fallback` | The sheets took the 12-month default instead of the index average |
 | `search_quote_window_telemetry` | Search was not priced: the exact-window index telemetry fetch failed after 2 attempts of 600s each. The serverless total leaves Search out and the run should be repeated. Runs queue on a lock in the artifacts root, so parallel runs fetch one at a time |
+| `region_not_on_serverless` | ECH deployments in a region Elastic Cloud Serverless is not offered in stay on ECH: no serverless price, and their ECH bill is out of the comparison |
 | `billing_reconciliation_outside_window` | Daily deployment billing missed org billing on some days, but fewer than 5% of the quote window's days. The ECH comparison was kept (medium severity) |
 | `estimate_dedupe_failed`, `pdf_export_failed`, `pdf_upload_failed` | Delivery steps; the quote itself is unaffected |
 

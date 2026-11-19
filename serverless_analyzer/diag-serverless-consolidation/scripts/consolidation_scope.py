@@ -268,6 +268,9 @@ def unpriced_reason(dep: dict, by_solution: dict, diagnostic: bool) -> str | Non
     """Why an ECH deployment has no serverless price. None when it has one."""
     sol = dep.get("solution") or "search"
     src = dep.get("ingest_source")
+    if src == "unsupported_region":
+        where = dep.get("unsupported_region") or {}
+        return f"region not offered on Serverless ({where.get('region')}), stays on ECH"
     if src == "decommissioned":
         return "decommissioned, not in the admin console"
     if src == "active_no_bundle":
@@ -360,13 +363,23 @@ def ech_scope(acc: dict, by_solution: dict) -> dict | None:
         if reason is None:
             priced += ecu
         else:
-            unpriced.append({"name": dep["name"], "solution": dep.get("solution") or "search", "reason": reason, "ecu_mo": round(ecu * as_month, 2)})
+            row = {"name": dep["name"], "solution": dep.get("solution") or "search", "reason": reason, "ecu_mo": round(ecu * as_month, 2)}
+            if dep.get("ingest_source") == "unsupported_region":
+                row["stays_on_ech"] = True
+                row["provider"] = (dep.get("unsupported_region") or {}).get("provider")
+                row["region"] = (dep.get("unsupported_region") or {}).get("region")
+            unpriced.append(row)
     total = sum(float(org_daily_totals[index] or 0) for index in window_indices)
     unpriced_total = sum(by_name.get(row["name"], 0.0) for row in unpriced)
     other = max(0.0, total - priced - unpriced_total - serverless)
-    compared = priced if opts["ech_scope"] == "priced" else total - (0.0 if opts["keep_serverless_spend"] else serverless)
+    # A workload that stays on ECH is never on the ECH side of a comparison, whatever the scope.
+    stays = sum(by_name.get(row["name"], 0.0) for row in unpriced if row.get("stays_on_ech"))
+    compared = priced if opts["ech_scope"] == "priced" else total - stays - (0.0 if opts["keep_serverless_spend"] else serverless)
     unpriced.sort(key=lambda row: (-row["ecu_mo"], row["name"]))
-    ech_only = priced + unpriced_total
+    # A workload that stays on ECH is not a deployment the quote failed to price, so it is not in the
+    # priced-share denominator or the unpriced counts. It is reported on its own.
+    stays_n = len([row for row in unpriced if row.get("stays_on_ech")])
+    ech_only = priced + unpriced_total - stays
     return {
         "status": "complete",
         "scope": opts["ech_scope"],
@@ -374,12 +387,14 @@ def ech_scope(acc: dict, by_solution: dict) -> dict | None:
         "window_days": window_days,
         "window_mo": round(total * as_month, 2),
         "priced_mo": round(priced * as_month, 2),
-        "unpriced_mo": round(unpriced_total * as_month, 2),
+        "unpriced_mo": round((unpriced_total - stays) * as_month, 2),
+        "stays_on_ech_mo": round(stays * as_month, 2),
+        "stays_on_ech_deployments": stays_n,
         "serverless_mo": round(serverless * as_month, 2),
         "other_mo": round(other * as_month, 2),
         "in_comparison_mo": round(compared * as_month, 2),
         "priced_deployments": len([d for d in rows if d.get("platform") != "serverless"]) - len(unpriced),
-        "unpriced_deployments": len(unpriced),
+        "unpriced_deployments": len(unpriced) - stays_n,
         "priced_share_pct": round(100 * priced / ech_only, 1) if ech_only > 0 else None,
         "min_priced_ecu_pct": opts["min_priced_ecu_pct"],
         "unpriced": unpriced,
@@ -400,6 +415,8 @@ def comparison_deployment_names(scope: dict | None) -> set[str]:
     names = {str(name) for name in (scope.get("by_deployment_mo") or {})}
     if scope.get("scope") == "priced":
         names -= {str(row.get("name")) for row in (scope.get("unpriced") or []) if row.get("name")}
+    else:
+        names -= {str(row.get("name")) for row in (scope.get("unpriced") or []) if row.get("name") and row.get("stays_on_ech")}
     return names
 
 
@@ -764,7 +781,8 @@ def _deployment_groups(acc: dict, infra: dict | None, months: float) -> list[dic
     grouped: dict[tuple[str, str], dict] = {}
     by_name = {d.get("name"): d for d in (acc.get("solutions") or {}).get("by_deployment") or [] if d.get("platform") != "serverless"}
     for d in (acc.get("solutions") or {}).get("by_deployment") or []:
-        if d.get("platform") == "serverless":
+        # A deployment in a region with no Serverless offering is not a serverless project.
+        if d.get("platform") == "serverless" or d.get("ingest_source") == "unsupported_region":
             continue
         sol = d.get("solution") or "search"
         reg = region_by_name.get(d["name"]) or "unknown region"
