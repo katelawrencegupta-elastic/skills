@@ -680,6 +680,9 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(ws["serverless_plus_stays_mo"], cons["savings"]["serverless_mo"] + support["stays_on_ech_mo"], places=1)
         self.assertAlmostEqual(ws["ech_today_mo"], cons["savings"]["ech_list_mo"] + support["stays_on_ech_mo"], places=1)
         self.assertIn("How it carries over", cover)
+        # The carried-over ECH is part of the total monthly spend, as a stat on the cover.
+        self.assertIn("Total monthly after consolidation", cover)
+        self.assertIn(f"${round(ws['serverless_plus_stays_mo']):,}", cover)
 
     def test_every_us_swap_lands_on_an_offered_region_of_the_same_provider(self):
         from serverless_regions import SERVERLESS_REGIONS, US_SWAPS, serverless_supports, us_alternative

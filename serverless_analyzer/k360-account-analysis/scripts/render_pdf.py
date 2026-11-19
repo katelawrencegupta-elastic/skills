@@ -3889,6 +3889,16 @@ def render_consolidation_html(acc: dict) -> str:
             chart_series = [(ech_cat, [float(sv.get("ech_list_mo") or 0), 0.0]), (svl_cat, [0.0, float(sv.get("serverless_mo") or 0)])]
         chart_colors = [PALETTE[0], PALETTE[2]]
         chart_subs = compare_subs
+    # ECH that cannot move keeps billing, so it is part of the monthly spend after consolidation.
+    _ws = ((c.get("region_support") or {}).get("with_stays") or {})
+    _stay_mo = (c.get("region_support") or {}).get("stays_on_ech_mo")
+    if _ws and _stay_mo and svl_total is not None and isinstance(stats, list):
+        _after = float(_ws.get("serverless_plus_stays_mo") or 0)
+        stats.append(stat(
+            usd(_after),
+            f"Total monthly after consolidation: serverless {usd(float(svl_total))} + ECH carried over {usd(float(_stay_mo))}. ECH today for the same scope, {usd(_ws.get('ech_today_mo'))}",
+            "success", tag="estimate", estimate=True,
+        ))
     B.append(f"<div class='stats' style='grid-template-columns:repeat({len(stats)},1fr)'>{''.join(stats)}</div>")
     B.append(_compared_share_cover(c))
     rate_label = ""
