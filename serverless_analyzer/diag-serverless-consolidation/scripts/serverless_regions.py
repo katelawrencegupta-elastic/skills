@@ -54,3 +54,27 @@ def serverless_supports(provider, region) -> bool | None:
     if prov not in SERVERLESS_REGIONS or not reg:
         return None
     return reg in SERVERLESS_REGIONS[prov]
+
+
+# A US deployment in a region Serverless is not offered in is quoted in the nearest offered region of the
+# same provider. The US has no data-residency constraint, and the same provider keeps a marketplace
+# purchase valid. Outside the US a region is never swapped: the country may matter, so that workload stays on ECH.
+# Each target is a region the page lists. A region already on the page is not in this table.
+US_SWAPS: dict[tuple[str, str], str] = {
+    ("azure", "southcentralus"): "centralus",
+    ("azure", "northcentralus"): "centralus",
+    ("azure", "westcentralus"): "centralus",
+    ("azure", "westus"): "westus2",
+    ("azure", "westus3"): "westus2",
+    ("aws", "us-west-1"): "us-west-2",
+    ("gcp", "us-west2"): "us-west1",
+    ("gcp", "us-west3"): "us-west1",
+    ("gcp", "us-west4"): "us-west1",
+    ("gcp", "us-south1"): "us-central1",
+    ("gcp", "us-east5"): "us-east4",
+}
+
+
+def us_alternative(provider, region) -> str | None:
+    """The offered region a US deployment is quoted in instead, or None. Never a non-US region."""
+    return US_SWAPS.get((_provider(provider), str(region or "").strip().lower()))

@@ -546,7 +546,52 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         "source_read": SERVERLESS_REGIONS_READ,
         "stays_on_ech": [],
         "stays_on_ech_mo": None,
+        "swapped": [],
+        "swapped_ech_mo": None,
     }
+    swap_rows = [
+        d for d in (acc.get("solutions") or {}).get("by_deployment") or []
+        if isinstance(d, dict) and d.get("region_swap") and d.get("platform") != "serverless"
+    ]
+    if swap_rows:
+        month_by_name = (scope or {}).get("by_deployment_mo") or {}
+        swapped = []
+        for d in swap_rows:
+            mo = month_by_name.get(d["name"])
+            if mo is None:
+                mo = d.get("ecu_monthly_avg")
+            swapped.append({
+                "name": d["name"], "solution": d.get("solution"), "provider": d["region_swap"]["provider"],
+                "from": d["region_swap"]["from"], "to": d["region_swap"]["to"],
+                "ech_mo": round(float(mo), 2) if mo is not None else None,
+            })
+        swapped.sort(key=lambda row: -(row["ech_mo"] or 0))
+        known = [row["ech_mo"] for row in swapped if row["ech_mo"] is not None]
+        region_support["swapped"] = swapped
+        region_support["swapped_ech_mo"] = round(sum(known), 2) if known else None
+        pairs = sorted({f"{row['provider']} {row['from']} to {row['to']}" for row in swapped})
+        cost = f" Their ECH bill is ${region_support['swapped_ech_mo']:,.0f}/mo." if region_support["swapped_ech_mo"] is not None else ""
+        listed = ", ".join(f"{row['name']} ({row['from']} to {row['to']}" + (f", ${row['ech_mo']:,.0f}/mo" if row["ech_mo"] is not None else "") + ")" for row in swapped[:6])
+        notes.append(
+            f"REGION CHANGE ASSUMED: {len(swapped)} US ECH {'deployment is' if len(swapped) == 1 else 'deployments are'} in "
+            f"{'a region' if len(pairs) == 1 else 'regions'} Elastic Cloud Serverless is not offered in, so "
+            f"{'it is' if len(swapped) == 1 else 'they are'} quoted in the nearest offered region of the same provider ({'; '.join(pairs)}). "
+            f"The US has no data-residency constraint, and the same provider keeps a marketplace purchase valid.{cost} "
+            f"{listed}{'' if len(swapped) <= 6 else f', and {len(swapped) - 6} more'}. "
+            "This needs a region migration: a serverless project cannot change region after it is created, and the move brings latency, "
+            "data-transfer and cutover work that the estimate does not price."
+        )
+        limits = sz.setdefault("diagnostics", {}).setdefault("estimation_limits", [])
+        if not any(row.get("code") == "region_swapped" for row in limits):
+            limits.append({
+                "code": "region_swapped",
+                "detail": (
+                    f"{len(swapped)} US ECH deployment(s) are quoted in a different region of the same provider "
+                    f"({'; '.join(pairs)}) because Serverless is not offered in their own."
+                    + (f" Their ECH bill is ${region_support['swapped_ech_mo']:,.0f}/mo." if region_support["swapped_ech_mo"] is not None else "")
+                ),
+                "severity": "medium",
+            })
     if stay_rows:
         month_by_name = (scope or {}).get("by_deployment_mo") or {}
         stays = []

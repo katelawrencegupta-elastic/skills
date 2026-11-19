@@ -681,6 +681,66 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(ws["ech_today_mo"], cons["savings"]["ech_list_mo"] + support["stays_on_ech_mo"], places=1)
         self.assertIn("How it carries over", cover)
 
+    def test_every_us_swap_lands_on_an_offered_region_of_the_same_provider(self):
+        from serverless_regions import SERVERLESS_REGIONS, US_SWAPS, serverless_supports, us_alternative
+        for (provider, source), target in US_SWAPS.items():
+            self.assertIs(serverless_supports(provider, source), False, f"{provider} {source} is already offered")
+            self.assertIn(target, SERVERLESS_REGIONS[provider])
+        self.assertEqual(us_alternative("AZURE", "southcentralus"), "centralus")
+        # Outside the US nothing is swapped: the country may matter.
+        for provider, region in (("AZURE", "francecentral"), ("AZURE", "uksouth"), ("GCP", "asia-east1")):
+            self.assertIsNone(us_alternative(provider, region))
+
+    def test_a_us_region_is_quoted_in_the_nearest_offered_region_and_called_out(self):
+        acc = {
+            "deployments": {"active": {"month": "2026-10", "names": ["tx", "fr"]}},
+            "cloud": {"by_deployment": [
+                {"name": "tx", "provider": "AZURE", "region": "southcentralus"},
+                {"name": "fr", "provider": "AZURE", "region": "francecentral"},
+            ]},
+            "solutions": {"by_deployment": [
+                {"name": "tx", "solution": "observability", "platform": "ech", "gb": 10, "ecu": 1},
+                {"name": "fr", "solution": "observability", "platform": "ech", "gb": 10, "ecu": 1},
+            ], "totals": {}},
+            "sizing": {"consolidated": {}}, "storage": {},
+        }
+        rows = [{"name": "tx", "bulk_gb_day": 5.0, "store_gb": 10.0, "retention_days": 30},
+                {"name": "fr", "bulk_gb_day": 7.0, "store_gb": 12.0, "retention_days": 30}]
+        out = apply_diagnostics(acc, rows, {"tx", "fr"})
+        by = {d["name"]: d for d in out["solutions"]["by_deployment"]}
+        # The US deployment is sized as normal, in the offered region.
+        self.assertEqual(by["tx"]["ingest_source"], "diagnostics")
+        self.assertEqual(by["tx"]["daily_raw_gb"], 5.0)
+        self.assertEqual(by["tx"]["region_swap"], {"provider": "AZURE", "from": "southcentralus", "to": "centralus"})
+        region = {d["name"]: d for d in out["cloud"]["by_deployment"]}
+        self.assertEqual((region["tx"]["region"], region["tx"]["ech_region"]), ("centralus", "southcentralus"))
+        # The French one has no swap and stays on ECH.
+        self.assertEqual(by["fr"]["ingest_source"], "unsupported_region")
+        cov = out["sizing"]["diagnostics"]
+        self.assertEqual([r["name"] for r in cov["region_swaps"]], ["tx"])
+        self.assertEqual([r["name"] for r in cov["unsupported_region"]], ["fr"])
+
+    def test_the_cover_calls_out_a_region_change(self):
+        acc = scope_account(ech_scope="priced", keep_serverless_spend=False)
+        for dep in acc["solutions"]["by_deployment"]:
+            if dep["name"] == "sec":
+                dep["region_swap"] = {"provider": "AZURE", "from": "southcentralus", "to": "centralus"}
+        cons = build_consolidation(acc, None)
+        support = cons["region_support"]
+        self.assertEqual(support["swapped"][0]["name"], "sec")
+        self.assertEqual((support["swapped"][0]["from"], support["swapped"][0]["to"]), ("southcentralus", "centralus"))
+        self.assertGreater(support["swapped_ech_mo"], 0)
+        self.assertIn("REGION CHANGE ASSUMED", " ".join(cons["notes"]))
+        codes = [row.get("code") for row in acc["sizing"]["diagnostics"]["estimation_limits"]]
+        self.assertIn("region_swapped", codes)
+        # It stays in the comparison: it is priced, in the other region.
+        from consolidation_scope import comparison_deployment_names
+        self.assertIn("sec", comparison_deployment_names(cons["ech_scope"]))
+        cover = render_consolidation_html({**acc, "consolidation": cons}).split("<section class='sec newpage'>", 1)[0]
+        self.assertIn("Region change assumed", cover)
+        self.assertIn("southcentralus to centralus", cover)
+        self.assertIn("cannot change region after it is created", cover)
+
     def test_apply_diagnostics_leaves_an_unsupported_region_out_of_the_sizing(self):
         acc = {
             "deployments": {"active": {"month": "2026-10", "names": ["ok", "far"]}},

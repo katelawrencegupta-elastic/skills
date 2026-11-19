@@ -27,7 +27,7 @@ from pathlib import Path
 from diag_inputs import ESTIMATE_MONTHS, index_retention_months, whole_months
 
 from constants import DAYS_PER_MONTH, RETENTION_ASSUMED_MAX_SHARE
-from serverless_regions import serverless_supports
+from serverless_regions import serverless_supports, us_alternative
 
 
 def _norm(name: str) -> str:
@@ -272,6 +272,7 @@ def apply_diagnostics(
         if d.get("name")
     }
     unsupported_region: list[dict] = []
+    region_swaps: list[dict] = []
     region_bundles: list[str] = []
     for dep in (out.get("solutions") or {}).get("by_deployment") or []:
         if dep.get("platform") == "serverless":
@@ -279,7 +280,17 @@ def apply_diagnostics(
         name = dep.get("name") or ""
         if not (use_active and name not in active_names):
             prov, reg = region_by_name.get(name) or (None, None)
-            if serverless_supports(prov, reg) is False:
+            alt = us_alternative(prov, reg) if serverless_supports(prov, reg) is False else None
+            if alt:
+                # A US region Serverless is not offered in. It is quoted in the nearest offered region of the
+                # same provider and the quote says so. The sizing below is the ordinary path.
+                for cloud_row in (out.get("cloud") or {}).get("by_deployment") or []:
+                    if cloud_row.get("name") == name:
+                        cloud_row["ech_region"] = cloud_row.get("region")
+                        cloud_row["region"] = alt
+                dep["region_swap"] = {"provider": str(prov), "from": str(reg), "to": alt}
+                region_swaps.append({"name": name, "provider": str(prov), "from": str(reg), "to": alt})
+            elif serverless_supports(prov, reg) is False:
                 # Elastic Cloud Serverless is not offered in this region. The workload stays on ECH:
                 # no ingest and no stored GB go to the estimators, and the ECH bill is not compared.
                 hit = match(name)
@@ -495,6 +506,7 @@ def apply_diagnostics(
         "fallback_names": fallback_names[:12],
         "unmeasured_mode": unmeasured,
         "unsupported_region": unsupported_region[:24],
+        "region_swaps": region_swaps[:48],
         "decommissioned": len(decommissioned_names),
         "decommissioned_names": decommissioned_names[:12],
         "unmatched_diagnostics": unmatched_diags[:12],

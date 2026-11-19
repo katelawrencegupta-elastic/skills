@@ -2066,6 +2066,31 @@ def _compared_share_cover(c: dict) -> str:
     return callout(f"Compared on {share:.0f}% of the ECH bill", body, "warning" if share < 50 else "info")
 
 
+def _region_swap_cover(c: dict) -> str:
+    """The cover callout for US deployments quoted in a different region of the same provider."""
+    support = (c or {}).get("region_support") or {}
+    rows = [r for r in (support.get("swapped") or []) if isinstance(r, dict)]
+    if not rows:
+        return ""
+    total = support.get("swapped_ech_mo")
+    pairs = sorted({f"{r.get('provider')} {r.get('from')} to {r.get('to')}" for r in rows})
+    named = ", ".join(
+        f"{esc(r.get('name'))} ({esc(r.get('from'))} to {esc(r.get('to'))}" + (f", {usd(r.get('ech_mo'))}/mo" if r.get("ech_mo") is not None else "") + ")"
+        for r in rows[:6]
+    ) + ("" if len(rows) <= 6 else f", and {len(rows) - 6} more")
+    many = len(rows) != 1
+    body = (
+        f"Elastic Cloud Serverless is not offered in {'these regions' if len(pairs) > 1 else 'this region'}, so "
+        f"{len(rows)} US ECH {'deployments are' if many else 'deployment is'} quoted in the nearest offered region of the same provider: "
+        f"{esc('; '.join(pairs))}"
+        + (f", {usd(total)}/mo of ECH billing" if total is not None else "")
+        + f". {named}. The US has no data-residency constraint here, and staying on one provider keeps a marketplace purchase valid. "
+        "Moving needs a region migration: a serverless project cannot change region after it is created, and latency, data transfer "
+        "and cutover work are not in the estimate."
+    )
+    return callout("Region change assumed: quoted in a different region of the same provider", body, "warning")
+
+
 def _stays_on_ech_cover(c: dict) -> str:
     """The cover callout for workloads in a region Elastic Cloud Serverless is not offered in."""
     support = (c or {}).get("region_support") or {}
@@ -3767,6 +3792,7 @@ def render_consolidation_html(acc: dict) -> str:
     # How much of this price was measured, beside the price itself. Pass and Fail answer a
     # different question, and a quote can pass every check on inputs that were largely assumed.
     B.append(_confidence_cover(integrity))
+    B.append(_region_swap_cover(c))
     B.append(_stays_on_ech_cover(c))
     rc = c.get("reconciliation") or {}
     project_n = _priced_project_count(svl)

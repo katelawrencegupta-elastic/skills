@@ -50,6 +50,8 @@ The supported regions are the Elastic Cloud Serverless regions page, https://www
 
 An ECH deployment whose provider and region are not on that page is not quoted on Serverless. `apply_diagnostics` marks it `ingest_source` `unsupported_region`: no ingest and no stored GB go to the estimators, it is not a serverless project in the plan or the per-region sheets, and its bundle is not counted as unmatched. Its workload continues on ECH. The comparison leaves its billed cost out under every `--ech-scope`, `ech_scope.unpriced` lists it with `stays_on_ech`, and `ech_scope.stays_on_ech_mo` and `stays_on_ech_deployments` report it on its own. It is not counted as a deployment the quote failed to price, so it does not lower Priced share and is not named in that check. The cover callout, the notes, `region_support` in the brief and the `region_not_on_serverless` limit say which deployments, which regions and what they bill on ECH. A deployment with no known provider or region is not treated as unsupported.
 
+A US deployment is the exception. The US has no data-residency constraint, and staying on one provider keeps a marketplace purchase valid, so a US region the page does not list is quoted in the nearest offered region of the same provider (`US_SWAPS` in `serverless_regions.py`: Azure `southcentralus` to `centralus`, for example). The deployment is sized and priced as normal in that region and stays in the comparison. The cover callout "Region change assumed", the notes (`REGION CHANGE ASSUMED`), `region_support.swapped` in the brief and the `region_swapped` limit say which deployments moved from and to which region and what they bill on ECH. The swap is an assumption: a serverless project cannot change region after it is created, and the latency, data-transfer and cutover work is not in the estimate. A non-US region is never swapped, because the country may matter, so that workload stays on ECH.
+
 A region the page lists but an estimator sheet does not is a different case. It is still priced at that provider's default and flagged by the Region fidelity check.
 
 ## Source precedence and estimation limits
@@ -75,6 +77,7 @@ A step that ran degraded is a limit too, not a line on the terminal. `run_consol
 | `ml_node_ecu_unverified` | ML-node ECU was not carried to the serverless total |
 | `retention_month_fallback` | The sheets took the 12-month default instead of the index average |
 | `search_quote_window_telemetry` | Search was not priced: the exact-window index telemetry fetch failed after 2 attempts of 600s each. The serverless total leaves Search out and the run should be repeated. Runs queue on a lock in the artifacts root, so parallel runs fetch one at a time |
+| `region_swapped` | US ECH deployments are quoted in a different region of the same provider because Serverless is not offered in their own |
 | `region_not_on_serverless` | ECH deployments in a region Elastic Cloud Serverless is not offered in stay on ECH: no serverless price, and their ECH bill is out of the comparison |
 | `billing_reconciliation_outside_window` | Daily deployment billing missed org billing on some days, but fewer than 5% of the quote window's days. The ECH comparison was kept (medium severity) |
 | `estimate_dedupe_failed`, `pdf_export_failed`, `pdf_upload_failed` | Delivery steps; the quote itself is unaffected |
