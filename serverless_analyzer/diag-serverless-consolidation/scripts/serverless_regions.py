@@ -78,3 +78,40 @@ US_SWAPS: dict[tuple[str, str], str] = {
 def us_alternative(provider, region) -> str | None:
     """The offered region a US deployment is quoted in instead, or None. Never a non-US region."""
     return US_SWAPS.get((_provider(provider), str(region or "").strip().lower()))
+
+
+def deployment_providers(acc: dict) -> dict[str, str]:
+    """Each ECH deployment's own cloud provider, from the account's cloud records.
+
+    A multi-cloud account has no single provider. Pricing a Search project in an AWS region against
+    the account's Azure provider finds no price or the wrong one, so every project takes the provider
+    of the deployments in it.
+    """
+    out: dict[str, str] = {}
+    for row in ((acc.get("cloud") or {}).get("by_deployment") or []):
+        if isinstance(row, dict) and row.get("name") and row.get("provider"):
+            out[str(row["name"])] = str(row["provider"])
+    return out
+
+
+def group_provider(acc: dict, names, default=None):
+    """The provider of the deployments in one project: the most common one, else `default`."""
+    known = deployment_providers(acc)
+    counts: dict[str, int] = {}
+    for name in names or []:
+        prov = known.get(str(name))
+        if prov:
+            counts[prov] = counts.get(prov, 0) + 1
+    if not counts:
+        return default
+    return max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+
+
+def solution_provider(acc: dict, solution: str, default=None):
+    """The provider of the ECH deployments behind one solution, for a project with no regional split."""
+    names = [
+        d.get("name") for d in (acc.get("solutions") or {}).get("by_deployment") or []
+        if isinstance(d, dict) and d.get("platform") != "serverless" and (d.get("solution") or "search") == solution
+        and d.get("ingest_source") not in ("inactive", "unsupported_region")
+    ]
+    return group_provider(acc, names, default)

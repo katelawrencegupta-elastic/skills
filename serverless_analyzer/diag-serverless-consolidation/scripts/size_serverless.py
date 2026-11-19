@@ -41,6 +41,7 @@ from sheets_io import (
     copy_verified, dedupe_estimates, ensure_drive_folder, export_xlsx, push_cells, read_cells,
     services, sheet_id, trash_file, write_search_sheet,
 )
+from serverless_regions import solution_provider  # noqa: E402
 from estimate_paths import (
     _fill_missing_doc_bytes, _months_for_sheet, _search_volume_scale, _suffix, architecture_regions,
     estimate_title, estimator_skip, fleet_sheet_region, open_estimate_place, prefer_regional_estimators,
@@ -177,7 +178,7 @@ def main() -> None:
             result = run_es3({
                 "stored_gb": float(se.get("stored_gb") or 0) * store_scale,
                 "org_stored_gb": org_store_gb(acc) * store_scale,
-                "provider": provider,
+                "provider": solution_provider(acc, "search", provider),
                 "region": search_scope or region,
                 "support_tier": support,
                 "workload": se.get("workload") or acc.get("workload") or {},
@@ -264,7 +265,7 @@ def main() -> None:
         o_months = _months_for_sheet(o, args.force_months)
         copied, reused, layout = copy_verified(drive, sheets, args.o11y_id, title_o, folder["id"], reuse=not args.fresh, kind="observability", tab=O11Y_TAB)
         opts = region_options(sheets, copied["id"])
-        reg, how = match_region(provider, o_scope or region, opts)
+        reg, how = match_region(solution_provider(acc, "observability", provider), o_scope or region, opts)
         if how == "none" or not reg:
             reason = _region_rejected(o_scope or region)
             try:
@@ -329,7 +330,7 @@ def main() -> None:
         s_months = _months_for_sheet(s, args.force_months)
         copied, reused, layout = copy_verified(drive, sheets, args.security_id, title_s, folder["id"], reuse=not args.fresh, kind="security", tab=SEC_TAB)
         opts = region_options(sheets, copied["id"])
-        reg, how = match_region(provider, s_scope or region, opts)
+        reg, how = match_region(solution_provider(acc, "security", provider), s_scope or region, opts)
         if how == "none" or not reg:
             reason = _region_rejected(s_scope or region)
             try:
@@ -381,7 +382,7 @@ def main() -> None:
             result = run_es3({
                 "stored_gb": float(se.get("stored_gb") or 0) * store_scale,
                 "org_stored_gb": org_store_gb(acc) * store_scale,
-                "provider": provider,
+                "provider": solution_provider(acc, "search", provider),
                 "region": search_scope or region,
                 "support_tier": support,
                 "workload": se.get("workload") or acc.get("workload") or {},

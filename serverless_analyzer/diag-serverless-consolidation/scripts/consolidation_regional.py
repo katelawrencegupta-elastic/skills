@@ -6,6 +6,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from serverless_regions import group_provider
 from consolidation_scope import (
     BILLING_WINDOW_MIN_SHARE, ESTIMATE_MONTHS, _clear_components, _money, _stash_model,
     e73_blocks_quote, ingest_echo, integrity_score, region_match_how, unpriced_reason,
@@ -220,7 +221,7 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                 result = {"readback": saved_rb, "profiles": saved_hit.get("profiles"), "region_match": saved_hit.get("region_match")} if _money(saved_rb.get("monthly_steady_state")) is not None else _es3_region({
                     "stored_gb": g["stored_gb"],
                     "org_stored_gb": org_gb,
-                    "provider": provider,
+                    "provider": group_provider(acc, g.get("deployments"), provider),
                     "region": g["region"],
                     "support_tier": support,
                     "workload": workload,

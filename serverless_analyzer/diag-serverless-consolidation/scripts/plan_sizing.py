@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from serverless_regions import deployment_providers, group_provider
 from sizing_shared import (
     O11Y_READBACK, O11Y_TAB, SEC_READBACK, SEC_TAB, TemplateMismatch, e73_blocks_quote, echo_gate,
     observability_echo_gate, observability_readback, sheet_money,
@@ -160,7 +161,7 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
                 "stored_gb": gb,
                 "parent_id": folder["id"],
                 "local_dir": str(local_dir),
-                "provider": provider,
+                "provider": group_provider(acc, g.get("deployments"), provider),
                 "support": support,
                 "feature_tier": feature_tier,
                 "skip_xlsx": skip_xlsx,
@@ -562,6 +563,7 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
         if dep.get("platform") != "serverless"
     }
     diagnostic_basis = ingest_basis(acc) == "metered"
+    providers = deployment_providers(acc)
     rows = []
     for dep in plan_roster(acc):
         measured_rec = measured.get(dep.get("name"))
@@ -576,7 +578,7 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
             "name": dep.get("name") or "",
             "solution": _plan_solution(dep, rec),
             "region": dep.get("region") or rec.get("region") or "",
-            "provider": dep.get("provider") or provider,
+            "provider": providers.get(str(dep.get("name"))) or dep.get("provider") or provider,
             "bulk_gb_day": 0 if diagnostic_basis and measured_rec is None else rec.get("daily_raw_gb") or 0,
             "store_gb": store_gb,
             "retention_days": rec.get("retention_days"),

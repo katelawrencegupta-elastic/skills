@@ -744,6 +744,59 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertIn("southcentralus to centralus", cover)
         self.assertIn("cannot change region after it is created", cover)
 
+    def test_a_tiny_search_project_keeps_a_positive_share_of_the_ingest_rate(self):
+        from es3_estimate import ingest_workloads, scale_search_workload, workload_share
+        org = {"ingest": {"docs_per_sec": 120.0, "avg_doc_bytes": 900.0}, "quote_window_telemetry": {"status": "complete"}}
+        # 0.01 GB of a 53,623 GB org: the share is about 2e-7. It rounded to 0.0 at four decimals and the
+        # estimator then reported no measured ingest, which dropped the whole deployment plan.
+        scaled = scale_search_workload(org, workload_share(0.01, 53622.9))
+        self.assertGreater(scaled["ingest"]["docs_per_sec"], 0)
+        rows = ingest_workloads(scaled, [])
+        self.assertGreater(rows[0]["docs_per_sec"], 0)
+
+    def test_each_project_is_priced_on_its_own_deployments_provider(self):
+        from serverless_regions import deployment_providers, group_provider
+        acc = {"cloud": {"summary": {"provider": "AZURE"}, "by_deployment": [
+            {"name": "a", "provider": "AWS", "region": "us-east-1"},
+            {"name": "b", "provider": "AWS", "region": "us-east-1"},
+            {"name": "c", "provider": "GCP", "region": "us-central1"},
+            {"name": "d", "provider": "AZURE", "region": "eastus"},
+        ]}}
+        self.assertEqual(deployment_providers(acc), {"a": "AWS", "b": "AWS", "c": "GCP", "d": "AZURE"})
+        self.assertEqual(group_provider(acc, ["a", "b"], "AZURE"), "AWS")
+        self.assertEqual(group_provider(acc, ["c"], "AZURE"), "GCP")
+        # No cloud record for the group: the account default, as before.
+        self.assertEqual(group_provider(acc, ["zzz"], "AZURE"), "AZURE")
+        self.assertEqual(group_provider(acc, [], None), None)
+
+    def test_the_deployment_plan_rows_carry_each_deployments_own_provider(self):
+        from unittest import mock
+        import plan_sizing
+        acc = {
+            "meta": {"run_key": "k"},
+            "cloud": {"summary": {"provider": "AZURE"}, "by_deployment": [
+                {"name": "aws-search", "provider": "AWS", "region": "us-east-1"},
+                {"name": "gcp-search", "provider": "GCP", "region": "us-central1"},
+            ]},
+            "solutions": {"by_deployment": [
+                {"name": "aws-search", "solution": "search", "platform": "ech", "gb": 10, "daily_raw_gb": 0, "ingest_source": "diagnostics", "region": "us-east-1"},
+                {"name": "gcp-search", "solution": "search", "platform": "ech", "gb": 20, "daily_raw_gb": 0, "ingest_source": "diagnostics", "region": "us-central1"},
+            ]},
+            "deployments": {"active": {"names": ["aws-search", "gcp-search"], "month": "2026-10"}},
+            "sizing": {"consolidated": {}}, "storage": {},
+        }
+        seen = {}
+
+        def capture(rows, **kwargs):
+            seen["rows"] = rows
+            return [], [], "stop here", 1
+
+        with mock.patch.object(plan_sizing, "plan_sheet_jobs", side_effect=capture):
+            plan_sizing.size_deployment_plan(acc, None, None, {"id": "x"}, o11y_id="o", security_id="s", support="Premium",
+                                             provider="AZURE", force_months=None, name_suffix="", fresh=False)
+        by = {r["name"]: r["provider"] for r in seen["rows"]}
+        self.assertEqual(by, {"aws-search": "AWS", "gcp-search": "GCP"})
+
     def test_apply_diagnostics_leaves_an_unsupported_region_out_of_the_sizing(self):
         acc = {
             "deployments": {"active": {"month": "2026-10", "names": ["ok", "far"]}},
@@ -783,7 +836,7 @@ class ReviewRegressionTests(unittest.TestCase):
         cover = render_consolidation_html({**acc, "consolidation": cons}).split("<section class='sec newpage'>", 1)[0]
         self.assertIn("Monthly spend: last 3 months on ECH, and after consolidation", cover)
         self.assertIn("ECH carried over, region not offered on Serverless", cover)
-        self.assertIn("Dark grey is ECH that cannot move", cover)
+        self.assertIn("that cannot move because Serverless is not offered in the region", cover)
         self.assertIn("stays on ECH", cover)
         # Each bar is labelled with its stack: the ECH months are compared + stays + unvalidated, and the
         # after bar is serverless + the ECH that stays + the unvalidated part.

@@ -52,6 +52,8 @@ An ECH deployment whose provider and region are not on that page is not quoted o
 
 A US deployment is the exception. The US has no data-residency constraint, and staying on one provider keeps a marketplace purchase valid, so a US region the page does not list is quoted in the nearest offered region of the same provider (`US_SWAPS` in `serverless_regions.py`: Azure `southcentralus` to `centralus`, for example). The deployment is sized and priced as normal in that region and stays in the comparison. The cover callout "Region change assumed", the notes (`REGION CHANGE ASSUMED`), `region_support.swapped` in the brief and the `region_swapped` limit say which deployments moved from and to which region and what they bill on ECH. The swap is an assumption: a serverless project cannot change region after it is created, and the latency, data-transfer and cutover work is not in the estimate. A non-US region is never swapped, because the country may matter, so that workload stays on ECH.
 
+Every project is priced on the provider of the deployments in it, taken from each deployment's own cloud record, never on one account-wide provider. A multi-cloud account has no single provider, and pricing an AWS or GCP region against Azure rates returns the Azure default or no price at all (`serverless_regions.deployment_providers`, `group_provider` and `solution_provider`).
+
 A region the page lists but an estimator sheet does not is a different case. It is still priced at that provider's default and flagged by the Region fidelity check.
 
 ## Source precedence and estimation limits

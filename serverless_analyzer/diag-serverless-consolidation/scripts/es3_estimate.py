@@ -222,7 +222,9 @@ def scale_search_workload(workload: dict, share: float) -> dict:
         wl["search"] = search
     ingest = dict(wl.get("ingest") or {})
     if ingest.get("docs_per_sec") is not None:
-        ingest["docs_per_sec"] = round(float(ingest["docs_per_sec"]) * factor, 4)
+        # A project with a tiny store has a tiny share. Four decimals rounded it to zero and the
+        # estimator then said it had no measured ingest, which dropped the whole plan.
+        ingest["docs_per_sec"] = round(float(ingest["docs_per_sec"]) * factor, 10)
         wl["ingest"] = ingest
     return wl
 
@@ -245,7 +247,7 @@ def ingest_workloads(workload: dict, assumptions: list[str]) -> list[dict]:
     hours = MONTHLY_HOURS if active is None else min(MONTHLY_HOURS, max(0.0, float(active)))
     return [
         {
-            "docs_per_sec": round(float(dps), 4),
+            "docs_per_sec": round(float(dps), 10),
             "avg_doc_size_bytes": float(avg),
             "active_hours_per_month": round(hours, 2),
         }
