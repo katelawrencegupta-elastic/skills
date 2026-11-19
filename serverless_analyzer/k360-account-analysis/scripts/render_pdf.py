@@ -491,7 +491,7 @@ def _axis_lines(cat: str) -> list[str]:
 
 def bar_chart(categories: list[str], series: list[tuple[str, list[float]]], *, stacked: bool = False, width: int = 640, height: int = 230,
               ref: tuple[float, str] | None = None, show_values: bool = False, prefix: str = "", colors: list[str] | None = None, exact_values: bool = False,
-              sublabels: list[str] | None = None) -> str:
+              sublabels: list[str] | None = None, label_first: int | None = None) -> str:
     colors = colors or PALETTE
     dx, dy = 9.0, 6.0
     wrapped = [_axis_lines(c) for c in categories]
@@ -537,7 +537,9 @@ def bar_chart(categories: list[str], series: list[tuple[str, list[float]]], *, s
             for y, bh, _v, fill, cap in drawn:
                 out.append(_vbar3d(x0, y, face, bh, fill, dx=depth, dy=rise, cap=cap))
             if show_values and base:
-                out.append(f"<text x='{x0 + face / 2:.1f}' y='{pt + h - h * base / vmax - rise - 4:.1f}' text-anchor='middle' fill='#343741' font-weight='700'>{lab(base)}</text>")
+                shown = sum(float(vals[i] or 0) for _, vals in series[:label_first]) if label_first else base
+                if shown:
+                    out.append(f"<text x='{x0 + face / 2:.1f}' y='{pt + h - h * base / vmax - rise - 4:.1f}' text-anchor='middle' fill='#343741' font-weight='700'>{lab(shown)}</text>")
             lx = x0 + face / 2
         else:
             face = max(bw - depth - 3, bw * 0.62)
@@ -3768,10 +3770,30 @@ def render_consolidation_html(acc: dict) -> str:
             ("ECH billed cost" if cover_rate is None else "ECH at contract rate", [v for _m, v in costs] + [0.0]),
             (svl_cat, [0.0] * len(costs) + [float(svl_total)]),
         ]
+        # ECH billed on deployments with no diagnostic bundle is shown greyed out on top of its month. It has no
+        # validated serverless price, so it is not in the compared total and the bar label leaves it out.
+        grey_by_month = {str(r.get("month")): float(r.get("unvalidated") or 0) for r in (priced_block.get("months") or [])} if (scope_unavailable or priced_scope) else {}
+        grey = [grey_by_month.get(str(r.get("month")), 0.0) * usd_per_ecu for r in recent]
+        chart_colors_m = [PALETTE[0], PALETTE[2]]
+        subs_m = ([compare_subs[0] or ""] * len(costs) + [compare_subs[1] or ""]) if compare_subs else None
+        label_first = None
+        if any(g > 0 for g in grey):
+            m_series.append(("No diagnostic bundle, unvalidated", grey + [0.0]))
+            chart_colors_m = [PALETTE[0], PALETTE[2], "#C9CED6"]
+            label_first = 2
+            subs_m = [(f"{(subs_m[i] if subs_m else '')} · +{usd(g)} unvalidated".strip(" ·") if g > 0 else (subs_m[i] if subs_m else "")) for i, g in enumerate(grey)] + [(subs_m[-1] if subs_m else "")]
         B.append(f"<h3>Last {len(costs)} months of ECH spend vs. the {est_months}-month serverless estimate</h3>" + bar_chart(
             m_cats, m_series, stacked=True, width=940, height=168, show_values=True, prefix="$", exact_values=True,
-            colors=[PALETTE[0], PALETTE[2]],
-            sublabels=([compare_subs[0] or ""] * len(costs) + [compare_subs[1] or ""]) if compare_subs else None) + rate_label)
+            colors=chart_colors_m, sublabels=subs_m, label_first=label_first) + rate_label)
+        if label_first:
+            unval = priced_block.get("unvalidated") or {}
+            names = ", ".join(str(n) for n in (unval.get("names") or [])[:8])
+            more = len(unval.get("names") or []) - 8
+            B.append(caption(
+                f"Grey is ECH cost billed on {len(unval.get('names') or [])} {'deployment' if len(unval.get('names') or []) == 1 else 'deployments'} with no diagnostic bundle ({esc(names)}{f' and {more} more' if more > 0 else ''}), "
+                f"about {usd(unval.get('avg_mo'))}/mo on average. It is shown but unvalidated: no serverless price was computed for it, "
+                "so it is not in the comparison, and the bar labels count only the compared deployments."
+            ))
         compare_cost = costs[-1][1] if window_unstable else avg_cost
         diff = compare_cost - float(svl_total)  # positive is a saving, as everywhere else on the cover
         rows = [[label, usd(v), "—"] for label, v in costs]

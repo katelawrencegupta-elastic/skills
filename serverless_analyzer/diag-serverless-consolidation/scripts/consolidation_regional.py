@@ -830,6 +830,11 @@ def recent_ech_months_priced(acc: dict, by_solution: dict, n: int = 3) -> dict:
             "unpriced_avg_mo": round(sum(row["avg_mo"] for row in unpriced), 2) if unpriced else 0.0,
             "basis": "monthly_by_deployment",
         }
+    # A deployment billed on ECH with no diagnostic bundle has a cost but no validated price. Its months
+    # ride beside the priced ones so the cover can show the cost greyed out. They never enter `cost`.
+    unvalidated_names = [row["name"] for row in unpriced if row["reason"] == "no diagnostic bundle"]
+    for row in unpriced:
+        row["unvalidated"] = row["name"] in unvalidated_names
     months = []
     for index, label in chosen:
         total = 0.0
@@ -837,7 +842,12 @@ def recent_ech_months_priced(acc: dict, by_solution: dict, n: int = 3) -> dict:
             series = by_dep.get(name) or []
             if index < len(series):
                 total += float(series[index] or 0)
-        months.append({"month": label, "cost": round(total, 2)})
+        grey = 0.0
+        for name in unvalidated_names:
+            series = by_dep.get(name) or []
+            if index < len(series):
+                grey += float(series[index] or 0)
+        months.append({"month": label, "cost": round(total, 2), "unvalidated": round(grey, 2)})
     average = round(sum(row["cost"] for row in months) / len(months), 2) if months else None
     latest_cost = months[-1]["cost"] if months else None
     stable = None
@@ -859,6 +869,10 @@ def recent_ech_months_priced(acc: dict, by_solution: dict, n: int = 3) -> dict:
         "stable": stable,
         "unpriced": unpriced,
         "unpriced_avg_mo": round(sum(row["avg_mo"] for row in unpriced), 2) if unpriced else 0.0,
+        "unvalidated": {
+            "names": unvalidated_names,
+            "avg_mo": round(sum(row["avg_mo"] for row in unpriced if row["unvalidated"]), 2),
+        },
         "basis": "monthly_by_deployment",
     }
 

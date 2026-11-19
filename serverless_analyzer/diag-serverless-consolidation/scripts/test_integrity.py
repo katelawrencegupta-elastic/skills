@@ -611,7 +611,11 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertIn("304 ECU/mo", header)                        # the whole window, 10 a day
         self.assertNotIn("182 ECU/mo", header)                     # not the 6 a day that is compared
         cover = html.split("<section class='sec newpage'>", 1)[0]
-        self.assertIn(">2 deployments<", cover)                    # the ECH bar bills for the two priced ones
+        self.assertIn(">2 deployments", cover)                     # the ECH bar bills for the two priced ones
+        # The one deployment with no bundle is shown greyed out and called unvalidated, not compared.
+        self.assertIn("#C9CED6", cover)
+        self.assertIn("No diagnostic bundle, unvalidated", cover)
+        self.assertIn("unvalidated: no serverless price was computed", cover)
         self.assertIn("The ECH bar bills for the priced ones only.", cover)
         # Each deployment's row is its own part of the window, the same figure the scope note uses.
         rows = {r["name"]: r["ech_ecu_mo"] for r in cons["by_deployment"]}

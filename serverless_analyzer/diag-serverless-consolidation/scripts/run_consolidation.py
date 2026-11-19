@@ -566,6 +566,8 @@ def _priced_months_brief(block) -> dict | None:
         "comparison": block.get("comparison"),
         "comparison_basis": block.get("comparison_basis"),
         "stable": block.get("stable"),
+        "unpriced": block.get("unpriced") or [],
+        "unvalidated": block.get("unvalidated") or {},
     }
 
 
