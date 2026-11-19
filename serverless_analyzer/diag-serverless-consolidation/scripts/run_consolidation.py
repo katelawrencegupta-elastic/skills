@@ -600,6 +600,10 @@ def chat_lines(brief: dict) -> list[str]:
     else:
         head.append(f"Serverless ${float(monthly):,.0f}/mo")
 
+    share = (brief.get("ech_scope") or {}).get("compared_share_pct")
+    if share is not None and float(share) < 99.5:
+        head[0] += f" · compared on {float(share):.0f}% of the ECH bill"
+
     drivers = [row for row in (conf.get("drivers") or []) if isinstance(row, dict)]
     warnings = [
         str(row.get("check"))

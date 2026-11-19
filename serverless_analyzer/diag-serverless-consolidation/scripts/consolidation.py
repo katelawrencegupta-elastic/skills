@@ -701,6 +701,18 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
     savings["ech_basis"] = "k360_cost"
     if ml_eis_mo is not None:
         savings["ml_eis_mo"] = ml_eis_mo
+    # The part that cannot move keeps billing on ECH at the same cost. Beside the serverless estimate it
+    # gives the monthly the account would pay for the quoted workload plus what stays, against ECH today.
+    stays_mo = region_support.get("stays_on_ech_mo")
+    if stays_mo and savings.get("serverless_mo") is not None and savings.get("ech_list_mo") is not None:
+        after = round(float(savings["serverless_mo"]) + float(stays_mo), 2)
+        today = round(float(savings["ech_list_mo"]) + float(stays_mo), 2)
+        region_support["with_stays"] = {
+            "serverless_plus_stays_mo": after,
+            "ech_today_mo": today,
+            "delta_mo": round(today - after, 2),
+            "delta_pct": round(100 * (today - after) / today, 1) if today else None,
+        }
 
     # ---- per-deployment standalone pricing + fragmentation
     sol_deps = (acc.get("solutions") or {}).get("by_deployment") or []

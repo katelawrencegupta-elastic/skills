@@ -672,8 +672,14 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertNotIn("sec", {n for g in cons["architecture"]["groups"] for n in g.get("deployments", [])})
         # And the cover says so.
         cover = render_consolidation_html({**acc, "consolidation": cons}).split("<section class='sec newpage'>", 1)[0]
-        self.assertIn("Stays on ECH: region not offered on Serverless", cover)
+        self.assertIn("Cannot be moved:", cover)
+        self.assertIn("stays on ECH, region not offered on Serverless", cover)
         self.assertIn("asia-east1", cover)
+        # How it carries over: serverless plus the part that stays, against ECH today including that part.
+        ws = support["with_stays"]
+        self.assertAlmostEqual(ws["serverless_plus_stays_mo"], cons["savings"]["serverless_mo"] + support["stays_on_ech_mo"], places=1)
+        self.assertAlmostEqual(ws["ech_today_mo"], cons["savings"]["ech_list_mo"] + support["stays_on_ech_mo"], places=1)
+        self.assertIn("How it carries over", cover)
 
     def test_apply_diagnostics_leaves_an_unsupported_region_out_of_the_sizing(self):
         acc = {
@@ -700,6 +706,19 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(cov["matched"], 1)
         self.assertEqual(cov["bulk_gb_day"], 5.0)
         self.assertEqual(cov["unmatched_diagnostics"], [])
+
+    def test_the_cover_shows_the_share_of_the_bill_that_is_compared(self):
+        acc = scope_account(ech_scope="priced", keep_serverless_spend=False)
+        cons = build_consolidation(acc, None)
+        scope = cons["ech_scope"]
+        self.assertAlmostEqual(scope["compared_share_pct"], round(100 * scope["in_comparison_mo"] / scope["window_mo"], 1))
+        cover = render_consolidation_html({**acc, "consolidation": cons}).split("<section class='sec newpage'>", 1)[0]
+        self.assertIn(f"Compared on {scope['compared_share_pct']:.0f}% of the ECH bill", cover)
+        self.assertIn("No serverless price", cover)
+        # The chat headline carries it too.
+        from run_consolidation import chat_lines
+        line = chat_lines({"savings": {"serverless_mo": 100}, "ech_scope": scope, "integrity": {"passed": True, "confidence": {"band": "High", "score": 0.9}}, "method": {}})[0]
+        self.assertIn(f"compared on {scope['compared_share_pct']:.0f}% of the ECH bill", line)
 
     def test_the_cover_names_the_whole_bill_and_the_compared_part(self):
         acc = scope_account(ech_scope="priced", keep_serverless_spend=False)

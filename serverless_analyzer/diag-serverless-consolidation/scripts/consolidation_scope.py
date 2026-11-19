@@ -388,6 +388,7 @@ def ech_scope(acc: dict, by_solution: dict) -> dict | None:
         "window_mo": round(total * as_month, 2),
         "priced_mo": round(priced * as_month, 2),
         "unpriced_mo": round((unpriced_total - stays) * as_month, 2),
+        "compared_share_pct": round(100 * compared / total, 1) if total > 0 else None,
         "stays_on_ech_mo": round(stays * as_month, 2),
         "stays_on_ech_deployments": stays_n,
         "serverless_mo": round(serverless * as_month, 2),

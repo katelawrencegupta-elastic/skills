@@ -2025,6 +2025,47 @@ def _integrity_block(acc: dict) -> str:
 _CONFIDENCE_TONE = {"High": "success", "Moderate": "warning", "Low": "danger"}
 
 
+def _compared_share_cover(c: dict) -> str:
+    """How much of the ECH bill the cover's comparison covers, and where the rest sits.
+
+    A saving or an increase on a small part of the bill reads like one on the whole bill, so the
+    share is on the page next to the numbers. Silent when the comparison is the whole window.
+    """
+    scope = (c or {}).get("ech_scope") or {}
+    if scope.get("status") != "complete":
+        return ""
+    try:
+        window = float(scope.get("window_mo") or 0)
+        compared = float(scope.get("in_comparison_mo") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if window <= 0 or abs(window - compared) <= 0.5:
+        return ""
+    share = 100 * compared / window
+    parts = [("Compared", compared, "#0B64DD")]
+    if scope.get("scope") == "priced":
+        parts += [
+            ("Stays on ECH, region not offered on Serverless", float(scope.get("stays_on_ech_mo") or 0), "#69707D"),
+            ("No serverless price", float(scope.get("unpriced_mo") or 0), "#C9CED6"),
+            ("Existing serverless projects", float(scope.get("serverless_mo") or 0), "#98A2B3"),
+            ("No deployment on the roster", float(scope.get("other_mo") or 0), "#E1E4E8"),
+        ]
+    else:
+        parts += [("Stays on ECH, region not offered on Serverless", float(scope.get("stays_on_ech_mo") or 0), "#69707D")]
+    parts = [p for p in parts if p[1] > 0.5]
+    segs = "".join(
+        f"<div title='{esc(name)} {usd(val)}/mo' style='width:{max(100 * val / window, 0.6):.2f}%;background:{color}'></div>"
+        for name, val, color in parts
+    )
+    legend = " · ".join(f"<span style='white-space:nowrap'><i style='display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px;background:{color}'></i>{esc(name)} {usd(val)}/mo</span>" for name, val, color in parts)
+    body = (
+        f"The cover's saving or increase is on {share:.0f}% of the ECH bill: {usd(compared)} of {usd(window)}/mo billed in the window. "
+        f"<div style='display:flex;height:10px;margin:6px 0 4px;border-radius:3px;overflow:hidden;background:#EEF2F7'>{segs}</div>"
+        f"<div style='font-size:11px'>{legend}</div>"
+    )
+    return callout(f"Compared on {share:.0f}% of the ECH bill", body, "warning" if share < 50 else "info")
+
+
 def _stays_on_ech_cover(c: dict) -> str:
     """The cover callout for workloads in a region Elastic Cloud Serverless is not offered in."""
     support = (c or {}).get("region_support") or {}
@@ -2046,7 +2087,22 @@ def _stays_on_ech_cover(c: dict) -> str:
         + f" and {'are' if many else 'is'} not in the comparison. {named}. "
         f"Supported regions are the <a href='{esc(support.get('source'))}'>Serverless regions page</a>, read {esc(support.get('source_read'))}."
     )
-    return callout("Stays on ECH: region not offered on Serverless", body, "warning")
+    carry = ""
+    ws = support.get("with_stays") or {}
+    if total is not None and ws:
+        delta = float(ws.get("delta_mo") or 0)
+        word = "saving" if delta > 0 else "increase"
+        carry = (
+            f"<div style='margin-top:6px'><b>How it carries over:</b> it keeps billing on ECH at the same cost. "
+            f"With the serverless estimate, the quoted workload plus this part costs {usd(ws.get('serverless_plus_stays_mo'))}/mo "
+            f"({usd((ws.get('serverless_plus_stays_mo') or 0) - total)} serverless + {usd(total)} ECH), "
+            f"against {usd(ws.get('ech_today_mo'))}/mo on ECH today: a {usd(abs(delta))}/mo {word}"
+            + (f" ({abs(float(ws['delta_pct'])):.1f}%)" if ws.get("delta_pct") is not None else "")
+            + ".</div>"
+        )
+    title = (f"Cannot be moved: {usd(total)}/mo stays on ECH, region not offered on Serverless" if total is not None
+             else "Stays on ECH: region not offered on Serverless")
+    return callout(title, body + carry, "warning")
 
 
 def _confidence_cover(integrity: dict) -> str:
@@ -3808,6 +3864,7 @@ def render_consolidation_html(acc: dict) -> str:
         chart_colors = [PALETTE[0], PALETTE[2]]
         chart_subs = compare_subs
     B.append(f"<div class='stats' style='grid-template-columns:repeat({len(stats)},1fr)'>{''.join(stats)}</div>")
+    B.append(_compared_share_cover(c))
     rate_label = ""
     if cover_rate is not None and cr.get("implied_usd_per_ecu") is not None:
         rate_label = caption(f"Contract rate ${cr.get('implied_usd_per_ecu')} per ECU")
