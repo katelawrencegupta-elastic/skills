@@ -302,8 +302,8 @@ def _apply_search_eis(
     notes.append(
         f"The Search EIS line includes activity found on {eis['deployments']} sized ECH Search deployment(s). "
         f"{pace_text}. EIS is ${usage:,.2f}/mo before support, based on billed inference ECU and tokens. "
-        f"ML-node ECU on those deployments (${eis['ml_node_ecu_mo']:,.2f}/mo) is not attributed to EIS. "
-        "The ECH comparison's ML-node exclusion is read separately, across every deployment in the comparison."
+        f"ML-node ECU on those deployments (${eis['ml_node_ecu_mo']:,.2f}/mo) is not in this EIS line. "
+        "ML capacity is carried to the serverless total separately, across every deployment in the comparison."
     )
 
 

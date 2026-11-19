@@ -242,7 +242,7 @@ def _quote_lines(by_solution: dict, sz: dict) -> list[dict]:
 
 def _sensitivity(acc: dict, sz: dict, by_solution: dict, dom: dict, dominant: str, con: dict,
                  ecu: dict, stored_gb: float, ech_mo: float, ech_window_mo: float,
-                 svls_total_mo: float, ech_comparison_available: bool) -> tuple[list[dict], list[dict]]:
+                 svls_total_mo: float, ech_comparison_available: bool, fixed_mo: float = 0.0) -> tuple[list[dict], list[dict]]:
     """Volume sensitivities. The estimator is not re-run: these rows scale one measurement."""
     e = ecu
     # ---- sensitivity: volume only. The quote is not re-run.
@@ -275,7 +275,7 @@ def _sensitivity(acc: dict, sz: dict, by_solution: dict, dom: dict, dominant: st
             scen.append(("ECH billing pace applied to the estimate (illustrative)", float(complete) / ech_window_mo))
         elif not quote_days and e.get("last_30d_daily_avg") and ech_window_mo:
             scen.append(("Last 30 days run-rate", float(e["last_30d_daily_avg"]) * DAYS_PER_MONTH / ech_window_mo))
-    eis_full = float((by_solution.get("search") or {}).get("eis_with_support_mo") or 0)
+    eis_full = float((by_solution.get("search") or {}).get("eis_with_support_mo") or 0) + float(fixed_mo or 0)
     eis_usage = float((by_solution.get("search") or {}).get("eis_mo") or 0)
     for label, k in scen:
         base = (svls_total_mo - eis_full) if svls_total_mo else 0.0
@@ -533,36 +533,41 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
                     f"${scope['unpriced_mo']:,.0f}/mo ({names}{more}), so the saving is overstated by their bill."
                 )
             notes.append(lead)
-    # No serverless project bills an ML node, so that capacity comes off the ECH side of the
-    # comparison. It is read over the deployments in the comparison, whatever solution they
-    # are, and whether or not Search returned a read-back. Telemetry that does not reconcile
-    # excludes nothing: an unverified deduction would overstate the saving.
+    # No serverless project bills an ML node, so the ML capacity ECH was paying for is carried
+    # to the serverless side as an EIS estimate instead of being dropped. It is read over the
+    # deployments in the comparison, whatever solution they are, and whether or not Search
+    # returned a read-back. It is priced at the ECU billed on ECH (1 ECU = $1), before support.
+    # Telemetry that does not reconcile carries nothing over: an unverified line would invent a price.
+    estimator_total_mo = svls_total_mo
     ml_read = ml_node_ecu(acc, comparison_deployment_names(scope)) if ech_comparison_available else {
         "status": "not_applicable", "reason": "the deployment-scoped ECH comparison is unavailable", "monthly": 0.0,
     }
-    ech_ml_excluded = None
+    ml_eis_mo = None
     if ech_comparison_available and ml_read.get("status") == "complete":
-        ech_ml_excluded = round(float(ml_read.get("monthly") or 0), 2)
-        if ech_ml_excluded:
-            ech_mo = round(max(0.0, float(ech_mo) - ech_ml_excluded), 2)
+        ml_eis_mo = round(float(ml_read.get("monthly") or 0), 2)
+        if ml_eis_mo and quoted:
+            svls_total_mo = round(svls_total_mo + ml_eis_mo, 2)
             word = "deployment" if int(ml_read.get("deployments") or 0) == 1 else "deployments"
             notes.append(
-                f"The ECH comparison excludes ${ech_ml_excluded:,.2f}/mo of quote-window ML-node ECU on "
-                f"{int(ml_read.get('deployments') or 0)} {word}. No serverless project bills an ML node, so that "
-                "capacity stays out of the serverless total. It is read across every deployment in the comparison, "
-                "not only the ones Search priced."
+                f"The serverless total includes ${ml_eis_mo:,.2f}/mo of ML capacity carried over as an EIS estimate: "
+                f"the quote-window ML-node ECU billed on {int(ml_read.get('deployments') or 0)} {word}, at 1 ECU = $1 and "
+                "before support. No serverless project bills an ML node, so this is a placeholder for the same ML work "
+                "moving to EIS inference or project VCUs, not an estimator read-back. It is read across every deployment "
+                "in the comparison, not only the ones Search priced."
             )
+        elif ml_eis_mo:
+            ml_eis_mo = 0.0
     elif ech_comparison_available and ml_read.get("status") == "incomplete":
         notes.append(
-            "ML-node ECU could not be verified from complete, reconciled quote-window telemetry, so none was taken "
-            f"out of the ECH comparison: {ml_read.get('reason')}. If the fleet runs ML nodes, the saving is understated."
+            "ML-node ECU could not be verified from complete, reconciled quote-window telemetry, so no ML capacity was "
+            f"carried to the serverless total: {ml_read.get('reason')}. If the fleet runs ML nodes, the serverless total is understated."
         )
         limits = sz.setdefault("diagnostics", {}).setdefault("estimation_limits", [])
         if not any(row.get("code") == "ml_node_ecu_unverified" for row in limits):
             limits.append({
                 "code": "ml_node_ecu_unverified",
                 "detail": (
-                    "ML-node ECU was not taken out of the ECH comparison because quote-window telemetry is "
+                    "ML-node ECU was not carried to the serverless total because quote-window telemetry is "
                     f"incomplete or does not reconcile: {ml_read.get('reason')}."
                 ),
                 "severity": "medium",
@@ -570,7 +575,7 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
     if quoted:
         notes.append(
             "Every serverless dollar comes from a named estimator: Search Serverless performant, or the Observability or Security Serverless estimator. "
-            "Search EIS is billed inference ECU and tokens at list; ML-node ECU remains separate and is not attributed to EIS. "
+            "Search EIS is billed inference ECU and tokens at list; any ML capacity carried over is a separate placeholder line. "
             "ECH dollars are the K360 billing cost field, summed as billed. No ARR ÷ commit rate is applied. Serverless is at estimator list."
         )
     if sz.get("ingest_source") == "diagnostics":
@@ -630,7 +635,7 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
             "list_yr": None,
             "list_pct": None,
         }
-        if ech_comparison_available and (ech_mo or ech_ml_excluded):
+        if ech_comparison_available and ech_mo:
             save_list_mo = ech_mo - svls_total_mo
             savings.update({
                 "ech_list_mo": round(ech_mo, 2),
@@ -641,8 +646,8 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
     else:
         savings = {"ech_list_mo": round(ech_mo, 2) if ech_comparison_available else None, "serverless_mo": None, "list_mo": None, "list_yr": None, "list_pct": None}
     savings["ech_basis"] = "k360_cost"
-    if ech_ml_excluded is not None:
-        savings["ech_ml_excluded_mo"] = ech_ml_excluded
+    if ml_eis_mo is not None:
+        savings["ml_eis_mo"] = ml_eis_mo
 
     # ---- per-deployment standalone pricing + fragmentation
     sol_deps = (acc.get("solutions") or {}).get("by_deployment") or []
@@ -705,7 +710,7 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
 
     retention_rows, fleet_rows = _sensitivity(
         acc, sz, by_solution, dom, dominant, con, e, stored_gb, ech_mo, ech_window_mo,
-        svls_total_mo, ech_comparison_available,
+        svls_total_mo, ech_comparison_available, fixed_mo=ml_eis_mo or 0.0,
     )
 
     # ---- architecture: one serverless project per solution per region
@@ -750,8 +755,8 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
     # The size-weighted age stays on `retention_months_measured` as a record.
 
     quotes = _quote_lines(by_solution, sz)
-    recon = {"kind": "readbacks", "quotes": quotes, "total_mo": round(svls_total_mo, 2), "quotable": "estimator read-backs"} if quotes else None
-    integrity = _integrity(acc, sz, by_solution, quotes, svls_total_mo, scope, priced_months)
+    recon = {"kind": "readbacks", "quotes": quotes, "total_mo": round(estimator_total_mo, 2), "quotable": "estimator read-backs"} if quotes else None
+    integrity = _integrity(acc, sz, by_solution, quotes, estimator_total_mo, scope, priced_months)
     for row in integrity.get("checks") or []:
         if row.get("warning") and row.get("detail"):
             notes.append(f"Warning: {row['detail']}")
@@ -793,12 +798,13 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         "retention_index_days": (acc.get("meta") or {}).get("retention_index_days"),
         "retention_index_count": (acc.get("meta") or {}).get("retention_index_count"),
         "ech_scope": scope,
-        # ML-node ECU taken off the ECH side, read over the comparison's deployments and
-        # independent of whether Search was quoted. `status` says whether any was excluded.
-        "ech_ml_exclusion": {
+        # ML-node ECU carried to the serverless side as an EIS estimate, read over the comparison's
+        # deployments and independent of whether Search was quoted. `status` says whether any was carried.
+        "ml_eis_carryover": {
             "status": ml_read.get("status"),
             "reason": ml_read.get("reason"),
-            "monthly": ech_ml_excluded,
+            "monthly": ml_eis_mo,
+            "basis": "ML-node ECU billed on ECH in the quote window, 1 ECU = $1, before support",
             "deployments": ml_read.get("deployments"),
             "by_deployment_mo": ml_read.get("by_deployment_mo") or {},
         },

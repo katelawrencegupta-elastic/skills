@@ -519,7 +519,7 @@ def consolidation_brief(acc: dict) -> dict:
         "fleet": ((cons.get("sensitivity") or {}).get("fleet")) or [],
         "contract_rate": cons.get("contract_rate"),
         "ech_scope": cons.get("ech_scope"),
-        "ech_ml_exclusion": cons.get("ech_ml_exclusion"),
+        "ml_eis_carryover": cons.get("ml_eis_carryover"),
         "ech_recent_months": cons.get("ech_recent_months"),
         "ech_recent_months_priced": _priced_months_brief(cons.get("ech_recent_months_priced")),
         "estimate_months": cons.get("estimate_months"),

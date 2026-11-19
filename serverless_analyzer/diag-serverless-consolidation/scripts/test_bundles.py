@@ -697,7 +697,7 @@ class MeasuredMixTests(unittest.TestCase):
         self.assertTrue(observability["pricing"].startswith("rejected"))
         self.assertEqual(observability["total_mo"], 0)
 
-    def test_bars_carry_the_cover_eis_and_ml_leaves_the_ech_side(self):
+    def test_bars_carry_the_cover_eis_and_ml_is_carried_to_serverless(self):
         from consolidation import per_cluster_plan
         acc = _quote_account(g28=10, e73=0)
         acc["ecu"]["monthly_avg_complete_months"] = 100
@@ -740,9 +740,12 @@ class MeasuredMixTests(unittest.TestCase):
             self.assertAlmostEqual(column, bar["monthly"], places=2)
         ml = search["ml_node_ecu_mo"]
         self.assertAlmostEqual(search["total_mo"], round(50 + eis, 2))
-        self.assertAlmostEqual(cons["savings"]["ech_ml_excluded_mo"], ml)
-        self.assertAlmostEqual(cons["savings"]["ech_list_mo"], round(cons["ech_scope"]["in_comparison_mo"] - ml, 2))
-        self.assertIn("ML-node ECU", " ".join(cons["notes"]))
+        self.assertAlmostEqual(cons["savings"]["ml_eis_mo"], ml)
+        # ECH keeps the ML nodes it billed, and the serverless total gains the same amount as an EIS estimate.
+        self.assertAlmostEqual(cons["savings"]["ech_list_mo"], cons["ech_scope"]["in_comparison_mo"])
+        estimators = sum(float(p.get("total_mo") or 0) for p in cons["serverless"]["by_solution"].values())
+        self.assertAlmostEqual(cons["serverless"]["total_mo"], round(estimators + ml, 2))
+        self.assertIn("carried over as an EIS estimate", " ".join(cons["notes"]))
 
     def _ml_only_fleet(self, *, ml=12.0, scope="all"):
         """Observability-only fleet: Search is never quoted, and an ML node bills on it."""
@@ -763,32 +766,30 @@ class MeasuredMixTests(unittest.TestCase):
         acc["sizing"]["estimators"]["search"] = {"status": "skipped — no search workload detected"}
         return acc
 
-    def test_ml_leaves_the_ech_side_when_search_was_never_quoted(self):
+    def test_ml_is_carried_to_serverless_when_search_was_never_quoted(self):
         acc = self._ml_only_fleet(ml=12.0)
         cons = build_consolidation(acc, None)
         search = cons["serverless"]["by_solution"]["search"]
         self.assertNotIn("quotable", str(search.get("pricing") or ""))
-        exclusion = cons["ech_ml_exclusion"]
+        exclusion = cons["ml_eis_carryover"]
         self.assertEqual(exclusion["status"], "complete")
         self.assertEqual(exclusion["deployments"], 1)
         self.assertGreater(exclusion["monthly"], 0)
-        self.assertEqual(cons["savings"]["ech_ml_excluded_mo"], exclusion["monthly"])
-        self.assertEqual(
-            cons["savings"]["ech_list_mo"],
-            round(cons["ech_scope"]["in_comparison_mo"] - exclusion["monthly"], 2),
-        )
+        self.assertEqual(cons["savings"]["ml_eis_mo"], exclusion["monthly"])
+        self.assertEqual(cons["savings"]["ech_list_mo"], cons["ech_scope"]["in_comparison_mo"])
+        self.assertAlmostEqual(cons["serverless"]["total_mo"], round(sum(float(p.get("total_mo") or 0) for p in cons["serverless"]["by_solution"].values()) + exclusion["monthly"], 2))
         self.assertIn("not only the ones Search priced", " ".join(cons["notes"]))
 
-    def test_an_unverified_ml_read_excludes_nothing_and_says_so(self):
+    def test_an_unverified_ml_read_carries_nothing_and_says_so(self):
         acc = self._ml_only_fleet(ml=12.0)
         # The authoritative total is non-zero and the daily series does not cover the window.
         acc["ai_ml"]["daily_usage_by_deployment"]["logs"]["days"] = ["2020-01-01"]
         cons = build_consolidation(acc, None)
-        self.assertEqual(cons["ech_ml_exclusion"]["status"], "incomplete")
-        self.assertIsNone(cons["ech_ml_exclusion"]["monthly"])
-        self.assertNotIn("ech_ml_excluded_mo", cons["savings"])
+        self.assertEqual(cons["ml_eis_carryover"]["status"], "incomplete")
+        self.assertIsNone(cons["ml_eis_carryover"]["monthly"])
+        self.assertNotIn("ml_eis_mo", cons["savings"])
         self.assertEqual(cons["savings"]["ech_list_mo"], cons["ech_scope"]["in_comparison_mo"])
-        self.assertIn("saving is understated", " ".join(cons["notes"]))
+        self.assertIn("serverless total is understated", " ".join(cons["notes"]))
         codes = [row.get("code") for row in acc["sizing"]["diagnostics"]["estimation_limits"]]
         self.assertIn("ml_node_ecu_unverified", codes)
 

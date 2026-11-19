@@ -41,7 +41,7 @@ The command prints `brief <path>`. That file is `<run_key>_consolidation_brief.j
 
 Quote only when `ingest_source` is `diagnostics`.
 
-Read from the brief: `savings`, `quotes`, `fleet`, `contract_rate`, `ech_scope`, `ech_ml_exclusion`, `ech_recent_months`, `ech_recent_months_priced`, `estimate_months`, `draft`, `notes`, `limits`, `region_matches`, `per_cluster_plan`, `diagnostics_coverage`, `excluded_deployments`, `method`, `deployment_plan`, `metered_rates`, `estimators`, `links`, `integrity`, `search_power`.
+Read from the brief: `savings`, `quotes`, `fleet`, `contract_rate`, `ech_scope`, `ml_eis_carryover`, `ech_recent_months`, `ech_recent_months_priced`, `estimate_months`, `draft`, `notes`, `limits`, `region_matches`, `per_cluster_plan`, `diagnostics_coverage`, `excluded_deployments`, `method`, `deployment_plan`, `metered_rates`, `estimators`, `links`, `integrity`, `search_power`.
 
 When the scope is unavailable, page 1 compares `ech_recent_months_priced` (`comparison`, `comparison_basis`, `stable`), not the whole-org `ech_recent_months`. `draft` true means the run is not verified.
 
@@ -61,7 +61,7 @@ Confirm these from the brief. Do not open the sheet.
 - A rejected region drops that whole solution, including Search. A region that is merely not on the estimator list is not rejected: it is priced at that provider's default and flagged, and `region_matches` in the brief says which region each sheet was written to.
 - `integrity.passed` is false when any scored check fails. Do not call a failed quote verified.
 - `integrity.confidence` is a different question: how much of the price was measured. Give the `band` (High, Moderate, Low) beside the monthly, and name `drivers` when it is not High. A quote can pass every check and still be Moderate. Rate window, Counter age, Rated ingest, Region fidelity, Retention basis and Retention month are warnings: they do not fail the quote, and `chat_lines` names them on their own line.
-- `ech_ml_exclusion.monthly` is ML-node ECU taken off the ECH side, because no serverless project bills an ML node. `status` `incomplete` means none was taken off and the saving is understated.
+- `ml_eis_carryover.monthly` is the ML-node ECU billed on ECH, carried to the serverless total as an EIS estimate (1 ECU = $1, before support). It is a placeholder, not an estimator read-back. `status` `incomplete` means none was carried and the serverless total is understated.
 - When the billing window is unstable, the comparison is the latest complete month. Do not call it a 3-month average.
 - When no serverless price came back, show the ECH bill and say there is no comparison.
 - Page 1 states the average retention across indexes and the whole month written to the estimator. That month is the headline.

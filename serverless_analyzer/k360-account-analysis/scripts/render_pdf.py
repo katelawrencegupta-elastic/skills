@@ -4115,7 +4115,7 @@ def render_consolidation_html(acc: dict) -> str:
                 "This EIS load is inside the estimate",
                 f"This EIS line covers the sized ECH Search deployments in the accepted Search estimate; existing Serverless projects are excluded. "
                 f"Billed inference ECU and tokens use {period_desc}: ${eis_mo_sum:,.2f}/mo before support. "
-                f"ML-node ECU is tracked separately at {n0(search_blk.get('ml_node_ecu_mo'))} ECU/mo and is not attributed to EIS. "
+                f"ML-node ECU on these deployments is {n0(search_blk.get('ml_node_ecu_mo'))} ECU/mo and is carried to the serverless total as a separate ML line, not in EIS. "
                 f"The EIS amount is included in regional Search totals and every Search profile. "
                 f"The EIS amount is held constant in quieter and busier sensitivity rows. "
                 "The node ECU is the capacity on the same deployment, not a per-model meter.",
@@ -4152,7 +4152,7 @@ def render_consolidation_html(acc: dict) -> str:
     title2 = f"{pct(oh)} of the active deployments' ECU is cluster overhead" if oh is not None else "Cluster overhead"
     search_eis = (svl.get("by_solution") or {}).get("search") or {}
     if search_eis.get("ml_node_ecu_mo"):
-        ml_line = f"Search EIS is {usd(search_eis.get('eis_mo'))}/mo from billed inference ECU and tokens. ML-node capacity is tracked separately at {n0(search_eis.get('ml_node_ecu_mo'))} ECU/mo and is not attributed to EIS. Snapshot storage, snapshot API calls, and data transfer over the full lookback add {n0(comp.get('non_capacity_mo'))} ECU/mo. The egress section follows."
+        ml_line = f"Search EIS is {usd(search_eis.get('eis_mo'))}/mo from billed inference ECU and tokens. ML-node capacity on these deployments is {n0(search_eis.get('ml_node_ecu_mo'))} ECU/mo and is carried to the serverless total as a separate ML line, not in EIS. Snapshot storage, snapshot API calls, and data transfer over the full lookback add {n0(comp.get('non_capacity_mo'))} ECU/mo. The egress section follows."
     else:
         ml_line = f"Machine learning over the full lookback adds {n0(comp.get('ml_nodes_mo'))} ECU/mo. Snapshot storage, snapshot API calls, and data transfer add {n0(comp.get('non_capacity_mo'))} ECU/mo. The egress section follows."
     shown_fixed = fr.get("fixed_overhead_ecu_mo") if fr.get("fixed_overhead_ecu_mo") else comp.get("fixed_overhead_mo")

@@ -490,7 +490,7 @@ def _align_primary_cost_rec(acc: dict, savings: dict, by_solution: dict) -> None
     )
     eis_mo = (by_solution.get("search") or {}).get("eis_mo")
     if eis_mo:
-        rec["evidence"] += f" That Search total includes EIS at ${float(eis_mo):,.2f}/mo from billed inference ECU and tokens; ML-node ECU is tracked separately."
+        rec["evidence"] += f" That Search total includes EIS at ${float(eis_mo):,.2f}/mo from billed inference ECU and tokens; ML capacity carried over from ECH ML nodes is a separate line."
     gap, year = float(savings["list_mo"]), float(savings.get("list_yr") or 0)
     side = "above" if gap < 0 else "below"
     rec["impact"] = f"${abs(gap):,.0f}/mo {side} the ECH billed cost (${abs(year):,.0f}/yr)"
