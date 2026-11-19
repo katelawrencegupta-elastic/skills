@@ -491,7 +491,7 @@ def _axis_lines(cat: str) -> list[str]:
 
 def bar_chart(categories: list[str], series: list[tuple[str, list[float]]], *, stacked: bool = False, width: int = 640, height: int = 230,
               ref: tuple[float, str] | None = None, show_values: bool = False, prefix: str = "", colors: list[str] | None = None, exact_values: bool = False,
-              sublabels: list[str] | None = None, label_first: int | None = None) -> str:
+              sublabels: list[str] | None = None) -> str:
     colors = colors or PALETTE
     dx, dy = 9.0, 6.0
     wrapped = [_axis_lines(c) for c in categories]
@@ -537,9 +537,7 @@ def bar_chart(categories: list[str], series: list[tuple[str, list[float]]], *, s
             for y, bh, _v, fill, cap in drawn:
                 out.append(_vbar3d(x0, y, face, bh, fill, dx=depth, dy=rise, cap=cap))
             if show_values and base:
-                shown = sum(float(vals[i] or 0) for _, vals in series[:label_first]) if label_first else base
-                if shown:
-                    out.append(f"<text x='{x0 + face / 2:.1f}' y='{pt + h - h * base / vmax - rise - 4:.1f}' text-anchor='middle' fill='#343741' font-weight='700'>{lab(shown)}</text>")
+                out.append(f"<text x='{x0 + face / 2:.1f}' y='{pt + h - h * base / vmax - rise - 4:.1f}' text-anchor='middle' fill='#343741' font-weight='700'>{lab(base)}</text>")
             lx = x0 + face / 2
         else:
             face = max(bw - depth - 3, bw * 0.62)
@@ -572,7 +570,7 @@ def bar_chart(categories: list[str], series: list[tuple[str, list[float]]], *, s
     return "".join(out) + legend
 
 
-def plan_hbar(rows: list[tuple[str, str, float]], *, ref: tuple[float, str] | None = None, width: int = 440, contract: list[float] | None = None, ech: tuple[float, str] | None = None, compact: bool = False) -> str:
+def plan_hbar(rows: list[tuple[str, str, float]], *, ref: tuple[float, str] | None = None, width: int = 440, contract: list[float] | None = None, ech: tuple[float, str] | None = None, compact: bool = False, ech_grey: float = 0.0) -> str:
     """Horizontal bars for a tall column. Each row is (cut, project count, monthly dollars).
 
     The dollar amount sits on the bar. The project count is a column on the
@@ -595,7 +593,7 @@ def plan_hbar(rows: list[tuple[str, str, float]], *, ref: tuple[float, str] | No
     height = top + n * row_h + tail
     vals = [float(v or 0) for _, _, v in rows]
     if ech is not None:
-        vals.append(float(ech[0]))
+        vals.append(float(ech[0]) + float(ech_grey or 0))
     if contract:
         vals.extend(float(v or 0) for v in contract)
     vmax = _nice_max(max(vals + ([ref[0]] if ref and ech is None else []) + [1]))
@@ -634,6 +632,14 @@ def plan_hbar(rows: list[tuple[str, str, float]], *, ref: tuple[float, str] | No
             gap = 4
             _money_bar(mid - bar_h - gap / 2, float(v or 0), PALETTE[2])
             _money_bar(mid + gap / 2, float(ech[0]), PALETTE[0])
+            if ech_grey and float(ech_grey) > 0:
+                # ECH billed on deployments with no diagnostic bundle: shown, greyed, and not compared.
+                gx = plot_x + plot_w * float(ech[0]) / vmax
+                gw = plot_w * float(ech_grey) / vmax
+                gy = mid + gap / 2
+                out.append(f"<rect x='{gx:.1f}' y='{gy:.1f}' width='{max(gw, 1):.1f}' height='{bar_h}' rx='3' fill='#C9CED6'/>")
+                if gw >= 120:
+                    out.append(f"<text x='{gx + 6:.1f}' y='{gy + bar_h * 0.72:.1f}' fill='#343741' font-size='10'>+{usd(ech_grey)} unvalidated</text>")
         elif contract is not None:
             gap = 4
             _money_bar(mid - bar_h - gap / 2, float(v or 0), PALETTE[2])
@@ -662,7 +668,10 @@ def plan_hbar(rows: list[tuple[str, str, float]], *, ref: tuple[float, str] | No
     out.append(f"<text x='{plot_x + plot_w:.1f}' y='{axis_y + 14:.1f}' text-anchor='end' fill='#69707D' font-size='11'>{usd(vmax)}</text>")
     out.append("</svg>")
     if ech is not None:
-        out.append(_legend(["Serverless at list", ech[1]], [PALETTE[2], PALETTE[0]]))
+        if ech_grey and float(ech_grey) > 0:
+            out.append(_legend(["Serverless at list", ech[1], "ECH with no diagnostic bundle, unvalidated"], [PALETTE[2], PALETTE[0], "#C9CED6"]))
+        else:
+            out.append(_legend(["Serverless at list", ech[1]], [PALETTE[2], PALETTE[0]]))
     elif contract is not None:
         out.append(_legend(["Serverless at list", "Serverless at contract rate"], [PALETTE[2], PALETTE[8]]))
     else:
@@ -1798,6 +1807,9 @@ def serverless_component_slide(acc: dict, *, new_page: bool = True, bare: bool =
         else:
             parts = []
         comp_rows.append([k.title(), " + ".join(parts) or "—", usd(v.get("total_mo")), estimator_label(v.get("pricing"))])
+    ml_line = float((c.get("ml_eis_carryover") or {}).get("monthly") or 0)
+    if ml_line:
+        comp_rows.append(["ML capacity", f"ML-node ECU billed on ECH, carried over as an EIS estimate (1 ECU = $1)", usd(ml_line), "Placeholder, not an estimator read-back"])
     comp_table = "<h3>By component</h3>" + table(
         ["Project", "Components / mo", "Estimate / mo", "Estimator"], comp_rows, ["left", "left", "right", "left"],
     )
@@ -3234,10 +3246,18 @@ def deployment_plan_body(c: dict, sv: dict, *, alongside: str = "", width: int =
     plan = c.get("deployment_plan") or []
     if not plan:
         return ""
+    # ML capacity carried to serverless is one constant line on every step, so each bar matches the cover total.
+    ml_eis = float((c.get("ml_eis_carryover") or {}).get("monthly") or 0)
     rows = [
-        (str(p.get("label") or ""), _count_label(p.get("projects"), "project"), float(p.get("monthly") or 0))
+        (str(p.get("label") or ""), _count_label(p.get("projects"), "project"), float(p.get("monthly") or 0) + ml_eis)
         for p in plan
     ]
+    # ECH billed on deployments with no diagnostic bundle, on the same window as the ECH bar.
+    scope_row = c.get("ech_scope") or {}
+    grey = round(sum(
+        float(u.get("ecu_mo") or 0) for u in (scope_row.get("unpriced") or [])
+        if isinstance(u, dict) and u.get("reason") == "no diagnostic bundle"
+    ), 2) if scope_row.get("status") == "complete" else 0.0
     if sv.get("ech_contract_mo") is not None:
         ech = (float(sv["ech_contract_mo"]), "ECH at contract rate")
     elif sv.get("ech_list_mo") is not None:
@@ -3263,7 +3283,12 @@ def deployment_plan_body(c: dict, sv: dict, *, alongside: str = "", width: int =
             plan_ret = "Retention on each serverless project is 12 months. The measured age is kept as a record."
     n = _plan_n(plan)
     n_bit = f" N = {n}." if n is not None else ""
-    chart = plan_hbar(rows, width=width, ech=ech, compact=True)
+    chart = plan_hbar(rows, width=width, ech=ech, compact=True, ech_grey=grey if ech is not None else 0.0)
+    extra = ""
+    if ml_eis:
+        extra += f" Every serverless bar includes {usd(ml_eis)}/mo of ML capacity carried over from ECH ML nodes as an EIS estimate, the same on each step."
+    if grey and ech is not None:
+        extra += f" The grey part of the ECH bar is {usd(grey)}/mo billed on deployments with no diagnostic bundle. It is unvalidated and is not in the comparison."
     if short:
         chart += caption(
             "Ceiling matches the cover count."
@@ -3273,6 +3298,7 @@ def deployment_plan_body(c: dict, sv: dict, *, alongside: str = "", width: int =
             + f"Floor is one project per feature per region, {int(c.get('deployment_plan_floor') or 1)}. "
             + "Upper bar is serverless at list; lower is the ECH bill. "
             + plan_ret
+            + extra
         )
     else:
         chart += caption(
@@ -3285,6 +3311,7 @@ def deployment_plan_body(c: dict, sv: dict, *, alongside: str = "", width: int =
             + "The upper bar is serverless at list. The lower bar is the ECH bill, the same on every step. "
             + "The amount under the project count is that ECH bill minus serverless at list. "
             + plan_ret
+            + extra
         )
     if alongside:
         chart += "<h3>Estimated monthly serverless total, by component</h3>" + alongside
@@ -3771,28 +3798,28 @@ def render_consolidation_html(acc: dict) -> str:
             (svl_cat, [0.0] * len(costs) + [float(svl_total)]),
         ]
         # ECH billed on deployments with no diagnostic bundle is shown greyed out on top of its month. It has no
-        # validated serverless price, so it is not in the compared total and the bar label leaves it out.
+        # validated serverless price, so it is not in the compared total. The bar label is the validated plus unvalidated total.
         grey_by_month = {str(r.get("month")): float(r.get("unvalidated") or 0) for r in (priced_block.get("months") or [])} if (scope_unavailable or priced_scope) else {}
         grey = [grey_by_month.get(str(r.get("month")), 0.0) * usd_per_ecu for r in recent]
         chart_colors_m = [PALETTE[0], PALETTE[2]]
         subs_m = ([compare_subs[0] or ""] * len(costs) + [compare_subs[1] or ""]) if compare_subs else None
-        label_first = None
+        has_grey = False
         if any(g > 0 for g in grey):
             m_series.append(("No diagnostic bundle, unvalidated", grey + [0.0]))
             chart_colors_m = [PALETTE[0], PALETTE[2], "#C9CED6"]
-            label_first = 2
+            has_grey = True
             subs_m = [(f"{(subs_m[i] if subs_m else '')} · +{usd(g)} unvalidated".strip(" ·") if g > 0 else (subs_m[i] if subs_m else "")) for i, g in enumerate(grey)] + [(subs_m[-1] if subs_m else "")]
         B.append(f"<h3>Last {len(costs)} months of ECH spend vs. the {est_months}-month serverless estimate</h3>" + bar_chart(
             m_cats, m_series, stacked=True, width=940, height=168, show_values=True, prefix="$", exact_values=True,
-            colors=chart_colors_m, sublabels=subs_m, label_first=label_first) + rate_label)
-        if label_first:
+            colors=chart_colors_m, sublabels=subs_m) + rate_label)
+        if has_grey:
             unval = priced_block.get("unvalidated") or {}
             names = ", ".join(str(n) for n in (unval.get("names") or [])[:8])
             more = len(unval.get("names") or []) - 8
             B.append(caption(
                 f"Grey is ECH cost billed on {len(unval.get('names') or [])} {'deployment' if len(unval.get('names') or []) == 1 else 'deployments'} with no diagnostic bundle ({esc(names)}{f' and {more} more' if more > 0 else ''}), "
                 f"about {usd(unval.get('avg_mo'))}/mo on average. It is shown but unvalidated: no serverless price was computed for it, "
-                "so it is not in the comparison, and the bar labels count only the compared deployments."
+                "so it is not in the comparison. Each bar's label is the validated plus the unvalidated total."
             ))
         compare_cost = costs[-1][1] if window_unstable else avg_cost
         diff = compare_cost - float(svl_total)  # positive is a saving, as everywhere else on the cover
@@ -4355,7 +4382,11 @@ def render_consolidation_html(acc: dict) -> str:
             ]
             for q in quotes
         ]
-        quote_rows.append(["Total", "both estimators", usd(rc.get("total_mo")), "—", "—", ""])
+        quote_rows.append(["Estimator total", "both estimators", usd(rc.get("total_mo")), "—", "—", ""])
+        _ml_row = float((c.get("ml_eis_carryover") or {}).get("monthly") or 0)
+        if _ml_row:
+            quote_rows.append(["ML capacity", "carried over as an EIS estimate", usd(_ml_row), "—", "—", ""])
+            quote_rows.append(["Serverless total", "the cover figure", usd(float(rc.get("total_mo") or 0) + _ml_row), "—", "—", ""])
         card = ("<div class='card'><div class='hd'>Serverless estimators<span>the prices in this report</span></div>"
                 + table(
                     ["Solution", "Estimator", "$ / mo", "Year 1", "Steady annual", ""],

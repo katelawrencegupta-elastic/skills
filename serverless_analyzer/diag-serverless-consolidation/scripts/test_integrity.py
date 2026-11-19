@@ -593,15 +593,42 @@ class ReviewRegressionTests(unittest.TestCase):
         acc = scope_account(ech_scope="priced", keep_serverless_spend=False)
         cons = build_consolidation(acc, None)
         self.assertEqual(cons["ech_scope"]["status"], "complete")
-        priced = [row["cost"] for row in cons["ech_recent_months_priced"]["months"]]
+        months = cons["ech_recent_months_priced"]["months"]
+        priced = [row["cost"] for row in months]
+        # The label above each bar is the validated plus the unvalidated cost.
+        labelled = [round(row["cost"] + row.get("unvalidated", 0.0), 2) for row in months]
         whole = [row["cost"] for row in cons["ech_recent_months"]["months"]]
         self.assertTrue(priced and priced != whole)
         cover = render_consolidation_html({**acc, "consolidation": cons}).split("<section class='sec newpage'>", 1)[0]
-        for value in priced:
-            self.assertIn(f"${value:,.0f}", cover)
-        for value in set(whole) - set(priced):
-            self.assertNotIn(f"${value:,.0f}<", cover)
+        for value in labelled:
+            self.assertIn(f">${value:,.0f}<", cover)
+        for value in set(whole) - set(labelled):
+            self.assertNotIn(f">${value:,.0f}<", cover)
         self.assertIn("not the whole account", cover)
+
+    def test_the_plan_page_carries_the_ml_line_and_the_unvalidated_ech(self):
+        from render_pdf import deployment_plan_body
+        c = {
+            "deployment_plan": [
+                {"label": "Ceiling", "projects": 2, "monthly": 100.0},
+                {"label": "Floor", "projects": 1, "monthly": 80.0},
+            ],
+            "ml_eis_carryover": {"monthly": 20.0},
+            "ech_scope": {"status": "complete", "unpriced": [
+                {"name": "nobundle", "reason": "no diagnostic bundle", "ecu_mo": 30.0},
+                {"name": "idle", "reason": "no stored GB to price", "ecu_mo": 5.0},
+            ]},
+            "estimate_months": 1,
+        }
+        html = deployment_plan_body(c, {"ech_list_mo": 90.0})
+        # Every serverless bar carries the ML line, so the floor matches the cover total.
+        self.assertIn("$120", html)
+        self.assertIn("$100", html)
+        self.assertNotIn(">$80<", html)
+        # Only the no-bundle deployment is greyed, on the ECH bar.
+        self.assertIn("+$30 unvalidated", html)
+        self.assertIn("unvalidated and is not in the comparison", html)
+        self.assertIn("ML capacity carried over", html)
 
     def test_the_cover_names_the_whole_bill_and_the_compared_part(self):
         acc = scope_account(ech_scope="priced", keep_serverless_spend=False)
