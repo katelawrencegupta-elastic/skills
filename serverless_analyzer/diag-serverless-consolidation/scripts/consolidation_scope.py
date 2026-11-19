@@ -806,7 +806,7 @@ def _deployment_groups(acc: dict, infra: dict | None, months: float) -> list[dic
     for g in grouped.values():
         row = {
             "solution": g["solution"], "region": g["region"], "deployments": g["deployments"],
-            "n": len(g["deployments"]), "ech_ecu_mo": round(g["ech_ecu_mo"], 2), "stored_gb": round(g["stored_gb"], 1),
+            "n": len(g["deployments"]), "ech_ecu_mo": round(g["ech_ecu_mo"], 2), "stored_gb": round(g["stored_gb"], 3),
         }
         if g["has_daily"]:
             row["daily_raw_gb"] = round(g["daily_raw_gb"], 3)
