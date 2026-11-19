@@ -66,6 +66,7 @@ A step that ran degraded is a limit too, not a line on the terminal. `run_consol
 | `consolidation_failed` | Building the consolidation raised; no quote was produced |
 | `ml_node_ecu_unverified` | ML-node ECU was not taken out of the ECH comparison |
 | `retention_month_fallback` | The sheets took the 12-month default instead of the index average |
+| `billing_reconciliation_outside_window` | Daily deployment billing missed org billing on some days, but fewer than 5% of the quote window's days. The ECH comparison was kept (medium severity) |
 | `estimate_dedupe_failed`, `pdf_export_failed`, `pdf_upload_failed` | Delivery steps; the quote itself is unaffected |
 
 A run marked DRAFT always names why: a test asserts that no path sets `meta.draft` without recording a limit.

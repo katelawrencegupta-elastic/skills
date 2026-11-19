@@ -861,5 +861,40 @@ class OverheadBucketTests(unittest.TestCase):
         self.assertEqual(len(edges), len(set(edges)))
 
 
+class ReconciliationWindowTests(unittest.TestCase):
+    """Mismatches outside the quote window must not withhold the ECH comparison."""
+
+    REASON = "deployment costs do not reconcile to org daily billing on {} day(s)"
+
+    def _acc(self, bad_days, reason=None, days=120):
+        labels = [f"d{i:03d}" for i in range(days)]
+        mm = [{"day": labels[i]} for i in bad_days]
+        return {"ecu": {"daily_days": labels, "daily_deployment_costs": {
+            "days": labels, "complete": False,
+            "status": {"complete": False, "reason": reason or self.REASON.format(len(mm)), "reconciliation_mismatches": mm}}}}
+
+    def _run(self, acc, window=90):
+        from analyze import relax_reconciliation
+        relax_reconciliation(acc, window)
+        return acc["ecu"]["daily_deployment_costs"]
+
+    def test_mismatches_only_before_the_window_are_accepted(self):
+        d = self._run(self._acc(range(0, 25)))
+        self.assertTrue(d["complete"] and d["status"]["complete"])
+        self.assertEqual(d["status"]["reconciliation_relaxed"]["mismatch_days_in_window"], 0)
+
+    def test_four_in_ninety_days_is_inside_five_percent(self):
+        d = self._run(self._acc([116, 117, 118, 119]))
+        self.assertTrue(d["complete"])
+        self.assertEqual(d["status"]["reconciliation_relaxed"]["mismatch_days_in_window"], 4)
+
+    def test_five_in_ninety_days_is_over_five_percent(self):
+        self.assertFalse(self._run(self._acc(range(115, 120)))["complete"])
+
+    def test_another_incomplete_reason_is_never_relaxed(self):
+        acc = self._acc([], reason="page cap hit; " + self.REASON.format(3))
+        self.assertFalse(self._run(acc)["complete"])
+
+
 if __name__ == "__main__":
     unittest.main()

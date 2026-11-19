@@ -645,6 +645,17 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
         print(f"WARN: {detail}", file=sys.stderr)
         pending.append({"code": code, "detail": detail, "severity": severity})
 
+    relaxed = ((((acc.get("ecu") or {}).get("daily_deployment_costs") or {}).get("status") or {}).get("reconciliation_relaxed"))
+    if relaxed:
+        stage(
+            "billing_reconciliation_outside_window",
+            f"daily deployment billing mismatched org billing on {relaxed['mismatch_days_total']} day(s), "
+            f"{relaxed['mismatch_days_in_window']} of them inside the {relaxed['window_days']}-day quote window. "
+            f"That is {relaxed['mismatch_days_in_window'] / relaxed['window_days']:.1%} of the window, under the 5% tolerance, "
+            "so the ECH comparison was kept. The unattributed billing on those days is not in the comparison.",
+            "medium",
+        )
+
     if args.diags_dir:
         out_dir = Path(args.diags_dir)
         if not out_dir.is_dir():

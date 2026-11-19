@@ -1705,6 +1705,40 @@ def active_deployment_set(org: dict, days_n: int = QUOTE_WINDOW_DAYS) -> dict:
     }
 
 
+RECONCILIATION_REASON = re.compile(r"^deployment costs do not reconcile to org daily billing on \d+ day\(s\)$")
+RECONCILIATION_WINDOW_MAX_SHARE = 0.05
+
+
+def relax_reconciliation(acc: dict, window_days: int) -> None:
+    """Accept the daily deployment series when the quote window itself reconciles.
+
+    The fetch compares deployment cost with org cost over the whole year and marks the
+    series incomplete on any mismatch. The ECH comparison only reads the quote window,
+    so mismatches outside it do not touch the number. The series is accepted when it was
+    incomplete for that reason alone and fewer than 5% of the window's days mismatch.
+    """
+    daily = (acc.get("ecu") or {}).get("daily_deployment_costs") or {}
+    status = daily.get("status") or {}
+    if daily.get("complete") or not RECONCILIATION_REASON.match(str(status.get("reason") or "")):
+        return
+    labels = [str(d)[:10] for d in (acc["ecu"].get("daily_days") or [])]
+    if not window_days or len(labels) < window_days or list(daily.get("days") or []) != labels:
+        return
+    window = set(labels[-window_days:])
+    bad = [m["day"] for m in status.get("reconciliation_mismatches") or [] if m.get("day") in window]
+    if len(bad) / window_days >= RECONCILIATION_WINDOW_MAX_SHARE:
+        return
+    status["reconciliation_relaxed"] = {
+        "mismatch_days_total": len(status.get("reconciliation_mismatches") or []),
+        "mismatch_days_in_window": len(bad),
+        "window_days": window_days,
+        "reason_was": status["reason"],
+    }
+    status["complete"] = True
+    status["reason"] = None
+    daily["complete"] = True
+
+
 def build_account(org: dict, infra: dict | None, *, when: date | None = None, retention_months: float = 3.0, security_retention_months: float | None = None, quote_window_days: int = QUOTE_WINDOW_DAYS) -> dict:
     when = when or datetime.now(timezone.utc).date()
     customer = (org.get("organization") or {}).get("name") or "Customer"
@@ -1724,6 +1758,7 @@ def build_account(org: dict, infra: dict | None, *, when: date | None = None, re
     acc["platform"] = platform_section(org, infra)
     acc["cloud"] = cloud_section(org, infra)
     acc["ecu"] = ecu_section(org, infra, acc["platform"])
+    relax_reconciliation(acc, quote_window_days)
     acc["deployments"] = deployments_section(org, acc["ecu"], infra)
     acc["deployments"]["active"] = active_deployment_set(org, quote_window_days)
     acc["storage"] = storage_section(org, acc["cloud"])
