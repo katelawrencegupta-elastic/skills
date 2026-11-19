@@ -770,6 +770,31 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(cov["bulk_gb_day"], 5.0)
         self.assertEqual(cov["unmatched_diagnostics"], [])
 
+    def test_the_cover_chart_stacks_before_and_after_totals_with_the_ech_that_stays(self):
+        acc = scope_account(ech_scope="priced", keep_serverless_spend=False)
+        for dep in acc["solutions"]["by_deployment"]:
+            if dep["name"] == "sec":
+                dep["ingest_source"] = "unsupported_region"
+                dep["daily_raw_gb"] = 0.0
+                dep["unsupported_region"] = {"provider": "GCP", "region": "asia-east1"}
+        cons = build_consolidation(acc, None)
+        months = cons["ech_recent_months_priced"]["months"]
+        self.assertTrue(all(m["stays_on_ech"] > 0 for m in months))
+        cover = render_consolidation_html({**acc, "consolidation": cons}).split("<section class='sec newpage'>", 1)[0]
+        self.assertIn("Monthly spend: last 3 months on ECH, and after consolidation", cover)
+        self.assertIn("ECH carried over, region not offered on Serverless", cover)
+        self.assertIn("Dark grey is ECH that cannot move", cover)
+        self.assertIn("stays on ECH", cover)
+        # Each bar is labelled with its stack: the ECH months are compared + stays + unvalidated, and the
+        # after bar is serverless + the ECH that stays + the unvalidated part.
+        for m in months:
+            total = m["cost"] + m["stays_on_ech"] + m["unvalidated"]
+            self.assertIn(f">${total:,.0f}<", cover)
+        support = cons["region_support"]
+        grey = sum(u["ecu_mo"] for u in cons["ech_scope"]["unpriced"] if u["reason"] == "no diagnostic bundle")
+        after = cons["savings"]["serverless_mo"] + support["stays_on_ech_mo"] + grey
+        self.assertIn(f">${after:,.0f}<", cover)
+
     def test_the_cover_shows_the_share_of_the_bill_that_is_compared(self):
         acc = scope_account(ech_scope="priced", keep_serverless_spend=False)
         cons = build_consolidation(acc, None)

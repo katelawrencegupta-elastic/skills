@@ -569,6 +569,7 @@ def _priced_months_brief(block) -> dict | None:
         "stable": block.get("stable"),
         "unpriced": block.get("unpriced") or [],
         "unvalidated": block.get("unvalidated") or {},
+        "stays_on_ech_names": block.get("stays_on_ech_names") or [],
     }
 
 

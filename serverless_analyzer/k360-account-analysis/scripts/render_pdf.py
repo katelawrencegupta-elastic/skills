@@ -3915,30 +3915,69 @@ def render_consolidation_html(acc: dict) -> str:
             ("ECH billed cost" if cover_rate is None else "ECH at contract rate", [v for _m, v in costs] + [0.0]),
             (svl_cat, [0.0] * len(costs) + [float(svl_total)]),
         ]
-        # ECH billed on deployments with no diagnostic bundle is shown greyed out on top of its month. It has no
-        # validated serverless price, so it is not in the compared total. The bar label is the validated plus unvalidated total.
-        grey_by_month = {str(r.get("month")): float(r.get("unvalidated") or 0) for r in (priced_block.get("months") or [])} if (scope_unavailable or priced_scope) else {}
-        grey = [grey_by_month.get(str(r.get("month")), 0.0) * usd_per_ecu for r in recent]
-        chart_colors_m = [PALETTE[0], PALETTE[2]]
+        # Each bar is a stacked monthly total. The ECH months stack the compared deployments, the ECH that cannot move to
+        # Serverless (region not offered), and the no-bundle deployments greyed out as unvalidated. The last bar is the
+        # same scope after consolidation: serverless plus the ECH that carries over plus the unvalidated part. Every bar
+        # label is its stack total, so before and after are the same scope.
+        use_priced = scope_unavailable or priced_scope
+        month_rows = {str(r.get("month")): r for r in (priced_block.get("months") or [])} if use_priced else {}
+        grey = [float((month_rows.get(str(r.get("month"))) or {}).get("unvalidated") or 0) * usd_per_ecu for r in recent]
+        stay = [float((month_rows.get(str(r.get("month"))) or {}).get("stays_on_ech") or 0) * usd_per_ecu for r in recent]
+        support = c.get("region_support") or {}
+        stay_after = float(support.get("stays_on_ech_mo") or 0) * usd_per_ecu
+        scope_unpriced = [u for u in ((c.get("ech_scope") or {}).get("unpriced") or []) if isinstance(u, dict)]
+        grey_after = (
+            sum(float(u.get("ecu_mo") or 0) for u in scope_unpriced if u.get("reason") == "no diagnostic bundle")
+            if (c.get("ech_scope") or {}).get("status") == "complete"
+            else float((priced_block.get("unvalidated") or {}).get("avg_mo") or 0)
+        ) * usd_per_ecu
         subs_m = ([compare_subs[0] or ""] * len(costs) + [compare_subs[1] or ""]) if compare_subs else None
-        has_grey = False
-        if any(g > 0 for g in grey):
-            m_series.append(("No diagnostic bundle, unvalidated", grey + [0.0]))
-            chart_colors_m = [PALETTE[0], PALETTE[2], "#C9CED6"]
-            has_grey = True
-            subs_m = [(f"{(subs_m[i] if subs_m else '')} · +{usd(g)} unvalidated".strip(" ·") if g > 0 else (subs_m[i] if subs_m else "")) for i, g in enumerate(grey)] + [(subs_m[-1] if subs_m else "")]
-        B.append(f"<h3>Last {len(costs)} months of ECH spend vs. the {est_months}-month serverless estimate</h3>" + bar_chart(
+        has_stay = any(v > 0 for v in stay) or stay_after > 0
+        has_grey = any(v > 0 for v in grey) or grey_after > 0
+        chart_colors_m = [PALETTE[0], PALETTE[2]]
+        if has_stay:
+            m_series.append(("ECH carried over, region not offered on Serverless", stay + [stay_after]))
+            chart_colors_m.append("#69707D")
+        if has_grey:
+            m_series.append(("No diagnostic bundle, unvalidated", grey + [grey_after]))
+            chart_colors_m.append("#C9CED6")
+        if has_stay or has_grey:
+            extra_subs = []
+            for k in range(len(costs)):
+                bits = []
+                if stay[k] > 0:
+                    bits.append(f"+{usd(stay[k])} stays on ECH")
+                if grey[k] > 0:
+                    bits.append(f"+{usd(grey[k])} unvalidated")
+                extra_subs.append(" · ".join(([subs_m[k]] if subs_m and subs_m[k] else []) + bits))
+            tail_bits = ["serverless"] + ([f"+{usd(stay_after)} stays on ECH"] if stay_after > 0 else []) + ([f"+{usd(grey_after)} unvalidated"] if grey_after > 0 else [])
+            subs_m = extra_subs + [" · ".join(tail_bits)]
+        heading = (
+            f"Monthly spend: last {len(costs)} months on ECH, and after consolidation (the {est_months}-month serverless estimate plus the ECH that stays)"
+            if has_stay else
+            f"Last {len(costs)} months of ECH spend vs. the {est_months}-month serverless estimate"
+        )
+        B.append(f"<h3>{heading}</h3>" + bar_chart(
             m_cats, m_series, stacked=True, width=940, height=168, show_values=True, prefix="$", exact_values=True,
             colors=chart_colors_m, sublabels=subs_m) + rate_label)
+        chart_notes = []
+        if has_stay:
+            names = ", ".join(str(r.get("name")) for r in (support.get("stays_on_ech") or [])[:6])
+            chart_notes.append(
+                f"Dark grey is ECH that cannot move because Serverless is not offered in its region ({esc(names)}). It keeps billing on ECH, "
+                f"{usd(stay_after)}/mo, so it is in the after-consolidation bar too."
+            )
         if has_grey:
             unval = priced_block.get("unvalidated") or {}
             names = ", ".join(str(n) for n in (unval.get("names") or [])[:8])
             more = len(unval.get("names") or []) - 8
-            B.append(caption(
-                f"Grey is ECH cost billed on {len(unval.get('names') or [])} {'deployment' if len(unval.get('names') or []) == 1 else 'deployments'} with no diagnostic bundle ({esc(names)}{f' and {more} more' if more > 0 else ''}), "
-                f"about {usd(unval.get('avg_mo'))}/mo on average. It is shown but unvalidated: no serverless price was computed for it, "
-                "so it is not in the comparison. Each bar's label is the validated plus the unvalidated total."
-            ))
+            chart_notes.append(
+                f"Light grey is ECH cost billed on {len(unval.get('names') or [])} {'deployment' if len(unval.get('names') or []) == 1 else 'deployments'} with no diagnostic bundle "
+                f"({esc(names)}{f' and {more} more' if more > 0 else ''}), about {usd(grey_after)}/mo. It is unvalidated: no serverless price was computed for it, "
+                "so it is not in the comparison."
+            )
+        if chart_notes:
+            B.append(caption(" ".join(chart_notes) + " Each bar's label is its stack total."))
         compare_cost = costs[-1][1] if window_unstable else avg_cost
         diff = compare_cost - float(svl_total)  # positive is a saving, as everywhere else on the cover
         rows = [[label, usd(v), "—"] for label, v in costs]
