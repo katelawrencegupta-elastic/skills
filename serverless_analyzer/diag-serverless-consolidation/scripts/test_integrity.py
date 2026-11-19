@@ -589,6 +589,20 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(backup["ingest_basis"], "K360 stored GB ÷ assumed retention")
         self.assertEqual(backup["retention"], "assumed month")
 
+    def test_the_cover_bars_plot_the_priced_scope_the_headline_compares(self):
+        acc = scope_account(ech_scope="priced", keep_serverless_spend=False)
+        cons = build_consolidation(acc, None)
+        self.assertEqual(cons["ech_scope"]["status"], "complete")
+        priced = [row["cost"] for row in cons["ech_recent_months_priced"]["months"]]
+        whole = [row["cost"] for row in cons["ech_recent_months"]["months"]]
+        self.assertTrue(priced and priced != whole)
+        cover = render_consolidation_html({**acc, "consolidation": cons}).split("<section class='sec newpage'>", 1)[0]
+        for value in priced:
+            self.assertIn(f"${value:,.0f}", cover)
+        for value in set(whole) - set(priced):
+            self.assertNotIn(f"${value:,.0f}<", cover)
+        self.assertIn("not the whole account", cover)
+
     def test_the_cover_names_the_whole_bill_and_the_compared_part(self):
         acc = scope_account(ech_scope="priced", keep_serverless_spend=False)
         cons = build_consolidation(acc, None)

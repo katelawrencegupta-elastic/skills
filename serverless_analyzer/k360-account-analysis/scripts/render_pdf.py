@@ -3543,8 +3543,13 @@ def render_consolidation_html(acc: dict) -> str:
     integrity = c.get("integrity") or {}
     integrity_failed = integrity.get("passed") is False
     priced_block = c.get("ech_recent_months_priced") or {}
-    # An unverified deployment scope uses only the deployments that received a price.
-    recent = (priced_block.get("months") or []) if scope_unavailable else ((c.get("ech_recent_months") or {}).get("months") or [])
+    # The bars plot the scope the headline compares. An unverified scope, and a deployment scope
+    # limited to the priced set, use only the deployments that received a price. Plotting the
+    # whole account's months beside a priced-only headline made a saving look like a reduction.
+    scope_row = c.get("ech_scope") or {}
+    priced_scope = (not scope_unavailable) and scope_row.get("status") == "complete" \
+        and scope_row.get("scope") == "priced" and bool(priced_block.get("months"))
+    recent = (priced_block.get("months") or []) if (scope_unavailable or priced_scope) else ((c.get("ech_recent_months") or {}).get("months") or [])
     est_months = int(c.get("estimate_months") or 12)
     month_pairs = []
     for row in recent:
@@ -3798,6 +3803,7 @@ def render_consolidation_html(acc: dict) -> str:
             )
             + ", the total reported by the spreadsheet or notebook."
             + (f" The comparison covers {usd(sv.get('ech_list_mo'))}/mo of the account's billing; the rest is named below as not compared." if _scope_is_partial(c) else "")
+            + (" The bars are the compared deployments' calendar months, not the whole account's." if priced_scope else "")
             + month_note))
         unpriced_rows = priced_block.get("unpriced") or []
         if scope_unavailable and unpriced_rows:
