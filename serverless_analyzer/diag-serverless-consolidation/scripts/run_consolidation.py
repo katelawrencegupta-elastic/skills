@@ -28,7 +28,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from skill_paths import find_skill, scripts_dir  # noqa: E402
+from skill_paths import artifacts_root, find_skill, scripts_dir  # noqa: E402
 
 _account_root = find_skill("k360-account-analysis", HERE)
 K360_SCRIPTS = scripts_dir(_account_root)
@@ -50,7 +50,7 @@ from run_account_analysis import (  # noqa: E402
 )
 
 
-from constants import TEMPLATE_MISMATCH_EXIT  # noqa: E402
+from constants import QUOTE_TELEMETRY_ATTEMPTS, QUOTE_TELEMETRY_BUDGET_S, TEMPLATE_MISMATCH_EXIT  # noqa: E402
 
 
 def _run(cmd: list[str]) -> None:
@@ -64,6 +64,71 @@ def _run(cmd: list[str]) -> None:
                 "The run stopped before a quote was written."
             ) from exc
         raise
+
+
+def fetch_with_budget(fetch, budget_s: float = QUOTE_TELEMETRY_BUDGET_S, attempts: int = QUOTE_TELEMETRY_ATTEMPTS):
+    """Run `fetch` on a worker thread, give each attempt `budget_s`, and retry a timeout or failure.
+
+    The quote-window telemetry fetch is many Elasticsearch calls in sequence. One slow call used
+    to spend the whole budget and lose Search's price with no second try. A timed-out attempt's
+    thread is abandoned (it is a daemon), so a retry starts a fresh one. Raises the last error.
+    """
+    import threading
+
+    last: BaseException | None = None
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        box: dict = {}
+
+        def _run() -> None:
+            try:
+                box["value"] = fetch()
+            except BaseException as exc:  # noqa: BLE001 - carried to the caller
+                box["error"] = exc
+
+        worker = threading.Thread(target=_run, daemon=True)
+        worker.start()
+        worker.join(budget_s)
+        if worker.is_alive():
+            last = TimeoutError(f"quote-window telemetry fetch exceeded {int(budget_s)}s (attempt {attempt} of {attempts})")
+        elif "error" in box:
+            last = box["error"]
+        else:
+            return box["value"]
+        print(f"NOTE: {last}", file=sys.stderr)
+    raise last if last is not None else RuntimeError("quote-window telemetry fetch did not run")
+
+
+class telemetry_lock:
+    """One telemetry fetch at a time across runs on this machine.
+
+    Parallel runs hit the same Elasticsearch cluster and each pushed the others past the
+    time limit. The lock makes a second run wait its turn instead of failing.
+    """
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.fh = None
+
+    def __enter__(self):
+        try:
+            import fcntl
+
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.fh = open(self.path, "a+")
+            fcntl.flock(self.fh, fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            self.fh = None
+        return self
+
+    def __exit__(self, *exc):
+        if self.fh:
+            try:
+                import fcntl
+
+                fcntl.flock(self.fh, fcntl.LOCK_UN)
+            finally:
+                self.fh.close()
+        return False
 
 
 def note_limit(acc_or_sz: dict, code: str, detail: str, severity: str = "high") -> None:
@@ -788,26 +853,16 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
             raise ValueError("the billed quote window has no complete daily date range")
         avg_doc_bytes = (((diag.get("workload") or {}).get("ingest") or {}).get("avg_doc_bytes"))
         base, key = es_base_and_key(env)
-        # A large fleet's 90-day index scan can sit on one socket past the HTTP timeout.
-        # Bound it so Observability and Security still quote, and Search stays unquoted.
-        fetched: dict = {}
+        # A large fleet's 90-day index scan is many calls. Each attempt is bounded and a failure
+        # is retried, and only one run at a time fetches so parallel runs do not starve each other.
+        def _fetch_quote_window():
+            return fetch_workload(
+                base, key, org_ids, avg_doc_bytes,
+                telemetry_start=quote_labels[0], telemetry_end=quote_labels[-1],
+            )
 
-        def _fetch_quote_window() -> None:
-            try:
-                fetched["value"] = fetch_workload(
-                    base, key, org_ids, avg_doc_bytes,
-                    telemetry_start=quote_labels[0], telemetry_end=quote_labels[-1],
-                )
-            except BaseException as exc:
-                fetched["error"] = exc
-
-        worker = __import__("threading").Thread(target=_fetch_quote_window, daemon=True)
-        worker.start()
-        worker.join(180)
-        if worker.is_alive():
-            raise TimeoutError("quote-window telemetry fetch exceeded 180s")
-        if "error" in fetched:
-            raise fetched["error"]
+        with telemetry_lock((Path(args.artifacts_root) if getattr(args, "artifacts_root", None) else artifacts_root()) / ".telemetry.lock"):
+            fetched = {"value": fetch_with_budget(_fetch_quote_window)}
         diag["workload"] = fetched["value"]
         (diag.get("sizing") or {}).get("consolidated", {}).setdefault("search", {})["workload"] = diag["workload"]
     except (Exception, SystemExit) as ex:

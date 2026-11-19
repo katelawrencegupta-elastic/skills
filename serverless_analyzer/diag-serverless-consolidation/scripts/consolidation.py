@@ -371,7 +371,8 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         if not any(row.get("code") == "search_quote_window_telemetry" for row in limits):
             limits.append({
                 "code": "search_quote_window_telemetry",
-                "detail": search_telemetry.get("reason") or "exact quote-window index telemetry is missing",
+                "detail": (search_telemetry.get("reason") or "exact quote-window index telemetry is missing")
+                + " Search has no price, so the serverless total leaves it out. Rerun the quote.",
                 "severity": "high",
             })
     for sol in ("observability", "security"):

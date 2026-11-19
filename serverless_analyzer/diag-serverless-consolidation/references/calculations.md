@@ -66,6 +66,7 @@ A step that ran degraded is a limit too, not a line on the terminal. `run_consol
 | `consolidation_failed` | Building the consolidation raised; no quote was produced |
 | `ml_node_ecu_unverified` | ML-node ECU was not taken out of the ECH comparison |
 | `retention_month_fallback` | The sheets took the 12-month default instead of the index average |
+| `search_quote_window_telemetry` | Search was not priced: the exact-window index telemetry fetch failed after 2 attempts of 600s each. The serverless total leaves Search out and the run should be repeated. Runs queue on a lock in the artifacts root, so parallel runs fetch one at a time |
 | `billing_reconciliation_outside_window` | Daily deployment billing missed org billing on some days, but fewer than 5% of the quote window's days. The ECH comparison was kept (medium severity) |
 | `estimate_dedupe_failed`, `pdf_export_failed`, `pdf_upload_failed` | Delivery steps; the quote itself is unaffected |
 

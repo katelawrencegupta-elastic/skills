@@ -26,6 +26,10 @@ ECHO_TOLERANCE_GB_DAY = 0.02
 # size_serverless.py exits with this status when an estimator copy does not have the
 # layout its cell addresses were written for. run_consolidation.py stops the run on it.
 TEMPLATE_MISMATCH_EXIT = 3
+# The quote-window telemetry fetch pages through every index in the window and then reads
+# daily counters in batches. Each attempt gets this long, and a timeout is retried.
+QUOTE_TELEMETRY_BUDGET_S = 600
+QUOTE_TELEMETRY_ATTEMPTS = 2
 
 
 # How much each evidence check moves the quoted dollar. Confidence is their weighted mean,

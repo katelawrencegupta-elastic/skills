@@ -997,5 +997,58 @@ class PhaseGuardTests(unittest.TestCase):
         self.assertIn("not in a git checkout", err.getvalue())
 
 
+class TelemetryFetchTests(unittest.TestCase):
+    def test_a_timeout_is_retried_and_the_second_attempt_wins(self):
+        import run_consolidation as rc
+        import threading
+
+        calls = []
+        release = threading.Event()
+
+        def fetch():
+            calls.append(1)
+            if len(calls) == 1:
+                release.wait(5)
+                return "late"
+            return "ok"
+
+        try:
+            self.assertEqual(rc.fetch_with_budget(fetch, budget_s=0.05, attempts=2), "ok")
+        finally:
+            release.set()
+        self.assertEqual(len(calls), 2)
+
+    def test_every_attempt_failing_raises_the_last_error(self):
+        import run_consolidation as rc
+
+        def fetch():
+            raise ValueError("boom")
+
+        with self.assertRaises(ValueError):
+            rc.fetch_with_budget(fetch, budget_s=1, attempts=2)
+
+    def test_a_timeout_names_the_attempt(self):
+        import run_consolidation as rc
+        import threading
+
+        release = threading.Event()
+        try:
+            with self.assertRaises(TimeoutError) as ctx:
+                rc.fetch_with_budget(lambda: release.wait(5), budget_s=0.02, attempts=2)
+        finally:
+            release.set()
+        self.assertIn("attempt 2 of 2", str(ctx.exception))
+
+    def test_the_lock_is_exclusive_and_released(self):
+        import run_consolidation as rc
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / ".telemetry.lock"
+            with rc.telemetry_lock(path):
+                self.assertTrue(path.exists())
+            with rc.telemetry_lock(path):
+                pass
+
+
 if __name__ == "__main__":
     unittest.main()
