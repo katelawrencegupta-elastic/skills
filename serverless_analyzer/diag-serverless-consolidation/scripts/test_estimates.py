@@ -1019,7 +1019,10 @@ class SearchTelemetryShareTests(unittest.TestCase):
             {"solution": "search", "region": "west", "stored_gb": 20, "daily_raw_gb": 0},
         ]}}
         import sheets_io as _sheets_io
-        with mock.patch.object(plan_sizing, "run_es3", side_effect=fake_es3), \
+        import search_sheet
+        import sizing_shared
+        with mock.patch.object(search_sheet, "run_es3", side_effect=fake_es3), \
+             mock.patch.object(sizing_shared, "_SEARCH_NOTEBOOK", True), \
              mock.patch.object(plan_sizing, "load_sheet_creds", return_value=None), \
              mock.patch.object(plan_sizing, "services_from", return_value=(None, None)), \
              mock.patch.object(_sheets_io, "sheet_workers", return_value=1):

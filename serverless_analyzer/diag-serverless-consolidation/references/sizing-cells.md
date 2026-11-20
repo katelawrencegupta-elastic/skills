@@ -16,7 +16,8 @@ The account summary starts sizing when `platform.ech_share_pct > 50`. A consolid
 |------|----------|----------|
 | Observability (v1.22) | [1tUdwJbTmd4helFOzEHMi_gpHw7qu_aCgprjlqmHh2hs](https://docs.google.com/spreadsheets/d/1tUdwJbTmd4helFOzEHMi_gpHw7qu_aCgprjlqmHh2hs/edit) | `O11Y_SHEET_ID` / `--o11y-id` |
 | Security (v2.6) | [1b91Uoa2e4vBrep_7I4RoY_8Mr19poqaUgWl7LqhIOqY](https://docs.google.com/spreadsheets/d/1b91Uoa2e4vBrep_7I4RoY_8Mr19poqaUgWl7LqhIOqY/edit?usp=drive_link) | `SECURITY_SHEET_ID` / `--security-id` |
-| Search | es3-estimator `the notebook estimate function` (clone via `ES3_ESTIMATOR_DIR`, venv via `ES3_ESTIMATOR_PY`) | performant profile is the quotable $ |
+| Search (v2.3) | [13OdvASrBHTVqfe1VMdp8gXyHrMZ7cPeyvtKMK7A9VpY](https://docs.google.com/spreadsheets/d/13OdvASrBHTVqfe1VMdp8gXyHrMZ7cPeyvtKMK7A9VpY/edit) | `SEARCH_SHEET_ID` / `--search-id`. Performant total (G110) is the quotable $ |
+| Search, notebook path | es3-estimator `the notebook estimate function` (clone via `ES3_ESTIMATOR_DIR`, venv via `ES3_ESTIMATOR_PY`) | `--search-notebook`. Performant profile is the quotable $ |
 
 Overrides accept a bare id or a full `docs.google.com/spreadsheets/d/<id>/…` URL. The consolidation-savings analysis (`consolidation.py`) prices with the Observability template's `Estimator_Reference` ladders (imported from the parent skill) and reconciles against the copied sheet's read-back.
 
@@ -61,7 +62,24 @@ Read-back, unformatted: `G5` metered GB/day · `E74` monthly total · `E61` inge
 ## Region matching (`size_serverless.match_region`)
 Dropdown strings are scraped live from the copy's `Estimator_Reference` tab (any cell matching `^(AWS|AZURE|GCP)`), so template version drift is tolerated. K360 region (`us-east-1`, `eastus2`, `europe-west1`) is normalised (strip dashes) and compared; Azure compass aliases handled (`eastus2` ⇄ `us-east-2`). Result recorded as `region_match: "<option> (exact|alias|provider_default|nearest|none)"`. A region that is not listed is priced as AWS `us-east-1`, Azure `eastus`, or GCP `us-east1`, recorded as `provider_default`. The Security sheet spells those Azure and GCP defaults `us-east-1`. The deployment's own region stays on the quote. Region fidelity fails, so the quote stays unverified. `none` is only when that cloud has no default on the list, and it leaves that solution unquoted, including Search. Another cloud is never written.
 
-## Search (es3-estimator)
+## Search (estimator sheet, v2.3)
+The default. A copy of the Search template is filled on tab `Estimator`, column C, and read back, as for Observability and Security. `search_sheet.py` owns the fill. Layout is checked first against `TEMPLATE_ANCHORS["search"]` in `estimator_layout.py` (labels in column B and E; the workbook has no Version Control tab, so labels are the whole check).
+
+| Cell | Input |
+| --- | --- |
+| C5, C6, C7, C8 | Provider, region text (`eastus (Virginia)`), support level, workload `text` |
+| C12 | Stored GB (the search slice). C13 and C14 stay blank |
+| C19, C20, C21, C22 | Peak QPS, complexity, share of the 730-hour month, minimum VCU (0) |
+| C24, C25, C26, C27 | The same for non-peak |
+| C30 | Idle minimum VCU (0) |
+| C33, C34, C35 | Ingest docs/s, average document bytes, active hours |
+| C37, C40:C45, C48 | Data out, cross-project search, fast refresh: all off (0, 0, No) |
+
+Every input is written, zeros included, so no template default survives. Read-back: C53 must say `Yes` (a region the sheet cannot price is rejected). Columns F, G and H are on-demand, performant and high availability; rows 103 to 110 are search, ingest, retained data, data out, CPS, subtotal, support and total per month, and 89, 96 and 98 are peak VCU, idle VCU and VCU-hours. The quote is G110. `annual_year1` is G110 × 12.
+
+The sheet only offers query complexity `simple` (100 ms), `moderate` (500 ms) and `complex` (5,000 ms). A measured query time is rounded to the nearest of those on a log scale and the rounding is written to `assumptions`. The notebook path uses the measured milliseconds, so the two paths can differ where query time is far from those three points. The deployment-count bars and the report's regional replication still price Search with the notebook library, because they price many what-if projects and a sheet copy per project would be slow.
+
+## Search (es3-estimator, `--search-notebook`)
 `es3_estimate.py` calls `the notebook estimate function` from the notebook's library. Inputs: text workload, `disk_storage_gb` = the search slice's stored GB, peak and non-peak QPS with measured query time (ms) and hour share, and telemetry-derived docs/s and QPS, both scaled by that project's diagnostic search store divided by diagnostic org store. Search is left unquoted unless Cloud Tracker index telemetry covers the exact billed quote window and includes measured docs/s and average document size. Billing pace never scales Search workload. Support Premium maps to the notebook's Enterprise (15%). Provider and region are matched to the library's price table. A region that is not in that table is priced as AWS `us-east-1`, Azure `eastus`, or GCP `us-east1`. A cloud with no default in the table leaves Search unquoted.
 
 Read-back (`estimators.search.readback`): `monthly_steady_state`, `annual_year1`, `annual_steady_state` from the **performant** profile, plus search / ingest / storage / support dollars and provisioned vs idle search VCU. On-demand and high availability are in the markdown and in `profiles`. They are not the quote. Performant is the profile this skill quotes. The es3-estimator README says more than 98% of customers run Performant, so it is the setting the model has the most data for. On-demand and high availability are shown beside it; the README says on-demand can come out too high and high availability too low because of the training data. `QUOTED_SEARCH_PROFILE` in `es3_estimate.py` sets the quoted profile, and a run whose estimator returns no numeric total for it leaves Search unquoted.

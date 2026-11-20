@@ -362,6 +362,8 @@ def _estimator_flags(args) -> list[str]:
         flags.append("--fresh")
     if getattr(args, "allow_nearest_region", False):
         flags.append("--allow-nearest-region")
+    if getattr(args, "search_notebook", False):
+        flags.append("--search-notebook")
     return flags
 
 

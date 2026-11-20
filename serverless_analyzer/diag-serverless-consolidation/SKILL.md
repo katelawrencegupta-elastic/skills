@@ -4,7 +4,7 @@ description: >-
   Diagnostic-to-Serverless consolidation report for one Elastic Cloud account.
   Prices Observability and Security from Elasticsearch diagnostic bundles
   (measured bulk GB/day, retention the average across indexes rounded up to a whole month)
-  through the matching estimator read-back, and Search from local store on es3.
+  through the matching estimator read-back, and Search from local store on the Search estimator sheet (the es3 notebook library behind `--search-notebook`).
   Produces one consolidation PDF at that month, with recent ECH spend on page 1,
   a deployment-count plan, per-cluster costs, a raw bulk ingest page, and an appendix.
   Triggers: diag consolidation, diagnostic bundles, serverless consolidation report,
@@ -70,7 +70,7 @@ Confirm these from the brief. Do not open the sheet.
 ## Hard rules
 
 1. Observability and Security ingest are diagnostic bulk, written as metered. The written month is the unweighted average retention across indexes with local primary store, rounded up to a whole month. Each index is aged by its ILM delete policy, else its data-stream retention, else 30 days. Search disk is not scaled by that month.
-2. The estimator read-back is the dollar: Observability D38, Security E74, Search the es3 performant profile.
+2. The estimator read-back is the dollar: Observability D38, Security E74, Search the performant total (G110 on the Search sheet, or the es3 performant profile with `--search-notebook`).
 3. Match the estimator to the solution.
 4. One sheet per solution per region, at that month, with no second fleet-wide sheet and no second measured-retention sheet.
 5. Size the last 90 billed days unless `--lookback-days` says otherwise.

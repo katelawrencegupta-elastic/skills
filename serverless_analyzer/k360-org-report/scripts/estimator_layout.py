@@ -2,8 +2,10 @@
 
 Every script that writes an estimator by cell address checks the copy against
 this file first, so a moved row stops the run instead of filling the wrong cell.
-The Search (ES3) estimator has no entry in TEMPLATE_ANCHORS yet, so no script
-fills it: see ES3_LAYOUT_MISSING.
+The Search estimator v2.3 is recorded here as kind "search" and is filled by
+`diag-serverless-consolidation`. The org report's older ES3 cell map has no
+entry in TEMPLATE_ANCHORS, so the org report still does not fill it: see
+ES3_LAYOUT_MISSING.
 `diag-serverless-consolidation/scripts/quote_checks.py` re-exports these names.
 When an estimator release moves a row, change the cell maps, this file, and
 `diag-serverless-consolidation/references/sizing-cells.md` together.
@@ -16,19 +18,60 @@ VERSION_TAB = "Version Control"
 OBSERVABILITY_TAB = "Observability Estimator"
 SECURITY_TAB = "Security Estimator"
 ES3_TAB = "Estimator"
+SEARCH_TAB = "Estimator"
 REFERENCE_TAB = "Estimator_Reference"
 
 # Golden templates. They are copied, never written. The env names are the overrides
 # that point a run at another template; an id set there is a template too.
 GOLDEN_ES3 = "1Jsi5cMIDGfaP-S1_xqDcGeMYJSgklcBbu4dSJAEjlA0"
+GOLDEN_SEARCH = "13OdvASrBHTVqfe1VMdp8gXyHrMZ7cPeyvtKMK7A9VpY"        # Search v2.3
 GOLDEN_OBSERVABILITY = "1tUdwJbTmd4helFOzEHMi_gpHw7qu_aCgprjlqmHh2hs"  # v1.22
 GOLDEN_SECURITY = "1b91Uoa2e4vBrep_7I4RoY_8Mr19poqaUgWl7LqhIOqY"       # v2.6
-TEMPLATE_ENV = ("ES3_SHEET_ID", "O11Y_SHEET_ID", "SECURITY_SHEET_ID")
+TEMPLATE_ENV = ("ES3_SHEET_ID", "SEARCH_SHEET_ID", "O11Y_SHEET_ID", "SECURITY_SHEET_ID")
 
 # Each anchor is the text beside a cell a script writes or reads. `min_version`
 # is the oldest layout these addresses fit. A sheet prints 1.20 as "1.2", so
 # versions compare as numbers.
 TEMPLATE_ANCHORS = {
+    # Search v2.3. Labels sit in column B beside the input in column C, and the
+    # price rows are labelled in column E. The workbook has no Version Control tab
+    # (its versions are on Release Notes), so the labels are the whole check.
+    "search": {
+        "min_version": None,
+        "labels": {
+            "B5": "cloud provider",
+            "B6": "region",
+            "B7": "support level",
+            "B8": "workload",
+            "B12": "data stored size (gb)",
+            "B19": "[peak] search qps",
+            "B20": "[peak] search query complexity",
+            "B21": "[peak] % of search hours/mo",
+            "B22": "[peak] minimum search vcu",
+            "B24": "[non-peak] search qps",
+            "B25": "[non-peak] search query complexity",
+            "B26": "[non-peak] % of search hours/mo",
+            "B27": "[non-peak] minimum search vcu",
+            "B30": "[idle] minimum search vcu",
+            "B33": "ingest docs/sec",
+            "B34": "ingest avg doc size",
+            "B35": "ingest active hours/mo",
+            "B37": "serverless data out",
+            "B40": "linked elasticsearch projects",
+            "B45": "cps data out",
+            "B48": "fast refresh",
+            "B53": "isregionvalid",
+            "E98": "total_vcu_hours",
+            "E103": "search price/mo",
+            "E104": "ingest price/mo",
+            "E105": "data retained price/mo",
+            "E106": "serverless data out price/mo",
+            "E107": "cps price/mo",
+            "E109": "support price/mo",
+            "E110": "total price/mo",
+            "F9": "performant",
+        },
+    },
     "observability": {
         "min_version": 1.22,
         "labels": {
@@ -134,7 +177,7 @@ def golden_template_ids(environ=None) -> set[str]:
     import os
 
     env = os.environ if environ is None else environ
-    ids = {GOLDEN_ES3, GOLDEN_OBSERVABILITY, GOLDEN_SECURITY}
+    ids = {GOLDEN_ES3, GOLDEN_SEARCH, GOLDEN_OBSERVABILITY, GOLDEN_SECURITY}
     for name in TEMPLATE_ENV:
         if env.get(name):
             ids.add(sheet_id(env[name]))

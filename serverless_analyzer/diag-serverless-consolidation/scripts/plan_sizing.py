@@ -13,6 +13,7 @@ from sheets_io import (
     copy_verified, export_xlsx, load_sheet_creds, map_in_order, push_cells, read_cells,
     services_from, trash_file, write_search_sheet,
 )
+from search_sheet import price_search
 from estimate_paths import _months_for_sheet, _search_volume_scale, estimate_title
 from sizing_fill import (
     _region_rejected, fill_security, ingest_basis, match_region, observability_fill,
@@ -24,19 +25,18 @@ def _fill_regional_job(job: dict, creds) -> dict:
     sheets, drive = services_from(creds)
     sol = job["solution"]
     if sol == "search":
-        result = run_es3({
-            "stored_gb": job["stored_gb"],
-            "org_stored_gb": job["org_gb"],
-            "provider": job["provider"],
-            "region": job["region"],
-            "support_tier": job["support"],
-            "workload": job["workload"],
-        })
-        published = {}
-        try:
-            published = write_search_sheet(drive, Path(job["local_dir"]), job["parent_id"], job["title"], result)
-        except Exception as ex:  # noqa: BLE001
-            published = {"error": str(ex)}
+        import sizing_shared
+        result, published = price_search(
+            drive, sheets, job["parent_id"], Path(job["local_dir"]), job["title"], {
+                "stored_gb": job["stored_gb"],
+                "org_stored_gb": job["org_gb"],
+                "provider": job["provider"],
+                "region": job["region"],
+                "support_tier": job["support"],
+                "workload": job["workload"],
+            }, notebook=sizing_shared._SEARCH_NOTEBOOK, template_id=sizing_shared._SEARCH_TEMPLATE_ID,
+            reuse=job["reuse"], skip_xlsx=job.get("skip_xlsx", True),
+        )
         entry = {
             "solution": sol, "region": job["region"], "title": job["title"], "stored_gb": job["stored_gb"],
             "store_scale": job.get("store_scale"),

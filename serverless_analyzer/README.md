@@ -78,7 +78,8 @@ Prices Observability and Security from Elasticsearch diagnostic bundles. Daily G
 | `sizing_fill.py` | The Observability, Security and Search fills, and the region match |
 | `plan_sizing.py` | The regional jobs and the deployment-count plan |
 | `constants.py` | Every shared number: the month, the tolerances, the thresholds, the exit status |
-| `es3_estimate.py` | Prices a Search slice with the es3-estimator library |
+| `search_sheet.py` | Prices a Search slice on a copy of the Search estimator sheet (v2.3), the default. Reads the performant total back |
+| `es3_estimate.py` | Prices a Search slice with the es3-estimator library. Used with `--search-notebook`, and for the deployment-count bars |
 | `consolidation.py` | Builds the savings, deployment-count plan, per-cluster cost table, metered rates, and quote integrity from the read-backs. Also the façade the runner and renderers import through |
 | `consolidation_scope.py` | The quote window, the billed series, which ECH deployments are on each side of the comparison, and the stand-in ladders |
 | `consolidation_regional.py` | One project per solution per region, the per-region read-backs, and the integrity facts |
@@ -92,6 +93,7 @@ Prices Observability and Security from Elasticsearch diagnostic bundles. Daily G
 
 Run options worth knowing:
 
+- `--search-notebook` prices Search with the es3-estimator notebook library instead of the Search estimator sheet, which is the default. `--search-id` (or `SEARCH_SHEET_ID`) points at another Search template. The deployment-count bars price Search with the library on both paths.
 - `--exclude-deployment <id>` (repeat or comma list) removes a deployment from the whole run. The run key gains `_excluding_<n>`, and page 1 names what was left out.
 - `--ech-scope priced|all` (default `priced`) sets the ECH side of the comparison: only deployments that got a serverless price, or the whole billing window. Page 1 names what was not compared.
 - `--unmeasured exclude|fail` (default `exclude`) says what an active deployment with no bundle does: left off both sides of the comparison, or a stop that names every one of them. There is no K360 mode: a size that was never measured cannot enter a diagnostic estimate.

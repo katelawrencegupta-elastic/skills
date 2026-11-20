@@ -51,6 +51,8 @@ from sizing_fill import (
     observability_input_cells, region_match_text, region_options, run_es3, security_expansion,
     security_input_cells,
 )
+from search_sheet import price_search
+from sizing_shared import DEFAULT_SEARCH
 from plan_sizing import (
     assemble_plan_bars, org_store_gb, plan_roster, plan_sheet_jobs, size_deployment_plan,
     size_regional_projects,
@@ -85,7 +87,9 @@ def main() -> None:
     ap.add_argument("--always-copy", action="store_true", help="Copy an estimator even when its slice has no workload")
     ap.add_argument("--fresh", action="store_true", help="Always create new copies (default reuses same-named copies in the folder)")
     ap.add_argument("--projects", action="store_true", help="Only write one sizing per regional project; leave the consolidated copies in place")
-    ap.add_argument("--search-sheets", action="store_true", help="Republish Search estimator output as Google Sheets and leave the other copies in place")
+    ap.add_argument("--search-sheets", action="store_true", help="Redo only the Search estimator copy (the sheet, or with --search-notebook the library report as a Google Sheet) and leave the other copies in place")
+    ap.add_argument("--search-notebook", action="store_true", help="Price Search with the es3-estimator notebook library instead of the Search estimator sheet (the default)")
+    ap.add_argument("--search-id", default=os.environ.get("SEARCH_SHEET_ID", DEFAULT_SEARCH), type=sheet_id, help="Search golden template (id or URL)")
     ap.add_argument("--name-suffix", default="", help="Appended to estimator titles so a second sizing does not overwrite the first")
     ap.add_argument("--sizing-json", default=None, help="Filename for the sizing sidecar (default sizing.json)")
     ap.add_argument("--force-months", type=int, default=None, help="Write this whole month on the Observability and Security sheets when a measured month already exists. Search disk is never scaled by a month")
@@ -97,6 +101,8 @@ def main() -> None:
     args = ap.parse_args()
     import sizing_shared
     sizing_shared._ALLOW_NEAREST = bool(args.allow_nearest_region)
+    sizing_shared._SEARCH_NOTEBOOK = bool(args.search_notebook)
+    sizing_shared._SEARCH_TEMPLATE_ID = args.search_id
     args.skip_xlsx = not args.xlsx
 
     acc_path = Path(args.account_json)
@@ -175,15 +181,21 @@ def main() -> None:
         else:
             title_se = estimate_title(key, "search", suffix, search_scope)
             store_scale = _search_volume_scale(suffix)
-            result = run_es3({
-                "stored_gb": float(se.get("stored_gb") or 0) * store_scale,
-                "org_stored_gb": org_store_gb(acc) * store_scale,
-                "provider": solution_provider(acc, "search", provider),
-                "region": search_scope or region,
-                "support_tier": support,
-                "workload": se.get("workload") or acc.get("workload") or {},
-            }) if (se.get("stored_gb") or 0) > 0 else {}
-            published = write_search_sheet(drive, estimate_dir, folder["id"], title_se, result) if result.get("report_csv") else {"error": result.get("error") or "no report"}
+            if (se.get("stored_gb") or 0) > 0:
+                result, published = price_search(
+                    drive, sheets, folder["id"], estimate_dir, title_se, {
+                        "stored_gb": float(se.get("stored_gb") or 0) * store_scale,
+                        "org_stored_gb": org_store_gb(acc) * store_scale,
+                        "provider": solution_provider(acc, "search", provider),
+                        "region": search_scope or region,
+                        "support_tier": support,
+                        "workload": se.get("workload") or acc.get("workload") or {},
+                    }, notebook=args.search_notebook, template_id=args.search_id, reuse=not args.fresh, skip_xlsx=args.skip_xlsx,
+                )
+                if not published.get("url") and not published.get("error"):
+                    published = {"error": result.get("error") or "no report"}
+            else:
+                result, published = {}, {"error": "no report"}
             entry = dict(estimators.get("search") or {"kind": "search", "title": title_se})
             entry["region"] = search_scope or region
             entry.pop("doc_id", None)
@@ -379,24 +391,22 @@ def main() -> None:
         result: dict = {}
         store_scale = _search_volume_scale(suffix)
         if has_search and (se.get("stored_gb") or 0) > 0:
-            result = run_es3({
-                "stored_gb": float(se.get("stored_gb") or 0) * store_scale,
-                "org_stored_gb": org_store_gb(acc) * store_scale,
-                "provider": solution_provider(acc, "search", provider),
-                "region": search_scope or region,
-                "support_tier": support,
-                "workload": se.get("workload") or acc.get("workload") or {},
-            })
+            result, published = price_search(
+                drive, sheets, folder["id"], estimate_dir, title_se, {
+                    "stored_gb": float(se.get("stored_gb") or 0) * store_scale,
+                    "org_stored_gb": org_store_gb(acc) * store_scale,
+                    "provider": solution_provider(acc, "search", provider),
+                    "region": search_scope or region,
+                    "support_tier": support,
+                    "workload": se.get("workload") or acc.get("workload") or {},
+                }, notebook=args.search_notebook, template_id=args.search_id, reuse=not args.fresh, skip_xlsx=args.skip_xlsx,
+            )
         elif has_search:
             result = {"status": "skipped — search slice has no stored GB", "assumptions": ["Nothing to price."]}
+            published = {}
         else:
             result = {"status": "skipped — no search workload detected (use --always-copy to force)"}
-        published = {}
-        if result.get("report_csv"):
-            try:
-                published = write_search_sheet(drive, estimate_dir, folder["id"], title_se, result)
-            except Exception as ex:  # noqa: BLE001
-                published = {"error": str(ex)}
+            published = {}
         entry = {
             "kind": "search",
             "region": search_scope or region,
@@ -413,6 +423,9 @@ def main() -> None:
             "source": result.get("source"),
             "url": published.get("url"),
             "spreadsheet_id": published.get("spreadsheet_id"),
+            "search_path": "notebook" if args.search_notebook else "sheet",
+            "template_id": None if args.search_notebook else args.search_id,
+            "cells": result.get("cells"),
             "note": "performant is the quotable profile" if result.get("readback") else (result.get("error") or result.get("status")),
         }
         if result.get("error"):
@@ -423,7 +436,7 @@ def main() -> None:
                 entry["readback"] = None
         if published.get("error"):
             entry["error"] = published["error"]
-            entry["note"] = f"{entry.get('note')}; Drive upload failed: {published['error']}"
+            entry["note"] = f"{entry.get('note')}; Search estimate was not published: {published['error']}"
         rb = result.get("readback") or {}
         lines.append(f"Search → {entry.get('url') or entry.get('local')}  (performant {rb.get('monthly_steady_state') or entry['status']}; region {result.get('region_match')})")
         estimators["search"] = entry
