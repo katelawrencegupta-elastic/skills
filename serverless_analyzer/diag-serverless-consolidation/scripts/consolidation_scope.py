@@ -154,6 +154,10 @@ def apply_quote_lookback(acc: dict, days: int = 90) -> float:
     ecu["quote_usage_factor"] = round(factor, 6)
     ecu["quote_ingest_factor"] = round(ingest_factor, 6)
     workload = acc.get("workload") or {}
+    if workload.get("source") == "service-proxy-requests":
+        # Proxy-log traffic is measured over its own recent window and says so in quote_window_telemetry.
+        # The billed quote window does not apply to it.
+        return float(ecu["quote_usage_factor"])
     quote_days = ecu.get("quote_lookback_days")
     telemetry_days = int(workload.get("window_days") or 0)
     telemetry_start = workload.get("window_start")

@@ -20,6 +20,9 @@ from sizing_fill import (
     region_match_text, region_options, run_es3,
 )
 
+from search_inputs import exact_inputs
+
+
 def _fill_regional_job(job: dict, creds) -> dict:
     """One regional project. The worker builds its own Sheets and Drive clients."""
     sheets, drive = services_from(creds)
@@ -173,7 +176,7 @@ def size_regional_projects(acc: dict, sheets, drive, folder: dict, *, o11y_id: s
                 job["stored_gb"] = gb * scale
                 job["org_gb"] = org_gb * scale
                 job["store_scale"] = scale
-                job["workload"] = workload
+                job["workload"], job["org_gb"] = exact_inputs(workload, region, job["stored_gb"], job["org_gb"])
             elif sol == "observability":
                 if g.get("mix_error"):
                     continue

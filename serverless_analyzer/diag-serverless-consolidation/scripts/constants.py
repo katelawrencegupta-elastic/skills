@@ -56,3 +56,8 @@ CONFIDENCE_WEIGHTS = {
 # A band, not a decimal: three decimals imply a precision these inputs do not have.
 CONFIDENCE_HIGH = 0.85
 CONFIDENCE_MODERATE = 0.60
+
+# Query complexity from the average query time, as the Search estimator sheet's Documentation tab sets it:
+# up to 250 ms is simple, 250 to 500 moderate, over 500 complex.
+SIMPLE_MAX_MS = 250.0
+MODERATE_MAX_MS = 500.0

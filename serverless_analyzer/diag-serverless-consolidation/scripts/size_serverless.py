@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import sizing_shared
+from search_inputs import exact_inputs
 from constants import TEMPLATE_MISMATCH_EXIT
 from sizing_shared import (
     DAYS_PER_MONTH, DEFAULT_O11Y, DEFAULT_SECURITY, O11Y_READBACK, O11Y_TAB, PLAN_FOLDER_NAME,
@@ -185,11 +186,11 @@ def main() -> None:
                 result, published = price_search(
                     drive, sheets, folder["id"], estimate_dir, title_se, {
                         "stored_gb": float(se.get("stored_gb") or 0) * store_scale,
-                        "org_stored_gb": org_store_gb(acc) * store_scale,
+                        "org_stored_gb": exact_inputs(se.get("workload") or acc.get("workload") or {}, search_scope or region, float(se.get("stored_gb") or 0) * store_scale, org_store_gb(acc) * store_scale)[1],
                         "provider": solution_provider(acc, "search", provider),
                         "region": search_scope or region,
                         "support_tier": support,
-                        "workload": se.get("workload") or acc.get("workload") or {},
+                        "workload": exact_inputs(se.get("workload") or acc.get("workload") or {}, search_scope or region, float(se.get("stored_gb") or 0) * store_scale, org_store_gb(acc) * store_scale)[0],
                     }, notebook=args.search_notebook, template_id=args.search_id, reuse=not args.fresh, skip_xlsx=args.skip_xlsx,
                 )
                 if not published.get("url") and not published.get("error"):
@@ -394,11 +395,11 @@ def main() -> None:
             result, published = price_search(
                 drive, sheets, folder["id"], estimate_dir, title_se, {
                     "stored_gb": float(se.get("stored_gb") or 0) * store_scale,
-                    "org_stored_gb": org_store_gb(acc) * store_scale,
+                    "org_stored_gb": exact_inputs(se.get("workload") or acc.get("workload") or {}, search_scope or region, float(se.get("stored_gb") or 0) * store_scale, org_store_gb(acc) * store_scale)[1],
                     "provider": solution_provider(acc, "search", provider),
                     "region": search_scope or region,
                     "support_tier": support,
-                    "workload": se.get("workload") or acc.get("workload") or {},
+                    "workload": exact_inputs(se.get("workload") or acc.get("workload") or {}, search_scope or region, float(se.get("stored_gb") or 0) * store_scale, org_store_gb(acc) * store_scale)[0],
                 }, notebook=args.search_notebook, template_id=args.search_id, reuse=not args.fresh, skip_xlsx=args.skip_xlsx,
             )
         elif has_search:

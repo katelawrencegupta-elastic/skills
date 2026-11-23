@@ -4,7 +4,7 @@ description: >-
   Diagnostic-to-Serverless consolidation report for one Elastic Cloud account.
   Prices Observability and Security from Elasticsearch diagnostic bundles
   (measured bulk GB/day, retention the average across indexes rounded up to a whole month)
-  through the matching estimator read-back, and Search from local store on the Search estimator sheet (the es3 notebook library behind `--search-notebook`).
+  through the matching estimator read-back, and Search from local store and the service proxy request logs on the Search estimator sheet (the es3 notebook library behind `--search-notebook`).
   Produces one consolidation PDF at that month, with recent ECH spend on page 1,
   a deployment-count plan, per-cluster costs, a raw bulk ingest page, and an appendix.
   Triggers: diag consolidation, diagnostic bundles, serverless consolidation report,
@@ -33,7 +33,7 @@ python <skill>/scripts/run_consolidation.py --org "ORG NAME" \
   --org-id ID1 --org-id ID2 --org-id ID3
 ```
 
-`--exclude-deployment` removes a deployment from billing, bulk, store, counts, the plan, and every estimate. Monitoring-named deployments are excluded unless `--keep-monitoring` is set. Do not pass `--skip-diags`, `--skip-sizing`, or `--k360-ingest` unless the user asked for the K360 backup. `--lookback-days` defaults to 90 and cannot exceed 365. `--ech-scope priced` compares only deployments that received a serverless price. `--unmeasured exclude` leaves an active deployment with no bundle off both sides.
+`--exclude-deployment` removes a deployment from billing, bulk, store, counts, the plan, and every estimate. Monitoring-named deployments are excluded unless `--keep-monitoring` is set. Do not pass `--skip-diags`, `--skip-sizing`, or `--k360-ingest` unless the user asked for the K360 backup. `--lookback-days` defaults to 90 and cannot exceed 365. `--proxy-days` (default 7) sets how many complete UTC days of proxy request logs feed Search QPS, complexity and hour shares. Search needs `PROXY_LOGS_URL` and `PROXY_LOGS_API_KEY` in `.env` or the environment, and a region without proxy traffic is left unquoted. `--ech-scope priced` compares only deployments that received a serverless price. `--unmeasured exclude` leaves an active deployment with no bundle off both sides.
 
 ## Read the brief
 

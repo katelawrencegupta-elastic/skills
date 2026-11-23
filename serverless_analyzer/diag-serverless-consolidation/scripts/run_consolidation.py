@@ -850,37 +850,22 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
     # account report's usual 21-day workload sample cannot stand in for a
     # different billing window.
     try:
-        org_root = find_skill("k360-org-report", HERE)
-        org_scripts = scripts_dir(org_root)
-        if str(org_scripts) not in sys.path:
-            sys.path.insert(0, str(org_scripts))
-        from fetch_org import es_base_and_key, fetch_workload
+        # Search traffic is read from the service proxy request logs for each region's own Search deployments,
+        # and ingest from the diagnostic bundles, so no workload is scaled by a store share.
+        import search_inputs
 
-        quote_days = int((diag.get("ecu") or {}).get("quote_lookback_days") or 0)
-        labels, _ = billed_series(diag.get("ecu") or {})
-        quote_labels = labels[-quote_days:] if quote_days else []
-        if not quote_labels or len(quote_labels) != quote_days:
-            raise ValueError("the billed quote window has no complete daily date range")
-        avg_doc_bytes = (((diag.get("workload") or {}).get("ingest") or {}).get("avg_doc_bytes"))
-        base, key = es_base_and_key(env)
-        # A large fleet's 90-day index scan is many calls. Each attempt is bounded and a failure
-        # is retried, and only one run at a time fetches so parallel runs do not starve each other.
-        def _fetch_quote_window():
-            return fetch_workload(
-                base, key, org_ids, avg_doc_bytes,
-                telemetry_start=quote_labels[0], telemetry_end=quote_labels[-1],
-            )
-
-        with telemetry_lock((Path(args.artifacts_root) if getattr(args, "artifacts_root", None) else artifacts_root()) / ".telemetry.lock"):
-            fetched = {"value": fetch_with_budget(_fetch_quote_window)}
-        diag["workload"] = fetched["value"]
+        base, key = search_inputs.settings(env)
+        fetched = search_inputs.regional_workloads(diag, base, key, days=int(getattr(args, "proxy_days", 7) or 7))
+        diag["workload"] = fetched
         (diag.get("sizing") or {}).get("consolidated", {}).setdefault("search", {})["workload"] = diag["workload"]
+        for region, why in (fetched.get("errors") or {}).items():
+            note_limit(diag, "search_proxy_workload_missing", f"Search in {region} was left unquoted: {why}")
     except (Exception, SystemExit) as ex:
         failed_workload = diag.setdefault("workload", {})
         failed_workload["quote_window_fetch_error"] = str(ex)
         failed_workload["quote_window_telemetry"] = {
             "status": "incomplete",
-            "reason": f"Cloud Tracker quote-window telemetry fetch failed: {ex}",
+            "reason": f"proxy-log Search workload failed: {ex}",
         }
         (diag.get("sizing") or {}).get("consolidated", {}).setdefault("search", {})["workload"] = failed_workload
     apply_quote_lookback(diag, args.lookback_days)

@@ -11,6 +11,7 @@ from consolidation_scope import (
     BILLING_WINDOW_MIN_SHARE, ESTIMATE_MONTHS, _clear_components, _money, _stash_model,
     e73_blocks_quote, ingest_echo, integrity_score, region_match_how, unpriced_reason,
 )
+from search_inputs import exact_inputs
 
 def es3_estimator_python() -> str:
     """Interpreter the es3 notebook library runs under."""
@@ -220,11 +221,11 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                     continue
                 result = {"readback": saved_rb, "profiles": saved_hit.get("profiles"), "region_match": saved_hit.get("region_match")} if _money(saved_rb.get("monthly_steady_state")) is not None else _es3_region({
                     "stored_gb": g["stored_gb"],
-                    "org_stored_gb": org_gb,
+                    "org_stored_gb": exact_inputs(workload, g["region"], g["stored_gb"], org_gb)[1],
                     "provider": group_provider(acc, g.get("deployments"), provider),
                     "region": g["region"],
                     "support_tier": support,
-                    "workload": workload,
+                    "workload": exact_inputs(workload, g["region"], g["stored_gb"], org_gb)[0],
                 }, es3_failures)
                 rb = (result or {}).get("readback") or {}
                 monthly = _money(rb.get("monthly_steady_state"))

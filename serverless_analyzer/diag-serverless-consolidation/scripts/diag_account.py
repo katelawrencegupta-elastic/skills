@@ -332,6 +332,11 @@ def apply_diagnostics(
             matched += 1
             dep["gb"] = round(float(hit.get("store_gb") or 0), 2)
             dep["daily_raw_gb"] = round(float(hit.get("bulk_gb_day") or 0), 3)
+            # What the Search workload needs from a measured bundle: the deployment id for the proxy logs,
+            # and the store bytes and documents that give the average document size.
+            dep["deployment_id"] = hit.get("id")
+            dep["store_bytes"] = int(hit.get("store_bytes") or 0)
+            dep["docs_count"] = int(hit.get("docs_count") or 0)
             dep.pop("compression_ratio", None)
             dep.pop("compressioncalc_accounted_for", None)
             snapshot_gb += float(hit.get("snapshot_gb") or 0)

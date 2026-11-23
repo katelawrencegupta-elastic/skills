@@ -91,11 +91,11 @@ class InputCellTests(unittest.TestCase):
         self.assertAlmostEqual(cells["C26"], 0.68, places=3)
         self.assertLessEqual(cells["C21"] + cells["C26"], 1.0)
 
-    def test_measured_query_time_is_rounded_to_a_sheet_option_and_said_so(self):
+    def test_measured_query_time_follows_the_documented_thresholds_and_says_so(self):
         cells, notes = self.cells()
         self.assertEqual(cells["C20"], "simple")
-        self.assertEqual(cells["C25"], "moderate")
-        self.assertTrue(any("40 ms was rounded to 'simple'" in note for note in notes))
+        self.assertEqual(cells["C25"], "complex")
+        self.assertTrue(any("40 ms is 'simple'" in note for note in notes))
 
     def test_ingest_cells_carry_the_measured_rate(self):
         cells, _ = self.cells()

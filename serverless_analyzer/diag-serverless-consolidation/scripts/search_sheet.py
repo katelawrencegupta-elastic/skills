@@ -11,7 +11,6 @@ Inputs are on tab `Estimator`, column C. Prices are per profile in columns F
 """
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
 from es3_estimate import (
@@ -20,7 +19,7 @@ from es3_estimate import (
 from sheets_io import _execute, assert_not_template, copy_verified, export_xlsx, push_cells, read_cells, trash_file, write_search_sheet
 from sizing_fill import _region_rejected, match_region, region_match_text, run_es3
 from sizing_shared import SEARCH_READBACK, SEARCH_TAB, sheet_money
-from constants import HOURS_PER_MONTH
+from constants import HOURS_PER_MONTH, MODERATE_MAX_MS, SIMPLE_MAX_MS
 
 QUOTED_PROFILE = "performant"
 PROFILE_COLUMN = {"on-demand": "F", "performant": "G", "high availability": "H"}
@@ -45,13 +44,12 @@ def search_region_options(sheets, sid: str) -> list[str]:
 
 
 def sheet_complexity(band: dict, label: str, assumptions: list[str]) -> str:
-    """The sheet only offers simple, moderate and complex, so a measured time is rounded to the nearest of them."""
+    """The Documentation tab's rule: QTT up to 250 ms is simple, 250 to 500 moderate, over 500 complex."""
     ms = band.get("complexity_ms")
     if ms is not None and float(ms) > 0:
-        pick = min(SHEET_COMPLEXITY, key=lambda name: abs(math.log(float(ms) / SHEET_COMPLEXITY[name])))
-        assumptions.append(
-            f"{label} query time {float(ms):g} ms was rounded to '{pick}' ({SHEET_COMPLEXITY[pick]:g} ms), the nearest option on the sheet."
-        )
+        ms = float(ms)
+        pick = "simple" if ms <= SIMPLE_MAX_MS else "moderate" if ms <= MODERATE_MAX_MS else "complex"
+        assumptions.append(f"{label} query time {ms:g} ms is '{pick}' by the sheet's rule (simple up to 250 ms, moderate 250 to 500, complex over 500).")
         return pick
     named = str(band.get("complexity") or "").strip().lower()
     if named in SHEET_COMPLEXITY:
