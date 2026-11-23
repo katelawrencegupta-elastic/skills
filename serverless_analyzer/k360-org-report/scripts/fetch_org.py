@@ -10,6 +10,7 @@ import argparse
 import json
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -36,6 +37,7 @@ DAYS_PER_MONTH = 30.416
 DEP_TERMS_SIZE = 300
 COMPOSITE_PAGE_SIZE = 5000
 COMPOSITE_MAX_PAGES = 10000
+ES_RETRIES = 3
 # A storage snapshot older than this many days before the range end is stale.
 STORAGE_STALE_DAYS = 45
 # A deployment with no bill in this many days before the range end is not in org stored GB.
@@ -89,11 +91,22 @@ def es_post(base: str, key: str, path: str, body: dict) -> dict:
         headers={"Authorization": f"ApiKey {key}", "Content-Type": "application/json"},
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            return json.load(resp)
-    except urllib.error.HTTPError as e:
-        raise SystemExit(f"ES HTTP {e.code} {path}: {e.read()[:600]!r}") from e
+    # A long composite walk (hundreds of pages) must not turn into "incomplete data" because one page
+    # hit a timeout, a dropped connection, or a 429/5xx. Retry those; anything else fails at once.
+    for attempt in range(ES_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 502, 503, 504) and attempt < ES_RETRIES:
+                time.sleep(2 ** attempt * 2)
+                continue
+            raise SystemExit(f"ES HTTP {e.code} {path}: {e.read()[:600]!r}") from e
+        except (TimeoutError, urllib.error.URLError, ConnectionError):
+            if attempt >= ES_RETRIES:
+                raise
+            time.sleep(2 ** attempt * 2)
+    raise AssertionError("unreachable")
 
 
 def composite_pages(base: str, key: str, path: str, body: dict, agg_name: str, consume) -> dict:
