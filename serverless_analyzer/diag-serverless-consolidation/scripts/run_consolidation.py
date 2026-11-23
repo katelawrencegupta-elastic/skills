@@ -893,6 +893,9 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
     extra = ["--sizing-json", "sizing.json", "--force-months", str(written_months)]
     if args.fresh:
         extra.append("--fresh")
+    if getattr(args, "search_notebook", False):
+        # The projects and deployment-plan steps reuse `extra`, so the flag has to ride on it.
+        extra.append("--search-notebook")
     if py.is_file():
         cmd = [str(py), str(HERE / "size_serverless.py"), "--account-json", str(diag_path), *extra]
         if args.xlsx:
