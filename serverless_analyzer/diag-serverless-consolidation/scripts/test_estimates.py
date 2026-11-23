@@ -1001,10 +1001,11 @@ class SearchTelemetryShareTests(unittest.TestCase):
             return {"readback": {"monthly_steady_state": 10}}
 
         acc = self._account()
+        # A workload with no regional blocks (the K360 backup) keeps the org-store share, on the notebook path.
         with mock.patch.object(plan_sizing, "run_es3", side_effect=fake_es3):
             plan = ss.size_deployment_plan(
                 acc, None, None, {"id": "folder"}, o11y_id="o", security_id="s", support="Premium",
-                provider="aws", force_months=12, name_suffix="", fresh=False,
+                provider="aws", force_months=12, name_suffix="", fresh=False, search_notebook=True,
             )
         self.assertFalse(plan.get("error"))
         self.assertEqual(len(seen), 2)
@@ -1047,6 +1048,14 @@ class SearchTelemetryShareTests(unittest.TestCase):
             {"solution": "search", "region": "west", "stored_gb": 20, "daily_raw_gb": 0, "deployments": ["west"]},
         ]
         by_solution = {"search": {"pricing": "es3-estimator performant (quotable)", "total_mo": 50, "stored_gb": 40}}
+        # On the default sheet path a region with no sheet read-back is unquoted. The notebook never runs.
+        sheet_solution = json.loads(json.dumps(by_solution))
+        sheet_notes: list[str] = []
+        with mock.patch("consolidation_regional._es3_region", side_effect=fake_region):
+            _replicate_by_region(acc, sheet_solution, groups, sheet_notes)
+        self.assertEqual(captured, [])
+        self.assertTrue(any("no read-back from its Search estimator sheet" in note for note in sheet_notes))
+        acc["sizing"].setdefault("estimators", {})["search"] = {"search_path": "notebook"}
         with mock.patch("consolidation_regional._es3_region", side_effect=fake_region):
             _replicate_by_region(acc, by_solution, groups, [])
         self.assertEqual(len(captured), 2)
@@ -1055,6 +1064,69 @@ class SearchTelemetryShareTests(unittest.TestCase):
             self.assertEqual(payload["stored_gb"], 20)
             self.assertEqual(payload["workload"]["ingest"]["docs_per_sec"], 100)
             self.assertEqual(payload["workload"]["search"]["peak"]["qps"], 40)
+
+
+class SearchPlanMatchesHeadlineTests(unittest.TestCase):
+    """The plan floor prices Search on the inputs the headline sheet got: the region's own workload, share 1."""
+
+    REGIONS = {
+        "east": {"search": {"peak": {"qps": 40, "complexity_ms": 120, "pct_hours_mo": 30},
+                            "nonpeak": {"qps": 10, "complexity_ms": 120, "pct_hours_mo": 70}},
+                 "ingest": {"docs_per_sec": 100, "avg_doc_bytes": 900, "active_hours_mo": 730}},
+        "west": {"search": {"peak": {"qps": 4, "complexity_ms": 600, "pct_hours_mo": 30},
+                            "nonpeak": {"qps": 1, "complexity_ms": 600, "pct_hours_mo": 70}},
+                 "ingest": {"docs_per_sec": 5, "avg_doc_bytes": 900, "active_hours_mo": 730}},
+    }
+
+    def _rows(self):
+        return [
+            {"name": "e1", "solution": "search", "region": "east", "provider": "aws", "store_gb": 30, "bulk_gb_day": 1},
+            {"name": "e2", "solution": "search", "region": "east", "provider": "aws", "store_gb": 10, "bulk_gb_day": 1},
+            {"name": "w1", "solution": "search", "region": "west", "provider": "aws", "store_gb": 20, "bulk_gb_day": 1},
+            {"name": "logs", "solution": "observability", "region": "east", "provider": "aws", "store_gb": 940,
+             "bulk_gb_day": 0},
+        ]
+
+    def _jobs(self, workload):
+        return plan_sheet_jobs(
+            self._rows(), run_key="Acme", name_suffix="", force_months=1, o11y_id="o", security_id="s",
+            parent_id="p", reuse=True, provider="aws", region_name="east", support="Premium",
+            feature_tier="Complete", workload=workload, org_gb=1000, search_id="t",
+        )
+
+    def test_the_floor_takes_each_regions_own_workload_unscaled(self):
+        from search_inputs import exact_inputs
+        workload = {"regions": json.loads(json.dumps(self.REGIONS))}
+        specs, jobs, err, _floor = self._jobs(workload)
+        self.assertIsNone(err)
+        floor = specs[-1]
+        for group in floor["groups"]:
+            if group.get("sheet") is None:
+                continue
+            payload = jobs[group["sheet"]]["payload"]
+            region = payload["region"]
+            headline_workload, headline_org = exact_inputs(workload, region, payload["stored_gb"], 1000)
+            # Same workload block and a share of 1, so the sheet gets the headline's inputs exactly.
+            self.assertEqual(payload["workload"], headline_workload)
+            self.assertEqual(payload["org_stored_gb"], payload["stored_gb"])
+            self.assertEqual(headline_org, payload["stored_gb"])
+            # Never the other solutions' store.
+            self.assertLess(payload["org_stored_gb"], 1000)
+
+    def test_a_packed_project_is_its_share_of_its_own_region(self):
+        workload = {"regions": json.loads(json.dumps(self.REGIONS))}
+        specs, jobs, err, _floor = self._jobs(workload)
+        self.assertIsNone(err)
+        for job in jobs:
+            payload = job["payload"]
+            region_store = 40 if payload["region"] == "east" else 20
+            self.assertEqual(payload["org_stored_gb"], region_store)
+            self.assertEqual(payload["workload"], self.REGIONS[payload["region"]])
+
+    def test_a_region_with_no_proxy_workload_leaves_the_plan_unpriced(self):
+        workload = {"regions": {"east": json.loads(json.dumps(self.REGIONS["east"]))}}
+        _specs, _jobs, err, _floor = self._jobs(workload)
+        self.assertIn("west has no measured proxy-log workload", str(err))
 
 
 class SearchPlanSeriesTests(unittest.TestCase):
@@ -1071,39 +1143,71 @@ class SearchPlanSeriesTests(unittest.TestCase):
         return [{"name": n, "solution": "search", "region": "us-east-1", "provider": "aws", "store_gb": st,
                  "bulk_gb_day": b, "retention_days": d} for n, st, b, d in self.ROWS]
 
-    def _bars(self, force):
+    @staticmethod
+    def _price(payload):
+        # Linear in disk plus a fixed per-project ingest floor, like the es3 model at this size.
+        return 620 + 2.3 * payload["stored_gb"]
+
+    def _bars(self, force, notebook=False):
         import plan_sizing
-        import size_serverless as ss
         seen = []
 
         def fake_es3(payload):
             seen.append(payload["stored_gb"])
-            # Linear in disk plus a fixed per-project ingest floor, like the es3 model at this size.
-            return {"readback": {"monthly_steady_state": 620 + 2.3 * payload["stored_gb"]}}
+            return {"readback": {"monthly_steady_state": self._price(payload)}}
 
         with mock.patch.object(plan_sizing, "run_es3", side_effect=fake_es3):
-            specs, _jobs, err, _floor = plan_sheet_jobs(
+            specs, jobs, err, _floor = plan_sheet_jobs(
                 self._rows(), run_key="Acme", name_suffix="", force_months=force, o11y_id="o", security_id="s",
                 parent_id="p", reuse=True, provider="aws", region_name="us-east-1", support="Premium",
                 feature_tier="Complete", workload={"search": {"peak": {"qps": 5, "complexity_ms": 10, "pct_hours_mo": 50}}},
-                org_gb=sum(r[1] for r in self.ROWS),
+                org_gb=sum(r[1] for r in self.ROWS), search_id="search-template", search_notebook=notebook,
             )
         self.assertIsNone(err)
+        if notebook:
+            self.assertEqual(jobs, [])
+            fills = []
+        else:
+            # Every Search project is a Search estimator sheet job. Nothing ran the notebook.
+            self.assertEqual(seen, [])
+            self.assertTrue(jobs)
+            self.assertTrue(all(job["solution"] == "search" and job["template_id"] == "search-template" for job in jobs))
+            seen = [job["payload"]["stored_gb"] for job in jobs]
+            fills = [{"monthly": round(self._price(job["payload"]), 2)} for job in jobs]
         self.seen = seen
-        return assemble_plan_bars(specs, [])["bars"]
+        return assemble_plan_bars(specs, fills)["bars"]
 
     def test_every_project_is_priced_on_its_whole_store(self):
-        bars = self._bars(None)
         total = sum(r[1] for r in self.ROWS)
-        # The floor is one project holding every cluster's store, unscaled by any cluster's age.
-        self.assertAlmostEqual(bars[-1]["monthly"], 620 + 2.3 * total, delta=1)
-        self.assertAlmostEqual(max(self.seen), total, places=3)
-        monthly = [b["monthly"] for b in bars]
-        for later, earlier in zip(monthly[1:], monthly):
-            self.assertLessEqual(later, earlier * 1.01)
+        for notebook in (False, True):
+            with self.subTest(notebook=notebook):
+                bars = self._bars(None, notebook)
+                # The floor is one project holding every cluster's store, unscaled by any cluster's age.
+                self.assertAlmostEqual(bars[-1]["monthly"], 620 + 2.3 * total, delta=1)
+                self.assertAlmostEqual(max(self.seen), total, places=3)
+                monthly = [b["monthly"] for b in bars]
+                for later, earlier in zip(monthly[1:], monthly):
+                    self.assertLessEqual(later, earlier * 1.01)
 
     def test_a_forced_month_does_not_change_search_disk(self):
-        self.assertEqual([b["monthly"] for b in self._bars(None)], [b["monthly"] for b in self._bars(1)])
+        for notebook in (False, True):
+            with self.subTest(notebook=notebook):
+                self.assertEqual(
+                    [b["monthly"] for b in self._bars(None, notebook)], [b["monthly"] for b in self._bars(1, notebook)],
+                )
+
+    def test_a_search_project_that_recurs_across_bars_is_one_sheet(self):
+        specs, jobs, err, _floor = plan_sheet_jobs(
+            self._rows(), run_key="Acme", name_suffix="", force_months=None, o11y_id="o", security_id="s",
+            parent_id="p", reuse=True, provider="aws", region_name="us-east-1", support="Premium",
+            feature_tier="Complete", workload={}, org_gb=0, search_id="t",
+        )
+        self.assertIsNone(err)
+        distinct = {
+            tuple(sorted(g["names"])) for spec in specs for g in spec.get("groups") or [] if g.get("sheet") is not None
+        }
+        self.assertEqual(len(jobs), len(distinct))
+        self.assertEqual(len({job["title"] for job in jobs}), len(jobs))
 
 
 class OrgReportLayoutTests(unittest.TestCase):

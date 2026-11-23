@@ -243,6 +243,7 @@ def main() -> None:
             acc, sheets, drive, plan_folder, o11y_id=args.o11y_id, security_id=args.security_id,
             support=support, provider=provider,
             force_months=args.force_months, name_suffix=suffix, fresh=args.fresh,
+            search_id=args.search_id, search_notebook=bool(args.search_notebook),
         )
         sz["deployment_plan"] = plan
         sz["drive_folder_deployment_plan"] = plan_folder
@@ -376,7 +377,7 @@ def main() -> None:
 
     _checkpoint_sizing(local_dir, sizing_name, sz, estimators)
 
-    # ---------------- Search (es3-estimator notebook library)
+    # ---------------- Search (the Search estimator sheet; the es3 notebook only with --search-notebook)
     se = con["search"]
     search_regions = architecture_regions(acc, "search")
     search_scope = fleet_sheet_region(acc, "search", region)

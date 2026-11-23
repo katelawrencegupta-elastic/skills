@@ -256,9 +256,11 @@ def preflight(args, *, network: bool = True) -> list[dict]:
     py = _sheets_py()
     row("Sheets venv", py.is_file(), str(py) if py.is_file() else f"missing at {py} — no estimator copy can be filled (references/setup.md)")
 
-    from consolidation_regional import es3_estimator_missing, es3_estimator_python
-    gone = es3_estimator_missing()
-    row("es3 estimator", gone is None, es3_estimator_python() if gone is None else f"missing at {gone} — Search regions cannot be re-estimated")
+    # Search is priced on the Search estimator sheet. The es3 notebook is needed only for --search-notebook.
+    if getattr(args, "search_notebook", False):
+        from consolidation_regional import es3_estimator_missing, es3_estimator_python
+        gone = es3_estimator_missing()
+        row("es3 estimator", gone is None, es3_estimator_python() if gone is None else f"missing at {gone} — --search-notebook cannot price Search")
 
     reuse = getattr(args, "reuse", None)
     if reuse:
@@ -625,10 +627,11 @@ def chat_lines(brief: dict) -> list[str]:
 
     links = brief.get("links") or {}
     shown = [links.get("drive")] if links.get("drive") else []
-    for entry in (links.get("pdfs") or {}).values():
-        if isinstance(entry, dict) and entry.get("drive_url"):
-            shown.append(entry["drive_url"])
-    tail_lines = ["Links: " + " ".join(shown[:2])] if shown else []
+    # The consolidation PDF is the deliverable. The account PDF and the appendix are not linked here.
+    cons_pdf = (links.get("pdfs") or {}).get("consolidation")
+    if isinstance(cons_pdf, dict) and (cons_pdf.get("drive_url") or cons_pdf.get("pdf")):
+        shown.append(cons_pdf.get("drive_url") or cons_pdf.get("pdf"))
+    tail_lines = ["Links: " + " ".join(shown)] if shown else []
 
     limits = [row for row in (brief.get("limits") or []) if isinstance(row, dict)]
     rank = {"high": 0, "medium": 1, "low": 2}

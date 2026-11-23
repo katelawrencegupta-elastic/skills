@@ -365,6 +365,19 @@ def caption(text: str) -> str:
     return f"<div class='cap'>{esc(text)}</div>"
 
 
+def search_on_notebook(acc: dict) -> bool:
+    """True only when the run priced Search with --search-notebook. The Search estimator sheet is the default."""
+    est = (((acc.get("sizing") or {}).get("estimators") or {}).get("search")) or {}
+    return est.get("search_path") == "notebook"
+
+
+def search_source_text(acc: dict) -> str:
+    """How the report names the Search price, from the engine the run used."""
+    if search_on_notebook(acc):
+        return "the es3 notebook's performant total"
+    return "the performant total (G110) on the Search estimator sheet"
+
+
 def estimator_label(text) -> str:
     """Plain name for a pricing source. Internal keys such as es3-estimator stay in the data."""
     low = str(text or "").strip().lower()
@@ -2329,7 +2342,9 @@ def search_power_section(acc: dict, *, new_page: bool = True) -> str:
             ["success" if str(p.get("Search Power Setting")) == "performant" else None for p in profiles],
         )
         body += bullets([
-            "On-demand, performant, and high availability are the three search-power settings. High availability is the notebook's third band: it keeps the most search capacity ready.",
+            "On-demand, performant, and high availability are the three search-power settings, read from "
+            + ("the es3 notebook" if search_on_notebook(acc) else "columns F, G and H of the Search estimator sheet")
+            + ". High availability keeps the most search capacity ready.",
             f"The bars use {stored_bit}, the measured query rate, and Premium support. They are not added to the Observability ingest quote.",
             "Y: dollars per month. X: search power.",
         ])
@@ -2472,7 +2487,7 @@ def _quote_window_rows(acc: dict) -> list[list]:
         elif name == "security":
             formula = "Security monthly is the E74 read-back. Quoted only when parsed E73 is 0."
         elif name == "search":
-            formula = "Search monthly is the es3 performant read-back."
+            formula = f"Search monthly is {search_source_text(acc)}."
         else:
             formula = "Estimator read-back."
         rows.append([f"{name.title()} monthly", formula, "Sheet read-back. Not recomputed here.", _formula_money(quote.get("total_mo"))])
@@ -4579,7 +4594,7 @@ def render_consolidation_html(acc: dict) -> str:
                     + bullets([
                         f"The headline was not matched to this sheet. The dominant solution is {dom_key}.",
                         "Quote the Observability sheet for that slice.",
-                        "Quote the es3-estimator performant figure for Search, not the storage-floor model.",
+                        f"Quote {search_source_text(acc)} for Search, not the storage-floor model.",
                         "Cells written: " + written,
                     ]) + "</div>")
         else:

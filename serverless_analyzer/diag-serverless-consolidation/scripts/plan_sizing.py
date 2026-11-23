@@ -20,7 +20,7 @@ from sizing_fill import (
     region_match_text, region_options, run_es3,
 )
 
-from search_inputs import exact_inputs
+from search_inputs import exact_inputs, project_inputs
 
 
 def _fill_regional_job(job: dict, creds) -> dict:
@@ -305,25 +305,38 @@ def assemble_plan_bars(specs: list[dict], fills: list[dict]) -> dict:
     return {"bars": bars}
 
 
-def _search_group_price(group: list[dict], *, workload: dict, org_gb: float, support: str, cache: dict) -> tuple[float | None, str | None]:
-    """Performant Search price for one project, on its measured store. A missing notebook total is an error."""
+def _search_payload(group: list[dict], *, workload: dict, region_search_gb: dict, org_gb: float, support: str) -> tuple[dict | None, str | None]:
+    """Estimator payload for one packed Search project: its store, and its region's own workload by store share."""
+    stored = sum(float(row.get("store_gb") or 0) for row in group)
+    region = str(group[0].get("region") or "")
+    provider = str(group[0].get("provider") or "")
+    block, share_of, err = project_inputs(workload, region, stored, region_search_gb.get(region, 0.0), org_gb)
+    if err:
+        return None, f"Deployment-count plan was not priced: {err}"
+    return {
+        "stored_gb": stored,
+        "org_stored_gb": share_of or stored,
+        "provider": provider,
+        "region": region,
+        "support_tier": support,
+        "workload": block or {},
+    }, None
+
+
+def _search_group_price(group: list[dict], *, workload: dict, region_search_gb: dict, org_gb: float, support: str, cache: dict) -> tuple[float | None, str | None]:
+    """Performant notebook price for one project (`--search-notebook` only). A missing total is an error."""
     stored = sum(float(row.get("store_gb") or 0) for row in group)
     region = str(group[0].get("region") or "")
     provider = str(group[0].get("provider") or "")
     if stored <= 0:
         return 0.0, None
-    org_store = float(org_gb or 0)
-    key = (provider, region, round(stored, 3), round(org_store, 3), support)
+    payload, err = _search_payload(group, workload=workload, region_search_gb=region_search_gb, org_gb=org_gb, support=support)
+    if err:
+        return None, err
+    key = (provider, region, round(stored, 3), round(float(payload["org_stored_gb"]), 3), support)
     if key in cache:
         return cache[key], None
-    result = run_es3({
-        "stored_gb": stored,
-        "org_stored_gb": org_store or stored,
-        "provider": provider,
-        "region": region,
-        "support_tier": support,
-        "workload": workload or {},
-    })
+    result = run_es3(payload)
     money = ((result.get("readback") or {}).get("monthly_steady_state"))
     if money is None:
         where = region or "the project"
@@ -332,18 +345,27 @@ def _search_group_price(group: list[dict], *, workload: dict, org_gb: float, sup
     return cache[key], None
 
 
-def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_months: int | None, o11y_id: str, security_id: str, parent_id: str, reuse: bool, provider, region_name, support: str, feature_tier, workload: dict | None = None, org_gb: float = 0, basis: str = "raw") -> tuple[list[dict], list[dict], str | None, int]:
+def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_months: int | None, o11y_id: str, security_id: str, parent_id: str, reuse: bool, provider, region_name, support: str, feature_tier, workload: dict | None = None, org_gb: float = 0, basis: str = "raw", search_id: str | None = None, search_notebook: bool = False) -> tuple[list[dict], list[dict], str | None, int]:
     """Bar specs plus the sheet jobs they point at.
 
     Observability projects read D38. Security projects read E74. Search projects
-    are the performant notebook. A missing month or a missing Search total fails
-    before the remaining copies are treated as a quote.
+    read the performant total (G110) from a copy of the Search estimator sheet, on
+    their region's own workload, so the floor prices exactly what the headline
+    priced. `--search-notebook` prices them on the notebook library instead. A
+    missing month or a missing Search total fails before the remaining copies are
+    treated as a quote.
     """
     diag = _diag_inputs()
     specs: list[dict] = []
     jobs: list[dict] = []
     shared: dict[int, list] = {}
     search_cache: dict = {}
+    search_jobs: dict[tuple, int] = {}
+    region_search_gb: dict[str, float] = {}
+    for row in rows:
+        if str(row.get("solution") or "") == "search":
+            region = str(row.get("region") or "")
+            region_search_gb[region] = region_search_gb.get(region, 0.0) + float(row.get("store_gb") or 0)
     floor = diag.plan_floor_for_rows(rows)
     for plan in diag.region_feature_plans(rows):
         pct = plan["cut_pct"]
@@ -375,21 +397,57 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
                 continue
             solution = str((group[0] if group else {}).get("solution") or "observability")
             if solution == "search":
-                money, err = _search_group_price(
-                    group,
-                    workload=workload or {},
-                    org_gb=float(org_gb or 0),
-                    support=support,
-                    cache=search_cache,
+                if search_notebook:
+                    money, err = _search_group_price(
+                        group,
+                        workload=workload or {},
+                        region_search_gb=region_search_gb,
+                        org_gb=float(org_gb or 0),
+                        support=support,
+                        cache=search_cache,
+                    )
+                    if err:
+                        return [], [], err, floor
+                    groups.append({
+                        "sheet": None,
+                        "names": summary.get("names") or [],
+                        "bulk_gb_day": summary.get("bulk_gb_day") or 0,
+                        "months_written": summary.get("months_written"),
+                        "monthly": money,
+                    })
+                    continue
+                stored = sum(float(row.get("store_gb") or 0) for row in group)
+                if stored <= 0:
+                    groups.append({"sheet": None, "names": summary.get("names") or [], "bulk_gb_day": 0, "monthly": 0.0})
+                    continue
+                payload, err = _search_payload(
+                    group, workload=workload or {}, region_search_gb=region_search_gb,
+                    org_gb=float(org_gb or 0), support=support,
                 )
                 if err:
                     return [], [], err, floor
+                group_region = str(group[0].get("region") or "")
+                # The same Search project recurs on every bar its region is not cut on. One sheet prices it.
+                key = (group_region, tuple(sorted(str(row.get("name")) for row in group)))
+                if key not in search_jobs:
+                    slug = re.sub(r"[\\/:\s]+", "-", group_region.strip()).strip("-")
+                    title = f"{run_key}_Search_plan_{pct}pct_{plan['projects']}projects_{index}"
+                    if slug:
+                        title = f"{title}_{slug}"
+                    search_jobs[key] = len(jobs)
+                    jobs.append({
+                        "solution": "search",
+                        "template_id": search_id,
+                        "title": f"{title}{name_suffix}",
+                        "parent_id": parent_id,
+                        "reuse": reuse,
+                        "payload": payload,
+                    })
                 groups.append({
-                    "sheet": None,
+                    "sheet": search_jobs[key],
                     "names": summary.get("names") or [],
                     "bulk_gb_day": summary.get("bulk_gb_day") or 0,
                     "months_written": summary.get("months_written"),
-                    "monthly": money,
                 })
                 continue
             if solution not in {"observability", "security"}:
@@ -450,7 +508,24 @@ def fill_plan_sheet(job: dict, creds) -> dict:
     """
     sheets, drive = services_from(creds)
     solution = job.get("solution") or "observability"
-    label = "Security" if solution == "security" else "Observability"
+    label = {"security": "Security", "search": "Search"}.get(solution, "Observability")
+    if solution == "search":
+        try:
+            result, published = price_search(
+                drive, sheets, job["parent_id"], Path("."), job["title"], job["payload"],
+                notebook=False, template_id=job["template_id"], reuse=job["reuse"], skip_xlsx=True,
+            )
+        except TemplateMismatch:
+            raise
+        except Exception as ex:  # noqa: BLE001
+            return {"error": f"Search deployment-count plan was not priced: {ex}"}
+        if result.get("error"):
+            reason = str(result["error"])
+            return {"error": f"Search deployment-count plan was not priced: {job['title']}: {reason}", "unpriced_reason": reason}
+        price = sheet_money((result.get("readback") or {}).get("monthly_steady_state"))
+        if price is None:
+            return {"error": f"Search deployment-count plan was not priced: {job['title']} has no G110 read-back."}
+        return {"monthly": round(price, 2), "url": published.get("url")}
     try:
         copied, _reused, _layout = copy_verified(
             drive, sheets, job["template_id"], job["title"], job["parent_id"], reuse=job["reuse"],
@@ -553,12 +628,19 @@ def plan_roster(acc: dict) -> list[dict]:
     return cloud_rows
 
 
-def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str, security_id: str, support: str, provider, force_months: int | None, name_suffix: str, fresh: bool) -> dict:
+def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str, security_id: str, support: str, provider, force_months: int | None, name_suffix: str, fresh: bool, search_id: str | None = None, search_notebook: bool | None = None) -> dict:
     """Price the cuts from the cover count down to one project per region and feature.
 
     Observability projects are D38 read-backs. Security projects are E74 read-backs.
-    Search projects are the performant estimator on their measured store.
+    Search projects are G110 read-backs from the Search estimator sheet, on their
+    measured store and their region's own workload (the notebook library with
+    `--search-notebook`).
     """
+    import sizing_shared
+    if search_notebook is None:
+        search_notebook = bool(sizing_shared._SEARCH_NOTEBOOK)
+    if search_id is None:
+        search_id = sizing_shared._SEARCH_TEMPLATE_ID
     del sheets, drive
     measured = {
         dep.get("name"): dep
@@ -606,8 +688,10 @@ def size_deployment_plan(acc: dict, sheets, drive, folder: dict, *, o11y_id: str
         support=support,
         feature_tier=(acc.get("sizing") or {}).get("feature_tier"),
         basis=ingest_basis(acc),
-        workload=acc.get("workload") or {},
+        workload=(((acc.get("sizing") or {}).get("consolidated") or {}).get("search") or {}).get("workload") or acc.get("workload") or {},
         org_gb=org_gb,
+        search_id=search_id,
+        search_notebook=search_notebook,
     )
     if error:
         return {"bars": [], "error": error}

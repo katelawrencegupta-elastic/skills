@@ -49,7 +49,7 @@ When the scope is unavailable, page 1 compares `ech_recent_months_priced` (`comp
 
 ## Chat output contract
 
-`chat_lines` prints at most six bullets. Say "not verified" when the serverless monthly is missing, any integrity check failed, or the run is a draft. Otherwise give the serverless monthly. Then name every failed check. Then the top three `limits` by severity. Then the Drive and PDF links. Do not add a seventh bullet.
+`chat_lines` prints at most six bullets. Say "not verified" when the serverless monthly is missing, any integrity check failed, or the run is a draft. Otherwise give the serverless monthly. Then name every failed check. Then the top three `limits` by severity. Then the Drive folder and the consolidation PDF (not the account PDF or the appendix). Do not add a seventh bullet.
 
 ## Gates
 
@@ -65,12 +65,12 @@ Confirm these from the brief. Do not open the sheet.
 - When the billing window is unstable, the comparison is the latest complete month. Do not call it a 3-month average.
 - When no serverless price came back, show the ECH bill and say there is no comparison.
 - Page 1 states the average retention across indexes and the whole month written to the estimator. That month is the headline.
-- When no index age was counted, the sheets take the 12-month default. The Retention month check warns, `limits` carries `retention_month_fallback`, and the month is an assumption. Say so rather than calling it measured.
+- When no index age was counted, the sheets take the delete age the bundles measured. When no retention can be ascertained at all, they take the 30-day default, written as month 1: the Retention month check warns, `limits` carries `retention_month_fallback`, and the month is an assumption. Say so rather than calling it measured.
 
 ## Hard rules
 
-1. Observability and Security ingest are diagnostic bulk, written as metered. The written month is the unweighted average retention across indexes with local primary store, rounded up to a whole month. Each index is aged by its ILM delete policy, else its data-stream retention, else 30 days. Search disk is not scaled by that month.
-2. The estimator read-back is the dollar: Observability D38, Security E74, Search the performant total (G110 on the Search sheet, or the es3 performant profile with `--search-notebook`).
+1. Observability and Security ingest are diagnostic bulk, written as metered. The written month is the store-weighted average retention across indexes with local primary store, rounded up to a whole month. Each index is aged by its ILM delete policy, else its data-stream retention, else 30 days. When no index was counted, the month is the ingest-weighted delete age the bundles measured, and when no retention can be ascertained at all, 30 days. Search disk is not scaled by that month.
+2. The estimator read-back is the dollar: Observability D38, Security E74, Search the performant total (G110) on the Search estimator sheet. Every Search figure in the report comes from Search sheet read-backs: the headline, each region, the deployment-count bars and the search-power profiles. `--search-notebook` switches all of them to the es3 notebook library together; the two are never mixed in one run.
 3. Match the estimator to the solution.
 4. One sheet per solution per region, at that month, with no second fleet-wide sheet and no second measured-retention sheet.
 5. Size the last 90 billed days unless `--lookback-days` says otherwise.

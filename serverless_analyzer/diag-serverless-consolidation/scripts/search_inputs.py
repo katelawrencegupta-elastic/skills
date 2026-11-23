@@ -140,3 +140,21 @@ def exact_inputs(workload: dict | None, region: str, stored_gb: float, org_gb: f
     if block is None:
         return workload or {}, org_gb
     return block, stored_gb
+
+
+def project_inputs(workload: dict | None, region: str, stored_gb: float, region_search_gb: float, org_gb: float) -> tuple[dict | None, float, str | None]:
+    """(workload, store the share is taken against, error) for one packed Search project in a region.
+
+    A project takes its own region's measured workload, scaled by its share of that region's Search store.
+    The project that holds the whole region gets exactly the inputs the headline sheet got, so the plan
+    floor and the headline price the same thing. A proxy-log workload with no block for the region is an
+    error, not the org-wide sum. A workload with no regional blocks at all (the K360 backup) keeps the
+    old org-wide share.
+    """
+    regions = (workload or {}).get("regions")
+    block = regional_block(workload, region)
+    if block is not None and block.get("search"):
+        return block, float(region_search_gb or stored_gb), None
+    if isinstance(regions, dict):
+        return None, 0.0, f"Search in {region or 'the project'} has no measured proxy-log workload."
+    return workload or {}, org_gb, None

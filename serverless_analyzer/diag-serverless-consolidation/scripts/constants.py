@@ -6,6 +6,9 @@ One copy of each figure. A local copy in another module will drift.
 DAYS_PER_MONTH = 30.416
 HOURS_PER_MONTH = 730
 ESTIMATE_MONTHS = 12
+# A diagnostic quote whose bundles give no index a retention age is written at 30 days, the same
+# default an index with no delete policy or data-stream retention takes. 30 days is 1 whole month.
+RETENTION_FALLBACK_DAYS = 30.0
 SECURITY_EXPANSION = 1.66
 O11Y_METER_FACTOR = 1.595
 RATE_WINDOW_MAX_SHARE = 0.25

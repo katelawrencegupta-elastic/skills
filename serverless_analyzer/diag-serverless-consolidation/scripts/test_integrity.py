@@ -848,6 +848,18 @@ class ReviewRegressionTests(unittest.TestCase):
         after = cons["savings"]["serverless_mo"] + support["stays_on_ech_mo"] + grey
         self.assertIn(f">${after:,.0f}<", cover)
 
+    def test_chat_links_the_consolidation_pdf_not_the_account_pdf(self):
+        from run_consolidation import chat_lines
+        brief = {"savings": {"serverless_mo": 100}, "method": {},
+                 "integrity": {"passed": True, "confidence": {"band": "High", "score": 0.9}},
+                 "links": {"drive": "https://drive/folder", "pdfs": {
+                     "account": {"drive_url": "https://drive/account"},
+                     "consolidation": {"drive_url": "https://drive/consolidation"},
+                     "appendix": {"drive_url": "https://drive/appendix"}}}}
+        links = [line for line in chat_lines(brief) if line.startswith("Links:")][0]
+        self.assertIn("https://drive/consolidation", links)
+        self.assertNotIn("https://drive/account", links)
+
     def test_the_cover_shows_the_share_of_the_bill_that_is_compared(self):
         acc = scope_account(ech_scope="priced", keep_serverless_spend=False)
         cons = build_consolidation(acc, None)

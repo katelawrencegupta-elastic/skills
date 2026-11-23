@@ -140,12 +140,20 @@ def complexity_of(ms: float | None) -> str | None:
     return "simple" if ms <= SIMPLE_MAX_MS else "moderate" if ms <= MODERATE_MAX_MS else "complex"
 
 
-def summarize(hours: list[dict]) -> dict:
-    """The query's last stages over hourly rows: one result per window, plus the hour shares."""
+def summarize(hours: list[dict], total_hours: int | None = None) -> dict:
+    """The query's last stages over hourly rows: one result per window, plus the hour shares.
+
+    Only an hour with requests is a row, so `total_hours` is every hour in the window. Each band's
+    share is its active hours over that total, and what is left is idle. Percentiles and averages run
+    over a band's active hours, because idle is priced as its own state. Without `total_hours` the
+    share is over the rows given.
+    """
     by_window: dict[str, list[dict]] = {"peak": [], "non_peak": []}
     for row in hours:
+        if row["search_requests"] <= 0:
+            continue
         by_window[window_of(row["hour"])].append(row)
-    total = len(hours)
+    total = max(int(total_hours or 0), sum(len(rows) for rows in by_window.values())) or len(hours)
     out: dict[str, dict] = {}
     for name, rows in by_window.items():
         if not rows:
@@ -196,7 +204,8 @@ def search_workload(
 
     `search.peak` and `search.nonpeak` carry qps (the query's recommended_qps), complexity_ms (typical
     p90 latency), complexity (simple, moderate or complex) and pct_hours_mo. The month is split by the
-    share of sampled hours in each window; idle is 0 because every sampled hour belongs to a window.
+    share of every hour in the window that had requests in each band. An hour with no requests is idle,
+    so idle is whatever the two bands leave of the window.
     """
     if not deployment_ids:
         raise ValueError("no Search deployments to read from the proxy logs")
@@ -217,7 +226,7 @@ def search_workload(
     hours: list[dict] = [row for part in parts for row in part]
     if not hours:
         raise RuntimeError("the proxy logs returned no external search or request traffic for these deployments")
-    result = summarize(hours)
+    result = summarize(hours, total_hours=days * 24)
     if "peak" not in result or "non_peak" not in result:
         raise RuntimeError("the window has hours in only one of peak and non-peak; use a longer window that includes weekdays and weekends")
 
@@ -232,12 +241,13 @@ def search_workload(
 
     peak, nonpeak = band("peak"), band("non_peak")
     return {
-        "search": {"peak": peak, "nonpeak": nonpeak, "idle_pct_hours_mo": max(0.0, 100.0 - peak["pct_hours_mo"] - nonpeak["pct_hours_mo"])},
+        "search": {"peak": peak, "nonpeak": nonpeak, "idle_pct_hours_mo": max(0.0, round(100.0 - peak["pct_hours_mo"] - nonpeak["pct_hours_mo"], 1))},
         "source": "service-proxy-requests",
         "window_days": days,
         "window_start": (today - timedelta(days=days)).strftime("%Y-%m-%d"),
         "window_end": (today - timedelta(days=1)).strftime("%Y-%m-%d"),
         "deployments": list(deployment_ids),
         "sampled_hours": len(hours),
+        "window_hours": days * 24,
         "detail": result,
     }

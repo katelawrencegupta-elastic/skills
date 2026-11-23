@@ -44,6 +44,20 @@ class SummarizeTests(unittest.TestCase):
         self.assertEqual(out["non_peak"]["query_complexity"], "simple")
         self.assertEqual(out["non_peak"]["recommended_qps"], 2)
 
+    def test_hours_with_no_traffic_are_idle_not_dropped(self):
+        # Weekday traffic 08:00-23:00 UTC for a week. Only those 75 hours are rows.
+        rows = []
+        for day in range(5):
+            for h in range(8, 23):
+                peak = pl.window_of(hour(day, h)) == "peak"
+                rows.append({"hour": hour(day, h), "search_requests": 36000 if peak else 3600,
+                             "peak_minute_search_qps": 12.4 if peak else 2.0, "p90": 100.0, "p99": 200.0})
+        out = pl.summarize(rows, total_hours=168)
+        self.assertEqual(out["peak"]["pct_of_hours"], 30)       # 50 of 168, not 50 of 75
+        self.assertEqual(out["non_peak"]["pct_of_hours"], 15)   # 25 of 168
+        self.assertEqual(out["non_peak"]["recommended_qps"], 2)  # percentiles are over active hours
+        self.assertEqual(out["non_peak"]["hours"], 25)
+
     def test_percentile_interpolates(self):
         self.assertEqual(pl.percentile([1, 2, 3, 4], 50), 2.5)
         self.assertEqual(pl.percentile([5], 95), 5)

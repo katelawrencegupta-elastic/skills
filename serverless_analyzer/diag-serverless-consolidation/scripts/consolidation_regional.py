@@ -63,6 +63,15 @@ def _es3_region(payload: dict, failures: list[dict] | None = None) -> dict | Non
         return None
 
 
+def search_path(acc: dict) -> str:
+    """'sheet' or 'notebook': the engine every Search figure in this run comes from.
+
+    The size step records it on the Search estimator. Only `--search-notebook` makes it the notebook.
+    """
+    est = (((acc.get("sizing") or {}).get("estimators") or {}).get("search")) or {}
+    return "notebook" if est.get("search_path") == "notebook" else "sheet"
+
+
 def _saved_projects(acc: dict) -> dict:
     rows = ((acc.get("sizing") or {}).get("estimators") or {}).get("projects") or []
     return {
@@ -186,6 +195,7 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
     workload = search_slice.get("workload") or acc.get("workload") or {}
     support = ((acc.get("sizing") or {}).get("support_tier")) or "Premium"
     saved = _saved_projects(acc)
+    search_notebook = search_path(acc) == "notebook"
     store_split = False
     regional_quoted = False
     profile_keys = ("Total $/month", "Provisioned Search VCU/h", "Idle Search VCU/h", "Search $/month", "Ingest $/month", "Storage $/month", "Support $/month")
@@ -219,21 +229,30 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                         "region_match": saved_hit.get("region_match"), "url": saved_hit.get("url"),
                     })
                     continue
-                result = {"readback": saved_rb, "profiles": saved_hit.get("profiles"), "region_match": saved_hit.get("region_match")} if _money(saved_rb.get("monthly_steady_state")) is not None else _es3_region({
-                    "stored_gb": g["stored_gb"],
-                    "org_stored_gb": exact_inputs(workload, g["region"], g["stored_gb"], org_gb)[1],
-                    "provider": group_provider(acc, g.get("deployments"), provider),
-                    "region": g["region"],
-                    "support_tier": support,
-                    "workload": exact_inputs(workload, g["region"], g["stored_gb"], org_gb)[0],
-                }, es3_failures)
+                if _money(saved_rb.get("monthly_steady_state")) is not None:
+                    result = {"readback": saved_rb, "profiles": saved_hit.get("profiles"), "region_match": saved_hit.get("region_match")}
+                elif search_notebook:
+                    result = _es3_region({
+                        "stored_gb": g["stored_gb"],
+                        "org_stored_gb": exact_inputs(workload, g["region"], g["stored_gb"], org_gb)[1],
+                        "provider": group_provider(acc, g.get("deployments"), provider),
+                        "region": g["region"],
+                        "support_tier": support,
+                        "workload": exact_inputs(workload, g["region"], g["stored_gb"], org_gb)[0],
+                    }, es3_failures)
+                else:
+                    # The Search estimator sheet is the only Search price. A region with no sheet read-back is
+                    # left unquoted, never re-priced on the notebook library.
+                    result = None
+                    notes.append(f"Search {g['region']} has no read-back from its Search estimator sheet, so that region was not quoted.")
                 rb = (result or {}).get("readback") or {}
                 monthly = _money(rb.get("monthly_steady_state"))
                 classified.append({
                     "region": g["region"], "stored_gb": g["stored_gb"],
                     "retention_months": source_months,
                     "kind": "own" if monthly is not None else "missing",
-                    "own_monthly": monthly, "own_pricing": "re-estimated performant",
+                    "own_monthly": monthly,
+                    "own_pricing": "es3 notebook performant" if search_notebook else "Search sheet performant (G110)",
                     "own_annual": _money(rb.get("annual_year1")),
                     "own_steady": _money(rb.get("annual_steady_state")),
                     "search_mo": _money(rb.get("search_monthly")),
@@ -738,6 +757,7 @@ def _integrity(acc: dict, sz: dict, by_solution: dict, quotes: list[dict], headl
             "index_count": (acc.get("meta") or {}).get("retention_index_count"),
             "index_days": (acc.get("meta") or {}).get("retention_index_days"),
             "explicit_days": (acc.get("meta") or {}).get("retention_days"),
+            "basis": (acc.get("meta") or {}).get("retention_month_basis"),
             "has_bulk": float((coverage or {}).get("bulk_gb_day") or 0) > 0,
         },
         "eis": (by_solution.get("search") or {}).get("eis_data_status"),

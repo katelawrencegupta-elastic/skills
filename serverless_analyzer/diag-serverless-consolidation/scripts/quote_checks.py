@@ -316,9 +316,16 @@ def _retention_month_row(retention: dict | None) -> dict:
             "Retention month", 1.0, True,
             f"{months} months is the average retention across indexes, rounded up{measured}.",
         )
+    if retention.get("basis") == "measured_age":
+        return _integrity_row(
+            "Retention month", 1.0, True,
+            f"{months} months is the ingest-weighted delete age the bundles measured, rounded up. "
+            "No per-index count was in the bundles.",
+        )
+    unit = "month" if months == 1 else "months"
     row = _integrity_row(
         "Retention month", 0.0, True,
-        f"No index retention age was counted, so every sheet was written at the {months}-month default "
+        f"No retention could be ascertained, so every sheet was written at the 30-day default ({months} {unit}) "
         "instead of the index average. Retention sets the estimator's retained-data ladder. "
         "The quote is still produced.",
     )
