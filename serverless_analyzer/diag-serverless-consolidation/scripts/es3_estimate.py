@@ -149,47 +149,61 @@ def _qtt(band: dict) -> float:
 
 
 def search_workloads(workload: dict, assumptions: list[str]) -> list[dict]:
+    """The library's workload rows. `search_bands` carries the same rows with their band names."""
+    return [row for _name, row in search_bands(workload, assumptions)]
+
+
+def search_bands(workload: dict, assumptions: list[str]) -> list[tuple[str | None, dict]]:
+    """(band name, workload row) for each measured band, so a caller never matches rows by position.
+
+    A band with QPS and no hour share is appended after the bands that have one, so the order of
+    the rows is not the order of ("peak", "nonpeak"). The name travels with its row. With no
+    measured band the single idle row has the name None.
+    """
     search = (workload or {}).get("search") or {}
     bands = []
     for name in ("peak", "nonpeak"):
         band = search.get(name) or {}
         if band.get("qps") is None:
             continue
-        bands.append(band)
+        bands.append((name, band))
     if not bands:
         assumptions.append(
             "No search QPS in the workload window. Search $ is the idle storage floor only."
         )
-        return [{"QPS": 0.0, "QTT": 10.0, "active_hours_per_month": 0.0}]
+        return [(None, {"QPS": 0.0, "QTT": 10.0, "active_hours_per_month": 0.0})]
 
-    specified: list[tuple[dict, float]] = []
-    missing: list[dict] = []
-    for band in bands:
+    specified: list[tuple[str, dict, float]] = []
+    missing: list[tuple[str, dict]] = []
+    for name, band in bands:
         hours = _hours(band.get("pct_hours_mo"))
         if hours is None:
-            missing.append(band)
+            missing.append((name, band))
         else:
-            specified.append((band, hours))
+            specified.append((name, band, hours))
     if missing:
-        used = sum(hours for _, hours in specified)
+        used = sum(hours for _, _, hours in specified)
         each = (MONTHLY_HOURS if not specified else max(0.0, MONTHLY_HOURS - used)) / len(missing)
         assumptions.append(
             "A search band had QPS but no hour share; remaining hours of the 730 h month were split across those bands."
         )
-        for band in missing:
-            specified.append((band, each))
-    total = sum(hours for _, hours in specified)
+        for name, band in missing:
+            specified.append((name, band, each))
+    total = sum(hours for _, _, hours in specified)
     if total > MONTHLY_HOURS and total > 0:
         scale = MONTHLY_HOURS / total
-        specified = [(band, hours * scale) for band, hours in specified]
+        specified = [(name, band, hours * scale) for name, band, hours in specified]
         assumptions.append("Peak and non-peak hour shares summed past 730 h and were scaled down.")
     return [
-        {
-            "QPS": float(band.get("qps") or 0),
-            "QTT": _qtt(band),
-            "active_hours_per_month": round(hours, 2),
-        }
-        for band, hours in specified
+        (
+            name,
+            {
+                "QPS": float(band.get("qps") or 0),
+                "QTT": _qtt(band),
+                "active_hours_per_month": round(hours, 2),
+            },
+        )
+        for name, band, hours in specified
     ]
 
 

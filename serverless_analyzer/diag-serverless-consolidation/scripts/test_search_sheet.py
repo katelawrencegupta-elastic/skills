@@ -91,6 +91,23 @@ class InputCellTests(unittest.TestCase):
         self.assertAlmostEqual(cells["C26"], 0.68, places=3)
         self.assertLessEqual(cells["C21"] + cells["C26"], 1.0)
 
+    def test_a_band_with_no_hour_share_keeps_its_own_cells(self):
+        # The band with no hour share is appended after the one that has a share, so the rows come
+        # back as [nonpeak, peak]. Matching rows to bands by position wrote peak into C24-C26.
+        workload = {
+            **WORKLOAD,
+            "search": {
+                "peak": {"qps": 30.0, "complexity_ms": 40.0},
+                "nonpeak": {"qps": 5.0, "complexity_ms": 900.0, "pct_hours_mo": 68.0},
+            },
+        }
+        cells, notes = self.cells(workload=workload)
+        self.assertEqual((cells["C19"], cells["C20"]), (30.0, "simple"))
+        self.assertEqual((cells["C24"], cells["C25"]), (5.0, "complex"))
+        self.assertAlmostEqual(cells["C26"], 0.68, places=3)
+        self.assertAlmostEqual(cells["C21"], (730 - 0.68 * 730) / 730, places=3)
+        self.assertTrue(any("no hour share" in note for note in notes))
+
     def test_measured_query_time_follows_the_documented_thresholds_and_says_so(self):
         cells, notes = self.cells()
         self.assertEqual(cells["C20"], "simple")

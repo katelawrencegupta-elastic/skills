@@ -14,7 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from es3_estimate import (
-    PROVIDER_BY_NAME, SUPPORT_BY_TIER, ingest_workloads, scale_search_workload, search_workloads, workload_share,
+    PROVIDER_BY_NAME, SUPPORT_BY_TIER, ingest_workloads, scale_search_workload, search_bands, workload_share,
 )
 from sheets_io import _execute, assert_not_template, copy_verified, export_xlsx, push_cells, read_cells, trash_file, write_search_sheet
 from sizing_fill import _region_rejected, match_region, region_match_text, run_es3
@@ -70,9 +70,10 @@ def search_input_cells(payload: dict, region_text: str, provider: str, support: 
         assumptions.append(f"Docs/s and QPS scaled by this project's share of diagnostic org store ({share:.3f}).")
     search = (workload or {}).get("search") or {}
     present = [name for name in ("peak", "nonpeak") if (search.get(name) or {}).get("qps") is not None]
-    sized = search_workloads(workload, assumptions) if present else []
+    sized = search_bands(workload, assumptions) if present else []
     bands: dict[str, dict] = {}
-    for name, row in zip(present, sized):
+    # Each row carries its band name: a band with no hour share is appended last, so position is not identity.
+    for name, row in sized:
         bands[name] = {
             "qps": float(row["QPS"]),
             "share": round(min(max(float(row["active_hours_per_month"]) / HOURS_PER_MONTH, 0.0), 1.0), 6),
