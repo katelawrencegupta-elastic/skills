@@ -3,7 +3,7 @@ name: diag-serverless-consolidation
 description: >-
   Diagnostic-to-Serverless consolidation report for one Elastic Cloud account.
   Prices Observability and Security from Elasticsearch diagnostic bundles
-  (measured bulk GB/day, retention the average across indexes rounded up to a whole month)
+  (measured bulk GB/day, retention the store-weighted average across indexes rounded up to a whole month)
   through the matching estimator read-back, and Search from local store and the service proxy request logs on the Search estimator sheet (the es3 notebook library behind `--search-notebook`).
   Produces one consolidation PDF at that month, with recent ECH spend on page 1,
   a deployment-count plan, per-cluster costs, a raw bulk ingest page, and an appendix.
@@ -64,7 +64,7 @@ Confirm these from the brief. Do not open the sheet.
 - `ml_eis_carryover.monthly` is the ML-node ECU billed on ECH, carried to the serverless total as an EIS estimate (1 ECU = $1, before support). It is a placeholder, not an estimator read-back. `status` `incomplete` means none was carried and the serverless total is understated.
 - When the billing window is unstable, the comparison is the latest complete month. Do not call it a 3-month average.
 - When no serverless price came back, show the ECH bill and say there is no comparison.
-- Page 1 states the average retention across indexes and the whole month written to the estimator. That month is the headline.
+- Page 1 states the store-weighted average retention across indexes and the whole month written to the estimator. That month is the headline. When a bundle was parsed before store weights existed the mean is one vote per index, `limits` carries `retention_unweighted`, and the notes say it is not store-weighted.
 - When no index age was counted, the sheets take the delete age the bundles measured. When no retention can be ascertained at all, they take the 30-day default, written as month 1: the Retention month check warns, `limits` carries `retention_month_fallback`, and the month is an assumption. Say so rather than calling it measured.
 
 ## Hard rules

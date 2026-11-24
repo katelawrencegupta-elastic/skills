@@ -19,7 +19,8 @@ Python 3.10 or newer is required (`requires-python >= 3.10` in `pyproject.toml`)
 | `FOUND_ADMIN_API_KEY` | A fresh diagnostic pull | Same `.env`. Not used when `--diags-dir` points at zips already on disk |
 | Sheets virtualenv | Estimator copies and PDF upload | `~/.config/serverless-analyzer/venv` |
 | OAuth client | Sheets and Drive sign-in | `~/.config/serverless-analyzer/client_secret.json` |
-| es3-estimator | `--search-notebook` and the deployment-count bars | Clone plus `~/.config/es3-estimator/venv` |
+| `PROXY_LOGS_URL`, `PROXY_LOGS_API_KEY` | Search workload: QPS, complexity, hour shares | Same `.env`. Without them Search is not quoted |
+| es3-estimator | `--search-notebook` only. Not needed for the default Search path | Clone plus `~/.config/es3-estimator/venv` |
 | Google Chrome | PDF print | `/Applications`, or `CHROME_PATH` |
 | Aviatrix VPN | A fresh admin-console pull | An `openvpn` process. `--diags-dir` does not need it |
 
@@ -50,7 +51,11 @@ Create the file in the project you will `cd` to, not in this skill folder. The i
 KIBANA_URL=https://your-kibana-url
 ELASTIC_API_KEY=
 FOUND_ADMIN_API_KEY=
+PROXY_LOGS_URL=
+PROXY_LOGS_API_KEY=
 ```
+
+`PROXY_LOGS_URL` and `PROXY_LOGS_API_KEY` reach the cluster that holds `logging-*:service-proxy-requests-*`. They are what makes a Search quote possible: a run without them prices Observability and Security and leaves Search unquoted. They can also come from the environment instead of `.env`.
 
 `KIBANA_URL` must be `https` and must not include a username or password. `FOUND_ADMIN_URL` defaults to `https://admin.found.no`. Another host is used only when it is listed in `FOUND_ADMIN_HOST_ALLOWLIST`. A URL with a username, password, query, fragment, or path is refused.
 
@@ -72,9 +77,9 @@ The sign-in opens a browser and writes `token.json` next to the client file. Run
 
 Golden Observability and Security templates are copied. They are never edited. `O11Y_SHEET_ID`, `SECURITY_SHEET_ID` and `SEARCH_SHEET_ID` override the built-in template ids. The Search template is the v2.3 sheet. The org report also accepts `ES3_SHEET_ID`.
 
-## 4. Search estimator
+## 4. Search estimator notebook (optional)
 
-Skip this section when the account has no Search workload. The library stays in the clone. The virtualenv only runs it. scikit-learn must stay at 1.7.2, the version the pickled models were trained with.
+Search is priced on the Search estimator sheet by default, which needs only the Sheets virtualenv from section 3. This section is for `--search-notebook`, which prices Search on the es3-estimator library instead. Skip it when the account has no Search workload, or when you will not pass that flag. The library stays in the clone. The virtualenv only runs it. scikit-learn must stay at 1.7.2, the version the pickled models were trained with.
 
 ```bash
 python3 -m venv ~/.config/es3-estimator/venv
