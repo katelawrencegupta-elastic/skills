@@ -348,14 +348,17 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                 continue
             if e73_rejected:
                 blank = _money(saved_rb.get("cps_addon_monthly")) is None
+                unchecked = blank and bool(saved_rb.get("addon_note"))
                 notes.append(
+                    f"Security {g['region']} {saved_rb['addon_note']} That region was not quoted."
+                    if unchecked else
                     f"Security {g['region']} E73 was blank, so that region was not quoted."
                     if blank else
                     f"Security {g['region']} still has an E73 add-on, so that region was not quoted."
                 )
                 classified.append({
                     "region": g["region"], "stored_gb": g["stored_gb"], "kind": "rejected",
-                    "own_pricing": "rejected — E73 was blank" if blank else "rejected — E73 add-on is not zero",
+                    "own_pricing": ("rejected — the add-on lines could not be checked" if unchecked else "rejected — E73 was blank") if blank else "rejected — E73 add-on is not zero",
                     "region_match": saved_hit.get("region_match"), "url": saved_hit.get("url"),
                 })
                 continue

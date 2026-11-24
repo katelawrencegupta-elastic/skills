@@ -616,7 +616,10 @@ def chat_lines(brief: dict) -> list[str]:
     band = conf.get("band")
 
     head: list[str] = []
-    if monthly is None or integrity.get("passed") is False or failed or draft:
+    # "Verified" has to be shown, not assumed. A missing integrity block, or one that scored no check, has
+    # `passed` None, and a $0 monthly is no quote, so neither may print a price as if it were verified.
+    has_price = monthly is not None and float(monthly) > 0
+    if not has_price or integrity.get("passed") is not True or failed or draft:
         head.append("not verified")
     elif band:
         head.append(f"Serverless ${float(monthly):,.0f}/mo · confidence {band} ({conf.get('score')})")
@@ -654,7 +657,8 @@ def chat_lines(brief: dict) -> list[str]:
     limits = [row for row in (brief.get("limits") or []) if isinstance(row, dict)]
     rank = {"high": 0, "medium": 1, "low": 2}
     limits.sort(key=lambda row: rank.get(str(row.get("severity") or "low"), 3))
-    room = max(0, 6 - len(head) - len(tail_lines))
+    # The contract is the top three limits by severity, and no more than six bullets in all.
+    room = min(3, max(0, 6 - len(head) - len(tail_lines)))
     middle = [str(row.get("detail") or row.get("code") or "limit") for row in limits[:room]]
     return (head + middle + tail_lines)[:6]
 

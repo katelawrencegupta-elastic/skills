@@ -50,7 +50,7 @@ from estimate_paths import (
 from sizing_fill import (
     _region_rejected, fill_security, ingest_basis, match_region, observability_fill,
     observability_input_cells, region_match_text, region_options, run_es3, security_expansion,
-    security_input_cells,
+    security_input_cells, withhold_monthly,
 )
 from search_sheet import price_search
 from sizing_shared import DEFAULT_SEARCH
@@ -315,6 +315,7 @@ def main() -> None:
             entry["echo_gate"] = observability_echo_gate(o_mix or o, rb) if basis == "metered" else echo_gate(daily, rb.get("echo_gb_day"))
             if not entry["echo_gate"]["accepted"]:
                 entry["readback_rejected"] = "the sheet echo differs from the written bulk by more than the tolerance (0.1% of it, at least 0.02 GB/day)"
+                withhold_monthly(rb)
             if not args.skip_xlsx:
                 try:
                     x = export_xlsx(drive, copied["id"], estimate_dir / f"{title_o}.xlsx")

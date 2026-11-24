@@ -405,7 +405,10 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
                 continue
         if sol == "security" and readback and e73_blocks_quote(readback.get("cps_addon_monthly")):
             addon = _money(readback.get("cps_addon_monthly"))
-            if addon is None:
+            if addon is None and readback.get("addon_note"):
+                blk["pricing"] = "rejected — the add-on lines could not be checked"
+                notes.append(str(readback["addon_note"]) + " E74 was not quoted.")
+            elif addon is None:
                 blk["pricing"] = "rejected — E73 was blank"
                 notes.append("Security E73 was blank or could not be read. E74 was not quoted.")
             else:

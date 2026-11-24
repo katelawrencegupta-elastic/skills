@@ -903,7 +903,8 @@ def security_readback(readback: dict, retention_months) -> dict:
     month12 = money(out.get("monthly_steady_state"))
     out["month12_monthly"] = month12
     cps = money(out.get("cps_addon_monthly"))
-    parts = [money(out.get(key)) for key in ("ingest_monthly", "retention_monthly", "support_monthly")]
+    part_keys = ("ingest_monthly", "retention_monthly", "support_monthly")
+    parts = [money(out.get(key)) for key in part_keys]
     if month12 is not None and cps is not None and all(part is not None for part in parts):
         other = round(month12 - cps - sum(parts), 2)
         out["other_addons_monthly"] = other
@@ -911,6 +912,15 @@ def security_readback(readback: dict, retention_months) -> dict:
             out["cps_addon_e73"] = out.get("cps_addon_monthly")
             out["cps_addon_monthly"] = round(cps + other, 2)
             out["addon_note"] = f"Security add-on lines E63 to E72 total ${other:,.2f}/mo on the sheet."
+    elif month12 is not None and cps is not None and any(key in out for key in part_keys):
+        # The lines were read and one is blank or unreadable, so E74 cannot be shown to hold nothing but
+        # ingest, retention, support and E73. An add-on could be hiding in the part that did not parse.
+        # That blocks the quote the way a blank E73 does. A read-back saved before the lines were read
+        # has none of these keys and still gates on E73 alone.
+        out["other_addons_monthly"] = None
+        out["cps_addon_e73"] = out.get("cps_addon_monthly")
+        out["cps_addon_monthly"] = None
+        out["addon_note"] = "Security E61, E62 or E69 was blank or unreadable, so the add-on lines (E63 to E72) could not be checked."
     del retention_months
     out["steady_basis"] = "month 12 (E74)"
     return out

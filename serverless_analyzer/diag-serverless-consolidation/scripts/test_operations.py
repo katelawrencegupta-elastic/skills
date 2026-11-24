@@ -979,6 +979,31 @@ class PhaseGuardTests(unittest.TestCase):
         self.assertEqual(entry["status"], "unquoted")
         self.assertEqual(entry["provider"], "azure")
 
+    def test_a_rejected_observability_echo_ships_no_dollar(self):
+        import plan_sizing
+        from unittest import mock
+        job = {
+            "solution": "observability", "region": "us-east-1", "title": "t", "stored_gb": 10.0, "parent_id": "p", "local_dir": ".",
+            "provider": "aws", "support": "Premium", "template_id": "tpl", "tab": "T", "readback": {}, "reuse": True,
+            "retention": 3, "daily": 11.0, "skip_xlsx": True, "basis": "metered",
+            "mix": {"basis": "x", "logs_gb_day": 10.0, "traces_gb_day": 0.0, "metrics_gb_day": 1.0, "k8s_logs_share": 0.0},
+        }
+        # The sheet echoes 99 GB/day of logs against 10 written, so the gate rejects it.
+        read = {"monthly_steady_state": 1000.0, "annual_year1": 12000.0, "annual_steady_state": 12000.0,
+                "metered_ex_metrics_gb_day": 99.0, "metered_metrics_gb_day": 1.0}
+        with mock.patch.object(plan_sizing, "services_from", return_value=(None, None)), \
+             mock.patch.object(plan_sizing, "copy_verified", return_value=({"id": "x", "name": "n", "url": "u"}, False, {"version": "1.22", "newer_than_validated": False})), \
+             mock.patch.object(plan_sizing, "region_options", return_value=["AWS: us-east-1 (N. Virginia)"]), \
+             mock.patch.object(plan_sizing, "match_region", return_value=("AWS: us-east-1 (N. Virginia)", "exact")), \
+             mock.patch.object(plan_sizing, "observability_fill", return_value={}), \
+             mock.patch.object(plan_sizing, "push_cells", return_value=0), \
+             mock.patch.object(plan_sizing, "read_cells", return_value=dict(read)):
+            entry = plan_sizing._fill_regional_job(job, None)
+        self.assertIn("echo differs", entry["readback_rejected"])
+        rb = entry["readback"]
+        self.assertEqual((rb["monthly_steady_state"], rb["annual_year1"], rb["annual_steady_state"]), (None, None, None))
+        self.assertEqual(rb["metered_ex_metrics_gb_day"], 99.0)         # the echo stays for the audit
+
     def test_the_cross_cloud_finding_is_reachable_from_real_estimator_entries(self):
         from consolidation_regional import _written_regions
         # What the fill now records: the provider the deployments run on, beside the cloud the sheet was written to.

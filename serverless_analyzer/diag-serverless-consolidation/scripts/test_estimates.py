@@ -972,6 +972,55 @@ class SecuritySteadyStateTests(unittest.TestCase):
         self.assertFalse(e73_blocks_quote(old["cps_addon_monthly"]))
 
 
+class SecurityAddonGateTests(unittest.TestCase):
+    """A blank part of E74 cannot show that no add-on is in it, so it blocks the quote."""
+
+    RB = SecuritySteadyStateTests.RB
+
+    def _blocked(self, **over):
+        from quote_checks import security_readback
+        rb = security_readback({**self.RB, **over}, 12)
+        return rb, e73_blocks_quote(rb["cps_addon_monthly"])
+
+    def test_a_blank_support_line_blocks_instead_of_skipping_the_gate(self):
+        for blank in ("support_monthly", "ingest_monthly", "retention_monthly"):
+            for empty in (None, "", "n/a"):
+                with self.subTest(blank=blank, empty=empty):
+                    rb, blocked = self._blocked(**{blank: empty, "monthly_steady_state": 1650.0})   # a 500 endpoint add-on
+                    self.assertTrue(blocked)
+                    self.assertIsNone(rb["other_addons_monthly"])
+                    self.assertIn("could not be checked", rb["addon_note"])
+                    self.assertEqual(rb["cps_addon_e73"], 0)
+
+    def test_a_blank_part_blocks_even_when_there_is_no_add_on(self):
+        # Unprovable is unprovable: the gate does not guess that the missing part was zero.
+        _rb, blocked = self._blocked(support_monthly=None)
+        self.assertTrue(blocked)
+
+    def test_all_parts_present_still_passes_and_a_real_addon_still_blocks(self):
+        self.assertFalse(self._blocked()[1])
+        rb, blocked = self._blocked(monthly_steady_state=1650.0)
+        self.assertTrue(blocked)
+        self.assertEqual(rb["other_addons_monthly"], 500.0)
+
+    def test_a_read_back_saved_before_the_lines_were_read_still_gates_on_e73_alone(self):
+        from quote_checks import security_readback
+        old = security_readback({"monthly_steady_state": 1150.0, "cps_addon_monthly": 0}, 12)
+        self.assertFalse(e73_blocks_quote(old["cps_addon_monthly"]))
+
+    def test_the_rejection_says_why_not_that_e73_was_blank(self):
+        from consolidation import build_consolidation  # noqa: F401  (the message lives in build_consolidation)
+        from quote_checks import security_readback
+        rb = security_readback({**self.RB, "support_monthly": None}, 12)
+        self.assertIsNone(_money_of(rb["cps_addon_monthly"]))
+        self.assertTrue(rb["addon_note"])
+
+
+def _money_of(value):
+    from quote_checks import money
+    return money(value)
+
+
 class RegionalEchoTests(unittest.TestCase):
     def test_every_regional_sheet_is_scored_and_one_bad_region_fails(self):
         from quote_checks import integrity_score
