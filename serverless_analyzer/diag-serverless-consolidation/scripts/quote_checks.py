@@ -17,7 +17,7 @@ from estimator_layout import (  # noqa: E402,F401
 from constants import (  # noqa: E402
     BILLING_WINDOW_MIN_SHARE, COUNTER_AGE_MAX_SHARE, ECHO_TOLERANCE_GB_DAY, ECHO_TOLERANCE_SHARE,
     CONFIDENCE_HIGH, CONFIDENCE_MODERATE, CONFIDENCE_WEIGHTS,
-    PLAN_HEADLINE_SHARE, PLAN_HEADLINE_USD, RATE_WINDOW_MAX_SHARE, RETENTION_ASSUMED_MAX_SHARE,
+    PLAN_HEADLINE_SHARE, PLAN_HEADLINE_USD, RATE_WINDOW_MAX_SHARE, RETENTION_UNAGED_MAX_SHARE,
     UNRATED_STORE_MAX_SHARE,
 )
 
@@ -254,12 +254,12 @@ def _eis_completeness_row(eis: dict | None) -> dict:
 def _retention_row(coverage: dict | None) -> dict:
     """Share of bulk a configured delete policy or data-stream retention ages.
 
-    A deployment counts while the store it leaves at the 30-day default is inside
-    `RETENTION_ASSUMED_MAX_SHARE`, so one unconfigured index does not drop a
+    A deployment counts while the store it leaves without a retention age is inside
+    `RETENTION_UNAGED_MAX_SHARE`, so one unconfigured index does not drop a
     configured cluster's whole bulk to zero. Past that share the deployment is
-    blended or assumed and contributes nothing. More than that share of fleet
-    bulk on an assumed age is a warning: the quote is still produced, because
-    the written month is the index average, not this share.
+    partial or unaged and contributes nothing. More than that share of fleet
+    bulk without an age is a warning: the quote is still produced, because
+    the written month is the index average of the store that has an age, not this share.
     """
     if not coverage:
         return _integrity_row("Retention basis", None, None, "This run has no diagnostic coverage.")
@@ -268,39 +268,49 @@ def _retention_row(coverage: dict | None) -> dict:
         return _integrity_row("Retention basis", None, None, "No bulk to weight.")
     if coverage.get("retention_policy_bulk_gb_day") is None:
         return _integrity_row("Retention basis", None, None, "Configured retention was not recorded for this run.")
-    limit = float(coverage.get("retention_assumed_max_share") or RETENTION_ASSUMED_MAX_SHARE)
+    limit = float(coverage.get("retention_unaged_max_share") or RETENTION_UNAGED_MAX_SHARE)
     policy = max(0.0, float(coverage.get("retention_policy_bulk_gb_day") or 0))
     score = min(policy / bulk, 1.0)
     partial = float(coverage.get("retention_policy_within_threshold_gb_day") or 0)
     detail = (
         f"{policy:.3f} GB/day of {bulk:.3f} ({score * 100:.1f}%) is on deployments a delete policy or "
-        f"data-stream retention ages, allowing up to {limit * 100:.0f}% of a deployment's store at the "
-        f"30-day default. The bar is {(1 - limit) * 100:.0f}%."
+        f"data-stream retention ages, allowing up to {limit * 100:.0f}% of a deployment's store with no "
+        f"retention age. The bar is {(1 - limit) * 100:.0f}%."
     )
     if partial > 0:
-        detail += f" {partial:.3f} GB/day of that is on deployments inside the threshold, not fully configured."
+        detail += f" {partial:.3f} GB/day of that is on deployments inside the threshold, with some store that has no age."
     if score >= 1 - limit:
         return _integrity_row("Retention basis", score, True, detail)
     row = _integrity_row(
         "Retention basis", score, True,
-        detail + f" More than {limit * 100:.0f}% of bulk is priced at the 30-day assumed default. "
-        "The quote is still produced.",
+        detail + f" More than {limit * 100:.0f}% of bulk is on deployments with store that has no retention age, "
+        "which the written month leaves out. The quote is still produced.",
     )
     row["warning"] = True
     return row
 
 
 def _retention_month_row(retention: dict | None) -> dict:
-    """The month written to every sheet: the index average, or the default.
+    """The month written to every sheet: the index average, a measured delete age, or --retention-days.
 
-    The month sets the estimator's retained-data ladder, so a month nobody
-    measured is a warning beside the quote. It does not fail the quote, the way
-    Rate window and Counter age do not.
+    The month sets the estimator's retained-data ladder. No default month exists: when none could be
+    ascertained nothing is written, the Observability and Security sheets are not filled, and this
+    row scores 0 as a warning. The solution then has a workload and no price, which Quote present
+    fails. A warning here does not fail the quote by itself, the way Rate window and Counter age do not.
     """
     retention = retention or {}
     months = retention.get("months")
-    if months is None or not retention.get("has_bulk"):
+    if not retention.get("has_bulk"):
         return _integrity_row("Retention month", None, None, "No Observability or Security month was written.")
+    if months is None:
+        row = _integrity_row(
+            "Retention month", 0.0, True,
+            "No retention age was ascertainable (no ILM delete phase, no data-stream retention, no measured delete age), "
+            "so no month was written and no default was assumed. Observability and Security were not quoted. "
+            "Pass --retention-days to quote at a known month.",
+        )
+        row["warning"] = True
+        return row
     months = int(months)
     explicit = retention.get("explicit_days")
     if explicit:
@@ -325,8 +335,7 @@ def _retention_month_row(retention: dict | None) -> dict:
     unit = "month" if months == 1 else "months"
     row = _integrity_row(
         "Retention month", 0.0, True,
-        f"No retention could be ascertained, so every sheet was written at the 30-day default ({months} {unit}) "
-        "instead of the index average. Retention sets the estimator's retained-data ladder. "
+        f"{months} {unit} was written and its basis was not recorded, so it cannot be shown to come from the bundles. "
         "The quote is still produced.",
     )
     row["warning"] = True
@@ -600,21 +609,26 @@ def _region_fidelity_row(sheets: list[dict]) -> dict:
         return _integrity_row("Region fidelity", None, None, "No region was written to an estimator.")
     bad = []
     for row in written:
+        # One finding per sheet, whatever is wrong with it, so the score is a share of sheets and stays in 0 to 1.
         how = region_match_how(row.get("region_match"))
         region = str(row.get("region") or "").strip()
+        cross_cloud = not alias_provider_matches(str(row.get("region_match") or ""), row.get("provider"))
+        no_region_alias = how == "alias" and not region
+        problems: list[str] = []
         if how not in {"exact", "alias"}:
-            bad.append(f"{region or 'a region'} ({how or 'none'})")
-            continue
-        if how == "alias":
+            problems.append(how or "none")
+        elif how == "alias" and region and not _alias_same_number(region, str(row.get("region_match") or "")):
+            problems.append("alias of a different region")
+        if cross_cloud:
+            problems.append("written to another cloud")
+        if no_region_alias:
             # An alias is only checkable against the region the sheet was scoped to. Say that
             # the region is missing rather than reporting a region-number mismatch that was
             # never measured.
-            if not region:
-                bad.append(f"{str(row.get('solution') or 'a sheet')} recorded an alias match and no region")
-            elif not _alias_same_number(region, str(row.get("region_match") or "")):
-                bad.append(f"{region} (alias of a different region)")
-        if not alias_provider_matches(str(row.get("region_match") or ""), row.get("provider")):
-            bad.append(f"{region or 'a region'} (written to another cloud)")
+            finding = f"{str(row.get('solution') or 'a sheet')} recorded an alias match and no region"
+            bad.append(finding + (", written to another cloud" if cross_cloud else ""))
+        elif problems:
+            bad.append(f"{region or 'a region'} ({'; '.join(problems)})")
     if bad:
         # Another cloud, or a region nobody recorded, first: a substitute on the same cloud is
         # a deliberate fallback, those two are not.
@@ -622,7 +636,7 @@ def _region_fidelity_row(sheets: list[dict]) -> dict:
         rest = [item for item in bad if item not in serious]
         row = _integrity_row(
             "Region fidelity",
-            round(1.0 - len(bad) / len(written), 3),
+            round(max(0.0, 1.0 - len(bad) / len(written)), 3),
             True,
             f"{len(bad)} of {len(written)} written regions are not an exact or same-region alias: "
             + "; ".join(serious + rest)
@@ -889,7 +903,8 @@ def security_readback(readback: dict, retention_months) -> dict:
     month12 = money(out.get("monthly_steady_state"))
     out["month12_monthly"] = month12
     cps = money(out.get("cps_addon_monthly"))
-    parts = [money(out.get(key)) for key in ("ingest_monthly", "retention_monthly", "support_monthly")]
+    part_keys = ("ingest_monthly", "retention_monthly", "support_monthly")
+    parts = [money(out.get(key)) for key in part_keys]
     if month12 is not None and cps is not None and all(part is not None for part in parts):
         other = round(month12 - cps - sum(parts), 2)
         out["other_addons_monthly"] = other
@@ -897,6 +912,15 @@ def security_readback(readback: dict, retention_months) -> dict:
             out["cps_addon_e73"] = out.get("cps_addon_monthly")
             out["cps_addon_monthly"] = round(cps + other, 2)
             out["addon_note"] = f"Security add-on lines E63 to E72 total ${other:,.2f}/mo on the sheet."
+    elif month12 is not None and cps is not None and any(key in out for key in part_keys):
+        # The lines were read and one is blank or unreadable, so E74 cannot be shown to hold nothing but
+        # ingest, retention, support and E73. An add-on could be hiding in the part that did not parse.
+        # That blocks the quote the way a blank E73 does. A read-back saved before the lines were read
+        # has none of these keys and still gates on E73 alone.
+        out["other_addons_monthly"] = None
+        out["cps_addon_e73"] = out.get("cps_addon_monthly")
+        out["cps_addon_monthly"] = None
+        out["addon_note"] = "Security E61, E62 or E69 was blank or unreadable, so the add-on lines (E63 to E72) could not be checked."
     del retention_months
     out["steady_basis"] = "month 12 (E74)"
     return out

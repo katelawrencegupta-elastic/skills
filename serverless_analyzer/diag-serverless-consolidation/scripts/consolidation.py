@@ -38,7 +38,7 @@ from consolidation_regional import (
     _replicate_by_region, _sync_plan_to_quote, recent_ech_months, recent_ech_months_priced,
 )
 from consolidation_eis import _apply_search_eis, _search_eis, ml_node_ecu
-from serverless_regions import SERVERLESS_REGIONS_READ, SERVERLESS_REGIONS_URL
+from serverless_regions import SERVERLESS_REGIONS_READ, SERVERLESS_REGIONS_URL, region_table_age_days, region_table_is_stale
 
 # consolidation.py is also the façade the runner, the renderers and the tests import from.
 # These names are re-exported on purpose, so `__all__` records that decision rather than
@@ -54,6 +54,23 @@ __all__ = [
     "_deployment_groups", "_replicate_by_region", "_priced_search_names", "_search_eis",
     "_has_workload", "_integrity", "PRICING_SOURCE",
 ]
+
+def no_swap_clause(stays: list[dict]) -> str:
+    """Name the US regions that stay on ECH only because the swap table has no entry for them.
+
+    The US swap is a lookup (`US_SWAPS`), not a rule that finds the nearest offered region. A US region in neither
+    the Serverless regions page nor that table is left on ECH like a non-US one, and without this the reader
+    cannot tell a policy decision from a missing table row.
+    """
+    named = sorted({f"{row.get('provider')} {row.get('region')}" for row in stays if row.get("us_no_swap")})
+    if not named:
+        return ""
+    return (
+        f" {', '.join(named)} {'is a US region' if len(named) == 1 else 'are US regions'} with no entry in US_SWAPS "
+        "(serverless_regions.py), so no swap was attempted. Add an entry to quote "
+        f"{'it' if len(named) == 1 else 'them'} in a nearby offered region of the same provider."
+    )
+
 
 def _ech_composition(acc: dict, infra: dict | None, months: float, ecu_total: float, notes: list[str]) -> tuple[dict, dict]:
     """Where the ECH bill sits by node role, as a month, plus each deployment's tiers.
@@ -365,14 +382,15 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         search["total_yr"] = 0.0
         search["by_region"] = []
         notes.append(
-            "Search was not quoted because Cloud Tracker index telemetry does not cover the exact billed quote window. "
-            "Rerun once quote-window telemetry is available."
+            "Search was not quoted because its workload could not be read from the service proxy request logs"
+            + (f" ({search_telemetry['reason']})" if search_telemetry.get("reason") else "")
+            + ". Rerun once the proxy logs are reachable."
         )
         limits = sz.setdefault("diagnostics", {}).setdefault("estimation_limits", [])
         if not any(row.get("code") == "search_quote_window_telemetry" for row in limits):
             limits.append({
                 "code": "search_quote_window_telemetry",
-                "detail": (search_telemetry.get("reason") or "exact quote-window index telemetry is missing")
+                "detail": (search_telemetry.get("reason") or "the Search workload could not be read from the service proxy request logs")
                 + " Search has no price, so the serverless total leaves it out. Rerun the quote.",
                 "severity": "high",
             })
@@ -405,7 +423,10 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
                 continue
         if sol == "security" and readback and e73_blocks_quote(readback.get("cps_addon_monthly")):
             addon = _money(readback.get("cps_addon_monthly"))
-            if addon is None:
+            if addon is None and readback.get("addon_note"):
+                blk["pricing"] = "rejected — the add-on lines could not be checked"
+                notes.append(str(readback["addon_note"]) + " E74 was not quoted.")
+            elif addon is None:
                 blk["pricing"] = "rejected — E73 was blank"
                 notes.append("Security E73 was blank or could not be read. E74 was not quoted.")
             else:
@@ -603,6 +624,7 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
             stays.append({
                 "name": d["name"], "solution": d.get("solution"), "provider": where.get("provider"),
                 "region": where.get("region"), "ech_mo": round(float(mo), 2) if mo is not None else None,
+                "us_no_swap": bool(where.get("us_no_swap")),
             })
         stays.sort(key=lambda row: -(row["ech_mo"] or 0))
         known = [row["ech_mo"] for row in stays if row["ech_mo"] is not None]
@@ -619,6 +641,7 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
             f"{'is' if len(stays) == 1 else 'are'} not in the comparison.{cost} "
             f"{listed}{'' if len(stays) <= 6 else f', and {len(stays) - 6} more'}. "
             f"Supported regions are those on the Serverless regions page ({SERVERLESS_REGIONS_URL}), read {SERVERLESS_REGIONS_READ}."
+            + no_swap_clause(stays)
         )
         limits = sz.setdefault("diagnostics", {}).setdefault("estimation_limits", [])
         if not any(row.get("code") == "region_not_on_serverless" for row in limits):
@@ -628,6 +651,29 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
                     f"{len(stays)} ECH deployment(s) in {', '.join(regions)} stay on ECH: Elastic Cloud Serverless is not offered in "
                     f"{'that region' if len(regions) == 1 else 'those regions'}."
                     + (f" Their ECH bill is ${region_support['stays_on_ech_mo']:,.0f}/mo and is not in the comparison." if region_support["stays_on_ech_mo"] is not None else "")
+                    + no_swap_clause(stays)
+                ),
+                "severity": "medium",
+            })
+    # The table behind those two decisions is read by hand. It matters only when it moved or kept a deployment:
+    # a region added to the page since would change that answer, and nothing else in the quote notices.
+    run_date = (acc.get("meta") or {}).get("date")
+    region_support["source_age_days"] = region_table_age_days(run_date)
+    if (stay_rows or swap_rows) and region_table_is_stale(run_date):
+        age = region_support["source_age_days"]
+        moved = len(stay_rows) + len(swap_rows)
+        notes.append(
+            f"The Serverless regions table was read {SERVERLESS_REGIONS_READ}, {age} days before this run. "
+            f"{moved} deployment(s) were moved or left on ECH by it, and the page may offer more regions now "
+            f"({SERVERLESS_REGIONS_URL}). Refresh serverless_regions.py and rerun if a region was added."
+        )
+        limits = sz.setdefault("diagnostics", {}).setdefault("estimation_limits", [])
+        if not any(row.get("code") == "region_table_stale" for row in limits):
+            limits.append({
+                "code": "region_table_stale",
+                "detail": (
+                    f"The Serverless regions table was read {SERVERLESS_REGIONS_READ}, {age} days before this run, and it "
+                    f"moved or kept {moved} deployment(s). A region added to the page since would change that."
                 ),
                 "severity": "medium",
             })
@@ -857,8 +903,8 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
     measured_ages = [float(g["retention_months_measured"]) for g in region_groups if g.get("retention_months_measured") is not None]
     if measured_ages:
         shown = round(sum(measured_ages) / len(measured_ages), 1)
-        written_months = int((acc.get("meta") or {}).get("estimate_months") or ESTIMATE_MONTHS)
-        if not (acc.get("meta") or {}).get("retention_index_count") and abs(shown - written_months) > 0.05:
+        written_months = (acc.get("meta") or {}).get("estimate_months")
+        if written_months is not None and not (acc.get("meta") or {}).get("retention_index_count") and abs(shown - int(written_months)) > 0.05:
             notes.append(f"Retention measured at {shown:g} months; the estimate prices {written_months}.")
     # No "At measured retention" row: the measured-retention copy is retired (SKILL.md hard
     # rule 4, one sheet per solution per region), so nothing prices that month any more.
@@ -903,7 +949,7 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         "savings": savings,
         "ech_recent_months": recent_ech_months(acc),
         "ech_recent_months_priced": priced_months,
-        "estimate_months": int((acc.get("meta") or {}).get("estimate_months") or 12),
+        "estimate_months": None if (acc.get("meta") or {}).get("retention_month_basis") == "unascertained" else int((acc.get("meta") or {}).get("estimate_months") or 12),
         "retention_days": (acc.get("meta") or {}).get("retention_days"),
         "retention_index_days": (acc.get("meta") or {}).get("retention_index_days"),
         "retention_index_count": (acc.get("meta") or {}).get("retention_index_count"),

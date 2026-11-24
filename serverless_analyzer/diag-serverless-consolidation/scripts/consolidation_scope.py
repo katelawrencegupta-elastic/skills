@@ -186,9 +186,9 @@ def apply_quote_lookback(acc: dict, days: int = 90) -> float:
         "telemetry_start": telemetry_start,
         "telemetry_end": telemetry_end,
         "reason": None if exact_window and workload.get("indices_complete", True) else (
-            "Cloud Tracker index telemetry index aggregation was truncated"
+            "the index aggregation behind the Search workload was truncated"
             if workload.get("indices_complete") is False
-            else workload.get("quote_window_fetch_error") or "Cloud Tracker index telemetry lacks complete exact-window QPS, docs/s, or average document size"
+            else workload.get("quote_window_fetch_error") or "the Search workload (QPS, query complexity, docs/s or average document size) is not complete for the quote window"
         ),
     }
     return float(ecu["quote_usage_factor"])
@@ -274,7 +274,8 @@ def unpriced_reason(dep: dict, by_solution: dict, diagnostic: bool) -> str | Non
     src = dep.get("ingest_source")
     if src == "unsupported_region":
         where = dep.get("unsupported_region") or {}
-        return f"region not offered on Serverless ({where.get('region')}), stays on ECH"
+        no_swap = ", a US region with no swap defined" if where.get("us_no_swap") else ""
+        return f"region not offered on Serverless ({where.get('region')}{no_swap}), stays on ECH"
     if src == "decommissioned":
         return "decommissioned, not in the admin console"
     if src == "active_no_bundle":
@@ -829,8 +830,10 @@ def _deployment_groups(acc: dict, infra: dict | None, months: float) -> list[dic
                 row["retention_months_measured"] = round((g["retention_weighted"] / g["retention_bulk"]) / DAYS_PER_MONTH, 6)
             if g["daily_raw_gb"]:
                 # Default is one year. --retention-days writes another whole month, measured or not.
+                # With no month ascertained the row carries none, so its sheet is not filled.
                 from diag_inputs import ESTIMATE_MONTHS
-                row["retention_months"] = int((acc.get("meta") or {}).get("estimate_months") or ESTIMATE_MONTHS)
+                if (acc.get("meta") or {}).get("retention_month_basis") != "unascertained":
+                    row["retention_months"] = int((acc.get("meta") or {}).get("estimate_months") or ESTIMATE_MONTHS)
         groups.append(row)
     order = {"search": 0, "observability": 1, "security": 2}
     groups.sort(key=lambda g: (order.get(g["solution"], 9), -g["ech_ecu_mo"]))

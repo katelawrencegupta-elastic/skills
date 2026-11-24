@@ -196,3 +196,113 @@ class DocLintTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NoRetentionDefaultTests(unittest.TestCase):
+    """A retention month is measured or absent. No default age or month stands in for it."""
+
+    RETIRED_DEFAULT = (
+        "fallback_30d", "retention_month_fallback", "retention_30d_assumed", "retention_blended_share",
+        "retention_assumed_share", "RETENTION_FALLBACK_DAYS", "RETENTION_ASSUMED_MAX_SHARE",
+        "30-day default", "30-day assumed", "30-day assumption",
+    )
+
+    def test_docs_do_not_describe_a_retention_default(self):
+        for doc in DOCS:
+            text = doc.read_text()
+            for phrase in self.RETIRED_DEFAULT:
+                self.assertNotIn(phrase, text, f"{doc.name} still mentions {phrase!r}")
+
+    def test_code_has_no_retention_default_constant_or_age(self):
+        import constants
+        self.assertFalse(hasattr(constants, "RETENTION_FALLBACK_DAYS"))
+        self.assertFalse(hasattr(constants, "RETENTION_ASSUMED_MAX_SHARE"))
+        source = (HERE / "admin_diags.py").read_text()
+        self.assertNotIn("default_age", source)
+        self.assertNotIn("fallback_30d", (HERE / "diag_inputs.py").read_text())
+
+    def test_the_documented_limit_codes_are_the_emitted_ones(self):
+        calc = (SKILL / "references" / "calculations.md").read_text()
+        emitted = (HERE / "diag_account.py").read_text()
+        for code in ("retention_month_missing", "retention_unaged"):
+            self.assertIn(code, calc)
+            self.assertIn(f'"{code}"', emitted)
+
+
+class SearchWorkloadWordingTests(unittest.TestCase):
+    """Search QPS, complexity and hour shares come from the proxy logs, and docs/s from the bundles."""
+
+    FILES = ("es3_estimate.py", "search_sheet.py", "search_inputs.py", "diag_account.py", "consolidation.py",
+             "consolidation_scope.py")
+    RETIRED = ("day averages from index telemetry", "Cloud Tracker index telemetry", "from Cloud Tracker telemetry",
+               "exact-window Cloud Tracker")
+
+    def test_no_user_visible_text_names_cloud_tracker_as_the_search_workload_source(self):
+        for name in self.FILES:
+            text = (HERE / name).read_text()
+            for phrase in self.RETIRED:
+                self.assertNotIn(phrase, text, f"{name} still says {phrase!r}")
+
+    def test_the_basis_note_says_what_was_measured(self):
+        import es3_estimate
+        proxy = es3_estimate.workload_basis_note({"source": es3_estimate.PROXY_SOURCE})
+        self.assertIn("95th percentile", proxy)
+        self.assertIn("median hourly p90", proxy)
+        self.assertIn("not a day average", proxy)
+        other = es3_estimate.workload_basis_note({"source": "k360"})
+        self.assertNotIn("proxy", other)
+        self.assertNotIn("proxy", es3_estimate.workload_basis_note(None))
+
+
+class LimitCodesAreDocumentedTests(unittest.TestCase):
+    """Every limit the scripts record is named in calculations.md, so a reader of a brief can look it up."""
+
+    PATTERNS = (
+        r'"code":\s*"([a-z_0-9]+)"',
+        r'(?:note_limit|warn|stage)\(\s*[A-Za-z_\.]*,?\s*"([a-z_0-9]+)"',
+        r'\bstage\(\s*"([a-z_0-9]+)"',
+    )
+
+    def _emitted(self) -> dict[str, set[str]]:
+        import re
+        found: dict[str, set[str]] = {}
+        for path in sorted(HERE.glob("*.py")):
+            if path.name.startswith("test_") or path.name == "_test_support.py":
+                continue
+            text = path.read_text()
+            for pattern in self.PATTERNS:
+                for match in re.finditer(pattern, text):
+                    found.setdefault(match.group(1), set()).add(path.name)
+        return found
+
+    def test_every_emitted_limit_code_is_in_the_reference(self):
+        doc = (SKILL / "references" / "calculations.md").read_text()
+        emitted = self._emitted()
+        self.assertGreater(len(emitted), 20)                      # the scan found the codes, not nothing
+        missing = {code: sorted(files) for code, files in emitted.items() if f"`{code}`" not in doc}
+        self.assertEqual(missing, {}, "limit codes recorded by the scripts and not named in calculations.md")
+
+
+class SecurityGateFigureIsDocumentedTests(unittest.TestCase):
+    """`cps_addon_monthly` is the gate figure, not the cell E73. The docs have to say so where a reader looks."""
+
+    def test_every_doc_that_describes_the_gate_names_the_fold_and_the_kept_cell(self):
+        for doc in DOCS:
+            text = doc.read_text()
+            self.assertIn("cps_addon_monthly", text, doc.name)
+            self.assertIn("cps_addon_e73", text, f"{doc.name} does not say where the sheet's own E73 is kept")
+
+    def test_the_fold_the_docs_describe_is_what_the_code_does(self):
+        from quote_checks import money, security_readback
+        base = {"monthly_steady_state": 1650.0, "cps_addon_monthly": 0, "ingest_monthly": 700.0,
+                "retention_monthly": 300.0, "support_monthly": 150.0}
+        folded = security_readback(base, 12)
+        self.assertEqual(money(folded["cps_addon_monthly"]), 500.0)         # E73 (0) plus other_addons_monthly (500)
+        self.assertEqual(folded["cps_addon_e73"], 0)                         # the cell itself
+        self.assertTrue(folded["addon_note"])
+        unchecked = security_readback({**base, "support_monthly": None}, 12)
+        self.assertIsNone(unchecked["cps_addon_monthly"])                    # null when the lines cannot be checked
+        self.assertEqual(unchecked["cps_addon_e73"], 0)
+        untouched = security_readback({**base, "monthly_steady_state": 1150.0}, 12)
+        self.assertEqual(untouched["cps_addon_monthly"], 0)                  # nothing folded: it is the cell
+        self.assertNotIn("cps_addon_e73", untouched)

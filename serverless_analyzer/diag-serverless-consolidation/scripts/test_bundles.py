@@ -84,7 +84,7 @@ class StoreTests(unittest.TestCase):
                 "keep": {"policy": {"phases": {"delete": {"min_age": "60d"}}}},
                 "short": {"policy": {"phases": {"delete": {"min_age": "0.042d"}}}},
             },
-            "diag/nodes_stats.json": {"nodes": {}},
+            "diag/nodes_stats.json": {"nodes": {"n1": {"timestamp": COLLECTION_MS}}},   # a capture with no nodes is refused
         }
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "bundle.zip"
@@ -108,10 +108,11 @@ class RetentionTests(unittest.TestCase):
         # No index counts: the measured delete age sets the month, and an unmeasured row stays out of it.
         self.assertEqual(mixed["months_written"], 1)
         self.assertEqual(mixed["retention_unmeasured"], [{"name": "a", "bulk_gb_day": 10.0}])
-        # Nothing measured at all: the 30-day default, 1 month. Never 12.
+        # Nothing measured at all: no month. No default (30 days or 12 months) stands in for it.
         empty = summarize([{"name": "a", "bulk_gb_day": 5, "retention_days": None, "store_gb": 1}])
-        self.assertEqual(empty["months_written"], 1)
-        self.assertEqual(empty["observability_cells"]["G11_retention_months"], 1)
+        self.assertIsNone(empty["months_written"])
+        self.assertNotIn("G11_retention_months", empty["observability_cells"])
+        self.assertNotIn("G12_tsds_retention_months", empty["observability_cells"])
         subday = summarize([{"name": "a", "bulk_gb_day": 2, "retention_days": 0.042, "store_gb": 1}])
         self.assertEqual(subday["months_written"], 1)
         self.assertEqual(subday["retention_unmeasured"], [])
@@ -276,9 +277,10 @@ class RetentionTests(unittest.TestCase):
         rows[0]["retention_days"] = None
         bare = apply_diagnostics(acc, rows)
         block = bare["sizing"]["consolidated"]["observability"]
-        # No retention can be ascertained: bulk with no measured age is written at the 30-day default, 1 month.
-        self.assertEqual(block["retention_months"], 1)
-        self.assertEqual(bare["meta"]["retention_month_basis"], "fallback_30d")
+        # No retention can be ascertained: no month is written, and none is assumed in its place.
+        self.assertNotIn("retention_months", block)
+        self.assertIsNone(bare["meta"]["estimate_months"])
+        self.assertEqual(bare["meta"]["retention_month_basis"], "unascertained")
         self.assertNotIn("retention_months_measured", block)
         self.assertFalse(block["retention_unmeasured"])
 
@@ -491,7 +493,8 @@ class RetentionAndRestartTests(unittest.TestCase):
         state = {"metadata": {"indices": {n: {"settings": {"index": {"creation_date": str(now - int(age * self.DAY))}}} for n, (_st, age, _pol, _b) in indices.items()}}}
         explain = {"indices": {n: {"managed": True, "policy": pol, "index_creation_date_millis": now - int(age * self.DAY), "lifecycle_date_millis": now - int(age * self.DAY), "action": "rollover"}
                                for n, (_st, age, pol, _b) in indices.items() if pol}}
-        pol = {name: {"policy": {"phases": {"delete": {"min_age": f"{days}d"}}}} for name, days in policies.items()}
+        # A policy whose days is None is real but has no delete phase: it never deletes.
+        pol = {name: {"policy": {"phases": ({"delete": {"min_age": f"{days}d"}} if days is not None else {"hot": {}})}} for name, days in policies.items()}
         path = tmp / "a__1.zip"
         with zipfile.ZipFile(path, "w") as z:
             z.writestr("diag/indices_stats.json", json.dumps(stats))
@@ -503,23 +506,63 @@ class RetentionAndRestartTests(unittest.TestCase):
                 z.writestr("diag/recovery.json", json.dumps(recovery))
         return path
 
-    def test_store_with_no_policy_is_blended_in_at_its_own_age(self):
+    def test_store_with_no_policy_is_left_out_of_the_average(self):
         from admin_diags import analyze_bundle
         with tempfile.TemporaryDirectory() as tmp:
             path = self._bundle(Path(tmp), {
-                "kept": (1_000_000_000, 10, "p30", 0),
+                "kept": (1_000_000_000, 10, "p90", 0),
                 "nopolicy": (3_000_000_000, 100, None, 0),
-            }, {"p30": 30})
+            }, {"p90": 90})
             row = analyze_bundle(path, captured=self.CAPTURED)
-        # 1 GB at the 30-day policy and 3 GB at the 30-day default.
-        self.assertAlmostEqual(row["retention_days"], 30.0, places=1)
-        self.assertEqual(row["retention_index_count"], 2)
-        self.assertAlmostEqual(row["retention_index_days_sum"], 60.0, places=3)
-        self.assertEqual(row["retention_basis"], "blended")
+        # 1 GB at the 90-day policy. The 3 GB with no policy has no age: it is not pulled to a default,
+        # it is not counted as an index, and it carries no weight.
+        self.assertAlmostEqual(row["retention_days"], 90.0, places=1)
+        self.assertEqual(row["retention_index_count"], 1)
+        self.assertAlmostEqual(row["retention_index_days_sum"], 90.0, places=3)
+        self.assertEqual(row["retention_basis"], "partial")
         self.assertAlmostEqual(row["retention_known_share"], 0.25, places=3)
-        self.assertIn("assumed", row["retention_label"])
+        self.assertAlmostEqual(row["retention_unaged_share"], 0.75, places=3)
+        self.assertIn("no retention age", row["retention_label"])
 
-    def test_with_no_policy_anywhere_retention_is_the_30_day_default(self):
+    def test_the_fleet_month_ignores_store_with_no_age_instead_of_averaging_it_in_as_zero(self):
+        from admin_diags import analyze_bundle
+        from diag_inputs import index_retention_basis, index_retention_months
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._bundle(Path(tmp), {
+                "kept": (1_000_000_000, 10, "p90", 0),
+                "nopolicy": (3_000_000_000, 100, None, 0),
+            }, {"p90": 90})
+            row = analyze_bundle(path, captured=self.CAPTURED)
+        # 1 GB at 90 days and 3 GB with no age. The row says 90 days. The fleet mean, built from the row's index
+        # fields, used to divide 90 GB-days by all 4 GB and say 22.5 days: 1 month where 3 is right.
+        self.assertAlmostEqual(row["retention_days"], 90.0, places=1)
+        self.assertEqual(row["retention_index_bytes"], 1_000_000_000)
+        days, weighting, legacy = index_retention_basis([row])
+        self.assertAlmostEqual(days, 90.0, places=1)
+        self.assertEqual((weighting, legacy), ("store_weighted", 0))
+        self.assertEqual(index_retention_months([row]), 3)
+
+    def test_a_fleet_of_aged_and_partly_unaged_deployments_weights_only_the_aged_store(self):
+        from diag_inputs import index_retention_months
+        aged = {"retention_index_count": 2, "retention_index_days_sum": 60.0, "retention_index_age_bytes": 30.0 * 1e9 + 30.0 * 1e9, "retention_index_bytes": 2e9}
+        partly = {"retention_index_count": 1, "retention_index_days_sum": 180.0, "retention_index_age_bytes": 180.0 * 2e9, "retention_index_bytes": 2e9}
+        # 4 GB aged: 30 d x 2 GB and 180 d x 2 GB is 105 days, 4 months. Unaged store never enters either list.
+        self.assertEqual(index_retention_months([aged, partly]), 4)
+
+    def test_an_ilm_policy_with_no_delete_phase_is_not_read_as_a_month(self):
+        # A managed index whose policy never deletes keeps its data indefinitely. That is not 30 days.
+        from admin_diags import analyze_bundle
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._bundle(Path(tmp), {
+                "forever": (4_000_000_000, 10, "keep", 0),
+                "deleted": (1_000_000_000, 10, "p90", 0),
+            }, {"p90": 90, "keep": None})
+            row = analyze_bundle(path, captured=self.CAPTURED)
+        self.assertAlmostEqual(row["retention_days"], 90.0, places=1)
+        self.assertEqual(row["retention_index_count"], 1)
+        self.assertAlmostEqual(row["retention_unaged_share"], 0.8, places=3)
+
+    def test_with_no_policy_anywhere_there_is_no_retention_and_no_default(self):
         from admin_diags import analyze_bundle
         with tempfile.TemporaryDirectory() as tmp:
             path = self._bundle(Path(tmp), {
@@ -527,10 +570,12 @@ class RetentionAndRestartTests(unittest.TestCase):
                 "tiny-old": (1_000_000, 2000, None, 0),
             }, {})
             row = analyze_bundle(path, captured=self.CAPTURED)
-        self.assertEqual(row["retention_basis"], "assumed")
-        self.assertAlmostEqual(row["retention_days"], 30.0, places=1)
+        self.assertIsNone(row["retention_basis"])
+        self.assertIsNone(row["retention_days"])
+        self.assertIsNone(row["retention_label"])
+        self.assertEqual(row["retention_index_count"], 0)
         self.assertEqual(row["retention_known_share"], 0.0)
-        self.assertIn("assumed", row["retention_label"])
+        self.assertEqual(row["retention_unaged_share"], 1.0)
 
     def test_a_restarted_primary_is_flagged_and_the_quoted_rate_is_unchanged(self):
         from admin_diags import series_rates
@@ -574,10 +619,10 @@ class RetentionAndRestartTests(unittest.TestCase):
         cov = apply_diagnostics(acc, rows, {"a"})["sizing"]["diagnostics"]
         self.assertEqual(cov["bulk_restart_gb_day"], 2.0)
         self.assertEqual(cov["bulk_restart_deployments"], [{"name": "a", "gb_day": 2.0}])
-        self.assertEqual(cov["retention_blended_share"], 0.5)
+        self.assertEqual(cov["retention_unaged_share"], 0.5)
         notes = " ".join(apply_diagnostics(acc, rows, {"a"})["sizing"]["notes"])
         self.assertIn("restarted or moved", notes)
-        self.assertIn("50% of local store has no delete policy", notes)
+        self.assertIn("50% of local store has no ILM delete phase", notes)
         self.assertEqual(cov["bulk_gb_day"], 10.0)             # the quote keeps esdiag's figure
 
 
@@ -607,7 +652,9 @@ class CompressionCalcTests(unittest.TestCase):
         self.assertNotIn("compressioncalc_accounted_for", row)
         self.assertNotIn("compression_ratio", row)
 
-    def test_system_write_index_stays_in_the_compression_sums(self):
+    def test_a_system_write_index_is_not_customer_bulk(self):
+        # This used to assert 150: the .monitoring stream's 50 GB/day was added to the logs mix. It is cluster-internal
+        # data, already kept out of store and retention, and it is not ingest the customer would send to Serverless.
         created, rolled = _write_phase(1, age_days=3)
         row = _analyze({
             "diag/nodes_stats.json": {"nodes": {"n1": {"timestamp": COLLECTION_MS}}},
@@ -625,7 +672,8 @@ class CompressionCalcTests(unittest.TestCase):
             }},
         })
         self.assertEqual(row["store_gb"], 20.0)
-        self.assertEqual(row["bulk_gb_day"], 150.0)
+        self.assertEqual(row["bulk_gb_day"], 100.0)
+        self.assertEqual(row["bulk_mix"]["logs"], 100.0)
         self.assertNotIn("compressioncalc_accounted_for", row)
         self.assertNotIn("compression_ratio", row)
 
@@ -990,3 +1038,237 @@ class BulkCellTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BundleTrustTests(unittest.TestCase):
+    """M5, M6 and M7: what is counted as customer data, and what is refused as a failed capture."""
+
+    NODE = {"nodes": {"n1": {"timestamp": COLLECTION_MS}}}
+    IDX = {"indices": {"logs-000001": {"primaries": {"store": {"size_in_bytes": 1_000_000_000}}}}}
+
+    def test_a_capture_with_no_nodes_is_refused_not_read_as_zero_bulk(self):
+        from admin_diags import BundleIncomplete
+        with self.assertRaises(BundleIncomplete) as ctx:
+            _analyze({"diag/nodes_stats.json": {"nodes": {}}, "diag/indices_stats.json": self.IDX})
+        self.assertIn("no nodes", str(ctx.exception))
+
+    def test_a_capture_with_no_indices_is_refused_not_read_as_zero_store(self):
+        from admin_diags import BundleIncomplete
+        with self.assertRaises(BundleIncomplete) as ctx:
+            _analyze({"diag/nodes_stats.json": self.NODE, "diag/indices_stats.json": {"indices": {}}})
+        self.assertIn("no indices", str(ctx.exception))
+
+    def test_a_refused_capture_is_a_missing_bundle_not_a_zero_row(self):
+        from admin_diags import _parse_zip
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "dep__aaa.zip"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("diag/nodes_stats.json", json.dumps({"nodes": {}}))
+                archive.writestr("diag/indices_stats.json", json.dumps(self.IDX))
+            out = _parse_zip((str(path), datetime(2026, 11, 1, tzinfo=timezone.utc).isoformat(), {}))
+        self.assertIn("warn", out)
+        self.assertIn("BundleIncomplete", out["warn"])
+
+    def test_system_data_streams_are_not_customer_bulk_or_part_of_the_mix(self):
+        created, rolled = _write_phase(1, age_days=3)
+        names = [".ds-logs-app-000001", ".ds-ilm-history-7-2026.11.17-000001", ".ds-.fleet-actions-results-000001",
+                 ".ds-.logs-deprecation.elasticsearch-default-000001"]
+        row = _analyze({
+            "diag/nodes_stats.json": self.NODE,
+            "diag/commercial/data_stream.json": {"data_streams": [
+                {"name": "logs-app", "indices": [{"index_name": names[0]}]},
+                {"name": "ilm-history-7", "indices": [{"index_name": names[1]}]},
+                {"name": ".fleet-actions-results", "indices": [{"index_name": names[2]}]},
+                {"name": ".logs-deprecation.elasticsearch-default", "indices": [{"index_name": names[3]}]},
+            ]},
+            "diag/commercial/ilm_explain.json": {"indices": {n: {"index_creation_date_millis": created, "lifecycle_date_millis": rolled} for n in names}},
+            "diag/indices_stats.json": {"indices": {
+                n: {"primaries": {"bulk": {"total_size_in_bytes": 10_000_000_000}, "store": {"size_in_bytes": 1_000_000_000}}} for n in names
+            }},
+        })
+        self.assertEqual(row["bulk_gb_day"], 10.0)                 # only .ds-logs-app, not the three system streams
+        self.assertEqual(row["bulk_mix"]["logs"], 10.0)
+
+    def test_a_fully_mounted_snapshot_is_not_local_store_whatever_it_is_called(self):
+        state = {"metadata": {"indices": {
+            "logs-000001": {"settings": {"index": {"creation_date": "1"}}},
+            "restored-logs-000001": {"settings": {"index": {"store": {"type": "snapshot"}}}},
+            "my-archive": {"settings": {"index": {"store": {"type": "snapshot"}}}},       # a customer-chosen name
+            "restored-by-hand": {"settings": {"index": {"creation_date": "1"}}},          # a normal index that happens to be named so
+        }}}
+        row = _analyze({
+            "diag/nodes_stats.json": self.NODE,
+            "diag/cluster_state.json": state,
+            "diag/indices_stats.json": {"indices": {
+                n: {"primaries": {"store": {"size_in_bytes": 5_000_000_000, "total_data_set_size_in_bytes": 5_000_000_000}}}
+                for n in ("logs-000001", "restored-logs-000001", "my-archive", "restored-by-hand")
+            }},
+        })
+        self.assertEqual(row["store_gb"], 10.0)                    # logs-000001 and restored-by-hand only
+        self.assertGreaterEqual(row["snapshot_gb"], 10.0)          # the two mounts are named as the snapshot gap
+        self.assertEqual(row["retention_index_count"], 0)         # no policy here, so no index is aged, mounts included
+
+    def test_a_flattened_store_type_setting_is_read_too(self):
+        row = _analyze({
+            "diag/nodes_stats.json": self.NODE,
+            "diag/cluster_state.json": {"metadata": {"indices": {"mounted": {"settings": {"index": {"store.type": "snapshot"}}}}}},
+            "diag/indices_stats.json": {"indices": {"mounted": {"primaries": {"store": {"size_in_bytes": 3_000_000_000}}},
+                                                     "real": {"primaries": {"store": {"size_in_bytes": 1_000_000_000}}}}},
+        })
+        self.assertEqual(row["store_gb"], 1.0)
+
+
+class RolloverLifetimeTests(unittest.TestCase):
+    """ILM min_age and data-stream retention run from rollover, so an index lives for its time in hot plus that age."""
+
+    D = 86_400_000
+    O = 1          # days after the epoch that "day 0" is, so no index is born at millisecond 0, which is falsy
+    NODE = {"nodes": {"n1": {"timestamp": COLLECTION_MS}}}      # 20 days after the epoch: every index is born inside it
+    GB = 1_000_000_000
+
+    def _stats(self, names):
+        return {"indices": {n: {"primaries": {"store": {"size_in_bytes": self.GB}}} for n in names}}
+
+    def _ilm_stream(self, born_days, rolled_days, *, min_age="10d", hot=None):
+        """A data stream under ILM. `born_days` are creation days, oldest first. `rolled_days[i]` is when gen i rolled
+        (None for the write index)."""
+        names = [f".ds-logs-app-{i + 1:06d}" for i in range(len(born_days))]
+        explain = {}
+        for name, born, rolled in zip(names, born_days, rolled_days):
+            explain[name] = {
+                "managed": True, "policy": "p", "phase": "hot", "action": "rollover",
+                "index_creation_date_millis": (born + self.O) * self.D,
+                "lifecycle_date_millis": ((rolled if rolled is not None else born) + self.O) * self.D,
+            }
+        phases = {"delete": {"min_age": min_age}}
+        if hot is not None:
+            phases["hot"] = {"actions": {"rollover": {"max_age": hot}}}
+        return names, {
+            "diag/nodes_stats.json": self.NODE,
+            "diag/commercial/data_stream.json": {"data_streams": [{"name": "logs-app", "indices": [{"index_name": n} for n in names]}]},
+            "diag/commercial/ilm_explain.json": {"indices": explain},
+            "diag/commercial/ilm_policies.json": {"p": {"policy": {"phases": phases}}},
+            "diag/indices_stats.json": self._stats(names),
+        }
+
+    def test_an_ilm_index_lives_for_its_time_in_hot_plus_min_age(self):
+        # Four generations rolling every 5 days under a 10-day delete: each lives 15 days, not 10.
+        _names, files = self._ilm_stream([0, 5, 10, 15], [5, 10, 15, None], min_age="10d")
+        row = _analyze(files)
+        self.assertAlmostEqual(row["retention_days"], 15.0, places=3)
+        self.assertAlmostEqual(row["retention_days_min_age"], 10.0, places=3)
+        self.assertAlmostEqual(row["retention_rollover_days"], 5.0, places=3)
+        self.assertEqual(row["retention_rollover_unknown_bytes"], 0)
+        self.assertEqual(row["retention_index_count"], 4)
+        self.assertAlmostEqual(row["retention_index_days_sum"], 60.0, places=3)        # 4 indexes x 15 days
+        self.assertEqual(row["retention_index_bytes"], 4 * self.GB)
+
+    def test_the_write_index_takes_the_median_of_its_rolled_siblings(self):
+        # Generations rolled after 2 and 8 days. The write index has not rolled: median 5. Lifetimes 12, 18, 15.
+        _names, files = self._ilm_stream([0, 2, 10], [2, 10, None], min_age="10d")
+        row = _analyze(files)
+        self.assertAlmostEqual(row["retention_days"], (12 + 18 + 15) / 3, places=3)
+        self.assertAlmostEqual(row["retention_rollover_days"], (2 + 8 + 5) / 3, places=3)
+
+    def test_a_data_stream_lifecycle_runs_from_rollover_too_and_has_no_ilm_explain(self):
+        names = [f".ds-metrics-app-{i + 1:06d}" for i in range(4)]
+        born = [0, 5, 10, 15]
+        row = _analyze({
+            "diag/nodes_stats.json": self.NODE,
+            "diag/commercial/data_stream.json": {"data_streams": [
+                {"name": "logs-app", "lifecycle": {"enabled": True, "data_retention": "10d"},
+                 "indices": [{"index_name": n} for n in names]}]},
+            "diag/cluster_state.json": {"metadata": {"indices": {n: {"settings": {"index": {"creation_date": str((b + self.O) * self.D)}}} for n, b in zip(names, born)}}},
+            "diag/indices_stats.json": self._stats(names),
+        })
+        # No explain. The next generation's creation is the rollover time: 5 days each, so 10 + 5.
+        self.assertAlmostEqual(row["retention_days"], 15.0, places=3)
+        self.assertAlmostEqual(row["retention_rollover_days"], 5.0, places=3)
+
+    def test_a_lone_write_index_takes_its_policys_rollover_max_age(self):
+        names, files = self._ilm_stream([15], [None], min_age="10d", hot="7d")
+        row = _analyze(files)
+        self.assertAlmostEqual(row["retention_days"], 17.0, places=3)
+        self.assertAlmostEqual(row["retention_rollover_days"], 7.0, places=3)
+        self.assertEqual(row["retention_rollover_unknown_bytes"], 0)
+
+    def test_a_lone_write_index_with_no_cap_adds_nothing_and_says_so(self):
+        names, files = self._ilm_stream([15], [None], min_age="10d")
+        row = _analyze(files)
+        self.assertAlmostEqual(row["retention_days"], 10.0, places=3)            # a floor, not a measurement
+        self.assertAlmostEqual(row["retention_rollover_days"], 0.0, places=3)
+        self.assertEqual(row["retention_rollover_unknown_bytes"], self.GB)
+
+    def test_an_index_outside_a_rollover_series_is_aged_from_creation(self):
+        row = _analyze({
+            "diag/nodes_stats.json": self.NODE,
+            "diag/commercial/ilm_explain.json": {"indices": {"orders": {
+                "managed": True, "policy": "p", "index_creation_date_millis": (2 + self.O) * self.D, "lifecycle_date_millis": (2 + self.O) * self.D}}},
+            "diag/commercial/ilm_policies.json": {"p": {"policy": {"phases": {"delete": {"min_age": "10d"}}}}},
+            "diag/indices_stats.json": self._stats(["orders"]),
+        })
+        self.assertAlmostEqual(row["retention_days"], 10.0, places=3)
+        self.assertAlmostEqual(row["retention_rollover_days"], 0.0, places=3)
+        self.assertEqual(row["retention_rollover_unknown_bytes"], 0)             # it is not a write index of a series
+
+    def test_a_write_alias_series_is_read_the_same_way(self):
+        names = ["app-000001", "app-000002", "app-000003"]
+        born, rolled = [0, 5, 10], [5, 10, None]
+        explain = {n: {"managed": True, "policy": "p", "index_creation_date_millis": (b + self.O) * self.D,
+                       "lifecycle_date_millis": ((r if r is not None else b) + self.O) * self.D} for n, b, r in zip(names, born, rolled)}
+        row = _analyze({
+            "diag/nodes_stats.json": self.NODE,
+            "diag/alias.json": {n: {"aliases": {"app": ({"is_write_index": True} if n == names[-1] else {})}} for n in names},
+            "diag/commercial/ilm_explain.json": {"indices": explain},
+            "diag/commercial/ilm_policies.json": {"p": {"policy": {"phases": {"delete": {"min_age": "10d"}}}}},
+            "diag/indices_stats.json": self._stats(names),
+        })
+        self.assertAlmostEqual(row["retention_days"], 15.0, places=3)
+
+    def test_the_whole_fleet_month_steps_up_because_of_it(self):
+        from diag_inputs import index_retention_months
+        # 85 days of min_age is 2.8 months, so 3. With 10 days in hot it is 95 days, 3.1 months, so 4.
+        _n, no_hot = self._ilm_stream([0], [None], min_age="85d")
+        _n, with_hot = self._ilm_stream([0, 10], [10, None], min_age="85d")
+        self.assertEqual(index_retention_months([_analyze(no_hot)]), 3)
+        self.assertEqual(index_retention_months([_analyze(with_hot)]), 4)
+
+
+class RolloverCoverageTests(unittest.TestCase):
+    """The account says what the rollover time is, how much of it is unmeasured, and what the month would be without it."""
+
+    MIX = {"logs": 5.0, "k8s_logs": 0.0, "metrics": 0.0, "traces": 0.0}
+
+    def _out(self, **row):
+        acc = {"meta": {}, "solutions": {"by_deployment": [{"name": "A", "solution": "observability", "gb": 10.0, "ecu": 100.0}]},
+               "sizing": {"consolidated": {}}, "storage": {}}
+        base = {"name": "A", "id": "a" * 32, "bulk_gb_day": 5.0, "store_gb": 10.0, "retention_days": 15.0, "bulk_mix": self.MIX,
+                "retention_index_count": 4, "retention_index_days_sum": 60.0, "retention_index_age_bytes": 60e9 / 4 * 4,
+                "retention_index_bytes": 4e9, "retention_known_share": 1.0, "retention_basis": "policy"}
+        base.update(row)
+        return apply_diagnostics(acc, [base], {"A"})
+
+    def test_a_fleet_reports_the_rollover_days_and_the_age_without_them(self):
+        out = self._out(retention_rollover_day_bytes=5.0 * 4e9, retention_base_age_bytes=10.0 * 4e9, retention_rollover_unknown_bytes=0.0)
+        cov = out["sizing"]["diagnostics"]
+        self.assertEqual((cov["retention_rollover_days"], cov["retention_days_min_age"], cov["retention_rollover_unknown_share"]), (5.0, 10.0, 0.0))
+        note = " ".join(out["sizing"]["notes"])
+        self.assertIn("time an index sat in hot before it rolled over, 5.0 days", note)
+        self.assertIn("10.0 days", note)
+        self.assertIn("15.0", note)
+        self.assertFalse(any(row["code"] == "retention_rollover_unknown" for row in cov["estimation_limits"]))
+
+    def test_unmeasured_rollover_is_a_limit_sized_by_its_share(self):
+        out = self._out(retention_rollover_day_bytes=0.0, retention_base_age_bytes=10.0 * 4e9, retention_rollover_unknown_bytes=2e9)
+        hit = next(row for row in out["sizing"]["diagnostics"]["estimation_limits"] if row["code"] == "retention_rollover_unknown")
+        self.assertEqual(hit["severity"], "medium")                     # 50% of aged store is over the 10% bar
+        self.assertIn("50%", hit["detail"])
+        small = self._out(retention_rollover_day_bytes=1.0, retention_base_age_bytes=10.0 * 4e9, retention_rollover_unknown_bytes=2e8)
+        low = next(row for row in small["sizing"]["diagnostics"]["estimation_limits"] if row["code"] == "retention_rollover_unknown")
+        self.assertEqual(low["severity"], "low")                        # 5%
+
+    def test_a_bundle_parsed_before_rollover_was_measured_reports_nothing_rather_than_zero(self):
+        cov = self._out()["sizing"]["diagnostics"]
+        self.assertIsNone(cov["retention_rollover_days"])
+        self.assertIsNone(cov["retention_rollover_unknown_share"])
+        self.assertFalse(any(row["code"] == "retention_rollover_unknown" for row in cov["estimation_limits"]))

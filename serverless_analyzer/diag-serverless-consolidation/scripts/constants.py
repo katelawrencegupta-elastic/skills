@@ -6,9 +6,6 @@ One copy of each figure. A local copy in another module will drift.
 DAYS_PER_MONTH = 30.416
 HOURS_PER_MONTH = 730
 ESTIMATE_MONTHS = 12
-# A diagnostic quote whose bundles give no index a retention age is written at 30 days, the same
-# default an index with no delete policy or data-stream retention takes. 30 days is 1 whole month.
-RETENTION_FALLBACK_DAYS = 30.0
 SECURITY_EXPANSION = 1.66
 O11Y_METER_FACTOR = 1.595
 RATE_WINDOW_MAX_SHARE = 0.25
@@ -20,11 +17,22 @@ COUNTER_AGE_MAX_SHARE = 0.25
 PLAN_HEADLINE_SHARE = 0.01
 PLAN_HEADLINE_USD = 5.0
 BILLING_WINDOW_MIN_SHARE = 0.5
-# Share of a deployment's local store that may sit at the 30-day assumed default and still
-# count as policy-aged. One unconfigured index does not make a configured fleet unmeasured.
-RETENTION_ASSUMED_MAX_SHARE = 0.10
+# Share of a deployment's local store that may have no retention age (no ILM delete phase and no
+# data-stream retention) and still count as policy-aged. That store carries no weight in the written
+# month: it is left out, never given a default age. One unconfigured index does not make a
+# configured fleet unmeasured.
+RETENTION_UNAGED_MAX_SHARE = 0.10
+# The Serverless regions table in serverless_regions.py is read by hand from a page that says more regions will
+# follow. Past this many days it is called stale where it matters: when it moved a deployment or left one on ECH.
+REGION_TABLE_STALE_DAYS = 30
 ECHO_TOLERANCE_SHARE = 0.001
 ECHO_TOLERANCE_GB_DAY = 0.02
+# How far a deployment's daily EIS ECU, million tokens or ML-node ECU may sit from its fetched-period total
+# before the daily series is called unreconciled and nothing is added to the quote. These are ECU and token
+# amounts, not GB/day, so they are their own constants: retuning the sheet echo above must not retune this
+# blocking completeness check. The values match what the echo tolerance was, so nothing moves today.
+EIS_RECONCILE_ABS = 0.02
+EIS_RECONCILE_SHARE = 0.001
 
 # size_serverless.py exits with this status when an estimator copy does not have the
 # layout its cell addresses were written for. run_consolidation.py stops the run on it.
@@ -33,6 +41,11 @@ TEMPLATE_MISMATCH_EXIT = 3
 # daily counters in batches. Each attempt gets this long, and a timeout is retried.
 QUOTE_TELEMETRY_BUDGET_S = 600
 QUOTE_TELEMETRY_ATTEMPTS = 2
+# `fetch_with_budget` gives up on a fetch thread this long after the fetch's own deadline. A call in
+# flight at the deadline can run to its socket timeout, so the grace is that timeout plus a margin:
+# the thread then finishes on its own and the regions it read are kept, instead of being abandoned
+# while a second attempt starts against the same cluster.
+QUOTE_TELEMETRY_GRACE_S = 310
 
 
 # How much each evidence check moves the quoted dollar. Confidence is their weighted mean,

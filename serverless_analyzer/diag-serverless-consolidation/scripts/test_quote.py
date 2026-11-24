@@ -227,7 +227,7 @@ class EfficiencyTests(unittest.TestCase):
             body = {"indices": {"logs-000001": {"primaries": {"store": {"size_in_bytes": nbytes}}}}}
             with zipfile.ZipFile(path, "w") as archive:
                 archive.writestr("diag/indices_stats.json", json.dumps(body))
-                archive.writestr("diag/nodes_stats.json", "{}")
+                archive.writestr("diag/nodes_stats.json", json.dumps({"nodes": {"n1": {"timestamp": 1_800_000_000_000}}}))
 
         with tempfile.TemporaryDirectory() as tmp:
             folder = Path(tmp)

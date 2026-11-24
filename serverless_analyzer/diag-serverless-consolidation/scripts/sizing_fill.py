@@ -24,6 +24,18 @@ def ingest_basis(acc: dict) -> str:
     return "metered" if (acc.get("sizing") or {}).get("ingest_source") == "diagnostics" else "raw"
 
 
+def withhold_monthly(rb: dict) -> dict:
+    """Clear the dollar cells of a read-back that was rejected, so a brief never shows a price beside a rejection.
+
+    Security does this where it rejects (`fill_security`). Observability's echo is checked by the caller,
+    so the caller clears it here. The echo and the written cells stay for the audit.
+    """
+    for key in ("monthly_steady_state", "annual_year1", "annual_steady_state"):
+        if key in rb:
+            rb[key] = None
+    return rb
+
+
 def observability_input_cells(acc: dict, support: str, region, retention: int, daily: float, logs=None, metrics=None, *, mix: dict | None = None, retention_metrics: int | None = None, basis: str = "raw") -> dict:
     """Cells for one Observability sheet.
 

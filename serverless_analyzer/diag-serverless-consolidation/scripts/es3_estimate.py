@@ -149,48 +149,81 @@ def _qtt(band: dict) -> float:
 
 
 def search_workloads(workload: dict, assumptions: list[str]) -> list[dict]:
+    """The library's workload rows. `search_bands` carries the same rows with their band names."""
+    return [row for _name, row in search_bands(workload, assumptions)]
+
+
+def search_bands(workload: dict, assumptions: list[str]) -> list[tuple[str | None, dict]]:
+    """(band name, workload row) for each measured band, so a caller never matches rows by position.
+
+    A band with QPS and no hour share is appended after the bands that have one, so the order of
+    the rows is not the order of ("peak", "nonpeak"). The name travels with its row. With no
+    measured band the single idle row has the name None.
+    """
     search = (workload or {}).get("search") or {}
     bands = []
     for name in ("peak", "nonpeak"):
         band = search.get(name) or {}
         if band.get("qps") is None:
             continue
-        bands.append(band)
+        bands.append((name, band))
     if not bands:
         assumptions.append(
             "No search QPS in the workload window. Search $ is the idle storage floor only."
         )
-        return [{"QPS": 0.0, "QTT": 10.0, "active_hours_per_month": 0.0}]
+        return [(None, {"QPS": 0.0, "QTT": 10.0, "active_hours_per_month": 0.0})]
 
-    specified: list[tuple[dict, float]] = []
-    missing: list[dict] = []
-    for band in bands:
+    specified: list[tuple[str, dict, float]] = []
+    missing: list[tuple[str, dict]] = []
+    for name, band in bands:
         hours = _hours(band.get("pct_hours_mo"))
         if hours is None:
-            missing.append(band)
+            missing.append((name, band))
         else:
-            specified.append((band, hours))
+            specified.append((name, band, hours))
     if missing:
-        used = sum(hours for _, hours in specified)
+        used = sum(hours for _, _, hours in specified)
         each = (MONTHLY_HOURS if not specified else max(0.0, MONTHLY_HOURS - used)) / len(missing)
         assumptions.append(
             "A search band had QPS but no hour share; remaining hours of the 730 h month were split across those bands."
         )
-        for band in missing:
-            specified.append((band, each))
-    total = sum(hours for _, hours in specified)
+        for name, band in missing:
+            specified.append((name, band, each))
+    total = sum(hours for _, _, hours in specified)
     if total > MONTHLY_HOURS and total > 0:
         scale = MONTHLY_HOURS / total
-        specified = [(band, hours * scale) for band, hours in specified]
+        specified = [(name, band, hours * scale) for name, band, hours in specified]
         assumptions.append("Peak and non-peak hour shares summed past 730 h and were scaled down.")
     return [
-        {
-            "QPS": float(band.get("qps") or 0),
-            "QTT": _qtt(band),
-            "active_hours_per_month": round(hours, 2),
-        }
-        for band, hours in specified
+        (
+            name,
+            {
+                "QPS": float(band.get("qps") or 0),
+                "QTT": _qtt(band),
+                "active_hours_per_month": round(hours, 2),
+            },
+        )
+        for name, band, hours in specified
     ]
+
+
+PROXY_SOURCE = "service-proxy-requests"
+
+
+def workload_basis_note(workload: dict | None) -> str:
+    """What the QPS and query time on this estimate are, said as they were measured.
+
+    From the proxy request logs they are near-peak figures: QPS is the 95th percentile of per-minute peak QPS in
+    each window and query time is the median hourly p90. "Day averages" described an older Cloud Tracker read and
+    understated what the sheet is priced on.
+    """
+    if (workload or {}).get("source") == PROXY_SOURCE:
+        return (
+            "QPS is the 95th percentile of per-minute peak QPS in each window (peak is weekdays 13:00 to 23:00 UTC) and "
+            "query time is the median hourly p90, both from the service proxy request logs. That is near-peak load, "
+            "not a day average and not peak-second load."
+        )
+    return "QPS and query time come from the workload block supplied for this estimate. They are not peak-second load."
 
 
 def workload_share(stored_gb: float, org_gb: float) -> float:
@@ -242,7 +275,7 @@ def ingest_workloads(workload: dict, assumptions: list[str]) -> list[dict]:
     dps = ingest.get("docs_per_sec")
     avg = ingest.get("avg_doc_bytes")
     if not dps or not avg or float(dps) <= 0 or float(avg) <= 0:
-        raise ValueError("Search estimate requires measured docs/s and average document size from Cloud Tracker telemetry")
+        raise ValueError("Search estimate requires measured docs/s and average document size from the diagnostic bundles")
     active = ingest.get("active_hours_mo")
     hours = MONTHLY_HOURS if active is None else min(MONTHLY_HOURS, max(0.0, float(active)))
     return [
@@ -257,7 +290,7 @@ def ingest_workloads(workload: dict, assumptions: list[str]) -> list[dict]:
 def build_user_info(payload: dict, pricing: dict, support_matrix: dict) -> tuple[dict, str, list[str]]:
     assumptions: list[str] = [
         "Workload type is text. Vector and time-series profiles are not inferred from K360.",
-        "QPS and query time are day averages from index telemetry, not peak-second load.",
+        workload_basis_note(payload.get("workload")),
         "Performant is the quoted profile. On-demand and high availability are shown beside it.",
     ]
     stored = max(float(payload.get("stored_gb") or 0), 0.0)
@@ -323,9 +356,13 @@ def readback_from(profiles: list[dict]) -> dict | None:
     monthly = _num(chosen.get("Total $/month"))
     if monthly is None:
         return None
+    # Round once and derive the year from the rounded month. The quote checks hold the steady annual to
+    # 12 x the monthly to the cent, so rounding the two separately (1234.567 gives 1234.57 and 14814.80,
+    # not 14814.84) failed Year agreement on a correct quote.
+    monthly = round(monthly, 2)
     return {
         "profile": chosen.get("Search Power Setting"),
-        "monthly_steady_state": round(monthly, 2),
+        "monthly_steady_state": monthly,
         "annual_year1": round(monthly * 12, 2),
         "annual_steady_state": round(monthly * 12, 2),
         "search_monthly": _num(chosen.get("Search $/month")),

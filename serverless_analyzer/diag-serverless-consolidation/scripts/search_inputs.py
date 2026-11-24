@@ -68,17 +68,21 @@ def _telemetry(status: str, window: dict | None, reason: str | None = None) -> d
 
 
 def regional_workloads(acc: dict, base: str, key: str, *, days: int = proxy_logs.DEFAULT_DAYS,
-                       now: datetime | None = None, run=proxy_logs.run_esql, workers: int = 4) -> dict:
+                       now: datetime | None = None, run=proxy_logs.run_esql, workers: int = 4,
+                       deadline: float | None = None) -> dict:
     """The workload the estimators read: one exact block per region plus an org-wide sum.
 
     The org-wide block exists for the what-if deployment-count bars, which still split it by store
     share. It adds the regions' recommended QPS, takes the slowest region's query time and the mean hour share.
+
+    `deadline` is a `time.monotonic()` instant shared by every region. A region still unread when it
+    passes is recorded in `errors` with the time-budget reason, and the regions already read are kept.
     """
     regions: dict[str, dict] = {}
     errors: dict[str, str] = {}
     for region, row in search_region_rows(acc).items():
         try:
-            proxy = proxy_logs.search_workload(base, key, row["ids"], days=days, now=now, run=run, workers=workers)
+            proxy = proxy_logs.search_workload(base, key, row["ids"], days=days, now=now, run=run, workers=workers, deadline=deadline)
             ingest = ingest_from_diagnostics(row)
         except (ValueError, RuntimeError) as exc:
             errors[region] = str(exc)
@@ -116,8 +120,12 @@ def regional_workloads(acc: dict, base: str, key: str, *, days: int = proxy_logs
     dps = sum(b["ingest"]["docs_per_sec"] for b in good)
     bps = sum(b["ingest"]["bytes_per_sec"] for b in good)
     first = good[0]
+    peak, nonpeak = merged("peak"), merged("nonpeak")
+    # What the two bands leave of the month is idle, the same arithmetic as each regional block. Claiming 0 idle
+    # while the shares add to 80 made this the one workload block whose figures could not all be true.
+    idle = max(0.0, round(100.0 - float(peak["pct_hours_mo"]) - float(nonpeak["pct_hours_mo"]), 2))
     out.update({
-        "search": {"peak": merged("peak"), "nonpeak": merged("nonpeak"), "idle_pct_hours_mo": 0.0},
+        "search": {"peak": peak, "nonpeak": nonpeak, "idle_pct_hours_mo": idle},
         "ingest": {"docs_per_sec": dps, "avg_doc_bytes": round(bps / dps, 1), "active_hours_mo": ACTIVE_HOURS, "source": "diagnostics"},
         "window_days": first["window_days"], "window_start": first["window_start"], "window_end": first["window_end"],
         "quote_window_telemetry": _telemetry("complete", first),
@@ -144,6 +152,12 @@ def exact_inputs(workload: dict | None, region: str, stored_gb: float, org_gb: f
     """
     block = regional_block(workload, region)
     if block is None:
+        if isinstance((workload or {}).get("regions"), dict):
+            # A proxy-log workload has a block for every Search region it tried. A region with none is a
+            # mismatch (a region string that differs, or a deployment with no id), not a reason to price
+            # this project on every region's traffic added together. Fail closed and say why.
+            reason = f"Search in {region or 'the project'} has no measured proxy-log workload."
+            return {"quote_window_telemetry": {"status": "incomplete", "source": SOURCE, "reason": reason}}, org_gb
         return workload or {}, org_gb
     return block, stored_gb
 

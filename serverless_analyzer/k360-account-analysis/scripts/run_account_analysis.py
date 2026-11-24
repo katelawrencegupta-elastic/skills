@@ -392,6 +392,22 @@ def check_reused_org(org: dict, args) -> None:
         )
 
 
+def apply_retention_override(acc: dict, run_key: str, estimate_months, retention_days) -> str:
+    """Record a named retention on the account and return the run key.
+
+    `retention_days` is recorded whatever month it converts to. 335 to 365 days is exactly 12 months,
+    and 12 is also the "unset" value, so keying the record on the month dropped the override and the
+    quote fell back to the index average. `estimate_months` is set only when it is not 12, as before.
+    """
+    if estimate_months and int(estimate_months) != 12:
+        acc["meta"]["estimate_months"] = int(estimate_months)
+    if retention_days:
+        acc["meta"]["retention_days"] = int(retention_days)
+        run_key = f"{run_key}_{int(retention_days)}d"
+        acc["meta"]["run_key"] = run_key
+    return run_key
+
+
 def prepare_account(args):
     """Fetch the org, fill infra, and write the account folder. Returns acc, infra, folder, env, acc_path."""
     warn_unignored_secrets()
@@ -463,14 +479,9 @@ def prepare_account(args):
         acc["meta"]["run_key"] = acc["meta"]["run_key"] + run_key_suffix(excluded)
     acc["storage"]["size_gaps"] = size_gaps(base, key, acc)
     run_key = acc["meta"]["run_key"]
-    estimate_months = getattr(args, "estimate_months", None)
-    retention_days = getattr(args, "retention_days", None)
-    if estimate_months and int(estimate_months) != 12:
-        acc["meta"]["estimate_months"] = int(estimate_months)
-        if retention_days:
-            acc["meta"]["retention_days"] = int(retention_days)
-            run_key = f"{run_key}_{int(retention_days)}d"
-            acc["meta"]["run_key"] = run_key
+    run_key = apply_retention_override(
+        acc, run_key, getattr(args, "estimate_months", None), getattr(args, "retention_days", None),
+    )
     root = Path(args.artifacts_root) if args.artifacts_root else artifacts_root()
     folder = root / run_key
     seal_dir(root)

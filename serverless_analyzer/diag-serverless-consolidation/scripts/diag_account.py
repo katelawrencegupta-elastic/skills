@@ -24,15 +24,28 @@ import json
 import re
 from pathlib import Path
 
-from diag_inputs import ESTIMATE_MONTHS, index_retention_basis, index_retention_months, retention_fallback_months, whole_months, written_retention_months
-from constants import RETENTION_FALLBACK_DAYS
+from diag_inputs import ESTIMATE_MONTHS, index_retention_basis, index_retention_months, whole_months, written_retention_months
 
-from constants import DAYS_PER_MONTH, RETENTION_ASSUMED_MAX_SHARE
-from serverless_regions import serverless_supports, us_alternative
+from constants import DAYS_PER_MONTH, RETENTION_UNAGED_MAX_SHARE
+from serverless_regions import is_us_region, serverless_supports, us_alternative
 
 
 def _norm(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
+
+
+def repeated_names(names) -> list[str]:
+    """Names that more than one entry carries, compared the way bundles are matched (case and punctuation ignored).
+
+    Bundles, exclusions and the billing roster are keyed by deployment name. Two entries with one name share a
+    key: one bundle can be matched to both deployments (double-counted) or one of two bundles can win (dropped).
+    Re-keying on the deployment id is the real fix. Until then the quote names the collision.
+    """
+    seen: dict[str, list[str]] = {}
+    for name in names:
+        if name:
+            seen.setdefault(_norm(name), []).append(str(name))
+    return sorted({group[0] for group in seen.values() if len(group) > 1})
 
 
 _sheet_months = whole_months  # one shared rounding rule, defined in diag_inputs
@@ -132,8 +145,9 @@ def _rollup_solutions(out: dict, clamped_notes: list[str]) -> None:
     elif index_months is not None:
         out.setdefault("meta", {})["retention_month_basis"] = "index_average"
     else:
-        # No index was counted. Use the delete age the bundles did measure, and only when no
-        # retention could be ascertained at all, the 30-day default. Never a 12-month assumption.
+        # No index was counted. Use the delete age the bundles did measure. When no retention could be
+        # ascertained at all there is no month: none is invented, `estimate_months` is None, and an
+        # Observability or Security sheet with bulk is not filled.
         fallback_months, basis = written_retention_months(
             [{"retention_days": d.get("retention_days"), "daily_raw_gb": d.get("daily_raw_gb")} for d in ech]
         )
@@ -176,7 +190,7 @@ def _rollup_solutions(out: dict, clamped_notes: list[str]) -> None:
         weight_bulk = sum(rate for rate, _days in weighed)
         weighted = sum(rate * days for rate, days in weighed)
         measured = (weighted / weight_bulk / DAYS_PER_MONTH) if weight_bulk else None
-        # Index average, rounded up, unless --retention-days named a month. With no index age, 30 days.
+        # Index average, rounded up, unless --retention-days named a month. With no index age, no month.
         if explicit_days:
             written_months = int((out.get("meta") or {}).get("estimate_months") or ESTIMATE_MONTHS)
         elif index_months is not None:
@@ -184,7 +198,7 @@ def _rollup_solutions(out: dict, clamped_notes: list[str]) -> None:
         else:
             written_months = fallback_months
         written = written_months if daily != 0 else None
-        if index_months is None and measured is not None and abs(written_months - measured) > 0.05:
+        if index_months is None and measured is not None and written_months is not None and abs(written_months - measured) > 0.05:
             clamped_notes.append(f"{sol} retention measures {measured:.1f} months. The estimate prices {written_months} months.")
         blk["deployments"] = len(group)
         # Deployments that were actually sized: a matched bundle, or priced from K360 on request.
@@ -324,13 +338,16 @@ def apply_diagnostics(
                 dep["gb"] = 0.0
                 dep["daily_raw_gb"] = 0.0
                 dep["ingest_source"] = "unsupported_region"
-                dep["unsupported_region"] = {"provider": str(prov), "region": str(reg)}
+                # A US region that is on neither the page nor US_SWAPS stays on ECH like any other, but the swap rule
+                # is a lookup, not a policy, so the quote says that no swap was defined for it.
+                us_no_swap = is_us_region(prov, reg)
+                dep["unsupported_region"] = {"provider": str(prov), "region": str(reg), "us_no_swap": us_no_swap}
                 dep["field_sources"] = {
                     "gb": "unsupported_region", "k360_gb": "cloud_tracker_telemetry",
                     "daily_raw_gb": "unsupported_region", "ecu": "cloud_tracker_billing",
                     "region": "cloud_tracker_infrastructure",
                 }
-                unsupported_region.append({"name": name, "provider": str(prov), "region": str(reg)})
+                unsupported_region.append({"name": name, "provider": str(prov), "region": str(reg), "us_no_swap": us_no_swap})
                 continue
         if use_active and name not in active_names:
             inactive += 1
@@ -506,22 +523,22 @@ def apply_diagnostics(
     skipped_bundles = set(inactive_bundles) | set(region_bundles)
     _known = [(float(r.get("store_gb") or 0), r.get("retention_known_share")) for r in rows if r.get("name") in used and r.get("name") not in skipped_bundles]
     _store = sum(gb for gb, _share in _known)
-    blended_share = None
+    unaged_share = None
     if _store > 0 and all(share is not None for _gb, share in _known):
-        blended_share = round(sum(gb * (1.0 - float(share)) for gb, share in _known) / _store, 4)
+        unaged_share = round(sum(gb * (1.0 - float(share)) for gb, share in _known) / _store, 4)
     active_rows = [r for r in rows if r.get("name") in used and r.get("name") not in skipped_bundles]
-    # Every row with store at the 30-day default, including a `policy` row that stayed inside
-    # the threshold. Counting it as policy-aged must not hide the assumption it still carries.
-    assumed_retention_rows = [
+    # Every row with store that has no retention age, including a `policy` row that stayed inside
+    # the threshold. Counting it as policy-aged must not hide the store the average leaves out.
+    unaged_retention_rows = [
         {
             "name": r.get("name"),
             "basis": r.get("retention_basis"),
-            "assumed_share": r.get("retention_assumed_share"),
+            "unaged_share": r.get("retention_unaged_share"),
             "within_threshold": r.get("retention_basis") == "policy",
         }
         for r in active_rows
-        if r.get("retention_basis") in ("assumed", "blended")
-        or float(r.get("retention_assumed_share") or 0) > 0
+        if r.get("retention_basis") == "partial"
+        or float(r.get("retention_unaged_share") or 0) > 0
     ]
     bulk_sum = sum(float(r.get("bulk_gb_day") or 0) for r in active_rows)
     active_store = sum(float(r.get("store_gb") or 0) for r in active_rows)
@@ -536,6 +553,15 @@ def apply_diagnostics(
             "share_of_store": round(unrated_store / active_store, 4) if active_store > 0 else None,
             "deployments": unrated_rows[:12],
         }
+    # Time in hot before rollover, which ILM `min_age` and data-stream retention both run from. Absent on a bundle parsed
+    # before it was measured, and then there is nothing to report rather than a zero.
+    measured_rollover = [r for r in active_rows if r.get("retention_rollover_day_bytes") is not None]
+    aged_bytes = sum(float(r.get("retention_index_bytes") or 0) for r in measured_rollover)
+    rollover_days_fleet = min_age_days_fleet = rollover_unknown_share = None
+    if measured_rollover and aged_bytes > 0:
+        rollover_days_fleet = sum(float(r.get("retention_rollover_day_bytes") or 0) for r in measured_rollover) / aged_bytes
+        min_age_days_fleet = sum(float(r.get("retention_base_age_bytes") or 0) for r in measured_rollover) / aged_bytes
+        rollover_unknown_share = sum(float(r.get("retention_rollover_unknown_bytes") or 0) for r in measured_rollover) / aged_bytes
     coverage = {
         "bundles": len(rows),
         "matched": matched,
@@ -552,18 +578,18 @@ def apply_diagnostics(
         "store_gb": round(sum(float(r.get("store_gb") or 0) for r in rows if r.get("name") in used and r.get("name") not in skipped_bundles), 2),
         "snapshot_gb": round(snapshot_gb, 2),
         "retention_unmeasured": no_age,
-        "retention_30d_assumed": assumed_retention_rows[:12],
+        "retention_unaged": unaged_retention_rows[:12],
         # Bulk on deployments a delete policy or data-stream retention ages, allowing up to
-        # RETENTION_ASSUMED_MAX_SHARE of local store at the 30-day default. A deployment past
-        # that share is blended or assumed and contributes nothing.
+        # RETENTION_UNAGED_MAX_SHARE of local store with no retention age. A deployment past
+        # that share is partial, and a deployment with no aged store contributes nothing.
         "retention_policy_bulk_gb_day": round(sum(
             float(row.get("bulk_gb_day") or 0) for row in active_rows if row.get("retention_basis") == "policy"
         ), 3),
-        "retention_assumed_max_share": RETENTION_ASSUMED_MAX_SHARE,
-        # Bulk counted as policy-aged that still carries some store at the 30-day default.
+        "retention_unaged_max_share": RETENTION_UNAGED_MAX_SHARE,
+        # Bulk counted as policy-aged that still has some store with no retention age.
         "retention_policy_within_threshold_gb_day": round(sum(
             float(row.get("bulk_gb_day") or 0) for row in active_rows
-            if row.get("retention_basis") == "policy" and float(row.get("retention_assumed_share") or 0) > 0
+            if row.get("retention_basis") == "policy" and float(row.get("retention_unaged_share") or 0) > 0
         ), 3),
         "unrated": unrated,
         "bulk_short_window_gb_day": round(sum(float(r.get("bulk_short_window_gb_day") or 0) for r in active_rows), 3),
@@ -575,8 +601,14 @@ def apply_diagnostics(
             for r in sorted(active_rows, key=lambda r: -float(r.get("bulk_restart_gb_day") or 0))
             if float(r.get("bulk_restart_gb_day") or 0) > 0
         ][:8],
-        # Share of local store whose retention is set by a delete policy. The rest uses the 30-day default.
-        "retention_blended_share": blended_share,
+        # Share of local store with no retention age (no delete phase, no data-stream retention). It is
+        # left out of the written month, not given a default.
+        "retention_unaged_share": unaged_share,
+        # Store-weighted days the aged store sat in hot before rollover, the same weighted age without it, and the share
+        # of aged store in a write index that had nothing to measure rollover from.
+        "retention_rollover_days": None if rollover_days_fleet is None else round(rollover_days_fleet, 3),
+        "retention_days_min_age": None if min_age_days_fleet is None else round(min_age_days_fleet, 3),
+        "retention_rollover_unknown_share": None if rollover_unknown_share is None else round(rollover_unknown_share, 4),
         "retention_clamped": clamped_notes,
         "active_month": active_info.get("month"),
         "active_month_partial": bool(active_info.get("partial")),
@@ -612,12 +644,37 @@ def apply_diagnostics(
         ],
     }
     limitations = []
+    duplicate_names = sorted(set(repeated_names(r.get("name") for r in rows)) | set(repeated_names(
+        d.get("name") for d in (out.get("solutions") or {}).get("by_deployment") or []
+        if isinstance(d, dict) and d.get("platform") != "serverless"
+    )))
+    if duplicate_names:
+        limitations.append({
+            "code": "duplicate_deployment_names", "count": len(duplicate_names), "names": duplicate_names[:12],
+            "detail": (
+                f"{len(duplicate_names)} deployment name(s) are carried by more than one bundle or deployment: "
+                f"{', '.join(duplicate_names[:6])}. Bundles, exclusions and the billing roster are matched by name, so one "
+                "bundle can be counted for both deployments or one can be dropped. Their ingest, stored GB and ECH cost "
+                "may be double counted or missing."
+            ),
+            "severity": "high",
+        })
     if fallback:
         limitations.append({"code": "missing_diagnostics", "count": fallback, "names": fallback_names[:12], "severity": "high"})
     if no_age:
         limitations.append({"code": "retention_unmeasured", "count": len(no_age), "names": [r["name"] for r in no_age[:12]], "severity": "medium"})
-    if assumed_retention_rows:
-        limitations.append({"code": "retention_30d_assumed", "count": len(assumed_retention_rows), "names": [r["name"] for r in assumed_retention_rows[:12]], "severity": "medium"})
+    if rollover_unknown_share:
+        limitations.append({
+            "code": "retention_rollover_unknown",
+            "detail": (
+                f"{rollover_unknown_share * 100:.0f}% of the store that has a retention age is in a write index with no rolled "
+                "generation to measure its time in hot from and no rollover max_age on its policy, so no rollover time was "
+                "added to it. The month is a floor for that store."
+            ),
+            "severity": "medium" if rollover_unknown_share > RETENTION_UNAGED_MAX_SHARE else "low",
+        })
+    if unaged_retention_rows:
+        limitations.append({"code": "retention_unaged", "count": len(unaged_retention_rows), "names": [r["name"] for r in unaged_retention_rows[:12]], "severity": "medium"})
     if short:
         limitations.append({"code": "short_diagnostic_window", "count": len(short), "deployments": short[:12], "severity": "medium"})
     if float(coverage.get("bulk_fallback_gb_day") or 0) > 0:
@@ -627,19 +684,17 @@ def apply_diagnostics(
     # The written month is the index average. With no index counted it falls back to the
     # 30-day default, and retention sets the estimator's retained-data ladder, so say so.
     meta_out = out.get("meta") or {}
-    retention_fallback = bool(
-        bulk_sum > 0 and meta_out.get("retention_month_basis") == "fallback_30d"
+    retention_missing = bool(
+        bulk_sum > 0 and meta_out.get("retention_month_basis") == "unascertained"
     )
-    if retention_fallback:
+    if retention_missing:
         limitations.append({
-            "code": "retention_month_fallback",
-            "months": retention_fallback_months(),
-            "days": RETENTION_FALLBACK_DAYS,
+            "code": "retention_month_missing",
             "detail": (
-                f"No index retention age was counted, so every Observability and Security sheet was written at the "
-                f"{RETENTION_FALLBACK_DAYS:g}-day default ({retention_fallback_months()} month) instead of the average "
-                "retention across indexes. Retention sets the estimator's retained-data ladder, so that month is an "
-                "assumption, not a measurement."
+                "No index had a retention age (an ILM delete phase or data-stream retention) and no delete age was "
+                "measured, so no retention month could be written. No default is assumed. Observability and Security "
+                "were not quoted. Retention sets the estimator's retained-data ladder. Set the month with "
+                "--retention-days if the customer's retention is known."
             ),
             "severity": "high",
         })
@@ -659,7 +714,8 @@ def apply_diagnostics(
         "Ingest GB/day is the write-index sum of index.primaries.bulk.est_bytes_per_day from the Elasticsearch diagnostic bundle. "
         "The month written to the estimator is the store-weighted average retention across indexes with local primary store, rounded up to a whole month. Each index is aged by its ILM delete policy, else its data-stream retention, else 30 days. The bulk-weighted delete age stays a record. "
         "Those two are summed by solution and by region. Search disk and the Search ingest-share denominator use diagnostic local store only; K360 stored sizes are excluded from the diagnostic estimate. "
-        "Search query rates use exact-window Cloud Tracker index telemetry. ECH ECU stays the K360 bill.",
+        "Search query rates, query complexity and hour shares come from the service proxy request logs, and docs/s and "
+        "document size from these bundles. ECH ECU stays the K360 bill.",
     ]
     if short:
         names = ", ".join(f"{s['name']} ({s['uptime_days']}d)" for s in short[:8])
@@ -700,29 +756,37 @@ def apply_diagnostics(
             f"{fallback} active {noun} {verb} no diagnostic bundle{named}. {adds} no ingest and no stored GB to the estimate. "
             "Pass --unmeasured fail to stop the run."
         )
-    within = [row for row in assumed_retention_rows if row.get("within_threshold")]
+    within = [row for row in unaged_retention_rows if row.get("within_threshold")]
     if within:
         shown = ", ".join(
-            f"{row['name']} ({float(row.get('assumed_share') or 0) * 100:.1f}%)"
-            for row in sorted(within, key=lambda r: -float(r.get("assumed_share") or 0))[:6]
+            f"{row['name']} ({float(row.get('unaged_share') or 0) * 100:.1f}%)"
+            for row in sorted(within, key=lambda r: -float(r.get("unaged_share") or 0))[:6]
         )
         noun = "deployment counts" if len(within) == 1 else "deployments count"
         notes.append(
-            f"{len(within)} {noun} as policy-aged with some store still at the 30-day default, each inside the "
-            f"{RETENTION_ASSUMED_MAX_SHARE * 100:.0f}% threshold ({shown}). One unconfigured index does not drop a "
-            "configured cluster out of the measured-retention total, and the assumption is still named here."
+            f"{len(within)} {noun} as policy-aged with some store that has no retention age, each inside the "
+            f"{RETENTION_UNAGED_MAX_SHARE * 100:.0f}% threshold ({shown}). That store is left out of the retention "
+            "average. It is not given a default age."
         )
-    if blended_share is not None and blended_share > RETENTION_ASSUMED_MAX_SHARE:
+    if unaged_share is not None and unaged_share > RETENTION_UNAGED_MAX_SHARE:
         notes.append(
-            f"{blended_share * 100:.0f}% of local store has no delete policy or data-stream retention. That share uses the 30-day assumed default, not an observed retention duration."
+            f"{unaged_share * 100:.0f}% of local store has no ILM delete phase and no data-stream retention. "
+            "That store is left out of the retention average: no default age is assumed, and an ILM policy that never "
+            "deletes is not read as a month. The written month rests on the rest of the store."
         )
-    elif assumed_retention_rows and not within:
-        notes.append("No delete policy or data-stream retention was available for some local store; its retention uses the 30-day assumed default.")
-    if retention_fallback:
+    elif unaged_retention_rows and not within:
+        notes.append("Some local store has no ILM delete phase and no data-stream retention. It is left out of the retention average, with no default age.")
+    if rollover_days_fleet and meta_out.get("retention_month_basis") == "index_average":
         notes.append(
-            f"No index retention age was counted, so the estimate prices the {RETENTION_FALLBACK_DAYS:g}-day default "
-            f"({retention_fallback_months()} month). "
-            "The written month is normally the store-weighted average retention across indexes, rounded up to a whole month."
+            f"Retention counts the time an index sat in hot before it rolled over, {rollover_days_fleet:.1f} days store-weighted. "
+            "An ILM delete min_age and a data stream's retention both run from rollover, so an index lives for that age plus "
+            f"this. The store-weighted age from the policies alone is {min_age_days_fleet:.1f} days and the written average is "
+            f"{(min_age_days_fleet or 0) + rollover_days_fleet:.1f}."
+        )
+    if retention_missing:
+        notes.append(
+            "No retention age could be ascertained for any index, so no month was written and Observability and Security "
+            "were not quoted. Pass --retention-days to quote them at a month you know."
         )
     restart_gb = sum(float(r.get("bulk_restart_gb_day") or 0) for r in rows if r.get("name") in used and r.get("name") not in skipped_bundles)
     if restart_gb > 0 and bulk_sum > 0 and restart_gb / bulk_sum > 0.05:

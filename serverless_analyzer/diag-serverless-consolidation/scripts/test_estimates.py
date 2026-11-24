@@ -972,6 +972,55 @@ class SecuritySteadyStateTests(unittest.TestCase):
         self.assertFalse(e73_blocks_quote(old["cps_addon_monthly"]))
 
 
+class SecurityAddonGateTests(unittest.TestCase):
+    """A blank part of E74 cannot show that no add-on is in it, so it blocks the quote."""
+
+    RB = SecuritySteadyStateTests.RB
+
+    def _blocked(self, **over):
+        from quote_checks import security_readback
+        rb = security_readback({**self.RB, **over}, 12)
+        return rb, e73_blocks_quote(rb["cps_addon_monthly"])
+
+    def test_a_blank_support_line_blocks_instead_of_skipping_the_gate(self):
+        for blank in ("support_monthly", "ingest_monthly", "retention_monthly"):
+            for empty in (None, "", "n/a"):
+                with self.subTest(blank=blank, empty=empty):
+                    rb, blocked = self._blocked(**{blank: empty, "monthly_steady_state": 1650.0})   # a 500 endpoint add-on
+                    self.assertTrue(blocked)
+                    self.assertIsNone(rb["other_addons_monthly"])
+                    self.assertIn("could not be checked", rb["addon_note"])
+                    self.assertEqual(rb["cps_addon_e73"], 0)
+
+    def test_a_blank_part_blocks_even_when_there_is_no_add_on(self):
+        # Unprovable is unprovable: the gate does not guess that the missing part was zero.
+        _rb, blocked = self._blocked(support_monthly=None)
+        self.assertTrue(blocked)
+
+    def test_all_parts_present_still_passes_and_a_real_addon_still_blocks(self):
+        self.assertFalse(self._blocked()[1])
+        rb, blocked = self._blocked(monthly_steady_state=1650.0)
+        self.assertTrue(blocked)
+        self.assertEqual(rb["other_addons_monthly"], 500.0)
+
+    def test_a_read_back_saved_before_the_lines_were_read_still_gates_on_e73_alone(self):
+        from quote_checks import security_readback
+        old = security_readback({"monthly_steady_state": 1150.0, "cps_addon_monthly": 0}, 12)
+        self.assertFalse(e73_blocks_quote(old["cps_addon_monthly"]))
+
+    def test_the_rejection_says_why_not_that_e73_was_blank(self):
+        from consolidation import build_consolidation  # noqa: F401  (the message lives in build_consolidation)
+        from quote_checks import security_readback
+        rb = security_readback({**self.RB, "support_monthly": None}, 12)
+        self.assertIsNone(_money_of(rb["cps_addon_monthly"]))
+        self.assertTrue(rb["addon_note"])
+
+
+def _money_of(value):
+    from quote_checks import money
+    return money(value)
+
+
 class RegionalEchoTests(unittest.TestCase):
     def test_every_regional_sheet_is_scored_and_one_bad_region_fails(self):
         from quote_checks import integrity_score
@@ -1321,3 +1370,88 @@ class OrgReportLayoutTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SearchYearAgreementTests(unittest.TestCase):
+    """The Search read-back's steady annual is 12 x its monthly, on both Search paths."""
+
+    TOTALS = (1234.567, 12.345, 99999.995, 0.005, 1000.0, 3333.333)
+
+    @staticmethod
+    def _lines(rb, *, eis=0.0):
+        from consolidation import _quote_lines
+        by = {"search": {"pricing": "es3-estimator performant (quotable)", "total_mo": rb["monthly_steady_state"],
+                         "by_region": [], "eis_with_support_mo": eis}}
+        return _quote_lines(by, {"estimators": {"search": {"readback": rb}}})
+
+    def _readbacks(self, raw):
+        import es3_estimate
+        import search_sheet
+        yield "notebook", es3_estimate.readback_from([{"Search Power Setting": "performant", "Total $/month": raw}])
+        yield "sheet", search_sheet.readback_from(
+            [{"Search Power Setting": "performant", "Total $/month": round(raw, 2)}])
+
+    def test_the_annual_is_twelve_times_the_rounded_monthly_on_both_paths(self):
+        for raw in self.TOTALS:
+            for path, rb in self._readbacks(raw):
+                with self.subTest(raw=raw, path=path):
+                    self.assertEqual(rb["monthly_steady_state"], round(raw, 2))
+                    self.assertEqual(rb["annual_steady_state"], round(rb["monthly_steady_state"] * 12, 2))
+                    self.assertEqual(rb["annual_year1"], rb["annual_steady_state"])
+
+    def test_year_agreement_passes_on_both_paths_without_eis(self):
+        from quote_checks import _year_row
+        for raw in self.TOTALS:
+            for path, rb in self._readbacks(raw):
+                with self.subTest(raw=raw, path=path):
+                    row = _year_row(self._lines(rb))
+                    self.assertTrue(row["passed"], row["detail"])
+                    self.assertEqual(row["score"], 1.0)
+
+    def test_year_agreement_passes_when_eis_is_added_to_the_line(self):
+        from quote_checks import _year_row
+        for raw in self.TOTALS:
+            for path, rb in self._readbacks(raw):
+                with self.subTest(raw=raw, path=path):
+                    self.assertTrue(_year_row(self._lines(rb, eis=17.0))["passed"])
+
+    def test_a_year_that_really_disagrees_still_fails(self):
+        # The bar is unchanged: only the producer was inconsistent.
+        from quote_checks import _year_row
+        import es3_estimate
+        rb = es3_estimate.readback_from([{"Search Power Setting": "performant", "Total $/month": 1234.567}])
+        rb["annual_steady_state"] = round(rb["annual_steady_state"] + 0.05, 2)
+        self.assertFalse(_year_row(self._lines(rb))["passed"])
+
+
+class EisReconciliationToleranceTests(unittest.TestCase):
+    """The EIS and ML-node reconciliation has its own tolerance, not the sheet echo's GB/day one."""
+
+    @staticmethod
+    def _acc(daily_eis, total_eis):
+        days = ["2026-11-01", "2026-11-02"]
+        return {
+            "ai_ml": {
+                "billing_by_deployment_complete": True,
+                "billing_by_deployment": {"d": {"eis_ecu": total_eis, "million_tokens": 1.0, "ml_node_ecu": 5.0}},
+                "daily_usage_complete": True,
+                "daily_usage_by_deployment": {"d": {
+                    "days": days, "eis_ecu": daily_eis, "million_tokens": [0.5, 0.5], "ml_node_ecu": [2.5, 2.5], "models": [[], []],
+                }},
+            },
+            "ecu": {"quote_lookback_days": 2, "daily_days": days, "daily_totals": [1.0, 1.0]},
+        }
+
+    def test_the_gate_uses_its_own_constants(self):
+        import inspect
+        import consolidation_eis
+        import constants
+        source = inspect.getsource(consolidation_eis)
+        self.assertNotIn("ECHO_TOLERANCE", source)
+        self.assertEqual((constants.EIS_RECONCILE_ABS, constants.EIS_RECONCILE_SHARE), (0.02, 0.001))
+
+    def test_a_daily_series_that_misses_its_total_is_refused(self):
+        from consolidation_eis import _ai_ml_window
+        self.assertEqual(_ai_ml_window(self._acc([5.0, 4.0], 10.0), {"d"})["status"], "incomplete")      # 1.0 short
+        self.assertEqual(_ai_ml_window(self._acc([5.0, 5.0], 10.0), {"d"})["status"], "complete")
+        self.assertEqual(_ai_ml_window(self._acc([5.0, 4.99], 10.0), {"d"})["status"], "complete")       # inside 0.02

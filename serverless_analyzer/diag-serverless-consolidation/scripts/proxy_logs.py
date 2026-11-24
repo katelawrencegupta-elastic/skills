@@ -26,6 +26,11 @@ from constants import HOURS_PER_MONTH, MODERATE_MAX_MS, SIMPLE_MAX_MS
 
 INDEX = "logging-*:service-proxy-requests-*"
 DEFAULT_DAYS = 7
+# Socket timeout of one ES|QL call. A call already in flight when the deadline passes can run this long.
+REQUEST_TIMEOUT_S = 300
+# A span that keeps failing is halved at most this many times (24 h, 12 h, 6 h, 3 h). Halving is for a
+# gateway that times out on a big span; it is not a way to keep retrying a cluster that is down.
+MAX_SPLIT_DEPTH = 3
 # Peak window from the query: weekdays (Mon=1 .. Sun=7), UTC hours 13 up to but not including 23.
 PEAK_WEEKDAYS = 5
 PEAK_START_HOUR = 13
@@ -50,7 +55,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def run_esql(base: str, key: str, query: str, timeout: int = 300) -> dict:
+def run_esql(base: str, key: str, query: str, timeout: int = REQUEST_TIMEOUT_S) -> dict:
     """One ES|QL call through Kibana's internal search route. Returns the raw response."""
     req = urllib.request.Request(
         base + "/internal/search/esql",
@@ -61,9 +66,30 @@ def run_esql(base: str, key: str, query: str, timeout: int = 300) -> dict:
     req.add_unredirected_header("Authorization", f"ApiKey {key}")
     try:
         with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as resp:
-            return json.load(resp)["rawResponse"]
+            return raw_response(json.load(resp))
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"proxy logs HTTP {exc.code}: {exc.read(300)!r}") from exc
+
+
+def raw_response(body) -> dict:
+    """The ES|QL result inside Kibana's envelope, or an error that says why it cannot be trusted.
+
+    A result with no `rawResponse` is not an empty day. A partial result (`is_partial`) or one where a
+    cross-cluster search skipped or failed a cluster has undercounted requests, and an undercounted QPS
+    would be quoted as measured. Both raise `RuntimeError`, which `_read_span` retries and, if it keeps
+    happening, reports against the region instead of quoting it.
+    """
+    raw = body.get("rawResponse") if isinstance(body, dict) else None
+    if not isinstance(raw, dict):
+        raise RuntimeError("proxy logs response has no rawResponse")
+    if raw.get("is_partial"):
+        raise RuntimeError("proxy logs returned a partial result (is_partial), so request counts may be low")
+    clusters = raw.get("_clusters") if isinstance(raw.get("_clusters"), dict) else {}
+    short = {name: int(clusters.get(name) or 0) for name in ("skipped", "failed", "partial")}
+    if any(short.values()):
+        said = ", ".join(f"{count} {name}" for name, count in short.items() if count)
+        raise RuntimeError(f"proxy logs searched fewer clusters than asked ({said}), so request counts may be low")
+    return raw
 
 
 def _in_list(ids: list[str]) -> str:
@@ -164,6 +190,9 @@ def summarize(hours: list[dict], total_hours: int | None = None) -> dict:
         p99 = percentile([r["p99"] for r in rows if r["p99"] is not None], 50)
         p95_minute = percentile(peak_minute, 95)
         out[name] = {
+            # The unrounded p90. Complexity is bucketed from this, so the sheet and the library bucket the same
+            # figure `complexity_of` did: 250.4 ms is moderate, not the "250" it displays as.
+            "p90_ms": p90,
             "hours": len(rows),
             "pct_of_hours": round(100.0 * len(rows) / total) if total else 0,
             "recommended_qps": math.ceil(p95_minute) if p95_minute is not None else 0,
@@ -178,27 +207,42 @@ def summarize(hours: list[dict], total_hours: int | None = None) -> dict:
     return out
 
 
-def _read_span(base, key, deployment_ids, start, end, run, attempts: int = 3, pause: float = 5.0) -> list[dict]:
-    """One span of hours. A gateway timeout or dropped connection is retried, then the span is split in half."""
+def _past(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def _read_span(base, key, deployment_ids, start, end, run, attempts: int = 3, pause: float = 5.0,
+               deadline: float | None = None, depth: int = 0) -> list[dict]:
+    """One span of hours. A gateway timeout or dropped connection is retried, then the span is split in half.
+
+    `deadline` is a `time.monotonic()` instant. Past it no further call is made and no further wait is
+    taken: the span raises, and the caller records the region as unread. A span is halved at most
+    `MAX_SPLIT_DEPTH` times. Without a deadline the retries and halving are bounded only by those two.
+    """
     last: Exception | None = None
     for attempt in range(attempts):
+        if _past(deadline):
+            raise RuntimeError(f"proxy logs exceeded their time budget before {start:%Y-%m-%d %H:00} UTC was read")
         try:
             return _hour_rows(run(base, key, hourly_query(deployment_ids, start, end)))
         except (RuntimeError, OSError) as exc:
             last = exc
             if attempt + 1 < attempts:
-                time.sleep(pause * (attempt + 1))
+                wait = pause * (attempt + 1)
+                if deadline is not None:
+                    wait = max(0.0, min(wait, deadline - time.monotonic()))
+                time.sleep(wait)
     hours = int((end - start).total_seconds() // 3600)
-    if hours <= 1:
+    if hours <= 1 or depth >= MAX_SPLIT_DEPTH or _past(deadline):
         raise RuntimeError(f"proxy logs failed for {start:%Y-%m-%d %H:00} UTC: {last}")
     mid = start + timedelta(hours=hours // 2)
-    return (_read_span(base, key, deployment_ids, start, mid, run, attempts, pause)
-            + _read_span(base, key, deployment_ids, mid, end, run, attempts, pause))
+    return (_read_span(base, key, deployment_ids, start, mid, run, attempts, pause, deadline, depth + 1)
+            + _read_span(base, key, deployment_ids, mid, end, run, attempts, pause, deadline, depth + 1))
 
 
 def search_workload(
     base: str, key: str, deployment_ids: list[str], *, days: int = DEFAULT_DAYS, now: datetime | None = None,
-    run=run_esql, workers: int = 1,
+    run=run_esql, workers: int = 1, deadline: float | None = None,
 ) -> dict:
     """The Search workload the estimators read, from the last `days` complete UTC days.
 
@@ -216,7 +260,7 @@ def search_workload(
     spans = [(today - timedelta(days=back), today - timedelta(days=back - 1)) for back in range(days, 0, -1)]
 
     def read(span: tuple[datetime, datetime]) -> list[dict]:
-        return _read_span(base, key, deployment_ids, span[0], span[1], run)
+        return _read_span(base, key, deployment_ids, span[0], span[1], run, deadline=deadline)
 
     if workers > 1:
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -239,7 +283,7 @@ def search_workload(
         return {
             "qps": float(row["recommended_qps"]),
             "complexity": row["query_complexity"],
-            "complexity_ms": float(row["typical_p90_latency_ms"] or 0),
+            "complexity_ms": float(row.get("p90_ms") if row.get("p90_ms") is not None else (row["typical_p90_latency_ms"] or 0)),
             "pct_hours_mo": float(row["pct_of_hours"]),
         }
 

@@ -17,7 +17,7 @@ from search_sheet import price_search
 from estimate_paths import _months_for_sheet, _search_volume_scale, estimate_title
 from sizing_fill import (
     _region_rejected, fill_security, ingest_basis, match_region, observability_fill,
-    region_match_text, region_options, run_es3,
+    region_match_text, region_options, run_es3, withhold_monthly,
 )
 
 from search_inputs import exact_inputs, project_inputs
@@ -41,7 +41,7 @@ def _fill_regional_job(job: dict, creds) -> dict:
             reuse=job["reuse"], skip_xlsx=job.get("skip_xlsx", True),
         )
         entry = {
-            "solution": sol, "region": job["region"], "title": job["title"], "stored_gb": job["stored_gb"],
+            "solution": sol, "region": job["region"], "provider": job["provider"], "title": job["title"], "stored_gb": job["stored_gb"],
             "store_scale": job.get("store_scale"),
             "status": result.get("status") or "error",
             "region_match": result.get("region_match"),
@@ -74,7 +74,7 @@ def _fill_regional_job(job: dict, creds) -> dict:
         except Exception:  # noqa: BLE001
             pass
         return {
-            "solution": sol, "region": job["region"], "title": job["title"],
+            "solution": sol, "region": job["region"], "provider": job["provider"], "title": job["title"],
             "region_match": "none", "readback_rejected": _region_rejected(job.get("region")),
             "readback": {}, "status": "unquoted", "error": _region_rejected(job.get("region")),
         }
@@ -90,7 +90,7 @@ def _fill_regional_job(job: dict, creds) -> dict:
     else:
         cells, n, rb, gate = fill_security(sheets, copied["id"], account, job["support"], reg, int(job["retention"]), job["daily"], opts, basis)
     entry = {
-        "solution": sol, "region": job["region"], "title": copied["name"], "stored_gb": job["stored_gb"],
+        "solution": sol, "region": job["region"], "provider": job["provider"], "title": copied["name"], "stored_gb": job["stored_gb"],
         "spreadsheet_id": copied["id"], "url": copied["url"], "reused_existing_copy": reused,
         "cells": cells, "cells_written": n, "region_match": match_text,
         "readback": rb, "status": "filled", "daily_raw_gb": round(job["daily"], 2),
@@ -104,6 +104,7 @@ def _fill_regional_job(job: dict, creds) -> dict:
         entry["echo_gate"] = gate
         if not gate["accepted"]:
             entry["readback_rejected"] = "the sheet echo differs from the written bulk by more than the tolerance (0.1% of it, at least 0.02 GB/day)"
+            withhold_monthly(rb)
     if not job["skip_xlsx"]:
         try:
             entry["local_xlsx"] = str(export_xlsx(drive, copied["id"], Path(job["local_dir"]) / f"{job['title']}.xlsx"))
@@ -580,7 +581,7 @@ def fill_plan_sheet(job: dict, creds) -> dict:
                 )}
             if e73_blocks_quote(rb.get("cps_addon_monthly")):
                 addon = sheet_money(rb.get("cps_addon_monthly"))
-                reason = "E73 was blank" if addon is None else (rb.get("addon_note") or f"E73 is {addon:g}")
+                reason = (rb.get("addon_note") or "E73 was blank") if addon is None else (rb.get("addon_note") or f"E73 is {addon:g}")
                 return {"error": f"Security deployment-count plan was not priced: {job['title']} {reason}."}
             price = sheet_money(rb.get("monthly_steady_state"))
             if price is None:

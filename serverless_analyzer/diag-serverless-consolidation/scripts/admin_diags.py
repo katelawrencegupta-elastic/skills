@@ -32,7 +32,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from datetime import datetime, timezone
 from pathlib import Path
 
-from constants import RETENTION_ASSUMED_MAX_SHARE
+from constants import RETENTION_UNAGED_MAX_SHARE
 from privacy import seal_dir, seal_file, seal_text
 
 _ADMIN_HOST = "admin.found.no"
@@ -362,12 +362,16 @@ def _parse_age(value) -> float | None:
     return n * {"ms": 1 / 86_400_000, "s": 1 / 86_400, "m": 1 / 1_440, "h": 1 / 24, "d": 1}[match.group(2)]
 
 
-def quoted_index_bytes(name: str, store: dict | None) -> dict:
-    """Local bytes are the quote. Searchable-snapshot mounts are reported and left out."""
+def quoted_index_bytes(name: str, store: dict | None, mounted: bool = False) -> dict:
+    """Local bytes are the quote. Searchable-snapshot mounts are reported and left out.
+
+    A `partial-*` index is a partially mounted snapshot. A fully mounted one (`restored-*` by default, any
+    name if the customer chose it) is found by its `index.store.type` of `snapshot`, passed as `mounted`.
+    """
     store = store or {}
     dataset_bytes = int(store.get("total_data_set_size_in_bytes") or store.get("size_in_bytes") or 0)
     local_bytes = int(store.get("size_in_bytes") or 0)
-    if str(name).startswith("partial-"):
+    if mounted or str(name).startswith("partial-"):
         return {"quote": 0, "dataset": 0, "snapshot": dataset_bytes or local_bytes}
     if not _user_index(name) or (local_bytes <= 0 and dataset_bytes <= 0):
         return {"quote": 0, "dataset": 0, "snapshot": 0}
@@ -409,14 +413,12 @@ def _zip_json(archive: zipfile.ZipFile, suffix: str):
 def _retention_label(parts: list[dict], basis: str | None) -> str | None:
     if not parts:
         return None
-    if basis == "assumed":
-        return f"{round(parts[0]['days']):,} days assumed"
     if parts[0]["pct"] >= 75:
         n = round(parts[0]["days"])
         label = "1 day" if n == 1 else f"{n:,} days"
     else:
         label = " · ".join(f"{round(p['days'])}d ({p['pct']:.0f}%)" for p in parts[:3])
-    return label + (" (part assumed)" if basis == "blended" else "")
+    return label + (" (part has no retention age)" if basis == "partial" else "")
 
 
 def _write_phase_sec(creation: int | None, lifecycle: int | None, action: str | None, collection: int) -> int:
@@ -591,6 +593,79 @@ def _counter_intact(stats: dict, older: str, write_name: str) -> bool:
     return (old_bulk / old_store) >= COUNTER_INTACT_MIN * (write_bulk / write_store)
 
 
+def series_members(streams: list, alias: dict, explain: dict, created: dict) -> tuple[dict[str, list[str]], set[str], dict[str, str]]:
+    """The generations of every series, oldest first, keyed by the write index (the last one).
+
+    A series is a data stream, or the indices under one write alias up to the write index. Returns
+    (`members_of`, the data-stream write indices, write index to its alias). One definition, shared by the bulk
+    rate and the retention lifetime, so the two cannot disagree about what a generation is.
+    """
+    members_of: dict[str, list[str]] = {}
+    for ds in streams or []:
+        names = [(ix or {}).get("index_name") or "" for ix in (ds.get("indices") or [])]
+        names = [n for n in names if n]
+        if names:
+            members_of[names[-1]] = names
+    stream_write = set(members_of)
+    alias_members: dict[str, list[str]] = defaultdict(list)
+    alias_write: dict[str, str] = {}
+    for name, body in (alias or {}).items():
+        for alias_name, st in (((body or {}).get("aliases")) or {}).items():
+            alias_members[alias_name].append(name)
+            if (st or {}).get("is_write_index"):
+                alias_write[name] = alias_name
+    for name, alias_name in alias_write.items():
+        if name not in members_of:
+            family = sorted(alias_members[alias_name], key=lambda n: (created.get(n) or (explain.get(n) or {}).get("index_creation_date_millis") or 0, n))
+            if name in family:
+                family = family[: family.index(name) + 1]
+            else:
+                family = [name]
+            members_of[name] = family
+    return members_of, stream_write, alias_write
+
+
+def rollover_days(members_of: dict[str, list[str]], explain: dict, created: dict) -> dict[str, float | None]:
+    """How long each generation sat in hot before it rolled over, in days, as the bundle recorded it.
+
+    ILM measures a delete phase's `min_age` from rollover, and a data stream lifecycle measures
+    `data_retention` from rollover too, so an index lives for this time plus that age. For a generation
+    that has rolled over it is the ILM rollover time minus its creation (`lifecycle_date_millis`), else
+    when the next generation was created, which is also what a data stream lifecycle has, since it has no
+    ILM explain. The write index has not rolled yet: it takes the median of its rolled siblings, and None
+    when there are none, which the caller turns into a policy cap or a flagged zero.
+    """
+    def born(name: str) -> int | None:
+        return (explain.get(name) or {}).get("index_creation_date_millis") or created.get(name)
+
+    out: dict[str, float | None] = {}
+    for write_name, family in members_of.items():
+        seen: list[float] = []
+        for position, name in enumerate(family[:-1]):
+            info = explain.get(name) or {}
+            start = born(name)
+            end = None
+            if info.get("lifecycle_date_millis") and start and int(info["lifecycle_date_millis"]) > int(start):
+                end = int(info["lifecycle_date_millis"])
+            elif start and born(family[position + 1]) and int(born(family[position + 1])) > int(start):
+                end = int(born(family[position + 1]))
+            if start and end and end > int(start):
+                days = (end - int(start)) / 86_400_000
+                out[name] = days
+                seen.append(days)
+        seen.sort()
+        out[write_name] = None if not seen else (seen[len(seen) // 2] if len(seen) % 2 else (seen[len(seen) // 2 - 1] + seen[len(seen) // 2]) / 2)
+    return out
+
+
+def hot_rollover_max_age_days(policies: dict, policy: str | None) -> float | None:
+    """The policy's hot-phase rollover `max_age` in days, or None. An upper bound on time in hot: a size trigger can fire first."""
+    body = (policies or {}).get(policy) if policy else None
+    phases = ((body or {}).get("policy") or body or {}).get("phases") or {}
+    rollover = (((phases.get("hot") or {}).get("actions") or {}).get("rollover") or {})
+    return _parse_age(rollover.get("max_age"))
+
+
 def series_rates(stats: dict, streams: list, alias: dict, explain: dict, created: dict, index_mode: dict, collection: int, counter_start: dict | None = None) -> dict:
     """Bulk bytes per day for every series in a bundle, with the logs, metrics, and traces split.
 
@@ -621,28 +696,7 @@ def series_rates(stats: dict, streams: list, alias: dict, explain: dict, created
     bytes were spread over the counter's own age. The quoted rate stays esdiag's
     figure; this is the flag beside it.
     """
-    members_of: dict[str, list[str]] = {}
-    for ds in streams or []:
-        names = [(ix or {}).get("index_name") or "" for ix in (ds.get("indices") or [])]
-        names = [n for n in names if n]
-        if names:
-            members_of[names[-1]] = names
-    stream_write = set(members_of)
-    alias_members: dict[str, list[str]] = defaultdict(list)
-    alias_write: dict[str, str] = {}
-    for name, body in (alias or {}).items():
-        for alias_name, st in (((body or {}).get("aliases")) or {}).items():
-            alias_members[alias_name].append(name)
-            if (st or {}).get("is_write_index"):
-                alias_write[name] = alias_name
-    for name, alias_name in alias_write.items():
-        if name not in members_of:
-            family = sorted(alias_members[alias_name], key=lambda n: (created.get(n) or (explain.get(n) or {}).get("index_creation_date_millis") or 0, n))
-            if name in family:
-                family = family[: family.index(name) + 1]
-            else:
-                family = [name]
-            members_of[name] = family
+    members_of, stream_write, alias_write = series_members(streams, alias, explain, created)
 
     def born(name: str) -> int | None:
         return (explain.get(name) or {}).get("index_creation_date_millis") or created.get(name)
@@ -671,6 +725,10 @@ def series_rates(stats: dict, streams: list, alias: dict, explain: dict, created
 
     stream_name = {names[-1]: ds.get("name") or names[-1] for ds in streams or [] for names in [[(ix or {}).get("index_name") or "" for ix in (ds.get("indices") or [])]] if names and names[-1]}
     for write_name, family in members_of.items():
+        if not _user_index(write_name):
+            # A system data stream (.ds-ilm-history, .fleet-*, .logs-deprecation) is not customer ingest. It was
+            # already out of store and retention, and counting its bulk put it in the logs mix of the quote.
+            continue
         info = explain.get(write_name) or {}
         seconds = _write_phase_sec(info.get("index_creation_date_millis"), info.get("lifecycle_date_millis"), info.get("action"), collection)
         by_fallback = False
@@ -754,6 +812,13 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         alias = _zip_json(archive, "/alias.json") or {}
         recovery = _zip_json(archive, "/recovery.json") or {}
 
+    # A member that is present and empty is a failed capture, not a quiet cluster. With no nodes there is no
+    # collection time, so every write phase is 0 and the bundle would read as 0 GB/day with nothing flagged.
+    if not nodes:
+        raise BundleIncomplete(f"{path.name} lists no nodes in nodes_stats.json")
+    if not stats:
+        raise BundleIncomplete(f"{path.name} lists no indices in the index-stats member")
+
     # When each index's primary shards last started on a node. The bulk counter restarts then.
     counter_start: dict[str, int] = {}
     for name, body in (recovery.items() if isinstance(recovery, dict) else []):
@@ -775,8 +840,12 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
             collection = ts
     created: dict[str, int] = {}
     index_mode: dict[str, str] = {}
+    mounted: set[str] = set()      # fully or partially mounted searchable snapshots: not local store
     for name, meta in ((state.get("metadata") or {}).get("indices") or {}).items():
         settings = ((meta.get("settings") or {}).get("index") or {})
+        store_type = (settings.get("store") or {}).get("type") if isinstance(settings.get("store"), dict) else None
+        if str(store_type or settings.get("store.type") or "").lower() == "snapshot":
+            mounted.add(name)
         if settings.get("mode"):
             index_mode[name] = str(settings.get("mode"))
         raw = settings.get("creation_date")
@@ -814,21 +883,29 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         (ix or {}).get("index_name"): ds.get("name") or ""
         for ds in streams for ix in (ds.get("indices") or [])
     }
+    # ILM `min_age` and a data stream's `data_retention` both run from rollover, so an index lives for the time it
+    # sat in hot plus that age. The stored volume the estimator prices is rate x that lifetime, not rate x min_age.
+    series_ret, _stream_write, _alias_write = series_members(streams, alias, explain, created)
+    hot_days = rollover_days(series_ret, explain, created)
+    write_indices = {family[-1] for family in series_ret.values()}
     by_age: dict[float, float] = defaultdict(float)
+    base_age_bytes = 0.0          # sum of the delete or retention age alone x store, the figure before rollover is added
+    rollover_day_bytes = 0.0      # sum of time in hot x store
+    rollover_unknown_bytes = 0.0  # store in a write index with no rolled sibling and no policy cap: nothing could be added
     metrics_age_bytes = 0.0
     metrics_bytes = 0.0
     unknown = 0.0
     local = 0.0
     dataset = 0.0
     snapshot = 0.0
-    blended_bytes = 0.0       # store with no configured retention, priced at the 30-day default
+    unaged_bytes = 0.0        # store with no ILM delete phase and no data-stream retention: no age, no weight
     index_days_sum = 0.0
     index_age_bytes = 0.0     # sum of age * store, so a larger index carries more of the written month
     index_count = 0
     docs_total = 0.0          # primary documents in the same indices the local store counts
     for ix, body in stats.items():
         store = ((body.get("primaries") or {}).get("store") or {})
-        measured = quoted_index_bytes(ix, store)
+        measured = quoted_index_bytes(ix, store, mounted=ix in mounted)
         snapshot += measured["snapshot"]
         if measured["dataset"] <= 0 and measured["quote"] <= 0:
             continue
@@ -843,15 +920,29 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         if age is None:
             age = ds_age.get(ix)
         if age is None:
-            # No delete policy covers this index. Use the explicit 30-day default rather than
-            # treating historical index age as the customer's retention setting.
+            # Nothing sets this index's retention: no delete phase (an ILM policy that never deletes
+            # keeps data indefinitely, which is not a month) and no data-stream retention. It is left
+            # out of the average and the index count. No default age is invented, and the historical
+            # age of the index is not a retention setting either.
             unknown += nbytes
-            default_age = 30.0
-            blended_bytes += nbytes
-            by_age[default_age] += nbytes
-            age = default_age
-        else:
-            by_age[round(age, 3)] += nbytes
+            unaged_bytes += nbytes
+            continue
+        base = float(age)
+        hot = hot_days.get(ix)
+        if hot is None and ix in write_indices:
+            # The write index has not rolled yet, and nothing rolled before it in this bundle to measure from.
+            # The policy's rollover max_age is an upper bound on time in hot. With neither, no rollover time
+            # is added (a floor) and the store is counted so the quote can say so.
+            hot = hot_rollover_max_age_days(policies, info.get("policy")) if info.get("managed") else None
+            if hot is None:
+                hot = 0.0
+                rollover_unknown_bytes += nbytes
+        elif hot is None:
+            hot = 0.0              # not part of a rollover series: its age already counts from creation
+        age = base + hot
+        base_age_bytes += base * nbytes
+        rollover_day_bytes += hot * nbytes
+        by_age[round(age, 3)] += nbytes
         index_days_sum += float(age)
         index_age_bytes += float(age) * nbytes
         index_count += 1
@@ -860,26 +951,23 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
             metrics_bytes += nbytes
 
     known = local - unknown                   # store whose age a policy or data stream sets
-    covered = known + blended_bytes           # store that has an age at all
-    weighted = sum(age * nbytes for age, nbytes in by_age.items()) / covered if covered > 0 else None
+    weighted = sum(age * nbytes for age, nbytes in by_age.items()) / known if known > 0 else None
     known_share = (known / local) if local > 0 else None
     parts: list[dict] = []
-    if covered > 0:
+    if known > 0:
         for age, nbytes in sorted(by_age.items(), key=lambda kv: -kv[1]):
-            parts.append({"days": age, "pct": round(100 * nbytes / covered, 1)})
-    # Share of local store priced at the 30-day assumed default. A deployment stays policy-aged
-    # while that share is inside RETENTION_ASSUMED_MAX_SHARE: one stray unconfigured index must
-    # not drop a configured cluster's whole bulk out of the measured-retention total.
-    assumed_share = (blended_bytes / local) if local > 0 else None
+            parts.append({"days": age, "pct": round(100 * nbytes / known, 1)})
+    # Share of local store with no retention age. A deployment stays policy-aged while that share is
+    # inside RETENTION_UNAGED_MAX_SHARE: one stray unconfigured index must not drop a configured
+    # cluster's whole bulk out of the measured-retention total. Past it the row is `partial`, and a
+    # row with no aged store at all has no basis and no retention days.
+    unaged_share = (unaged_bytes / local) if local > 0 else None
     if not weighted:
         basis, days = None, None
-    elif known <= 0:
-        basis, days = "assumed", weighted
-        parts = [{"days": round(weighted, 1), "pct": 100.0, "basis": "assumed"}]
-    elif blended_bytes <= 0 or (assumed_share is not None and assumed_share <= RETENTION_ASSUMED_MAX_SHARE):
+    elif unaged_bytes <= 0 or (unaged_share is not None and unaged_share <= RETENTION_UNAGED_MAX_SHARE):
         basis, days = "policy", weighted
     else:
-        basis, days = "blended", weighted
+        basis, days = "partial", weighted
     return {
         "cluster": health.get("cluster_name"),
         "bulk_gb_day": round(gb_day, 3),
@@ -888,16 +976,24 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         "retention_index_count": index_count,
         "retention_index_days_sum": round(index_days_sum, 3),
         "retention_index_age_bytes": index_age_bytes,
-        "retention_index_bytes": local,
+        # Local store of the indexes that have an age: the weight the fleet mean divides by. It is not `local`.
+        # Store with no retention age is left out of the average, so counting it here treated it as age zero.
+        "retention_index_bytes": known,
+        # The part of retention_days that is time in hot before rollover, and what it would have been without it.
+        "retention_rollover_days": None if known <= 0 else round(rollover_day_bytes / known, 3),
+        "retention_days_min_age": None if known <= 0 else round(base_age_bytes / known, 3),
+        "retention_rollover_day_bytes": rollover_day_bytes,
+        "retention_base_age_bytes": base_age_bytes,
+        "retention_rollover_unknown_bytes": rollover_unknown_bytes,
         # Size-weighted delete age of the metrics indices alone, for the TSDS retention row.
         "retention_days_metrics": round(metrics_age_bytes / metrics_bytes, 3) if metrics_bytes > 0 else None,
         "retention_basis": basis,
-        # Share of local store whose age a delete policy or data stream sets. The rest is taken at
-        # the 30-day default (assumed) because no retention policy covers it.
+        # Share of local store whose age a delete policy or data stream sets. The rest has no age
+        # and no weight: it is left out of the retention average.
         "retention_known_share": None if known_share is None else round(known_share, 4),
-        # Store priced at the 30-day default, as a share. Above 0 on a `policy` row means the
-        # row was inside the threshold and still carries an assumption worth naming.
-        "retention_assumed_share": None if assumed_share is None else round(assumed_share, 6),
+        # Store with no retention age, as a share. Above 0 on a `policy` row means the row was inside
+        # the threshold and still has store the average does not cover.
+        "retention_unaged_share": None if unaged_share is None else round(unaged_share, 6),
         "retention_label": _retention_label(parts, basis),
         "store_gb": round(local / 1e9, 2),
         # Local primary store bytes and primary documents, for the average document size of Search ingest.

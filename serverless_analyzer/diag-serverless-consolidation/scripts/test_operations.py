@@ -819,7 +819,8 @@ class PhaseGuardTests(unittest.TestCase):
         self.assertEqual(row["score"], 0.4)
         self.assertTrue(row["passed"])
         self.assertTrue(row["warning"])
-        self.assertIn("30-day assumed default", row["detail"])
+        self.assertIn("no retention age", row["detail"])
+        self.assertNotIn("30-day", row["detail"])
         recorded = integrity_score({"coverage": {"bulk_gb_day": 10, "retention_policy_bulk_gb_day": 4}})
         self.assertNotIn("Retention basis", [item["check"] for item in recorded["checks"] if item.get("passed") is False])
 
@@ -838,8 +839,8 @@ class PhaseGuardTests(unittest.TestCase):
         self.assertIn("inside the threshold", row["detail"])
 
     def test_one_unconfigured_index_keeps_a_deployment_policy_aged(self):
-        from constants import RETENTION_ASSUMED_MAX_SHARE
-        self.assertEqual(RETENTION_ASSUMED_MAX_SHARE, 0.10)
+        from constants import RETENTION_UNAGED_MAX_SHARE
+        self.assertEqual(RETENTION_UNAGED_MAX_SHARE, 0.10)
         from diag_account import apply_diagnostics
         acc = {
             "meta": {},
@@ -852,40 +853,170 @@ class PhaseGuardTests(unittest.TestCase):
         }
         mix = {"logs": 1.0, "k8s_logs": 0.0, "metrics": 0.0, "traces": 0.0}
         rows = [
-            # 0.3% of store at the 30-day default: inside the threshold, still policy-aged.
+            # 0.3% of store with no retention age: inside the threshold, still policy-aged.
             {"name": "mostly", "bulk_gb_day": 120.0, "store_gb": 100.0, "retention_days": 48.0,
-             "retention_basis": "policy", "retention_known_share": 0.997, "retention_assumed_share": 0.003,
+             "retention_basis": "policy", "retention_known_share": 0.997, "retention_unaged_share": 0.003,
              "retention_index_count": 10, "retention_index_days_sum": 480.0, "bulk_mix": mix},
-            # 40% at the default: past the threshold, contributes nothing.
+            # 40% with no retention age: past the threshold, contributes nothing.
             {"name": "half", "bulk_gb_day": 80.0, "store_gb": 100.0, "retention_days": 35.0,
-             "retention_basis": "blended", "retention_known_share": 0.6, "retention_assumed_share": 0.4,
+             "retention_basis": "partial", "retention_known_share": 0.6, "retention_unaged_share": 0.4,
              "retention_index_count": 10, "retention_index_days_sum": 350.0, "bulk_mix": mix},
         ]
         cov = apply_diagnostics(acc, rows)["sizing"]["diagnostics"]
         self.assertEqual(cov["retention_policy_bulk_gb_day"], 120.0)
         self.assertEqual(cov["retention_policy_within_threshold_gb_day"], 120.0)
-        self.assertEqual(cov["retention_assumed_max_share"], 0.10)
-        named = {row["name"]: row for row in cov["retention_30d_assumed"]}
+        self.assertEqual(cov["retention_unaged_max_share"], 0.10)
+        named = {row["name"]: row for row in cov["retention_unaged"]}
         self.assertTrue(named["mostly"]["within_threshold"])
         self.assertFalse(named["half"]["within_threshold"])
 
     def test_the_bundle_basis_uses_the_ten_percent_threshold(self):
         import admin_diags
-        def basis(known_bytes, assumed_bytes):
-            local = known_bytes + assumed_bytes
+        def basis(known_bytes, unaged_bytes):
+            local = known_bytes + unaged_bytes
             if local <= 0:
                 return None
-            share = assumed_bytes / local
+            share = unaged_bytes / local
             if known_bytes <= 0:
-                return "assumed"
-            if assumed_bytes <= 0 or share <= admin_diags.RETENTION_ASSUMED_MAX_SHARE:
+                return None                            # no aged store: no basis, no days, no default
+            if unaged_bytes <= 0 or share <= admin_diags.RETENTION_UNAGED_MAX_SHARE:
                 return "policy"
-            return "blended"
+            return "partial"
         self.assertEqual(basis(1000, 0), "policy")
-        self.assertEqual(basis(997, 3), "policy")      # KeyBank Production, 0.3% assumed
+        self.assertEqual(basis(997, 3), "policy")      # 0.3% with no retention age
         self.assertEqual(basis(900, 100), "policy")    # exactly at the 10% bar
-        self.assertEqual(basis(899, 101), "blended")
-        self.assertEqual(basis(0, 1000), "assumed")
+        self.assertEqual(basis(899, 101), "partial")
+        self.assertIsNone(basis(0, 1000))
+
+    def test_a_sheet_with_two_problems_is_one_finding_and_the_score_stays_in_range(self):
+        from quote_checks import _region_fidelity_row
+        # An alias of a different region number, written to another cloud. This used to append two
+        # findings for one sheet, so a lone sheet scored 1 - 2/1 = -1.
+        row = _region_fidelity_row([{
+            "solution": "observability", "region": "us-east-2", "provider": "azure",
+            "region_match": "AWS: us-east-1 (N. Virginia) (alias)",
+        }])
+        self.assertGreaterEqual(row["score"], 0.0)
+        self.assertLessEqual(row["score"], 1.0)
+        self.assertEqual(row["score"], 0.0)
+        self.assertTrue(row["warning"])
+        self.assertTrue(row["passed"])
+        self.assertIn("1 of 1 written regions", row["detail"])
+        self.assertIn("alias of a different region", row["detail"])
+        self.assertIn("written to another cloud", row["detail"])
+
+    def test_the_score_is_a_share_of_sheets_whatever_is_wrong_with_each(self):
+        from quote_checks import _region_fidelity_row
+        sheets = [
+            {"solution": "observability", "region": "us-east-1", "provider": "aws", "region_match": "AWS: us-east-1 (N. Virginia) (exact)"},
+            {"solution": "security", "region": "us-east-2", "provider": "azure", "region_match": "AWS: us-east-1 (N. Virginia) (alias)"},
+            {"solution": "search", "region": "mars-1", "provider": "gcp", "region_match": "AWS: us-east-1 (N. Virginia) (provider_default)"},
+        ]
+        row = _region_fidelity_row(sheets)
+        self.assertEqual(row["score"], round(1 / 3, 3))
+        self.assertIn("2 of 3 written regions", row["detail"])
+
+    def test_a_substitute_region_on_the_wrong_cloud_is_reported_as_another_cloud(self):
+        from quote_checks import _region_fidelity_row
+        # A provider_default or nearest match used to `continue` before the cloud was compared.
+        row = _region_fidelity_row([{
+            "solution": "search", "region": "us-east1", "provider": "gcp",
+            "region_match": "AWS: us-east-1 (N. Virginia) (provider_default)",
+        }])
+        self.assertIn("provider_default; written to another cloud", row["detail"])
+        self.assertLess(row["detail"].index("another cloud"), row["detail"].index("Each is priced"))
+
+    def test_the_same_cloud_substitute_is_still_not_called_another_cloud(self):
+        from quote_checks import _region_fidelity_row
+        row = _region_fidelity_row([{
+            "solution": "search", "region": "us-east1", "provider": "gcp",
+            "region_match": "GCP: us-east1 (S. Carolina) (provider_default)",
+        }])
+        self.assertTrue(row["warning"])
+        self.assertNotIn("another cloud", row["detail"])
+
+    def test_every_estimator_entry_records_the_provider_the_deployments_run_on(self):
+        import ast
+        tree = ast.parse((Path(__file__).resolve().parent / "size_serverless.py").read_text())
+        entries = [
+            node for node in ast.walk(tree) if isinstance(node, ast.Dict)
+            and {"kind", "region"} <= {k.value for k in node.keys if isinstance(k, ast.Constant)}
+        ]
+        # Observability and security, each filled and unquoted, plus the Search fleet entry. The regional-scope
+        # Search entry is an existing dict updated in place, and is checked by its assignment below.
+        self.assertGreaterEqual(len(entries), 5)
+        for node in entries:
+            keys = {k.value for k in node.keys if isinstance(k, ast.Constant)}
+            self.assertIn("provider", keys, f"line {node.lineno}: an estimator entry has no provider")
+        source = (Path(__file__).resolve().parent / "size_serverless.py").read_text()
+        self.assertIn('entry["provider"] = solution_provider(acc, "search", provider)', source)
+
+    def test_a_regional_job_entry_carries_its_provider_filled_or_unquoted(self):
+        import plan_sizing
+        from unittest import mock
+        search_job = {
+            "solution": "search", "region": "us-east-1", "title": "t", "stored_gb": 10.0, "parent_id": "p", "local_dir": ".",
+            "provider": "aws", "support": "Premium", "workload": {}, "org_gb": 10.0, "reuse": True,
+        }
+        result = ({"status": "estimated", "region_match": "AWS: us-east-1 (N. Virginia) (exact)",
+                   "readback": {"monthly_steady_state": 100.0}}, {"url": "u", "spreadsheet_id": "i"})
+        with mock.patch.object(plan_sizing, "services_from", return_value=(None, None)), \
+             mock.patch.object(plan_sizing, "price_search", return_value=result):
+            entry = plan_sizing._fill_regional_job(search_job, None)
+        self.assertEqual(entry["provider"], "aws")
+
+        sheet_job = {
+            "solution": "security", "region": "mars-1", "title": "t", "stored_gb": 10.0, "parent_id": "p", "local_dir": ".",
+            "provider": "azure", "support": "Premium", "template_id": "tpl", "tab": "T", "readback": {}, "reuse": True,
+            "retention": 3, "daily": 5.0, "skip_xlsx": True,
+        }
+        with mock.patch.object(plan_sizing, "services_from", return_value=(None, None)), \
+             mock.patch.object(plan_sizing, "copy_verified", return_value=({"id": "x", "name": "n", "url": "u"}, False, {"version": "2.6", "newer_than_validated": False})), \
+             mock.patch.object(plan_sizing, "region_options", return_value=[]), \
+             mock.patch.object(plan_sizing, "match_region", return_value=(None, "none")), \
+             mock.patch.object(plan_sizing, "trash_file"):
+            entry = plan_sizing._fill_regional_job(sheet_job, None)
+        self.assertEqual(entry["status"], "unquoted")
+        self.assertEqual(entry["provider"], "azure")
+
+    def test_a_rejected_observability_echo_ships_no_dollar(self):
+        import plan_sizing
+        from unittest import mock
+        job = {
+            "solution": "observability", "region": "us-east-1", "title": "t", "stored_gb": 10.0, "parent_id": "p", "local_dir": ".",
+            "provider": "aws", "support": "Premium", "template_id": "tpl", "tab": "T", "readback": {}, "reuse": True,
+            "retention": 3, "daily": 11.0, "skip_xlsx": True, "basis": "metered",
+            "mix": {"basis": "x", "logs_gb_day": 10.0, "traces_gb_day": 0.0, "metrics_gb_day": 1.0, "k8s_logs_share": 0.0},
+        }
+        # The sheet echoes 99 GB/day of logs against 10 written, so the gate rejects it.
+        read = {"monthly_steady_state": 1000.0, "annual_year1": 12000.0, "annual_steady_state": 12000.0,
+                "metered_ex_metrics_gb_day": 99.0, "metered_metrics_gb_day": 1.0}
+        with mock.patch.object(plan_sizing, "services_from", return_value=(None, None)), \
+             mock.patch.object(plan_sizing, "copy_verified", return_value=({"id": "x", "name": "n", "url": "u"}, False, {"version": "1.22", "newer_than_validated": False})), \
+             mock.patch.object(plan_sizing, "region_options", return_value=["AWS: us-east-1 (N. Virginia)"]), \
+             mock.patch.object(plan_sizing, "match_region", return_value=("AWS: us-east-1 (N. Virginia)", "exact")), \
+             mock.patch.object(plan_sizing, "observability_fill", return_value={}), \
+             mock.patch.object(plan_sizing, "push_cells", return_value=0), \
+             mock.patch.object(plan_sizing, "read_cells", return_value=dict(read)):
+            entry = plan_sizing._fill_regional_job(job, None)
+        self.assertIn("echo differs", entry["readback_rejected"])
+        rb = entry["readback"]
+        self.assertEqual((rb["monthly_steady_state"], rb["annual_year1"], rb["annual_steady_state"]), (None, None, None))
+        self.assertEqual(rb["metered_ex_metrics_gb_day"], 99.0)         # the echo stays for the audit
+
+    def test_the_cross_cloud_finding_is_reachable_from_real_estimator_entries(self):
+        from consolidation_regional import _written_regions
+        # What the fill now records: the provider the deployments run on, beside the cloud the sheet was written to.
+        estimators = {"observability": {
+            "kind": "observability", "region": "eastus", "provider": "azure",
+            "region_match": "AWS: us-east-1 (N. Virginia) (exact)", "readback": {"monthly_steady_state": 10.0},
+        }}
+        written = _written_regions(estimators)
+        self.assertEqual(written[0]["provider"], "azure")
+        recorded = integrity_score({"written_regions": written})
+        row = next(item for item in recorded["checks"] if item["check"] == "Region fidelity")
+        self.assertTrue(row["warning"])
+        self.assertIn("written to another cloud", row["detail"])
 
     def test_an_alias_with_no_region_recorded_says_so(self):
         from quote_checks import _region_fidelity_row
@@ -919,13 +1050,20 @@ class PhaseGuardTests(unittest.TestCase):
         self.assertNotIn("warning", row)
         self.assertIn("--retention-days", row["detail"])
 
-    def test_the_30_day_fallback_warns_and_does_not_fail_the_quote(self):
-        row = self._retention_month(index_count=None, months=1, basis="fallback_30d")
-        self.assertTrue(row["passed"])
+    def test_no_ascertainable_month_scores_zero_and_names_that_nothing_was_assumed(self):
+        row = self._retention_month(index_count=None, months=None, basis="unascertained")
+        self.assertTrue(row["passed"])      # the missing price fails Quote present, not this row
         self.assertTrue(row["warning"])
         self.assertEqual(row["score"], 0.0)
-        self.assertIn("30-day default (1 month)", row["detail"])
-        self.assertIn("still produced", row["detail"])
+        self.assertIn("no default was assumed", row["detail"])
+        self.assertIn("--retention-days", row["detail"])
+        self.assertNotIn("30-day", row["detail"])
+
+    def test_a_written_month_with_no_recorded_basis_is_a_warning(self):
+        row = self._retention_month(index_count=None, months=1, basis=None)
+        self.assertTrue(row["warning"])
+        self.assertEqual(row["score"], 0.0)
+        self.assertIn("basis was not recorded", row["detail"])
 
     def test_a_measured_delete_age_without_index_counts_is_a_measured_month(self):
         row = self._retention_month(index_count=None, months=4, basis="measured_age")
@@ -940,7 +1078,135 @@ class PhaseGuardTests(unittest.TestCase):
         row = next(item for item in recorded["checks"] if item["check"] == "Retention month")
         self.assertIsNone(row["passed"])
 
-    def test_the_fallback_month_is_a_limit_and_a_note(self):
+    def test_is_us_region_reads_each_clouds_naming(self):
+        from serverless_regions import is_us_region
+        for provider, region in (("aws", "us-gov-west-1"), ("aws", "us-west-1"), ("gcp", "us-east7"), ("gcp", "us-south1"),
+                                 ("azure", "eastus"), ("azure", "westus3"), ("azure", "southcentralus"), ("Azure", "centralus")):
+            self.assertTrue(is_us_region(provider, region), (provider, region))
+        for provider, region in (("aws", "eu-west-1"), ("aws", "ap-south-1"), ("gcp", "europe-north1"), ("gcp", "asia-east1"),
+                                 ("azure", "uaenorth"), ("azure", "australiaeast"), ("azure", "austriaeast"), ("aws", ""), (None, "us-east-1")):
+            self.assertFalse(is_us_region(provider, region), (provider, region))
+
+    def test_the_swap_table_only_moves_a_us_region_to_an_offered_one(self):
+        from serverless_regions import SERVERLESS_REGIONS, US_SWAPS, is_us_region, serverless_supports
+        for (provider, region), target in US_SWAPS.items():
+            self.assertFalse(serverless_supports(provider, region), f"{provider} {region} is offered, so it needs no swap")
+            self.assertTrue(serverless_supports(provider, target), f"{provider} {target} is not offered")
+            self.assertTrue(is_us_region(provider, region) and is_us_region(provider, target), (provider, region, target))
+            self.assertIn(target, SERVERLESS_REGIONS[provider])
+
+    def test_the_region_table_age_is_counted_from_the_run_date(self):
+        from serverless_regions import SERVERLESS_REGIONS_READ, region_table_age_days, region_table_is_stale
+        import datetime as dt
+        read = dt.date.fromisoformat(SERVERLESS_REGIONS_READ)
+        self.assertEqual(region_table_age_days(read), 0)
+        self.assertEqual(region_table_age_days((read + dt.timedelta(days=45)).isoformat()), 45)
+        self.assertEqual(region_table_age_days(f"{(read + dt.timedelta(days=7)).isoformat()}T10:00:00Z"), 7)
+        self.assertFalse(region_table_is_stale(read + dt.timedelta(days=30)))        # 30 days is the bar, not past it
+        self.assertTrue(region_table_is_stale(read + dt.timedelta(days=31)))
+        self.assertIsNone(region_table_age_days("not a date"))
+        self.assertFalse(region_table_is_stale("not a date"))
+
+    def test_a_stale_table_that_moved_a_deployment_is_a_limit_and_otherwise_silent(self):
+        import copy
+        from consolidation import build_consolidation
+        import datetime as dt
+        from serverless_regions import SERVERLESS_REGIONS_READ
+        from fixture_loader import load_case, CASES
+        read = dt.date.fromisoformat(SERVERLESS_REGIONS_READ)
+        acc, infra = load_case(CASES[0])
+
+        def build(on, **dep_over):
+            a = copy.deepcopy(acc)
+            a.setdefault("meta", {})["date"] = (read + dt.timedelta(days=on)).isoformat()
+            if dep_over:
+                first = next(d for d in a["solutions"]["by_deployment"] if d.get("platform") != "serverless")
+                first.update(dep_over)
+            cons = build_consolidation(a, infra)
+            return cons, [row["code"] for row in (a.get("sizing", {}).get("diagnostics", {}).get("estimation_limits") or [])]
+
+        # Stale, but nothing was moved or left on ECH by the table: nothing to say.
+        cons, codes = build(90)
+        self.assertNotIn("region_table_stale", codes)
+        self.assertEqual(cons["region_support"]["source_age_days"], 90)
+        # Stale and a deployment was swapped by it: said.
+        cons, codes = build(90, region_swap={"provider": "gcp", "from": "us-west4", "to": "us-west1"})
+        self.assertIn("region_table_stale", codes)
+        self.assertTrue(any("regions table was read" in str(n) for n in cons["notes"]))
+        # Moved but fresh: not said.
+        _cons, codes = build(5, region_swap={"provider": "gcp", "from": "us-west4", "to": "us-west1"})
+        self.assertNotIn("region_table_stale", codes)
+
+    def test_preflight_shows_the_region_table_age(self):
+        import argparse
+        import run_consolidation as rc
+        rows = rc.preflight(argparse.Namespace(lookback_days=90, env="/nonexistent/.env", reuse=None, skip_vpn_check=True,
+                                               search_notebook=False), network=False)
+        row = next(r for r in rows if r["check"] == "region table")
+        self.assertIn("Serverless regions read", row["detail"])
+        self.assertIn(row["ok"], (True, False))
+
+    def test_a_us_region_with_no_swap_entry_is_marked_and_named(self):
+        from diag_account import apply_diagnostics
+        from consolidation import no_swap_clause
+        from consolidation_scope import unpriced_reason
+        mix = {"logs": 5.0, "k8s_logs": 0.0, "metrics": 0.0, "traces": 0.0}
+        acc = {
+            "meta": {},
+            "cloud": {"by_deployment": [
+                {"name": "us-odd", "provider": "gcp", "region": "us-east7"},           # US, not offered, no swap entry
+                {"name": "eu-odd", "provider": "gcp", "region": "europe-north1"},      # not US, not offered
+                {"name": "us-swap", "provider": "gcp", "region": "us-west4"},          # US, not offered, has a swap
+            ]},
+            "solutions": {"by_deployment": [
+                {"name": n, "solution": "observability", "gb": 10.0, "ecu": 100.0, "platform": "ech"} for n in ("us-odd", "eu-odd", "us-swap")
+            ]},
+            "sizing": {"consolidated": {}}, "storage": {},
+        }
+        rows = [{"name": n, "id": c * 32, "bulk_gb_day": 5.0, "store_gb": 10.0, "retention_days": 30.0, "bulk_mix": mix}
+                for n, c in (("us-odd", "a"), ("eu-odd", "b"), ("us-swap", "c"))]
+        out = apply_diagnostics(acc, rows)
+        deps = {d["name"]: d for d in out["solutions"]["by_deployment"]}
+        self.assertTrue(deps["us-odd"]["unsupported_region"]["us_no_swap"])
+        self.assertFalse(deps["eu-odd"]["unsupported_region"]["us_no_swap"])
+        self.assertNotIn("unsupported_region", deps["us-swap"])           # swapped, so it is quoted
+        self.assertIn("region_swap", deps["us-swap"])
+        self.assertIn("a US region with no swap defined", unpriced_reason(deps["us-odd"], {}, True))
+        self.assertNotIn("no swap defined", unpriced_reason(deps["eu-odd"], {}, True))
+
+        clause = no_swap_clause([{"provider": "gcp", "region": "us-east7", "us_no_swap": True},
+                                 {"provider": "gcp", "region": "europe-north1", "us_no_swap": False}])
+        self.assertIn("gcp us-east7 is a US region with no entry in US_SWAPS", clause)
+        self.assertNotIn("europe-north1", clause)
+        self.assertEqual(no_swap_clause([{"provider": "gcp", "region": "europe-north1", "us_no_swap": False}]), "")
+        self.assertIn("are US regions", no_swap_clause([
+            {"provider": "gcp", "region": "us-east7", "us_no_swap": True}, {"provider": "aws", "region": "us-gov-west-1", "us_no_swap": True}]))
+
+    def test_a_repeated_deployment_name_is_a_named_limit_not_a_silent_mismatch(self):
+        from diag_account import apply_diagnostics, repeated_names
+        self.assertEqual(repeated_names(["a", "B", "b-", "c"]), ["B"])
+        self.assertEqual(repeated_names(["a", "b", None, ""]), [])
+        mix = {"logs": 5.0, "k8s_logs": 0.0, "metrics": 0.0, "traces": 0.0}
+        acc = {
+            "meta": {},
+            "solutions": {"by_deployment": [
+                {"name": "prod", "solution": "observability", "gb": 10.0, "ecu": 100.0},
+                {"name": "Prod", "solution": "observability", "gb": 10.0, "ecu": 100.0},
+                {"name": "other", "solution": "observability", "gb": 10.0, "ecu": 100.0},
+            ]},
+            "sizing": {"consolidated": {}}, "storage": {},
+        }
+        rows = [{"name": "prod", "id": "a" * 32, "bulk_gb_day": 5.0, "store_gb": 10.0, "retention_days": 30.0, "bulk_mix": mix}]
+        limits = apply_diagnostics(acc, rows)["sizing"]["diagnostics"]["estimation_limits"]
+        hit = next(row for row in limits if row["code"] == "duplicate_deployment_names")
+        self.assertEqual(hit["severity"], "high")
+        self.assertEqual(hit["names"], ["prod"])
+        self.assertIn("double counted or missing", hit["detail"])
+        clean = {**acc, "solutions": {"by_deployment": [{"name": "x", "solution": "observability", "gb": 1.0, "ecu": 1.0}]}}
+        limits = apply_diagnostics(clean, [{"name": "x", "id": "b" * 32, "bulk_gb_day": 1.0, "store_gb": 1.0, "retention_days": 30.0, "bulk_mix": mix}])["sizing"]["diagnostics"]["estimation_limits"]
+        self.assertFalse(any(row["code"] == "duplicate_deployment_names" for row in limits))
+
+    def test_no_ascertainable_month_is_a_limit_a_note_and_no_written_month(self):
         from diag_account import apply_diagnostics
         acc = {
             "meta": {},
@@ -953,13 +1219,107 @@ class PhaseGuardTests(unittest.TestCase):
                  "bulk_mix": {"logs": 5.0, "k8s_logs": 0.0, "metrics": 0.0, "traces": 0.0}}]
         out = apply_diagnostics(acc, rows)
         limits = (out["sizing"].get("diagnostics") or {}).get("estimation_limits") or []
-        hit = next(row for row in limits if row.get("code") == "retention_month_fallback")
+        hit = next(row for row in limits if row.get("code") == "retention_month_missing")
         self.assertEqual(hit["severity"], "high")
-        self.assertEqual((hit["months"], hit["days"]), (1, 30.0))
-        self.assertEqual(out["meta"]["estimate_months"], 1)
-        self.assertEqual(out["meta"]["retention_month_basis"], "fallback_30d")
-        self.assertEqual(out["sizing"]["consolidated"]["observability"]["retention_months"], 1)
-        self.assertTrue(any("30-day default" in str(note) for note in out["sizing"].get("notes") or []))
+        self.assertNotIn("30-day", hit["detail"].replace("No default", ""))
+        self.assertIsNone(out["meta"]["estimate_months"])
+        self.assertEqual(out["meta"]["retention_month_basis"], "unascertained")
+        self.assertNotIn("retention_months", out["sizing"]["consolidated"]["observability"])
+        self.assertFalse(any(row.get("code") == "retention_month_fallback" for row in limits))
+        notes = " ".join(str(note) for note in out["sizing"].get("notes") or [])
+        self.assertIn("no month was written", notes)
+        self.assertIn("--retention-days", notes)
+        self.assertNotIn("30-day default", notes)
+
+    def test_the_proxy_log_fetch_runs_under_the_lock_and_a_deadline(self):
+        import inspect
+        import time
+        import run_consolidation as rc
+        seen = {}
+
+        def read(deadline):
+            seen["deadline"] = deadline
+            seen["lock_held"] = path.exists()
+            return {"regions": {}, "errors": {}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".telemetry.lock"
+            before = time.monotonic()
+            out = rc.fetch_proxy_workloads(read, lock_path=path, budget_s=5, grace_s=1)
+        self.assertEqual(out, {"regions": {}, "errors": {}})
+        self.assertTrue(seen["lock_held"])
+        self.assertTrue(before + 4.5 <= seen["deadline"] <= time.monotonic() + 5.5)
+        # The production call goes through it. A bare regional_workloads call is the un-wired state.
+        source = inspect.getsource(rc._diagnostics_document)
+        self.assertIn("fetch_proxy_workloads(", source)
+        self.assertNotIn("= search_inputs.regional_workloads(", source)
+
+    def test_a_deadline_that_passes_mid_fetch_keeps_what_was_read_and_does_not_retry(self):
+        import time
+        import run_consolidation as rc
+        calls = []
+
+        def read(deadline):
+            calls.append(deadline)
+            while time.monotonic() < deadline:
+                time.sleep(0.01)
+            return {"regions": {"a": {"search": {}}}, "errors": {"b": "proxy logs exceeded their time budget"}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = rc.fetch_proxy_workloads(read, lock_path=Path(tmp) / ".lock", budget_s=0.1, grace_s=1, attempts=2)
+        self.assertEqual(len(calls), 1)                      # the thread finished on its own: no second attempt
+        self.assertEqual(set(out["regions"]), {"a"})
+        self.assertEqual(set(out["errors"]), {"b"})
+
+    def test_a_named_retention_is_recorded_even_when_it_converts_to_12_months(self):
+        # 12 is also the "unset" value. 335 to 365 days must still be recorded as the override,
+        # or the quote falls back to the index average and ignores what was asked for.
+        import run_consolidation  # noqa: F401  (puts the k360 scripts on the path)
+        from run_account_analysis import apply_retention_override
+        from diag_inputs import whole_months
+        from constants import DAYS_PER_MONTH
+        for days in (14, 60, 335, 365):
+            acc = {"meta": {}}
+            months = whole_months(days / DAYS_PER_MONTH)
+            key = apply_retention_override(acc, "acme_2026-11-24", months, days)
+            self.assertEqual(acc["meta"]["retention_days"], days, days)
+            self.assertEqual(key, f"acme_2026-11-24_{days}d")
+            self.assertEqual(acc["meta"]["run_key"], key)
+            if months == 12:
+                self.assertNotIn("estimate_months", acc["meta"])      # 12 stays the unset value
+            else:
+                self.assertEqual(acc["meta"]["estimate_months"], months)
+        unset = {"meta": {}}
+        self.assertEqual(apply_retention_override(unset, "k", 12, None), "k")
+        self.assertNotIn("retention_days", unset["meta"])
+
+    def test_no_month_is_forced_and_the_sizing_step_skips_the_sheet(self):
+        import argparse
+        import run_consolidation as rc
+        from estimate_paths import _months_for_sheet, estimator_skip
+        args = argparse.Namespace(estimate_months=12)
+        # Nothing ascertainable: the runner has no month to force. It must not fall back to 12.
+        unascertained = {"meta": {"retention_month_basis": "unascertained", "estimate_months": None}}
+        self.assertIsNone(rc._written_months(unascertained, args))
+        # An index average and an explicit --retention-days are still written.
+        self.assertEqual(rc._written_months({"meta": {"retention_month_basis": "index_average", "estimate_months": 4}}, args), 4)
+        # A block with bulk and no month is skipped for retention, even when a month is forced.
+        block = {"has_workload": True, "daily_raw_gb": 5.0}
+        self.assertIsNone(_months_for_sheet(block, None))
+        self.assertIsNone(_months_for_sheet(block, 6))
+        self.assertEqual(estimator_skip(block, None), "retention")
+        self.assertEqual(estimator_skip({**block, "retention_months": 3}, None), None)
+
+    def test_no_month_leaves_the_solution_unquoted_and_the_quote_unverified(self):
+        from quote_checks import integrity_score
+        recorded = integrity_score({
+            "retention_month": {"months": None, "has_bulk": True, "basis": "unascertained"},
+            "solutions": [{"solution": "observability", "has_workload": True, "serverless_mo": 0.0, "direct": False}],
+        })
+        by_name = {row["check"]: row for row in recorded["checks"]}
+        self.assertTrue(by_name["Retention month"]["warning"])
+        self.assertFalse(by_name["Quote present"]["passed"])
+        self.assertFalse(recorded["passed"])
 
     def test_a_measured_delete_age_is_used_when_no_index_was_counted(self):
         from diag_account import apply_diagnostics

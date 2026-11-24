@@ -12,6 +12,10 @@ is a different matter: that one is still priced at the provider default and flag
 """
 from __future__ import annotations
 
+import datetime as dt
+
+from constants import REGION_TABLE_STALE_DAYS
+
 SERVERLESS_REGIONS_URL = "https://www.elastic.co/docs/deploy-manage/deploy/elastic-cloud/regions"
 SERVERLESS_REGIONS_READ = "2026-11-19"
 
@@ -30,6 +34,24 @@ SERVERLESS_REGIONS: dict[str, frozenset[str]] = {
         "europe-west2", "europe-west3", "europe-west4", "us-central1", "us-east1", "us-east4", "us-west1",
     }),
 }
+
+
+def region_table_age_days(on=None) -> int | None:
+    """Days from the date the table was read to `on` (a date or ISO string; today when None). None if unreadable.
+
+    The quote passes its own run date, so building it again later gives the same answer.
+    """
+    try:
+        read = dt.date.fromisoformat(SERVERLESS_REGIONS_READ)
+        when = dt.date.today() if on is None else (on if isinstance(on, dt.date) else dt.date.fromisoformat(str(on)[:10]))
+    except ValueError:
+        return None
+    return (when - read).days
+
+
+def region_table_is_stale(on=None) -> bool:
+    age = region_table_age_days(on)
+    return age is not None and age > REGION_TABLE_STALE_DAYS
 
 
 def _provider(value) -> str:
@@ -73,6 +95,23 @@ US_SWAPS: dict[tuple[str, str], str] = {
     ("gcp", "us-south1"): "us-central1",
     ("gcp", "us-east5"): "us-east4",
 }
+
+
+def is_us_region(provider, region) -> bool:
+    """True for a United States region of the provider, by how each cloud names them.
+
+    AWS and GCP prefix them `us-`. Azure names end in `us` (`eastus`, `westus3`, `southcentralus`). This only
+    decides whether a missing swap is worth saying out loud. It never chooses a region to move a customer to.
+    """
+    prov = _provider(provider)
+    reg = str(region or "").strip().lower()
+    if not reg:
+        return False
+    if prov in ("aws", "gcp"):
+        return reg.startswith("us-")
+    if prov == "azure":
+        return reg.endswith("us") or reg[-1].isdigit() and reg[:-1].endswith("us")
+    return False
 
 
 def us_alternative(provider, region) -> str | None:

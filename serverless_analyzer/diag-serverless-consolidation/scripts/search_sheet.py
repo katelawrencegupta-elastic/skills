@@ -14,7 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from es3_estimate import (
-    PROVIDER_BY_NAME, SUPPORT_BY_TIER, ingest_workloads, scale_search_workload, search_workloads, workload_share,
+    PROVIDER_BY_NAME, SUPPORT_BY_TIER, ingest_workloads, scale_search_workload, search_bands, workload_basis_note, workload_share,
 )
 from sheets_io import _execute, assert_not_template, copy_verified, export_xlsx, push_cells, read_cells, trash_file, write_search_sheet
 from sizing_fill import _region_rejected, match_region, region_match_text, run_es3
@@ -69,10 +69,14 @@ def search_input_cells(payload: dict, region_text: str, provider: str, support: 
     if org_gb and stored and share < 1:
         assumptions.append(f"Docs/s and QPS scaled by this project's share of diagnostic org store ({share:.3f}).")
     search = (workload or {}).get("search") or {}
-    present = [name for name in ("peak", "nonpeak") if (search.get(name) or {}).get("qps") is not None]
-    sized = search_workloads(workload, assumptions) if present else []
+    # Always asked, so a workload with no measured search band says so in `assumptions` ("Search $ is the idle
+    # storage floor only") instead of writing zero QPS with nothing recorded. That row has the name None.
+    sized = search_bands(workload, assumptions)
     bands: dict[str, dict] = {}
-    for name, row in zip(present, sized):
+    # Each row carries its band name: a band with no hour share is appended last, so position is not identity.
+    for name, row in sized:
+        if name is None:
+            continue
         bands[name] = {
             "qps": float(row["QPS"]),
             "share": round(min(max(float(row["active_hours_per_month"]) / HOURS_PER_MONTH, 0.0), 1.0), 6),
@@ -141,9 +145,12 @@ def readback_from(profiles: list[dict]) -> dict | None:
     monthly = None if not chosen else sheet_money(chosen.get("Total $/month"))
     if monthly is None:
         return None
+    # Round once and derive the year from the rounded month, the same as the notebook path. Year agreement
+    # holds the steady annual to 12 x the monthly to the cent.
+    monthly = round(monthly, 2)
     return {
         "profile": QUOTED_PROFILE,
-        "monthly_steady_state": round(monthly, 2),
+        "monthly_steady_state": monthly,
         "annual_year1": round(monthly * 12, 2),
         "annual_steady_state": round(monthly * 12, 2),
         "search_monthly": chosen.get("Search $/month"),
@@ -164,7 +171,7 @@ def fill_search(sheets, sid: str, payload: dict, region_options_: list[str]) -> 
     """Write one Search copy and read it back. Returns the es3-shaped result."""
     assumptions = [
         "Workload type is text. Vector and time-series profiles are not inferred from K360.",
-        "QPS and query time are day averages from index telemetry, not peak-second load.",
+        workload_basis_note(payload.get("workload")),
         "Performant is the quoted profile. On-demand and high availability are shown beside it.",
         "Priced on the Search Serverless Ballpark Pricing Estimator sheet. Minimum VCU, data out, cross-project search and fast refresh are all off.",
     ]

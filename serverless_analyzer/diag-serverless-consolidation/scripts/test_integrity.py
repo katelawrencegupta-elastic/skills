@@ -818,7 +818,7 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(far["ingest_source"], "unsupported_region")
         self.assertEqual((far["gb"], far["daily_raw_gb"]), (0.0, 0.0))
         cov = out["sizing"]["diagnostics"]
-        self.assertEqual(cov["unsupported_region"], [{"name": "far", "provider": "GCP", "region": "asia-east1"}])
+        self.assertEqual(cov["unsupported_region"], [{"name": "far", "provider": "GCP", "region": "asia-east1", "us_no_swap": False}])
         # Only the supported deployment is measured, and the bundle that was not used is not "unmatched".
         self.assertEqual(cov["matched"], 1)
         self.assertEqual(cov["bulk_gb_day"], 5.0)
@@ -1075,3 +1075,48 @@ class ConfidenceTests(unittest.TestCase):
         self.assertNotIn(False, [r["passed"] for r in recorded["checks"]])
         self.assertEqual(recorded["confidence"]["band"], "Low")
         self.assertEqual(recorded["confidence"]["drivers"][0]["check"], "Retention basis")
+
+
+class ChatContractTests(unittest.TestCase):
+    """SKILL.md: at most six bullets, the top three limits, and 'not verified' unless it was shown to pass."""
+
+    LIMITS = [{"code": f"l{i}", "detail": f"limit {i}", "severity": "high"} for i in range(6)]
+    LINKS = {"drive": "https://drive/x", "pdfs": {"consolidation": {"drive_url": "https://drive/c.pdf"}}}
+
+    def _lines(self, **brief):
+        from run_consolidation import chat_lines
+        return chat_lines({"savings": {"serverless_mo": 250}, "integrity": {"passed": True}, "draft": False,
+                           "links": self.LINKS, **brief})
+
+    def test_no_more_than_three_limits_even_when_the_head_is_one_line(self):
+        lines = self._lines(limits=self.LIMITS)
+        self.assertEqual(lines[0], "Serverless $250/mo")
+        named = [line for line in lines if line.startswith("limit ")]
+        self.assertEqual(len(named), 3)
+        self.assertLessEqual(len(lines), 6)
+        self.assertTrue(lines[-1].startswith("Links:"))
+
+    def test_the_links_survive_when_the_head_is_long(self):
+        failed = [{"check": f"C{i}", "detail": "x"} for i in range(3)]
+        lines = self._lines(integrity={"passed": False, "failed": failed}, limits=self.LIMITS)
+        self.assertLessEqual(len(lines), 6)
+        self.assertEqual(lines[0], "not verified")
+        self.assertTrue(lines[-1].startswith("Links:"))
+
+    def test_a_missing_or_empty_integrity_block_is_not_verified(self):
+        from run_consolidation import chat_lines
+        for integrity in (None, {}, {"passed": None}, {"passed": None, "checks": []}):
+            with self.subTest(integrity=integrity):
+                brief = {"savings": {"serverless_mo": 250}, "draft": False}
+                if integrity is not None:
+                    brief["integrity"] = integrity
+                self.assertEqual(chat_lines(brief)[0], "not verified")
+
+    def test_a_zero_or_missing_monthly_is_not_verified(self):
+        from run_consolidation import chat_lines
+        for savings in ({"serverless_mo": 0}, {"serverless_mo": 0.0}, {"serverless_mo": None}, {}):
+            with self.subTest(savings=savings):
+                self.assertEqual(chat_lines({"savings": savings, "integrity": {"passed": True}, "draft": False})[0], "not verified")
+
+    def test_a_passing_quote_still_gives_the_price(self):
+        self.assertEqual(self._lines()[0], "Serverless $250/mo")

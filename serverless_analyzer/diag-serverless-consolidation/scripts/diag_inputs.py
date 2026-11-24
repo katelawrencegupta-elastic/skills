@@ -16,7 +16,7 @@ import json
 import math
 from pathlib import Path
 
-from constants import DAYS_PER_MONTH, ESTIMATE_MONTHS, HOURS_PER_MONTH, RETENTION_FALLBACK_DAYS, SECURITY_EXPANSION
+from constants import DAYS_PER_MONTH, ESTIMATE_MONTHS, HOURS_PER_MONTH, SECURITY_EXPANSION
 # First Observability ingest tier. A deployment under this, priced alone, never
 # leaves the top $/GB band. Pool those rows into one project.
 POOL_UNDER_GB_DAY = 50.0
@@ -48,8 +48,8 @@ def load_rows(path: Path) -> list[dict]:
 def index_retention_basis(rows: list[dict]) -> tuple[float | None, str | None, int]:
     """(days, weighting, unweighted rows): the mean index retention age and how it was weighted.
 
-    Each index's age is the ILM delete age, else the data-stream retention, else the 30-day
-    default. Weighting by local primary store keeps a swarm of small short-lived indexes from
+    Each index's age is the ILM delete age, else the data-stream retention. An index with neither has
+    no age and is not counted. Weighting by local primary store keeps a swarm of small short-lived indexes from
     setting the month a large long-lived one is priced at.
 
     `weighting` is `store_weighted` or `per_index`. A row that carries the store fields but no local
@@ -106,12 +106,13 @@ def index_retention_months(rows: list[dict]) -> int | None:
     return whole_months(days / DAYS_PER_MONTH)
 
 
-def written_retention_months(rows: list[dict]) -> tuple[int, str]:
-    """(whole month, basis) for the Observability and Security sheets when no month was named.
+def written_retention_months(rows: list[dict]) -> tuple[int | None, str]:
+    """(whole month or None, basis) for the Observability and Security sheets when no month was named.
 
     The index average when indexes were counted. Else the ingest-weighted delete age the bundles
     measured (a bundle parsed before index counts existed carries only that). Else, when no
-    retention could be ascertained at all, the 30-day default.
+    retention could be ascertained at all, no month: `(None, "unascertained")`. No default is
+    written, and a sheet with no month is not filled.
     """
     index = index_retention_months(rows)
     if index is not None:
@@ -132,12 +133,7 @@ def written_retention_months(rows: list[dict]) -> tuple[int, str]:
         weighted += rate * days
     if weight > 0:
         return whole_months((weighted / weight) / DAYS_PER_MONTH), "measured_age"
-    return retention_fallback_months(), "fallback_30d"
-
-
-def retention_fallback_months() -> int:
-    """The whole month written when no index retention age could be counted: 30 days, so 1."""
-    return whole_months(RETENTION_FALLBACK_DAYS / DAYS_PER_MONTH)
+    return None, "unascertained"
 
 
 def whole_months(months: float) -> int:
@@ -228,7 +224,7 @@ def summarize(rows: list[dict], retention_months: int | None = None, *, basis: s
         weight += rate * days
     days = (weight / weight_bulk) if weight_bulk else None
     months = (days / DAYS_PER_MONTH) if days is not None else None
-    # The month set by the caller, else the index average, else the 30-day fallback.
+    # The month set by the caller, else the index average, else the measured delete age, else none.
     written = None
     if bulk:
         if retention_months is not None:

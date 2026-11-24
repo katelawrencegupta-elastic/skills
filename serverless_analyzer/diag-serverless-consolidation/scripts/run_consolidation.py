@@ -50,7 +50,7 @@ from run_account_analysis import (  # noqa: E402
 )
 
 
-from constants import QUOTE_TELEMETRY_ATTEMPTS, QUOTE_TELEMETRY_BUDGET_S, TEMPLATE_MISMATCH_EXIT  # noqa: E402
+from constants import QUOTE_TELEMETRY_ATTEMPTS, QUOTE_TELEMETRY_BUDGET_S, QUOTE_TELEMETRY_GRACE_S, TEMPLATE_MISMATCH_EXIT  # noqa: E402
 
 
 def _run(cmd: list[str]) -> None:
@@ -131,6 +131,22 @@ class telemetry_lock:
         return False
 
 
+def fetch_proxy_workloads(read, *, lock_path: Path, budget_s: float = QUOTE_TELEMETRY_BUDGET_S,
+                          grace_s: float = QUOTE_TELEMETRY_GRACE_S, attempts: int = QUOTE_TELEMETRY_ATTEMPTS):
+    """Read the Search workload from the proxy logs: one run at a time on this machine, inside a time budget.
+
+    `read(deadline)` takes a `time.monotonic()` instant. The deadline is what stops the reads: past it no
+    call is made, so a region still unread comes back in `errors` and the regions read before it are kept.
+    `fetch_with_budget` is the backstop for a call that hangs past its own socket timeout, so its limit is
+    the deadline plus `grace_s`. The deadline starts when the lock is held, not while this run waits for it.
+    """
+    def attempt() -> dict:
+        return read(time.monotonic() + budget_s)
+
+    with telemetry_lock(lock_path):
+        return fetch_with_budget(attempt, budget_s=budget_s + grace_s, attempts=attempts)
+
+
 def note_limit(acc_or_sz: dict, code: str, detail: str, severity: str = "high") -> None:
     """Record a degraded step on the quote, not only on stderr.
 
@@ -154,9 +170,11 @@ def warn(acc_or_sz: dict | None, code: str, detail: str, severity: str = "high")
         note_limit(acc_or_sz, code, detail, severity)
 
 
-def _retention_label(diagnostic: bool, retention_months: int, retention_days: int | None, *, index_average: bool = False) -> str:
+def _retention_label(diagnostic: bool, retention_months: int | None, retention_days: int | None, *, index_average: bool = False) -> str:
     if not diagnostic:
         return "assumed month"
+    if retention_months is None:
+        return "not ascertained, no month written"
     if index_average:
         unit = "month" if int(retention_months) == 1 else "months"
         return f"index average rounded up to {int(retention_months)} {unit}"
@@ -165,7 +183,7 @@ def _retention_label(diagnostic: bool, retention_months: int, retention_days: in
     return "one year (12 months)"
 
 
-def method_stamp(lookback_days: int, *, diagnostic: bool = True, retention_months: int = 12, retention_days: int | None = None, index_average: bool = False) -> dict:
+def method_stamp(lookback_days: int, *, diagnostic: bool = True, retention_months: int | None = 12, retention_days: int | None = None, index_average: bool = False) -> dict:
     """Which code and which rules produced this run.
 
     Two runs of one customer can only be compared when they carry the same stamp.
@@ -274,6 +292,15 @@ def preflight(args, *, network: bool = True) -> list[dict]:
                 row("org report", False, f"could not be read ({exc!r})")
             else:
                 row("org report", bool(daily), f"{len(daily)} daily billing days" if daily else "no daily billing series: fetched at week grain, so there is no quote window")
+
+    from serverless_regions import SERVERLESS_REGIONS_READ, region_table_age_days, region_table_is_stale
+    age = region_table_age_days()
+    if age is None:
+        row("region table", None, "the date it was read could not be parsed")
+    elif region_table_is_stale():
+        row("region table", False, f"Serverless regions read {SERVERLESS_REGIONS_READ}, {age} days ago: refresh serverless_regions.py if the page added regions")
+    else:
+        row("region table", True, f"Serverless regions read {SERVERLESS_REGIONS_READ}, {age} days ago")
 
     if network and env and not getattr(args, "skip_vpn_check", False):
         try:
@@ -598,7 +625,10 @@ def chat_lines(brief: dict) -> list[str]:
     band = conf.get("band")
 
     head: list[str] = []
-    if monthly is None or integrity.get("passed") is False or failed or draft:
+    # "Verified" has to be shown, not assumed. A missing integrity block, or one that scored no check, has
+    # `passed` None, and a $0 monthly is no quote, so neither may print a price as if it were verified.
+    has_price = monthly is not None and float(monthly) > 0
+    if not has_price or integrity.get("passed") is not True or failed or draft:
         head.append("not verified")
     elif band:
         head.append(f"Serverless ${float(monthly):,.0f}/mo · confidence {band} ({conf.get('score')})")
@@ -636,7 +666,8 @@ def chat_lines(brief: dict) -> list[str]:
     limits = [row for row in (brief.get("limits") or []) if isinstance(row, dict)]
     rank = {"high": 0, "medium": 1, "low": 2}
     limits.sort(key=lambda row: rank.get(str(row.get("severity") or "low"), 3))
-    room = max(0, 6 - len(head) - len(tail_lines))
+    # The contract is the top three limits by severity, and no more than six bullets in all.
+    room = min(3, max(0, 6 - len(head) - len(tail_lines)))
     middle = [str(row.get("detail") or row.get("code") or "limit") for row in limits[:room]]
     return (head + middle + tail_lines)[:6]
 
@@ -694,6 +725,18 @@ def _money_note(diag_mo, k360_mo) -> str:
         f"The K360 backup, stored GB ÷ assumed retention, prices it at ${float(k360_mo):,.0f}/mo. "
         "K360 does not provide a raw ingest total, so those two figures are not interchangeable."
     )
+
+
+def _written_months(diag: dict, args) -> int | None:
+    """The month written to the Observability and Security sheets, or None when none could be ascertained.
+
+    `retention_month_basis` `unascertained` means no index had a retention age and no delete age was
+    measured. No default month stands in for that.
+    """
+    meta = diag.get("meta") or {}
+    if meta.get("retention_month_basis") == "unascertained":
+        return None
+    return int(meta.get("estimate_months") or getattr(args, "estimate_months", None) or ESTIMATE_MONTHS)
 
 
 def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args) -> dict | None:
@@ -836,7 +879,7 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
     diag["sizing"]["quote_options"] = options
     diag.setdefault("meta", {})["method"] = method_stamp(
         args.lookback_days,
-        retention_months=int((diag.get("meta") or {}).get("estimate_months") or ESTIMATE_MONTHS),
+        retention_months=_written_months(diag, args),
         retention_days=(diag.get("meta") or {}).get("retention_days"),
         index_average=bool((diag.get("meta") or {}).get("retention_index_count")),
     )
@@ -858,7 +901,12 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
         import search_inputs
 
         base, key = search_inputs.settings(env)
-        fetched = search_inputs.regional_workloads(diag, base, key, days=int(getattr(args, "proxy_days", 7) or 7))
+        fetched = fetch_proxy_workloads(
+            lambda deadline: search_inputs.regional_workloads(
+                diag, base, key, days=int(getattr(args, "proxy_days", 7) or 7), deadline=deadline,
+            ),
+            lock_path=folder.parent / ".telemetry.lock",
+        )
         diag["workload"] = fetched
         (diag.get("sizing") or {}).get("consolidated", {}).setdefault("search", {})["workload"] = diag["workload"]
         for region, why in (fetched.get("errors") or {}).items():
@@ -876,9 +924,12 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
     seal_text(diag_path, json.dumps(diag, indent=2))
     py = _sheets_py()
     sizing_ran = False
-    # The written month is the index average rounded up. --retention-days replaces it.
-    written_months = int((diag.get("meta") or {}).get("estimate_months") or getattr(args, "estimate_months", None) or ESTIMATE_MONTHS)
-    extra = ["--sizing-json", "sizing.json", "--force-months", str(written_months)]
+    # The written month is the index average rounded up. --retention-days replaces it. With no month
+    # ascertained none is forced: the sizing step leaves Observability and Security unfilled.
+    written_months = _written_months(diag, args)
+    extra = ["--sizing-json", "sizing.json"]
+    if written_months is not None:
+        extra += ["--force-months", str(written_months)]
     if args.fresh:
         extra.append("--fresh")
     if getattr(args, "search_notebook", False):
