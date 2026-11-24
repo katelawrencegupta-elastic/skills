@@ -274,7 +274,8 @@ def unpriced_reason(dep: dict, by_solution: dict, diagnostic: bool) -> str | Non
     src = dep.get("ingest_source")
     if src == "unsupported_region":
         where = dep.get("unsupported_region") or {}
-        return f"region not offered on Serverless ({where.get('region')}), stays on ECH"
+        no_swap = ", a US region with no swap defined" if where.get("us_no_swap") else ""
+        return f"region not offered on Serverless ({where.get('region')}{no_swap}), stays on ECH"
     if src == "decommissioned":
         return "decommissioned, not in the admin console"
     if src == "active_no_bundle":

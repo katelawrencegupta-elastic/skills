@@ -818,7 +818,7 @@ class ReviewRegressionTests(unittest.TestCase):
         self.assertEqual(far["ingest_source"], "unsupported_region")
         self.assertEqual((far["gb"], far["daily_raw_gb"]), (0.0, 0.0))
         cov = out["sizing"]["diagnostics"]
-        self.assertEqual(cov["unsupported_region"], [{"name": "far", "provider": "GCP", "region": "asia-east1"}])
+        self.assertEqual(cov["unsupported_region"], [{"name": "far", "provider": "GCP", "region": "asia-east1", "us_no_swap": False}])
         # Only the supported deployment is measured, and the bundle that was not used is not "unmatched".
         self.assertEqual(cov["matched"], 1)
         self.assertEqual(cov["bulk_gb_day"], 5.0)

@@ -22,6 +22,9 @@ BILLING_WINDOW_MIN_SHARE = 0.5
 # month: it is left out, never given a default age. One unconfigured index does not make a
 # configured fleet unmeasured.
 RETENTION_UNAGED_MAX_SHARE = 0.10
+# The Serverless regions table in serverless_regions.py is read by hand from a page that says more regions will
+# follow. Past this many days it is called stale where it matters: when it moved a deployment or left one on ECH.
+REGION_TABLE_STALE_DAYS = 30
 ECHO_TOLERANCE_SHARE = 0.001
 ECHO_TOLERANCE_GB_DAY = 0.02
 # How far a deployment's daily EIS ECU, million tokens or ML-node ECU may sit from its fetched-period total

@@ -293,6 +293,15 @@ def preflight(args, *, network: bool = True) -> list[dict]:
             else:
                 row("org report", bool(daily), f"{len(daily)} daily billing days" if daily else "no daily billing series: fetched at week grain, so there is no quote window")
 
+    from serverless_regions import SERVERLESS_REGIONS_READ, region_table_age_days, region_table_is_stale
+    age = region_table_age_days()
+    if age is None:
+        row("region table", None, "the date it was read could not be parsed")
+    elif region_table_is_stale():
+        row("region table", False, f"Serverless regions read {SERVERLESS_REGIONS_READ}, {age} days ago: refresh serverless_regions.py if the page added regions")
+    else:
+        row("region table", True, f"Serverless regions read {SERVERLESS_REGIONS_READ}, {age} days ago")
+
     if network and env and not getattr(args, "skip_vpn_check", False):
         try:
             from urllib.parse import urlsplit

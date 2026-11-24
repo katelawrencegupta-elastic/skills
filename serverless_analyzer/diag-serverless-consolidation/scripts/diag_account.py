@@ -27,7 +27,7 @@ from pathlib import Path
 from diag_inputs import ESTIMATE_MONTHS, index_retention_basis, index_retention_months, whole_months, written_retention_months
 
 from constants import DAYS_PER_MONTH, RETENTION_UNAGED_MAX_SHARE
-from serverless_regions import serverless_supports, us_alternative
+from serverless_regions import is_us_region, serverless_supports, us_alternative
 
 
 def _norm(name: str) -> str:
@@ -338,13 +338,16 @@ def apply_diagnostics(
                 dep["gb"] = 0.0
                 dep["daily_raw_gb"] = 0.0
                 dep["ingest_source"] = "unsupported_region"
-                dep["unsupported_region"] = {"provider": str(prov), "region": str(reg)}
+                # A US region that is on neither the page nor US_SWAPS stays on ECH like any other, but the swap rule
+                # is a lookup, not a policy, so the quote says that no swap was defined for it.
+                us_no_swap = is_us_region(prov, reg)
+                dep["unsupported_region"] = {"provider": str(prov), "region": str(reg), "us_no_swap": us_no_swap}
                 dep["field_sources"] = {
                     "gb": "unsupported_region", "k360_gb": "cloud_tracker_telemetry",
                     "daily_raw_gb": "unsupported_region", "ecu": "cloud_tracker_billing",
                     "region": "cloud_tracker_infrastructure",
                 }
-                unsupported_region.append({"name": name, "provider": str(prov), "region": str(reg)})
+                unsupported_region.append({"name": name, "provider": str(prov), "region": str(reg), "us_no_swap": us_no_swap})
                 continue
         if use_active and name not in active_names:
             inactive += 1

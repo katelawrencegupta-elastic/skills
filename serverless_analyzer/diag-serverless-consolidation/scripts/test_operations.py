@@ -1078,6 +1078,110 @@ class PhaseGuardTests(unittest.TestCase):
         row = next(item for item in recorded["checks"] if item["check"] == "Retention month")
         self.assertIsNone(row["passed"])
 
+    def test_is_us_region_reads_each_clouds_naming(self):
+        from serverless_regions import is_us_region
+        for provider, region in (("aws", "us-gov-west-1"), ("aws", "us-west-1"), ("gcp", "us-east7"), ("gcp", "us-south1"),
+                                 ("azure", "eastus"), ("azure", "westus3"), ("azure", "southcentralus"), ("Azure", "centralus")):
+            self.assertTrue(is_us_region(provider, region), (provider, region))
+        for provider, region in (("aws", "eu-west-1"), ("aws", "ap-south-1"), ("gcp", "europe-north1"), ("gcp", "asia-east1"),
+                                 ("azure", "uaenorth"), ("azure", "australiaeast"), ("azure", "austriaeast"), ("aws", ""), (None, "us-east-1")):
+            self.assertFalse(is_us_region(provider, region), (provider, region))
+
+    def test_the_swap_table_only_moves_a_us_region_to_an_offered_one(self):
+        from serverless_regions import SERVERLESS_REGIONS, US_SWAPS, is_us_region, serverless_supports
+        for (provider, region), target in US_SWAPS.items():
+            self.assertFalse(serverless_supports(provider, region), f"{provider} {region} is offered, so it needs no swap")
+            self.assertTrue(serverless_supports(provider, target), f"{provider} {target} is not offered")
+            self.assertTrue(is_us_region(provider, region) and is_us_region(provider, target), (provider, region, target))
+            self.assertIn(target, SERVERLESS_REGIONS[provider])
+
+    def test_the_region_table_age_is_counted_from_the_run_date(self):
+        from serverless_regions import SERVERLESS_REGIONS_READ, region_table_age_days, region_table_is_stale
+        import datetime as dt
+        read = dt.date.fromisoformat(SERVERLESS_REGIONS_READ)
+        self.assertEqual(region_table_age_days(read), 0)
+        self.assertEqual(region_table_age_days((read + dt.timedelta(days=45)).isoformat()), 45)
+        self.assertEqual(region_table_age_days(f"{(read + dt.timedelta(days=7)).isoformat()}T10:00:00Z"), 7)
+        self.assertFalse(region_table_is_stale(read + dt.timedelta(days=30)))        # 30 days is the bar, not past it
+        self.assertTrue(region_table_is_stale(read + dt.timedelta(days=31)))
+        self.assertIsNone(region_table_age_days("not a date"))
+        self.assertFalse(region_table_is_stale("not a date"))
+
+    def test_a_stale_table_that_moved_a_deployment_is_a_limit_and_otherwise_silent(self):
+        import copy
+        from consolidation import build_consolidation
+        import datetime as dt
+        from serverless_regions import SERVERLESS_REGIONS_READ
+        from fixture_loader import load_case, CASES
+        read = dt.date.fromisoformat(SERVERLESS_REGIONS_READ)
+        acc, infra = load_case(CASES[0])
+
+        def build(on, **dep_over):
+            a = copy.deepcopy(acc)
+            a.setdefault("meta", {})["date"] = (read + dt.timedelta(days=on)).isoformat()
+            if dep_over:
+                first = next(d for d in a["solutions"]["by_deployment"] if d.get("platform") != "serverless")
+                first.update(dep_over)
+            cons = build_consolidation(a, infra)
+            return cons, [row["code"] for row in (a.get("sizing", {}).get("diagnostics", {}).get("estimation_limits") or [])]
+
+        # Stale, but nothing was moved or left on ECH by the table: nothing to say.
+        cons, codes = build(90)
+        self.assertNotIn("region_table_stale", codes)
+        self.assertEqual(cons["region_support"]["source_age_days"], 90)
+        # Stale and a deployment was swapped by it: said.
+        cons, codes = build(90, region_swap={"provider": "gcp", "from": "us-west4", "to": "us-west1"})
+        self.assertIn("region_table_stale", codes)
+        self.assertTrue(any("regions table was read" in str(n) for n in cons["notes"]))
+        # Moved but fresh: not said.
+        _cons, codes = build(5, region_swap={"provider": "gcp", "from": "us-west4", "to": "us-west1"})
+        self.assertNotIn("region_table_stale", codes)
+
+    def test_preflight_shows_the_region_table_age(self):
+        import argparse
+        import run_consolidation as rc
+        rows = rc.preflight(argparse.Namespace(lookback_days=90, env="/nonexistent/.env", reuse=None, skip_vpn_check=True,
+                                               search_notebook=False), network=False)
+        row = next(r for r in rows if r["check"] == "region table")
+        self.assertIn("Serverless regions read", row["detail"])
+        self.assertIn(row["ok"], (True, False))
+
+    def test_a_us_region_with_no_swap_entry_is_marked_and_named(self):
+        from diag_account import apply_diagnostics
+        from consolidation import no_swap_clause
+        from consolidation_scope import unpriced_reason
+        mix = {"logs": 5.0, "k8s_logs": 0.0, "metrics": 0.0, "traces": 0.0}
+        acc = {
+            "meta": {},
+            "cloud": {"by_deployment": [
+                {"name": "us-odd", "provider": "gcp", "region": "us-east7"},           # US, not offered, no swap entry
+                {"name": "eu-odd", "provider": "gcp", "region": "europe-north1"},      # not US, not offered
+                {"name": "us-swap", "provider": "gcp", "region": "us-west4"},          # US, not offered, has a swap
+            ]},
+            "solutions": {"by_deployment": [
+                {"name": n, "solution": "observability", "gb": 10.0, "ecu": 100.0, "platform": "ech"} for n in ("us-odd", "eu-odd", "us-swap")
+            ]},
+            "sizing": {"consolidated": {}}, "storage": {},
+        }
+        rows = [{"name": n, "id": c * 32, "bulk_gb_day": 5.0, "store_gb": 10.0, "retention_days": 30.0, "bulk_mix": mix}
+                for n, c in (("us-odd", "a"), ("eu-odd", "b"), ("us-swap", "c"))]
+        out = apply_diagnostics(acc, rows)
+        deps = {d["name"]: d for d in out["solutions"]["by_deployment"]}
+        self.assertTrue(deps["us-odd"]["unsupported_region"]["us_no_swap"])
+        self.assertFalse(deps["eu-odd"]["unsupported_region"]["us_no_swap"])
+        self.assertNotIn("unsupported_region", deps["us-swap"])           # swapped, so it is quoted
+        self.assertIn("region_swap", deps["us-swap"])
+        self.assertIn("a US region with no swap defined", unpriced_reason(deps["us-odd"], {}, True))
+        self.assertNotIn("no swap defined", unpriced_reason(deps["eu-odd"], {}, True))
+
+        clause = no_swap_clause([{"provider": "gcp", "region": "us-east7", "us_no_swap": True},
+                                 {"provider": "gcp", "region": "europe-north1", "us_no_swap": False}])
+        self.assertIn("gcp us-east7 is a US region with no entry in US_SWAPS", clause)
+        self.assertNotIn("europe-north1", clause)
+        self.assertEqual(no_swap_clause([{"provider": "gcp", "region": "europe-north1", "us_no_swap": False}]), "")
+        self.assertIn("are US regions", no_swap_clause([
+            {"provider": "gcp", "region": "us-east7", "us_no_swap": True}, {"provider": "aws", "region": "us-gov-west-1", "us_no_swap": True}]))
+
     def test_a_repeated_deployment_name_is_a_named_limit_not_a_silent_mismatch(self):
         from diag_account import apply_diagnostics, repeated_names
         self.assertEqual(repeated_names(["a", "B", "b-", "c"]), ["B"])
