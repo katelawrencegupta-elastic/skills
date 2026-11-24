@@ -24,6 +24,12 @@ BILLING_WINDOW_MIN_SHARE = 0.5
 RETENTION_UNAGED_MAX_SHARE = 0.10
 ECHO_TOLERANCE_SHARE = 0.001
 ECHO_TOLERANCE_GB_DAY = 0.02
+# How far a deployment's daily EIS ECU, million tokens or ML-node ECU may sit from its fetched-period total
+# before the daily series is called unreconciled and nothing is added to the quote. These are ECU and token
+# amounts, not GB/day, so they are their own constants: retuning the sheet echo above must not retune this
+# blocking completeness check. The values match what the echo tolerance was, so nothing moves today.
+EIS_RECONCILE_ABS = 0.02
+EIS_RECONCILE_SHARE = 0.001
 
 # size_serverless.py exits with this status when an estimator copy does not have the
 # layout its cell addresses were written for. run_consolidation.py stops the run on it.

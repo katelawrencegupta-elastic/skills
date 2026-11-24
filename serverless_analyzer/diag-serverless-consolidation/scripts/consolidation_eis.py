@@ -6,7 +6,7 @@ depend on whether Search happened to return a read-back.
 """
 from __future__ import annotations
 
-from constants import ECHO_TOLERANCE_GB_DAY, ECHO_TOLERANCE_SHARE
+from constants import EIS_RECONCILE_ABS, EIS_RECONCILE_SHARE
 from consolidation_scope import DAYS_PER_MONTH, billed_series
 
 
@@ -81,7 +81,7 @@ def _ai_ml_window(acc: dict, names: set[str]) -> dict:
             )
         for field, total_key in (("eis_ecu", "eis"), ("million_tokens", "tokens"), ("ml_node_ecu", "ml")):
             daily_sum = sum(float(value or 0) for value in (data.get(field) or []))
-            tolerance = max(ECHO_TOLERANCE_GB_DAY, abs(totals[name][total_key]) * ECHO_TOLERANCE_SHARE)
+            tolerance = max(EIS_RECONCILE_ABS, abs(totals[name][total_key]) * EIS_RECONCILE_SHARE)
             if abs(daily_sum - totals[name][total_key]) > tolerance:
                 return short(
                     "complete daily EIS and ML-node telemetry for the exact quote window is unavailable "

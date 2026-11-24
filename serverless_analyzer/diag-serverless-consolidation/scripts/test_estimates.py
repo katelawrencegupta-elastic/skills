@@ -1422,3 +1422,36 @@ class SearchYearAgreementTests(unittest.TestCase):
         rb = es3_estimate.readback_from([{"Search Power Setting": "performant", "Total $/month": 1234.567}])
         rb["annual_steady_state"] = round(rb["annual_steady_state"] + 0.05, 2)
         self.assertFalse(_year_row(self._lines(rb))["passed"])
+
+
+class EisReconciliationToleranceTests(unittest.TestCase):
+    """The EIS and ML-node reconciliation has its own tolerance, not the sheet echo's GB/day one."""
+
+    @staticmethod
+    def _acc(daily_eis, total_eis):
+        days = ["2026-11-01", "2026-11-02"]
+        return {
+            "ai_ml": {
+                "billing_by_deployment_complete": True,
+                "billing_by_deployment": {"d": {"eis_ecu": total_eis, "million_tokens": 1.0, "ml_node_ecu": 5.0}},
+                "daily_usage_complete": True,
+                "daily_usage_by_deployment": {"d": {
+                    "days": days, "eis_ecu": daily_eis, "million_tokens": [0.5, 0.5], "ml_node_ecu": [2.5, 2.5], "models": [[], []],
+                }},
+            },
+            "ecu": {"quote_lookback_days": 2, "daily_days": days, "daily_totals": [1.0, 1.0]},
+        }
+
+    def test_the_gate_uses_its_own_constants(self):
+        import inspect
+        import consolidation_eis
+        import constants
+        source = inspect.getsource(consolidation_eis)
+        self.assertNotIn("ECHO_TOLERANCE", source)
+        self.assertEqual((constants.EIS_RECONCILE_ABS, constants.EIS_RECONCILE_SHARE), (0.02, 0.001))
+
+    def test_a_daily_series_that_misses_its_total_is_refused(self):
+        from consolidation_eis import _ai_ml_window
+        self.assertEqual(_ai_ml_window(self._acc([5.0, 4.0], 10.0), {"d"})["status"], "incomplete")      # 1.0 short
+        self.assertEqual(_ai_ml_window(self._acc([5.0, 5.0], 10.0), {"d"})["status"], "complete")
+        self.assertEqual(_ai_ml_window(self._acc([5.0, 4.99], 10.0), {"d"})["status"], "complete")       # inside 0.02
