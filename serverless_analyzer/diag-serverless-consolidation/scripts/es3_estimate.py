@@ -337,9 +337,13 @@ def readback_from(profiles: list[dict]) -> dict | None:
     monthly = _num(chosen.get("Total $/month"))
     if monthly is None:
         return None
+    # Round once and derive the year from the rounded month. The quote checks hold the steady annual to
+    # 12 x the monthly to the cent, so rounding the two separately (1234.567 gives 1234.57 and 14814.80,
+    # not 14814.84) failed Year agreement on a correct quote.
+    monthly = round(monthly, 2)
     return {
         "profile": chosen.get("Search Power Setting"),
-        "monthly_steady_state": round(monthly, 2),
+        "monthly_steady_state": monthly,
         "annual_year1": round(monthly * 12, 2),
         "annual_steady_state": round(monthly * 12, 2),
         "search_monthly": _num(chosen.get("Search $/month")),

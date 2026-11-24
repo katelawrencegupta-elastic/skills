@@ -1321,3 +1321,55 @@ class OrgReportLayoutTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SearchYearAgreementTests(unittest.TestCase):
+    """The Search read-back's steady annual is 12 x its monthly, on both Search paths."""
+
+    TOTALS = (1234.567, 12.345, 99999.995, 0.005, 1000.0, 3333.333)
+
+    @staticmethod
+    def _lines(rb, *, eis=0.0):
+        from consolidation import _quote_lines
+        by = {"search": {"pricing": "es3-estimator performant (quotable)", "total_mo": rb["monthly_steady_state"],
+                         "by_region": [], "eis_with_support_mo": eis}}
+        return _quote_lines(by, {"estimators": {"search": {"readback": rb}}})
+
+    def _readbacks(self, raw):
+        import es3_estimate
+        import search_sheet
+        yield "notebook", es3_estimate.readback_from([{"Search Power Setting": "performant", "Total $/month": raw}])
+        yield "sheet", search_sheet.readback_from(
+            [{"Search Power Setting": "performant", "Total $/month": round(raw, 2)}])
+
+    def test_the_annual_is_twelve_times_the_rounded_monthly_on_both_paths(self):
+        for raw in self.TOTALS:
+            for path, rb in self._readbacks(raw):
+                with self.subTest(raw=raw, path=path):
+                    self.assertEqual(rb["monthly_steady_state"], round(raw, 2))
+                    self.assertEqual(rb["annual_steady_state"], round(rb["monthly_steady_state"] * 12, 2))
+                    self.assertEqual(rb["annual_year1"], rb["annual_steady_state"])
+
+    def test_year_agreement_passes_on_both_paths_without_eis(self):
+        from quote_checks import _year_row
+        for raw in self.TOTALS:
+            for path, rb in self._readbacks(raw):
+                with self.subTest(raw=raw, path=path):
+                    row = _year_row(self._lines(rb))
+                    self.assertTrue(row["passed"], row["detail"])
+                    self.assertEqual(row["score"], 1.0)
+
+    def test_year_agreement_passes_when_eis_is_added_to_the_line(self):
+        from quote_checks import _year_row
+        for raw in self.TOTALS:
+            for path, rb in self._readbacks(raw):
+                with self.subTest(raw=raw, path=path):
+                    self.assertTrue(_year_row(self._lines(rb, eis=17.0))["passed"])
+
+    def test_a_year_that_really_disagrees_still_fails(self):
+        # The bar is unchanged: only the producer was inconsistent.
+        from quote_checks import _year_row
+        import es3_estimate
+        rb = es3_estimate.readback_from([{"Search Power Setting": "performant", "Total $/month": 1234.567}])
+        rb["annual_steady_state"] = round(rb["annual_steady_state"] + 0.05, 2)
+        self.assertFalse(_year_row(self._lines(rb))["passed"])

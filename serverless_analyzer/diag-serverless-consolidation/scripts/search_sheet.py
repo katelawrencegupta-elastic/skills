@@ -142,9 +142,12 @@ def readback_from(profiles: list[dict]) -> dict | None:
     monthly = None if not chosen else sheet_money(chosen.get("Total $/month"))
     if monthly is None:
         return None
+    # Round once and derive the year from the rounded month, the same as the notebook path. Year agreement
+    # holds the steady annual to 12 x the monthly to the cent.
+    monthly = round(monthly, 2)
     return {
         "profile": QUOTED_PROFILE,
-        "monthly_steady_state": round(monthly, 2),
+        "monthly_steady_state": monthly,
         "annual_year1": round(monthly * 12, 2),
         "annual_steady_state": round(monthly * 12, 2),
         "search_monthly": chosen.get("Search $/month"),
