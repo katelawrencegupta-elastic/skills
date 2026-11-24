@@ -32,6 +32,11 @@ TEMPLATE_MISMATCH_EXIT = 3
 # daily counters in batches. Each attempt gets this long, and a timeout is retried.
 QUOTE_TELEMETRY_BUDGET_S = 600
 QUOTE_TELEMETRY_ATTEMPTS = 2
+# `fetch_with_budget` gives up on a fetch thread this long after the fetch's own deadline. A call in
+# flight at the deadline can run to its socket timeout, so the grace is that timeout plus a margin:
+# the thread then finishes on its own and the regions it read are kept, instead of being abandoned
+# while a second attempt starts against the same cluster.
+QUOTE_TELEMETRY_GRACE_S = 310
 
 
 # How much each evidence check moves the quoted dollar. Confidence is their weighted mean,

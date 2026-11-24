@@ -50,7 +50,7 @@ from run_account_analysis import (  # noqa: E402
 )
 
 
-from constants import QUOTE_TELEMETRY_ATTEMPTS, QUOTE_TELEMETRY_BUDGET_S, TEMPLATE_MISMATCH_EXIT  # noqa: E402
+from constants import QUOTE_TELEMETRY_ATTEMPTS, QUOTE_TELEMETRY_BUDGET_S, QUOTE_TELEMETRY_GRACE_S, TEMPLATE_MISMATCH_EXIT  # noqa: E402
 
 
 def _run(cmd: list[str]) -> None:
@@ -129,6 +129,22 @@ class telemetry_lock:
             finally:
                 self.fh.close()
         return False
+
+
+def fetch_proxy_workloads(read, *, lock_path: Path, budget_s: float = QUOTE_TELEMETRY_BUDGET_S,
+                          grace_s: float = QUOTE_TELEMETRY_GRACE_S, attempts: int = QUOTE_TELEMETRY_ATTEMPTS):
+    """Read the Search workload from the proxy logs: one run at a time on this machine, inside a time budget.
+
+    `read(deadline)` takes a `time.monotonic()` instant. The deadline is what stops the reads: past it no
+    call is made, so a region still unread comes back in `errors` and the regions read before it are kept.
+    `fetch_with_budget` is the backstop for a call that hangs past its own socket timeout, so its limit is
+    the deadline plus `grace_s`. The deadline starts when the lock is held, not while this run waits for it.
+    """
+    def attempt() -> dict:
+        return read(time.monotonic() + budget_s)
+
+    with telemetry_lock(lock_path):
+        return fetch_with_budget(attempt, budget_s=budget_s + grace_s, attempts=attempts)
 
 
 def note_limit(acc_or_sz: dict, code: str, detail: str, severity: str = "high") -> None:
@@ -872,7 +888,12 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
         import search_inputs
 
         base, key = search_inputs.settings(env)
-        fetched = search_inputs.regional_workloads(diag, base, key, days=int(getattr(args, "proxy_days", 7) or 7))
+        fetched = fetch_proxy_workloads(
+            lambda deadline: search_inputs.regional_workloads(
+                diag, base, key, days=int(getattr(args, "proxy_days", 7) or 7), deadline=deadline,
+            ),
+            lock_path=folder.parent / ".telemetry.lock",
+        )
         diag["workload"] = fetched
         (diag.get("sizing") or {}).get("consolidated", {}).setdefault("search", {})["workload"] = diag["workload"]
         for region, why in (fetched.get("errors") or {}).items():

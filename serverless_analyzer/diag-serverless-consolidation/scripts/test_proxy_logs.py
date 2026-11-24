@@ -1,3 +1,4 @@
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -166,3 +167,56 @@ class RetryTests(unittest.TestCase):
         day = datetime(2026, 11, 16, tzinfo=timezone.utc)
         with self.assertRaises(RuntimeError):
             pl._read_span("b", "k", [DEP], day, day + timedelta(hours=1), always, attempts=1, pause=0)
+
+
+class DeadlineTests(unittest.TestCase):
+    day = datetime(2026, 11, 16, tzinfo=timezone.utc)
+
+    def test_a_failing_span_stops_at_its_deadline_and_does_not_wait_out_the_pause(self):
+        calls = []
+
+        def always(base, key, query):
+            calls.append(1)
+            raise RuntimeError("proxy logs HTTP 502")
+
+        started = time.monotonic()
+        # Three attempts and a 5 s pause would be 15 s of sleeping and a split on top. The deadline is 0.3 s.
+        with self.assertRaises(RuntimeError) as ctx:
+            pl._read_span("b", "k", [DEP], self.day, self.day + timedelta(days=1), always,
+                          attempts=3, pause=5.0, deadline=time.monotonic() + 0.3)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertLessEqual(len(calls), 3)
+        self.assertTrue("time budget" in str(ctx.exception) or "failed for" in str(ctx.exception))
+
+    def test_a_deadline_already_past_makes_no_call(self):
+        calls = []
+
+        def run(base, key, query):
+            calls.append(1)
+            return {"columns": [], "values": []}
+
+        with self.assertRaises(RuntimeError) as ctx:
+            pl._read_span("b", "k", [DEP], self.day, self.day + timedelta(days=1), run, deadline=time.monotonic() - 1)
+        self.assertEqual(calls, [])
+        self.assertIn("time budget", str(ctx.exception))
+
+    def test_halving_stops_at_the_depth_cap(self):
+        calls = []
+
+        def always(base, key, query):
+            calls.append(query.split('@timestamp >= "')[1][:13])
+            raise RuntimeError("proxy logs HTTP 502")
+
+        with self.assertRaises(RuntimeError):
+            pl._read_span("b", "k", [DEP], self.day, self.day + timedelta(days=1), always, attempts=1, pause=0)
+        # 24 h, 12 h, 6 h, 3 h. Halving to a single hour (five calls) is what the cap removed.
+        self.assertEqual(len(calls), pl.MAX_SPLIT_DEPTH + 1)
+
+    def test_a_span_that_reads_inside_the_deadline_is_unchanged(self):
+        def ok(base, key, query):
+            start = query.split('@timestamp >= "')[1][:13]
+            cols = [{"name": n} for n in ("hour", "search_requests", "peak_minute_search_qps", "search_latency_p90_ms", "search_latency_p99_ms")]
+            return {"columns": cols, "values": [[f"{start}:00:00.000Z", 3600, 1.0, 20.0, 40.0]]}
+
+        rows = pl._read_span("b", "k", [DEP], self.day, self.day + timedelta(days=1), ok, deadline=time.monotonic() + 30)
+        self.assertEqual(len(rows), 1)

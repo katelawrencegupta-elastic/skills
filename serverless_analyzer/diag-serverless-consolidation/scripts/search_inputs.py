@@ -68,17 +68,21 @@ def _telemetry(status: str, window: dict | None, reason: str | None = None) -> d
 
 
 def regional_workloads(acc: dict, base: str, key: str, *, days: int = proxy_logs.DEFAULT_DAYS,
-                       now: datetime | None = None, run=proxy_logs.run_esql, workers: int = 4) -> dict:
+                       now: datetime | None = None, run=proxy_logs.run_esql, workers: int = 4,
+                       deadline: float | None = None) -> dict:
     """The workload the estimators read: one exact block per region plus an org-wide sum.
 
     The org-wide block exists for the what-if deployment-count bars, which still split it by store
     share. It adds the regions' recommended QPS, takes the slowest region's query time and the mean hour share.
+
+    `deadline` is a `time.monotonic()` instant shared by every region. A region still unread when it
+    passes is recorded in `errors` with the time-budget reason, and the regions already read are kept.
     """
     regions: dict[str, dict] = {}
     errors: dict[str, str] = {}
     for region, row in search_region_rows(acc).items():
         try:
-            proxy = proxy_logs.search_workload(base, key, row["ids"], days=days, now=now, run=run, workers=workers)
+            proxy = proxy_logs.search_workload(base, key, row["ids"], days=days, now=now, run=run, workers=workers, deadline=deadline)
             ingest = ingest_from_diagnostics(row)
         except (ValueError, RuntimeError) as exc:
             errors[region] = str(exc)

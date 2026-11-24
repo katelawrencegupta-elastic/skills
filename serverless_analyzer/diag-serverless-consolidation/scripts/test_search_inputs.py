@@ -1,3 +1,4 @@
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -114,3 +115,34 @@ class WorkloadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DeadlineTests(unittest.TestCase):
+    now = datetime(2026, 11, 23, 9, tzinfo=timezone.utc)
+
+    def test_a_deadline_already_past_leaves_every_region_unread_and_makes_no_call(self):
+        calls = []
+
+        def run(base, key, query):
+            calls.append(1)
+            return fake_run(base, key, query)
+
+        wl = si.regional_workloads(acc(), "https://x", "k", days=7, now=self.now, run=run, workers=1,
+                                   deadline=time.monotonic() - 1)
+        self.assertEqual(calls, [])
+        self.assertEqual(set(wl["errors"]), {"us-central1", "europe-west1"})
+        self.assertTrue(all("time budget" in why for why in wl["errors"].values()))
+        self.assertEqual(wl["quote_window_telemetry"]["status"], "incomplete")
+
+    def test_a_hung_gateway_ends_inside_the_budget_and_names_the_regions(self):
+        def down(base, key, query):
+            time.sleep(0.05)
+            raise RuntimeError("proxy logs HTTP 504")
+
+        started = time.monotonic()
+        wl = si.regional_workloads(acc(), "https://x", "k", days=7, now=self.now, run=down, workers=1,
+                                   deadline=time.monotonic() + 0.4)
+        # With the default 5 s pause, three attempts and halving this ran for minutes. The deadline bounds it.
+        self.assertLess(time.monotonic() - started, 5.0)
+        self.assertEqual(set(wl["errors"]), {"us-central1", "europe-west1"})
+        self.assertNotIn("search", wl)

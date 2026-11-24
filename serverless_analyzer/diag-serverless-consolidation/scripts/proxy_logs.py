@@ -26,6 +26,11 @@ from constants import HOURS_PER_MONTH, MODERATE_MAX_MS, SIMPLE_MAX_MS
 
 INDEX = "logging-*:service-proxy-requests-*"
 DEFAULT_DAYS = 7
+# Socket timeout of one ES|QL call. A call already in flight when the deadline passes can run this long.
+REQUEST_TIMEOUT_S = 300
+# A span that keeps failing is halved at most this many times (24 h, 12 h, 6 h, 3 h). Halving is for a
+# gateway that times out on a big span; it is not a way to keep retrying a cluster that is down.
+MAX_SPLIT_DEPTH = 3
 # Peak window from the query: weekdays (Mon=1 .. Sun=7), UTC hours 13 up to but not including 23.
 PEAK_WEEKDAYS = 5
 PEAK_START_HOUR = 13
@@ -50,7 +55,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def run_esql(base: str, key: str, query: str, timeout: int = 300) -> dict:
+def run_esql(base: str, key: str, query: str, timeout: int = REQUEST_TIMEOUT_S) -> dict:
     """One ES|QL call through Kibana's internal search route. Returns the raw response."""
     req = urllib.request.Request(
         base + "/internal/search/esql",
@@ -178,27 +183,42 @@ def summarize(hours: list[dict], total_hours: int | None = None) -> dict:
     return out
 
 
-def _read_span(base, key, deployment_ids, start, end, run, attempts: int = 3, pause: float = 5.0) -> list[dict]:
-    """One span of hours. A gateway timeout or dropped connection is retried, then the span is split in half."""
+def _past(deadline: float | None) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
+def _read_span(base, key, deployment_ids, start, end, run, attempts: int = 3, pause: float = 5.0,
+               deadline: float | None = None, depth: int = 0) -> list[dict]:
+    """One span of hours. A gateway timeout or dropped connection is retried, then the span is split in half.
+
+    `deadline` is a `time.monotonic()` instant. Past it no further call is made and no further wait is
+    taken: the span raises, and the caller records the region as unread. A span is halved at most
+    `MAX_SPLIT_DEPTH` times. Without a deadline the retries and halving are bounded only by those two.
+    """
     last: Exception | None = None
     for attempt in range(attempts):
+        if _past(deadline):
+            raise RuntimeError(f"proxy logs exceeded their time budget before {start:%Y-%m-%d %H:00} UTC was read")
         try:
             return _hour_rows(run(base, key, hourly_query(deployment_ids, start, end)))
         except (RuntimeError, OSError) as exc:
             last = exc
             if attempt + 1 < attempts:
-                time.sleep(pause * (attempt + 1))
+                wait = pause * (attempt + 1)
+                if deadline is not None:
+                    wait = max(0.0, min(wait, deadline - time.monotonic()))
+                time.sleep(wait)
     hours = int((end - start).total_seconds() // 3600)
-    if hours <= 1:
+    if hours <= 1 or depth >= MAX_SPLIT_DEPTH or _past(deadline):
         raise RuntimeError(f"proxy logs failed for {start:%Y-%m-%d %H:00} UTC: {last}")
     mid = start + timedelta(hours=hours // 2)
-    return (_read_span(base, key, deployment_ids, start, mid, run, attempts, pause)
-            + _read_span(base, key, deployment_ids, mid, end, run, attempts, pause))
+    return (_read_span(base, key, deployment_ids, start, mid, run, attempts, pause, deadline, depth + 1)
+            + _read_span(base, key, deployment_ids, mid, end, run, attempts, pause, deadline, depth + 1))
 
 
 def search_workload(
     base: str, key: str, deployment_ids: list[str], *, days: int = DEFAULT_DAYS, now: datetime | None = None,
-    run=run_esql, workers: int = 1,
+    run=run_esql, workers: int = 1, deadline: float | None = None,
 ) -> dict:
     """The Search workload the estimators read, from the last `days` complete UTC days.
 
@@ -216,7 +236,7 @@ def search_workload(
     spans = [(today - timedelta(days=back), today - timedelta(days=back - 1)) for back in range(days, 0, -1)]
 
     def read(span: tuple[datetime, datetime]) -> list[dict]:
-        return _read_span(base, key, deployment_ids, span[0], span[1], run)
+        return _read_span(base, key, deployment_ids, span[0], span[1], run, deadline=deadline)
 
     if workers > 1:
         with ThreadPoolExecutor(max_workers=workers) as pool:

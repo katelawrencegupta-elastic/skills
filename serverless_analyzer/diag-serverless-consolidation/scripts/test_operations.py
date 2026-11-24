@@ -973,6 +973,46 @@ class PhaseGuardTests(unittest.TestCase):
         self.assertIn("--retention-days", notes)
         self.assertNotIn("30-day default", notes)
 
+    def test_the_proxy_log_fetch_runs_under_the_lock_and_a_deadline(self):
+        import inspect
+        import time
+        import run_consolidation as rc
+        seen = {}
+
+        def read(deadline):
+            seen["deadline"] = deadline
+            seen["lock_held"] = path.exists()
+            return {"regions": {}, "errors": {}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".telemetry.lock"
+            before = time.monotonic()
+            out = rc.fetch_proxy_workloads(read, lock_path=path, budget_s=5, grace_s=1)
+        self.assertEqual(out, {"regions": {}, "errors": {}})
+        self.assertTrue(seen["lock_held"])
+        self.assertTrue(before + 4.5 <= seen["deadline"] <= time.monotonic() + 5.5)
+        # The production call goes through it. A bare regional_workloads call is the un-wired state.
+        source = inspect.getsource(rc._diagnostics_document)
+        self.assertIn("fetch_proxy_workloads(", source)
+        self.assertNotIn("= search_inputs.regional_workloads(", source)
+
+    def test_a_deadline_that_passes_mid_fetch_keeps_what_was_read_and_does_not_retry(self):
+        import time
+        import run_consolidation as rc
+        calls = []
+
+        def read(deadline):
+            calls.append(deadline)
+            while time.monotonic() < deadline:
+                time.sleep(0.01)
+            return {"regions": {"a": {"search": {}}}, "errors": {"b": "proxy logs exceeded their time budget"}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = rc.fetch_proxy_workloads(read, lock_path=Path(tmp) / ".lock", budget_s=0.1, grace_s=1, attempts=2)
+        self.assertEqual(len(calls), 1)                      # the thread finished on its own: no second attempt
+        self.assertEqual(set(out["regions"]), {"a"})
+        self.assertEqual(set(out["errors"]), {"b"})
+
     def test_a_named_retention_is_recorded_even_when_it_converts_to_12_months(self):
         # 12 is also the "unset" value. 335 to 365 days must still be recorded as the override,
         # or the quote falls back to the index average and ignores what was asked for.
