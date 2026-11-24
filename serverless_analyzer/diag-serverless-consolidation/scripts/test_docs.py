@@ -281,3 +281,28 @@ class LimitCodesAreDocumentedTests(unittest.TestCase):
         self.assertGreater(len(emitted), 20)                      # the scan found the codes, not nothing
         missing = {code: sorted(files) for code, files in emitted.items() if f"`{code}`" not in doc}
         self.assertEqual(missing, {}, "limit codes recorded by the scripts and not named in calculations.md")
+
+
+class SecurityGateFigureIsDocumentedTests(unittest.TestCase):
+    """`cps_addon_monthly` is the gate figure, not the cell E73. The docs have to say so where a reader looks."""
+
+    def test_every_doc_that_describes_the_gate_names_the_fold_and_the_kept_cell(self):
+        for doc in DOCS:
+            text = doc.read_text()
+            self.assertIn("cps_addon_monthly", text, doc.name)
+            self.assertIn("cps_addon_e73", text, f"{doc.name} does not say where the sheet's own E73 is kept")
+
+    def test_the_fold_the_docs_describe_is_what_the_code_does(self):
+        from quote_checks import money, security_readback
+        base = {"monthly_steady_state": 1650.0, "cps_addon_monthly": 0, "ingest_monthly": 700.0,
+                "retention_monthly": 300.0, "support_monthly": 150.0}
+        folded = security_readback(base, 12)
+        self.assertEqual(money(folded["cps_addon_monthly"]), 500.0)         # E73 (0) plus other_addons_monthly (500)
+        self.assertEqual(folded["cps_addon_e73"], 0)                         # the cell itself
+        self.assertTrue(folded["addon_note"])
+        unchecked = security_readback({**base, "support_monthly": None}, 12)
+        self.assertIsNone(unchecked["cps_addon_monthly"])                    # null when the lines cannot be checked
+        self.assertEqual(unchecked["cps_addon_e73"], 0)
+        untouched = security_readback({**base, "monthly_steady_state": 1150.0}, 12)
+        self.assertEqual(untouched["cps_addon_monthly"], 0)                  # nothing folded: it is the cell
+        self.assertNotIn("cps_addon_e73", untouched)
