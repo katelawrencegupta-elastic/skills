@@ -901,7 +901,9 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         "retention_index_count": index_count,
         "retention_index_days_sum": round(index_days_sum, 3),
         "retention_index_age_bytes": index_age_bytes,
-        "retention_index_bytes": local,
+        # Local store of the indexes that have an age: the weight the fleet mean divides by. It is not `local`.
+        # Store with no retention age is left out of the average, so counting it here treated it as age zero.
+        "retention_index_bytes": known,
         # Size-weighted delete age of the metrics indices alone, for the TSDS retention row.
         "retention_days_metrics": round(metrics_age_bytes / metrics_bytes, 3) if metrics_bytes > 0 else None,
         "retention_basis": basis,

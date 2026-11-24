@@ -524,6 +524,31 @@ class RetentionAndRestartTests(unittest.TestCase):
         self.assertAlmostEqual(row["retention_unaged_share"], 0.75, places=3)
         self.assertIn("no retention age", row["retention_label"])
 
+    def test_the_fleet_month_ignores_store_with_no_age_instead_of_averaging_it_in_as_zero(self):
+        from admin_diags import analyze_bundle
+        from diag_inputs import index_retention_basis, index_retention_months
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._bundle(Path(tmp), {
+                "kept": (1_000_000_000, 10, "p90", 0),
+                "nopolicy": (3_000_000_000, 100, None, 0),
+            }, {"p90": 90})
+            row = analyze_bundle(path, captured=self.CAPTURED)
+        # 1 GB at 90 days and 3 GB with no age. The row says 90 days. The fleet mean, built from the row's index
+        # fields, used to divide 90 GB-days by all 4 GB and say 22.5 days: 1 month where 3 is right.
+        self.assertAlmostEqual(row["retention_days"], 90.0, places=1)
+        self.assertEqual(row["retention_index_bytes"], 1_000_000_000)
+        days, weighting, legacy = index_retention_basis([row])
+        self.assertAlmostEqual(days, 90.0, places=1)
+        self.assertEqual((weighting, legacy), ("store_weighted", 0))
+        self.assertEqual(index_retention_months([row]), 3)
+
+    def test_a_fleet_of_aged_and_partly_unaged_deployments_weights_only_the_aged_store(self):
+        from diag_inputs import index_retention_months
+        aged = {"retention_index_count": 2, "retention_index_days_sum": 60.0, "retention_index_age_bytes": 30.0 * 1e9 + 30.0 * 1e9, "retention_index_bytes": 2e9}
+        partly = {"retention_index_count": 1, "retention_index_days_sum": 180.0, "retention_index_age_bytes": 180.0 * 2e9, "retention_index_bytes": 2e9}
+        # 4 GB aged: 30 d x 2 GB and 180 d x 2 GB is 105 days, 4 months. Unaged store never enters either list.
+        self.assertEqual(index_retention_months([aged, partly]), 4)
+
     def test_an_ilm_policy_with_no_delete_phase_is_not_read_as_a_month(self):
         # A managed index whose policy never deletes keeps its data indefinitely. That is not 30 days.
         from admin_diags import analyze_bundle
