@@ -178,3 +178,28 @@ class ExactInputsFailClosedTests(unittest.TestCase):
         workload, org = si.exact_inputs(k360, "us-central1", 10.0, 500.0)
         self.assertEqual(workload, k360)
         self.assertEqual(org, 500.0)
+
+
+class MergedWorkloadShareTests(unittest.TestCase):
+    now = datetime(2026, 11, 23, 9, tzinfo=timezone.utc)
+
+    def test_the_org_wide_block_accounts_for_the_whole_month(self):
+        wl = si.regional_workloads(acc(), "https://x", "k", days=7, now=self.now, run=fake_run, workers=1)
+        search = wl["search"]
+        total = search["peak"]["pct_hours_mo"] + search["nonpeak"]["pct_hours_mo"] + search["idle_pct_hours_mo"]
+        self.assertAlmostEqual(total, 100.0, places=1)
+        # fake_run has traffic every hour, so there is no idle. The point is that idle is computed, not asserted.
+        self.assertEqual(search["idle_pct_hours_mo"], 0.0)
+
+    def test_idle_is_whatever_the_two_bands_leave(self):
+        def weekday_daytime_only(base, key, query):
+            day = datetime.fromisoformat(query.split('@timestamp >= "')[1][:10]).replace(tzinfo=timezone.utc)
+            cols = [{"name": n} for n in ("hour", "search_requests", "peak_minute_search_qps", "search_latency_p90_ms", "search_latency_p99_ms")]
+            rows = [[(day + timedelta(hours=h)).strftime("%Y-%m-%dT%H:00:00.000Z"), 3600, 1.0, 40.0, 80.0] for h in range(8, 12)]
+            return {"columns": cols, "values": rows}
+
+        wl = si.regional_workloads(acc(), "https://x", "k", days=7, now=self.now, run=weekday_daytime_only, workers=1)
+        search = wl["search"]
+        self.assertGreater(search["idle_pct_hours_mo"], 50.0)          # 4 busy hours of 24 leaves most of the month idle
+        total = search["peak"]["pct_hours_mo"] + search["nonpeak"]["pct_hours_mo"] + search["idle_pct_hours_mo"]
+        self.assertAlmostEqual(total, 100.0, delta=1.0)

@@ -120,8 +120,12 @@ def regional_workloads(acc: dict, base: str, key: str, *, days: int = proxy_logs
     dps = sum(b["ingest"]["docs_per_sec"] for b in good)
     bps = sum(b["ingest"]["bytes_per_sec"] for b in good)
     first = good[0]
+    peak, nonpeak = merged("peak"), merged("nonpeak")
+    # What the two bands leave of the month is idle, the same arithmetic as each regional block. Claiming 0 idle
+    # while the shares add to 80 made this the one workload block whose figures could not all be true.
+    idle = max(0.0, round(100.0 - float(peak["pct_hours_mo"]) - float(nonpeak["pct_hours_mo"]), 2))
     out.update({
-        "search": {"peak": merged("peak"), "nonpeak": merged("nonpeak"), "idle_pct_hours_mo": 0.0},
+        "search": {"peak": peak, "nonpeak": nonpeak, "idle_pct_hours_mo": idle},
         "ingest": {"docs_per_sec": dps, "avg_doc_bytes": round(bps / dps, 1), "active_hours_mo": ACTIVE_HOURS, "source": "diagnostics"},
         "window_days": first["window_days"], "window_start": first["window_start"], "window_end": first["window_end"],
         "quote_window_telemetry": _telemetry("complete", first),

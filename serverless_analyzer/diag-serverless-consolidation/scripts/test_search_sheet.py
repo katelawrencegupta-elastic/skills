@@ -108,6 +108,18 @@ class InputCellTests(unittest.TestCase):
         self.assertAlmostEqual(cells["C21"], (730 - 0.68 * 730) / 730, places=3)
         self.assertTrue(any("no hour share" in note for note in notes))
 
+    def test_no_measured_search_band_says_so_instead_of_writing_silent_zeros(self):
+        workload = {**WORKLOAD, "search": {"peak": {"qps": None}, "nonpeak": {"qps": None}, "idle_pct_hours_mo": 100.0}}
+        cells, notes = self.cells(workload=workload)
+        self.assertEqual((cells["C19"], cells["C21"], cells["C24"], cells["C26"]), (0.0, 0.0, 0.0, 0.0))
+        self.assertTrue(any("idle storage floor only" in note for note in notes))
+        # Ingest is still written: the sheet prices storage and ingest, and the note says that is all it is.
+        self.assertEqual(cells["C33"], 95.0)
+
+    def test_a_workload_with_a_search_band_does_not_get_the_floor_note(self):
+        _cells, notes = self.cells()
+        self.assertFalse(any("idle storage floor only" in note for note in notes))
+
     def test_measured_query_time_follows_the_documented_thresholds_and_says_so(self):
         cells, notes = self.cells()
         self.assertEqual(cells["C20"], "simple")

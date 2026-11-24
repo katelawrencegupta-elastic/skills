@@ -69,11 +69,14 @@ def search_input_cells(payload: dict, region_text: str, provider: str, support: 
     if org_gb and stored and share < 1:
         assumptions.append(f"Docs/s and QPS scaled by this project's share of diagnostic org store ({share:.3f}).")
     search = (workload or {}).get("search") or {}
-    present = [name for name in ("peak", "nonpeak") if (search.get(name) or {}).get("qps") is not None]
-    sized = search_bands(workload, assumptions) if present else []
+    # Always asked, so a workload with no measured search band says so in `assumptions` ("Search $ is the idle
+    # storage floor only") instead of writing zero QPS with nothing recorded. That row has the name None.
+    sized = search_bands(workload, assumptions)
     bands: dict[str, dict] = {}
     # Each row carries its band name: a band with no hour share is appended last, so position is not identity.
     for name, row in sized:
+        if name is None:
+            continue
         bands[name] = {
             "qps": float(row["QPS"]),
             "share": round(min(max(float(row["active_hours_per_month"]) / HOURS_PER_MONTH, 0.0), 1.0), 6),
