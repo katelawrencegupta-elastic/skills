@@ -199,6 +199,7 @@ def main() -> None:
                 result, published = {}, {"error": "no report"}
             entry = dict(estimators.get("search") or {"kind": "search", "title": title_se})
             entry["region"] = search_scope or region
+            entry["provider"] = solution_provider(acc, "search", provider)
             entry.pop("doc_id", None)
             entry.update({
                 "status": result.get("status") or "error",
@@ -288,7 +289,7 @@ def main() -> None:
                 pass
             estimators["observability"] = {
                 "kind": "observability", "title": title_o, "region": o_scope or region, "region_match": "none",
-                "readback_rejected": reason, "readback": {}, "status": "unquoted",
+                "provider": solution_provider(acc, "observability", provider), "readback_rejected": reason, "readback": {}, "status": "unquoted",
             }
             lines.append(f"Observability → {reason}")
         else:
@@ -309,7 +310,7 @@ def main() -> None:
                 )
             n = push_cells(sheets, copied["id"], O11Y_TAB, cells, allowed_text=set(opts))
             rb = observability_readback(read_cells(sheets, copied["id"], O11Y_TAB, O11Y_READBACK), basis)
-            entry = {"kind": "observability", "region": o_scope or region, "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.o11y_id, "reused_existing_copy": reused, "tab": O11Y_TAB, "cells": cells, "cells_written": n, "region_match": match_text, "readback": rb, "status": "filled", "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"]}
+            entry = {"kind": "observability", "region": o_scope or region, "provider": solution_provider(acc, "observability", provider), "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.o11y_id, "reused_existing_copy": reused, "tab": O11Y_TAB, "cells": cells, "cells_written": n, "region_match": match_text, "readback": rb, "status": "filled", "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"]}
             entry["ingest_basis"] = basis
             entry["echo_gate"] = observability_echo_gate(o_mix or o, rb) if basis == "metered" else echo_gate(daily, rb.get("echo_gb_day"))
             if not entry["echo_gate"]["accepted"]:
@@ -353,14 +354,14 @@ def main() -> None:
                 pass
             estimators["security"] = {
                 "kind": "security", "title": title_s, "region": s_scope or region, "region_match": "none",
-                "readback_rejected": reason, "readback": {}, "status": "unquoted",
+                "provider": solution_provider(acc, "security", provider), "readback_rejected": reason, "readback": {}, "status": "unquoted",
             }
             lines.append(f"Security → {reason}")
         else:
             s_daily = float(s.get("siem_gb_day") if s.get("siem_gb_day") is not None else s.get("daily_raw_gb") or 0)
             cells, n, rb, s_gate = fill_security(sheets, copied["id"], acc, support, reg, s_months, s_daily, opts, basis)
             match_text = region_match_text(reg, how, s_scope or region)
-            entry = {"kind": "security", "region": s_scope or region, "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.security_id, "reused_existing_copy": reused, "tab": SEC_TAB, "cells": cells, "cells_written": n, "region_match": match_text, "readback": rb, "status": "filled", "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"]}
+            entry = {"kind": "security", "region": s_scope or region, "provider": solution_provider(acc, "security", provider), "title": copied["name"], "spreadsheet_id": copied["id"], "url": copied["url"], "template_id": args.security_id, "reused_existing_copy": reused, "tab": SEC_TAB, "cells": cells, "cells_written": n, "region_match": match_text, "readback": rb, "status": "filled", "template_version": layout["version"], "template_newer_than_validated": layout["newer_than_validated"]}
             entry["ingest_basis"] = basis
             if s_gate is not None:
                 entry["echo_gate"] = s_gate
@@ -412,6 +413,7 @@ def main() -> None:
         entry = {
             "kind": "search",
             "region": search_scope or region,
+            "provider": solution_provider(acc, "search", provider),
             "status": result.get("status") or "error",
             "title": title_se,
             "local": published.get("local"),

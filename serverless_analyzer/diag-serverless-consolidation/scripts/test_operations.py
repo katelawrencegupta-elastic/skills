@@ -888,6 +888,111 @@ class PhaseGuardTests(unittest.TestCase):
         self.assertEqual(basis(899, 101), "partial")
         self.assertIsNone(basis(0, 1000))
 
+    def test_a_sheet_with_two_problems_is_one_finding_and_the_score_stays_in_range(self):
+        from quote_checks import _region_fidelity_row
+        # An alias of a different region number, written to another cloud. This used to append two
+        # findings for one sheet, so a lone sheet scored 1 - 2/1 = -1.
+        row = _region_fidelity_row([{
+            "solution": "observability", "region": "us-east-2", "provider": "azure",
+            "region_match": "AWS: us-east-1 (N. Virginia) (alias)",
+        }])
+        self.assertGreaterEqual(row["score"], 0.0)
+        self.assertLessEqual(row["score"], 1.0)
+        self.assertEqual(row["score"], 0.0)
+        self.assertTrue(row["warning"])
+        self.assertTrue(row["passed"])
+        self.assertIn("1 of 1 written regions", row["detail"])
+        self.assertIn("alias of a different region", row["detail"])
+        self.assertIn("written to another cloud", row["detail"])
+
+    def test_the_score_is_a_share_of_sheets_whatever_is_wrong_with_each(self):
+        from quote_checks import _region_fidelity_row
+        sheets = [
+            {"solution": "observability", "region": "us-east-1", "provider": "aws", "region_match": "AWS: us-east-1 (N. Virginia) (exact)"},
+            {"solution": "security", "region": "us-east-2", "provider": "azure", "region_match": "AWS: us-east-1 (N. Virginia) (alias)"},
+            {"solution": "search", "region": "mars-1", "provider": "gcp", "region_match": "AWS: us-east-1 (N. Virginia) (provider_default)"},
+        ]
+        row = _region_fidelity_row(sheets)
+        self.assertEqual(row["score"], round(1 / 3, 3))
+        self.assertIn("2 of 3 written regions", row["detail"])
+
+    def test_a_substitute_region_on_the_wrong_cloud_is_reported_as_another_cloud(self):
+        from quote_checks import _region_fidelity_row
+        # A provider_default or nearest match used to `continue` before the cloud was compared.
+        row = _region_fidelity_row([{
+            "solution": "search", "region": "us-east1", "provider": "gcp",
+            "region_match": "AWS: us-east-1 (N. Virginia) (provider_default)",
+        }])
+        self.assertIn("provider_default; written to another cloud", row["detail"])
+        self.assertLess(row["detail"].index("another cloud"), row["detail"].index("Each is priced"))
+
+    def test_the_same_cloud_substitute_is_still_not_called_another_cloud(self):
+        from quote_checks import _region_fidelity_row
+        row = _region_fidelity_row([{
+            "solution": "search", "region": "us-east1", "provider": "gcp",
+            "region_match": "GCP: us-east1 (S. Carolina) (provider_default)",
+        }])
+        self.assertTrue(row["warning"])
+        self.assertNotIn("another cloud", row["detail"])
+
+    def test_every_estimator_entry_records_the_provider_the_deployments_run_on(self):
+        import ast
+        tree = ast.parse((Path(__file__).resolve().parent / "size_serverless.py").read_text())
+        entries = [
+            node for node in ast.walk(tree) if isinstance(node, ast.Dict)
+            and {"kind", "region"} <= {k.value for k in node.keys if isinstance(k, ast.Constant)}
+        ]
+        # Observability and security, each filled and unquoted, plus the Search fleet entry. The regional-scope
+        # Search entry is an existing dict updated in place, and is checked by its assignment below.
+        self.assertGreaterEqual(len(entries), 5)
+        for node in entries:
+            keys = {k.value for k in node.keys if isinstance(k, ast.Constant)}
+            self.assertIn("provider", keys, f"line {node.lineno}: an estimator entry has no provider")
+        source = (Path(__file__).resolve().parent / "size_serverless.py").read_text()
+        self.assertIn('entry["provider"] = solution_provider(acc, "search", provider)', source)
+
+    def test_a_regional_job_entry_carries_its_provider_filled_or_unquoted(self):
+        import plan_sizing
+        from unittest import mock
+        search_job = {
+            "solution": "search", "region": "us-east-1", "title": "t", "stored_gb": 10.0, "parent_id": "p", "local_dir": ".",
+            "provider": "aws", "support": "Premium", "workload": {}, "org_gb": 10.0, "reuse": True,
+        }
+        result = ({"status": "estimated", "region_match": "AWS: us-east-1 (N. Virginia) (exact)",
+                   "readback": {"monthly_steady_state": 100.0}}, {"url": "u", "spreadsheet_id": "i"})
+        with mock.patch.object(plan_sizing, "services_from", return_value=(None, None)), \
+             mock.patch.object(plan_sizing, "price_search", return_value=result):
+            entry = plan_sizing._fill_regional_job(search_job, None)
+        self.assertEqual(entry["provider"], "aws")
+
+        sheet_job = {
+            "solution": "security", "region": "mars-1", "title": "t", "stored_gb": 10.0, "parent_id": "p", "local_dir": ".",
+            "provider": "azure", "support": "Premium", "template_id": "tpl", "tab": "T", "readback": {}, "reuse": True,
+            "retention": 3, "daily": 5.0, "skip_xlsx": True,
+        }
+        with mock.patch.object(plan_sizing, "services_from", return_value=(None, None)), \
+             mock.patch.object(plan_sizing, "copy_verified", return_value=({"id": "x", "name": "n", "url": "u"}, False, {"version": "2.6", "newer_than_validated": False})), \
+             mock.patch.object(plan_sizing, "region_options", return_value=[]), \
+             mock.patch.object(plan_sizing, "match_region", return_value=(None, "none")), \
+             mock.patch.object(plan_sizing, "trash_file"):
+            entry = plan_sizing._fill_regional_job(sheet_job, None)
+        self.assertEqual(entry["status"], "unquoted")
+        self.assertEqual(entry["provider"], "azure")
+
+    def test_the_cross_cloud_finding_is_reachable_from_real_estimator_entries(self):
+        from consolidation_regional import _written_regions
+        # What the fill now records: the provider the deployments run on, beside the cloud the sheet was written to.
+        estimators = {"observability": {
+            "kind": "observability", "region": "eastus", "provider": "azure",
+            "region_match": "AWS: us-east-1 (N. Virginia) (exact)", "readback": {"monthly_steady_state": 10.0},
+        }}
+        written = _written_regions(estimators)
+        self.assertEqual(written[0]["provider"], "azure")
+        recorded = integrity_score({"written_regions": written})
+        row = next(item for item in recorded["checks"] if item["check"] == "Region fidelity")
+        self.assertTrue(row["warning"])
+        self.assertIn("written to another cloud", row["detail"])
+
     def test_an_alias_with_no_region_recorded_says_so(self):
         from quote_checks import _region_fidelity_row
         row = _region_fidelity_row([{"solution": "security", "region": None, "region_match": "AZURE: us-east-2 (alias)"}])

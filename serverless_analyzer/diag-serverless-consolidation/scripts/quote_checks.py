@@ -609,21 +609,26 @@ def _region_fidelity_row(sheets: list[dict]) -> dict:
         return _integrity_row("Region fidelity", None, None, "No region was written to an estimator.")
     bad = []
     for row in written:
+        # One finding per sheet, whatever is wrong with it, so the score is a share of sheets and stays in 0 to 1.
         how = region_match_how(row.get("region_match"))
         region = str(row.get("region") or "").strip()
+        cross_cloud = not alias_provider_matches(str(row.get("region_match") or ""), row.get("provider"))
+        no_region_alias = how == "alias" and not region
+        problems: list[str] = []
         if how not in {"exact", "alias"}:
-            bad.append(f"{region or 'a region'} ({how or 'none'})")
-            continue
-        if how == "alias":
+            problems.append(how or "none")
+        elif how == "alias" and region and not _alias_same_number(region, str(row.get("region_match") or "")):
+            problems.append("alias of a different region")
+        if cross_cloud:
+            problems.append("written to another cloud")
+        if no_region_alias:
             # An alias is only checkable against the region the sheet was scoped to. Say that
             # the region is missing rather than reporting a region-number mismatch that was
             # never measured.
-            if not region:
-                bad.append(f"{str(row.get('solution') or 'a sheet')} recorded an alias match and no region")
-            elif not _alias_same_number(region, str(row.get("region_match") or "")):
-                bad.append(f"{region} (alias of a different region)")
-        if not alias_provider_matches(str(row.get("region_match") or ""), row.get("provider")):
-            bad.append(f"{region or 'a region'} (written to another cloud)")
+            finding = f"{str(row.get('solution') or 'a sheet')} recorded an alias match and no region"
+            bad.append(finding + (", written to another cloud" if cross_cloud else ""))
+        elif problems:
+            bad.append(f"{region or 'a region'} ({'; '.join(problems)})")
     if bad:
         # Another cloud, or a region nobody recorded, first: a substitute on the same cloud is
         # a deliberate fallback, those two are not.
@@ -631,7 +636,7 @@ def _region_fidelity_row(sheets: list[dict]) -> dict:
         rest = [item for item in bad if item not in serious]
         row = _integrity_row(
             "Region fidelity",
-            round(1.0 - len(bad) / len(written), 3),
+            round(max(0.0, 1.0 - len(bad) / len(written)), 3),
             True,
             f"{len(bad)} of {len(written)} written regions are not an exact or same-region alias: "
             + "; ".join(serious + rest)

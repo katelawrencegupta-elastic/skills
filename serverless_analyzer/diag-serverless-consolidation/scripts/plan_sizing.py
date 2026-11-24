@@ -41,7 +41,7 @@ def _fill_regional_job(job: dict, creds) -> dict:
             reuse=job["reuse"], skip_xlsx=job.get("skip_xlsx", True),
         )
         entry = {
-            "solution": sol, "region": job["region"], "title": job["title"], "stored_gb": job["stored_gb"],
+            "solution": sol, "region": job["region"], "provider": job["provider"], "title": job["title"], "stored_gb": job["stored_gb"],
             "store_scale": job.get("store_scale"),
             "status": result.get("status") or "error",
             "region_match": result.get("region_match"),
@@ -74,7 +74,7 @@ def _fill_regional_job(job: dict, creds) -> dict:
         except Exception:  # noqa: BLE001
             pass
         return {
-            "solution": sol, "region": job["region"], "title": job["title"],
+            "solution": sol, "region": job["region"], "provider": job["provider"], "title": job["title"],
             "region_match": "none", "readback_rejected": _region_rejected(job.get("region")),
             "readback": {}, "status": "unquoted", "error": _region_rejected(job.get("region")),
         }
@@ -90,7 +90,7 @@ def _fill_regional_job(job: dict, creds) -> dict:
     else:
         cells, n, rb, gate = fill_security(sheets, copied["id"], account, job["support"], reg, int(job["retention"]), job["daily"], opts, basis)
     entry = {
-        "solution": sol, "region": job["region"], "title": copied["name"], "stored_gb": job["stored_gb"],
+        "solution": sol, "region": job["region"], "provider": job["provider"], "title": copied["name"], "stored_gb": job["stored_gb"],
         "spreadsheet_id": copied["id"], "url": copied["url"], "reused_existing_copy": reused,
         "cells": cells, "cells_written": n, "region_match": match_text,
         "readback": rb, "status": "filled", "daily_raw_gb": round(job["daily"], 2),
