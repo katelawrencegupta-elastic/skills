@@ -34,6 +34,20 @@ def _norm(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
 
 
+def repeated_names(names) -> list[str]:
+    """Names that more than one entry carries, compared the way bundles are matched (case and punctuation ignored).
+
+    Bundles, exclusions and the billing roster are keyed by deployment name. Two entries with one name share a
+    key: one bundle can be matched to both deployments (double-counted) or one of two bundles can win (dropped).
+    Re-keying on the deployment id is the real fix. Until then the quote names the collision.
+    """
+    seen: dict[str, list[str]] = {}
+    for name in names:
+        if name:
+            seen.setdefault(_norm(name), []).append(str(name))
+    return sorted({group[0] for group in seen.values() if len(group) > 1})
+
+
 _sheet_months = whole_months  # one shared rounding rule, defined in diag_inputs
 
 
@@ -613,6 +627,21 @@ def apply_diagnostics(
         ],
     }
     limitations = []
+    duplicate_names = sorted(set(repeated_names(r.get("name") for r in rows)) | set(repeated_names(
+        d.get("name") for d in (out.get("solutions") or {}).get("by_deployment") or []
+        if isinstance(d, dict) and d.get("platform") != "serverless"
+    )))
+    if duplicate_names:
+        limitations.append({
+            "code": "duplicate_deployment_names", "count": len(duplicate_names), "names": duplicate_names[:12],
+            "detail": (
+                f"{len(duplicate_names)} deployment name(s) are carried by more than one bundle or deployment: "
+                f"{', '.join(duplicate_names[:6])}. Bundles, exclusions and the billing roster are matched by name, so one "
+                "bundle can be counted for both deployments or one can be dropped. Their ingest, stored GB and ECH cost "
+                "may be double counted or missing."
+            ),
+            "severity": "high",
+        })
     if fallback:
         limitations.append({"code": "missing_diagnostics", "count": fallback, "names": fallback_names[:12], "severity": "high"})
     if no_age:

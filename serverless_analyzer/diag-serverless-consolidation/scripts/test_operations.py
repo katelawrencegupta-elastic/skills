@@ -1078,6 +1078,30 @@ class PhaseGuardTests(unittest.TestCase):
         row = next(item for item in recorded["checks"] if item["check"] == "Retention month")
         self.assertIsNone(row["passed"])
 
+    def test_a_repeated_deployment_name_is_a_named_limit_not_a_silent_mismatch(self):
+        from diag_account import apply_diagnostics, repeated_names
+        self.assertEqual(repeated_names(["a", "B", "b-", "c"]), ["B"])
+        self.assertEqual(repeated_names(["a", "b", None, ""]), [])
+        mix = {"logs": 5.0, "k8s_logs": 0.0, "metrics": 0.0, "traces": 0.0}
+        acc = {
+            "meta": {},
+            "solutions": {"by_deployment": [
+                {"name": "prod", "solution": "observability", "gb": 10.0, "ecu": 100.0},
+                {"name": "Prod", "solution": "observability", "gb": 10.0, "ecu": 100.0},
+                {"name": "other", "solution": "observability", "gb": 10.0, "ecu": 100.0},
+            ]},
+            "sizing": {"consolidated": {}}, "storage": {},
+        }
+        rows = [{"name": "prod", "id": "a" * 32, "bulk_gb_day": 5.0, "store_gb": 10.0, "retention_days": 30.0, "bulk_mix": mix}]
+        limits = apply_diagnostics(acc, rows)["sizing"]["diagnostics"]["estimation_limits"]
+        hit = next(row for row in limits if row["code"] == "duplicate_deployment_names")
+        self.assertEqual(hit["severity"], "high")
+        self.assertEqual(hit["names"], ["prod"])
+        self.assertIn("double counted or missing", hit["detail"])
+        clean = {**acc, "solutions": {"by_deployment": [{"name": "x", "solution": "observability", "gb": 1.0, "ecu": 1.0}]}}
+        limits = apply_diagnostics(clean, [{"name": "x", "id": "b" * 32, "bulk_gb_day": 1.0, "store_gb": 1.0, "retention_days": 30.0, "bulk_mix": mix}])["sizing"]["diagnostics"]["estimation_limits"]
+        self.assertFalse(any(row["code"] == "duplicate_deployment_names" for row in limits))
+
     def test_no_ascertainable_month_is_a_limit_a_note_and_no_written_month(self):
         from diag_account import apply_diagnostics
         acc = {

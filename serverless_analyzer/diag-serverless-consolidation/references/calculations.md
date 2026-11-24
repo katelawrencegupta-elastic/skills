@@ -58,7 +58,7 @@ A region the page lists but an estimator sheet does not is a different case. It 
 
 ## Source precedence and estimation limits
 
-For deployments with a matched diagnostic bundle, diagnostics take precedence for local primary store, bulk GB/day, retention ages, product-derived Observability mix, and the aggregates derived from those fields. `field_sources` on deployment rows and `sizing.source_precedence` make the source choice explicit. Cloud Tracker remains authoritative for billed ECU/cost, the billing-window active roster, Search workload telemetry, cloud region/provider/tier metadata, and deployment classification. The Search ingest-share denominator is the sum of diagnostic local stores. Cloud Tracker stored GB on an unmeasured deployment is retained for context only and cannot change any diagnostic estimator input.
+For deployments with a matched diagnostic bundle, diagnostics take precedence for local primary store, bulk GB/day, retention ages, product-derived Observability mix, and the aggregates derived from those fields. `field_sources` on deployment rows and `sizing.source_precedence` make the source choice explicit. Cloud Tracker remains authoritative for billed ECU/cost, the billing-window active roster, cloud region/provider/tier metadata, and deployment classification. Search workload (QPS, query complexity, hour shares) is read from the service proxy request logs, and docs/s from the diagnostics. The Search ingest-share denominator is the sum of diagnostic local stores. Cloud Tracker stored GB on an unmeasured deployment is retained for context only and cannot change any diagnostic estimator input.
 
 `diagnostics.estimation_limits` lists missing bundles, unmeasured retention, store with no retention age, a missing retention month, short diagnostic uptime, bulk without a measured ILM write phase, unrated ingest, assumed Observability mix, EIS quote-pace proxy use, and incomplete EIS totals that were omitted. Reports surface these limits with the quote. A limit is not silently converted to a diagnostic measurement.
 
@@ -91,9 +91,11 @@ A run marked DRAFT always names why: a test asserts that no path sets `meta.draf
 
 ```
 bulk_gb_day = Σ bulk_gb_day
-weighted_days = Σ (bulk_gb_day × retention_days) / bulk_gb_day
-months = weighted_days / 30.416
+weighted_days = Σ (bulk_gb_day × retention_days) / bulk_gb_day     the record, retention_months_measured
+months = weighted_days / 30.416                                   not the month written to the sheet
 ```
+
+The bulk-weighted delete age above is `retention_months_measured`. It is kept beside the quote and does not enter the price. The month written to the sheet is the store-weighted average across indexes, rounded up (next paragraph).
 
 The written month is the store-weighted average retention across indexes with local primary store, rounded up with `whole_months` (`index_retention_months`). Each index counts once. Its age is the ILM delete age, else the data-stream retention. An index with neither has no age and is not counted. The mean is weighted by local primary store. A cluster with no local primary store (all searchable snapshots) gives no weight and does not turn the weighting off. Only a bundle parsed before store weights existed makes the whole mean one vote per index, and then the notes say it is not store-weighted and `estimation_limits` carries `retention_unweighted`. Deployments carry `retention_index_days_sum` and `retention_index_count`, and the fleet mean divides the sums so a large deployment is not one vote. That integer is written on every Observability and Security sheet, including each regional sheet and each deployment-plan sheet. When no index was counted, the written month is the ingest-weighted delete age the bundles measured, rounded up (`retention_month_basis` `measured_age`). When no retention can be ascertained at all, there is no month (`retention_month_basis` `unascertained`, `estimate_months` null). Nothing stands in for it, neither 30 days nor 12 months: `retention_months` is not set, the sizing step does not fill an Observability or Security sheet, the solution has a workload and no price so Quote present fails, the Retention month check scores 0 as a warning, and `estimation_limits` carries `retention_month_missing` at high severity. `--retention-days` names a month when the customer's retention is known. The size-weighted age stays `retention_months_measured` and does not enter the price. A solution with no bulk is skipped. Security monthly at the written month is E74.
 
@@ -115,7 +117,7 @@ A row with `uptime_days_min` < 2 has a short node uptime. Keep it in the sum and
 
 Each rated series is one kind, from its data stream or index name: `metrics-*`, `metricbeat-*`, and any index whose `index.mode` is `time_series` are metrics; `traces-*` are traces; everything else is logs; `logs-kubernetes.*` is the Kubernetes part of logs. The bundle row carries `bulk_mix` (`logs`, `k8s_logs`, `metrics`, `traces`, in GB/day; logs + metrics + traces = `bulk_gb_day`) and `retention_days_metrics`, the size-weighted delete age of the metrics indices.
 
-A group's split is the sum of its deployments' product-derived splits, each scaled to that deployment's written GB/day, so the proportions are kept. On the metered basis the Observability sheet takes logs plus traces on G19 and metrics on G20 (see Metered basis). On the raw basis it takes logs plus traces on G23, the Kubernetes share of logs on G24, and metrics on G25. G12 is the metrics month, rounded up like G11. The fleet sheet, each regional sheet, and each deployment-plan sheet use the split of the deployments in that sheet. If a diagnostic bundle has no product classification, sizing stops instead of applying a synthetic split.
+A group's split is the sum of its deployments' product-derived splits, each scaled to that deployment's written GB/day, so the proportions are kept. On the metered basis the Observability sheet takes logs plus traces on G19 and metrics on G20 (see Metered basis). On the raw basis it takes logs plus traces on G23, the Kubernetes share of logs on G24, and metrics on G25. G12 is the same month as G11 on every orchestrated run (`--force-months`); see sizing-cells.md. The fleet sheet, each regional sheet, and each deployment-plan sheet use the split of the deployments in that sheet. If a diagnostic bundle has no product classification, sizing stops instead of applying a synthetic split.
 
 ## Retention with no delete policy
 
@@ -174,7 +176,7 @@ The compression-applied quote path is retired. Bulk goes into the metered cells 
 
 | Solution | Inputs | Quote cell |
 |----------|--------|------------|
-| Observability | G19 = (product-classified logs + traces) × 730 ÷ 24, G20 = product-classified metrics × 730 ÷ 24, G23 0, G24 0%, G25 0, G26 0, G27 100%, G11, G12 metrics retention, G4 Complete, G5 Premium, G8 region, G15 No, G33 No | D38 monthly, E38 year 1, F38 steady annual |
+| Observability | G19 = (product-classified logs + traces) × 730 ÷ 24, G20 = product-classified metrics × 730 ÷ 24, G23 0, G24 0%, G25 0, G26 0, G27 100%, G11 and G12 the written month, G4 Complete, G5 Premium, G8 region, G15 No, G33 No | D38 monthly, E38 year 1, F38 steady annual |
 | Security | G4 = Security-row bulk ÷ the copy's own G5 ÷ G4 (1.66 on v2.6), G6 = the written month, G7 region, G8 Complete, G21 Premium | E74 monthly |
 | Search | disk = Σ diagnostic local `store_gb`. QPS, complexity and hour shares are read from the service proxy request logs for that region's Search deployments, and docs/s from the diagnostics' bulk rate over 730 h (see sizing-cells.md). Nothing is scaled. K360 stored GB for an unmeasured deployment is excluded. A packed what-if project takes its region's own workload, scaled by its share of that region's Search store. Search sheet performant (G110); es3 performant only with `--search-notebook` | `monthly_steady_state` |
 
@@ -315,7 +317,7 @@ Split the dollar gap into:
 - **Ingest.** Same retention, the two daily rates. Diagnostic bulk versus stored GB ÷ retention (or versus cloud-tracker dataset growth, when that was the other tab).
 - **Retention.** Same daily rate, diagnostic weighted days versus the flat assumed months.
 
-Most of a large gap is the ingest measure. Bulk request bytes over a node's uptime run well above the growth of `index.dataset_size_bytes`. Stored size on the two sides often agrees; that does not make the daily rates interchangeable.
+Most of a large gap is the ingest measure. Bulk request bytes over each write index's write phase run well above the growth of `index.dataset_size_bytes`. Stored size on the two sides often agrees; that does not make the daily rates interchangeable.
 
 Do not count `partial-*` (searchable snapshots) as ingest. Do count `.ds-*` data streams. Exclude `.ds-.` and `.ds-ilm`.
 
