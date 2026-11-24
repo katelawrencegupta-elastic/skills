@@ -59,7 +59,7 @@ References: `setup.md` is the machine setup. `output-schema.md` is the account J
 
 ## diag-serverless-consolidation
 
-Prices Observability and Security from Elasticsearch diagnostic bundles. Daily GB is bulk on the write indices. Retention is the measured age, written as a whole month. Search disk is local store, and Search ingest stays the K360 rate scaled by that store. The estimator read-back is the dollar. Bulk is measured after ingest pipelines and before compression, so it is written to the estimators as metered ingest: Observability through the Option 1 cells, Security as bulk ÷ the sheet's expansion factor. The earlier compression-applied set is retired.
+Prices Observability and Security from Elasticsearch diagnostic bundles. Daily GB is bulk on the write indices. Retention is the store-weighted average index age, written as a whole month. Search is priced on the Search estimator sheet: disk is the measured local store, QPS, query complexity and the peak and non-peak hour shares come from the service proxy request logs for that region's own Search deployments, and ingest docs/s and the average document size come from the bundles. Nothing about Search is scaled by a billing pace or an org-wide store share. The estimator read-back is the dollar. Bulk is measured after ingest pipelines and before compression, so it is written to the estimators as metered ingest: Observability through the Option 1 cells, Security as bulk ÷ the sheet's expansion factor. The earlier compression-applied set is retired.
 
 `python <skill>/scripts/run_consolidation.py --org "ORG NAME" --reuse <org_report.json> --diags-dir <bundles>`
 
@@ -79,7 +79,9 @@ Prices Observability and Security from Elasticsearch diagnostic bundles. Daily G
 | `plan_sizing.py` | The regional jobs and the deployment-count plan |
 | `constants.py` | Every shared number: the month, the tolerances, the thresholds, the exit status |
 | `search_sheet.py` | Prices a Search slice on a copy of the Search estimator sheet (v2.3), the default. Reads the performant total back |
-| `es3_estimate.py` | Prices a Search slice with the es3-estimator library. Used with `--search-notebook`, and for the deployment-count bars |
+| `es3_estimate.py` | Prices a Search slice with the es3-estimator library. Used only with `--search-notebook`, which switches every Search figure to it at once |
+| `proxy_logs.py` | Reads the service proxy request logs one UTC day at a time, retries and splits a failing span by hour, and returns peak and non-peak QPS, complexity and hour shares |
+| `search_inputs.py` | Builds one Search workload block per region from those logs and the bundles, and gives a packed project its region's share |
 | `consolidation.py` | Builds the savings, deployment-count plan, per-cluster cost table, metered rates, and quote integrity from the read-backs. Also the façade the runner and renderers import through |
 | `consolidation_scope.py` | The quote window, the billed series, which ECH deployments are on each side of the comparison, and the stand-in ladders |
 | `consolidation_regional.py` | One project per solution per region, the per-region read-backs, and the integrity facts |
@@ -87,13 +89,14 @@ Prices Observability and Security from Elasticsearch diagnostic bundles. Daily G
 | `quote_checks.py` | Checks the estimator layout before a write, the sheet echo, coverage, retention, unrated ingest, and published totals. No network |
 | `diag_inputs.py` | Prints 2–5 project packs and per-deployment inputs. It does not quote dollars |
 | `privacy.py` | Sets private file modes and warns when `.env` or an in-repo `diag_artifacts/` folder would be committed |
-| `test_bundles.py`, `test_estimates.py`, `test_quote.py`, `test_integrity.py`, `test_operations.py`, `test_docs.py` | Offline unit tests, by area. No Google account and no sheets. Run them with `python3 -m unittest discover -s . -p 'test_*.py'` from `diag-serverless-consolidation/scripts` |
+| `test_bundles.py`, `test_estimates.py`, `test_quote.py`, `test_integrity.py`, `test_operations.py`, `test_proxy_logs.py`, `test_search_inputs.py`, `test_search_sheet.py`, `test_docs.py` | Offline unit tests, by area. No Google account, no sheets, and no proxy logs. Run them with `python3 -m unittest discover -s . -p 'test_*.py'` from `diag-serverless-consolidation/scripts` |
 | `_test_support.py` | Fixtures the suites share. The leading underscore keeps it out of discovery |
 | `skill_paths.py` | Finds `k360-org-report` and `k360-account-analysis` for this run. The same file is in the other two skills |
 
 Run options worth knowing:
 
-- `--search-notebook` prices Search with the es3-estimator notebook library instead of the Search estimator sheet, which is the default. `--search-id` (or `SEARCH_SHEET_ID`) points at another Search template. The deployment-count bars price Search with the library on both paths.
+- Search needs `PROXY_LOGS_URL` and `PROXY_LOGS_API_KEY` in `.env` or the environment. Without them there is no Search quote, rather than a degraded one. `--proxy-days` (default 7) sets how many complete UTC days of request logs feed QPS, complexity and the hour shares. A region with no proxy traffic is left unquoted and named in `limits`; the other regions still price.
+- `--search-notebook` prices Search with the es3-estimator notebook library instead of the Search estimator sheet, which is the default. `--search-id` (or `SEARCH_SHEET_ID`) points at another Search template. The flag moves every Search figure together — the headline, each region, the deployment-count bars and the search-power profiles — and the two paths are never mixed in one run.
 - `--exclude-deployment <id>` (repeat or comma list) removes a deployment from the whole run. The run key gains `_excluding_<n>`, and page 1 names what was left out.
 - `--ech-scope priced|all` (default `priced`) sets the ECH side of the comparison: only deployments that got a serverless price, or the whole billing window. Page 1 names what was not compared.
 - `--unmeasured exclude|fail` (default `exclude`) says what an active deployment with no bundle does: left off both sides of the comparison, or a stop that names every one of them. There is no K360 mode: a size that was never measured cannot enter a diagnostic estimate.
@@ -108,7 +111,8 @@ Run options worth knowing:
 - Every run is stamped with the commit and rules that produced it (`meta.method`, `method` in the brief, and the last line of the PDF). Compare two runs of one customer only when the stamp matches. A run refuses to start on a tree with uncommitted changes, or with an untracked `.py` under a `scripts/` folder that an import could pick up; an untracked file that cannot change behaviour is listed on the stamp instead of blocking. `--allow-dirty` runs anyway and marks the PDF DRAFT.
 - Every run also writes `<run_key>_run.json`: the options, the method stamp, the preflight table, every limit, the integrity verdict and the timings. Paths and the customer name are left out of it.
 - A step that ran degraded records an `estimation_limits` entry, not just a line on the terminal, so the brief, the chat bullets and the PDF all carry it. A run marked DRAFT always says why.
-- Quote integrity passes only when every check passes. One failed check fails the quote. Rate window, Counter age, Retention basis and Retention month are warnings instead: they report a weakness and the quote is still produced.
+- Quote integrity passes only when every check passes. One failed check fails the quote. Rate window, Counter age, Rated ingest, Region fidelity, Search regions quoted, Retention basis and Retention month are warnings instead: they report how well the fleet could be measured, and the quote is still produced.
+- `integrity.confidence` is the separate question of how much of the price was measured rather than assumed: a weighted mean of the evidence checks, reported as a band (High, Moderate, Low) with the drivers holding it down. A quote can pass every check and still be Moderate.
 
 A note on the module layout: each module imports the names it uses and nothing more. There are no star imports between them, and no constant has two homes — `test_docs.py` enforces both, because 27 constants once lived in two files and agreed only by hand. `consolidation.py` and `size_serverless.py` carry an explicit `__all__` because they are the façades the runner, the renderers and the suites import through.
 
@@ -116,4 +120,4 @@ References: `calculations.md` is the arithmetic. `sizing-cells.md` is the estima
 
 ## How a quote is assembled
 
-`k360-org-report` writes `<customer>_<date>_org_report.json`. `k360-account-analysis` can reuse that file for the summary. `diag-serverless-consolidation` reuses it again, then replaces ingest and retention with the diagnostic measurements. Observability monthly is D38. Security monthly is E74. Search is the es3 performant profile. Every PDF is in the customer folder root: the account PDF, the appendix, and the consolidation PDF. Estimate sheets are directly in `generated_estimates/`, and plan sheets in `generated_estimates/plan_sheets/`. There are no `full_retention` or `30d` folders, and no 30-day read.
+`k360-org-report` writes `<customer>_<date>_org_report.json`. `k360-account-analysis` can reuse that file for the summary. `diag-serverless-consolidation` reuses it again, then replaces ingest and retention with the diagnostic measurements. Observability monthly is D38. Security monthly is E74. Search is the performant total, G110, on the Search estimator sheet, or the es3 performant profile with `--search-notebook`. Every PDF is in the customer folder root: the account PDF, the appendix, and the consolidation PDF. Estimate sheets are directly in `generated_estimates/`, and plan sheets in `generated_estimates/plan_sheets/`. There are no `full_retention` or `30d` folders, and no 30-day read.
