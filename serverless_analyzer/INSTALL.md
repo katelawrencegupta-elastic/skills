@@ -19,7 +19,7 @@ Python 3.10 or newer is required (`requires-python >= 3.10` in `pyproject.toml`)
 | `FOUND_ADMIN_API_KEY` | A fresh diagnostic pull | Same `.env`. Not used when `--diags-dir` points at zips already on disk |
 | Sheets virtualenv | Estimator copies and PDF upload | `~/.config/serverless-analyzer/venv` |
 | OAuth client | Sheets and Drive sign-in | `~/.config/serverless-analyzer/client_secret.json` |
-| es3-estimator | Search quotes only | Clone plus `~/.config/es3-estimator/venv` |
+| es3-estimator | `--search-notebook` and the deployment-count bars | Clone plus `~/.config/es3-estimator/venv` |
 | Google Chrome | PDF print | `/Applications`, or `CHROME_PATH` |
 | Aviatrix VPN | A fresh admin-console pull | An `openvpn` process. `--diags-dir` does not need it |
 
@@ -70,7 +70,7 @@ python3 -m venv ~/.config/serverless-analyzer/venv
 
 The sign-in opens a browser and writes `token.json` next to the client file. Run it again if the token predates the Drive scopes. `SERVERLESS_SHEETS_PY` overrides the interpreter. `SHEETS_CLIENT_SECRET` and `SHEETS_TOKEN` override the two files.
 
-Golden Observability and Security templates are copied. They are never edited. `O11Y_SHEET_ID` and `SECURITY_SHEET_ID` override the built-in template ids. The org report also accepts `ES3_SHEET_ID`.
+Golden Observability and Security templates are copied. They are never edited. `O11Y_SHEET_ID`, `SECURITY_SHEET_ID` and `SEARCH_SHEET_ID` override the built-in template ids. The Search template is the v2.3 sheet. The org report also accepts `ES3_SHEET_ID`.
 
 ## 4. Search estimator
 

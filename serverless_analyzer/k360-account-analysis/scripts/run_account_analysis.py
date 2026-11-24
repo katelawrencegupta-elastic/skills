@@ -278,6 +278,8 @@ def parse_args(argv=None, description: str | None = None):
     ap.add_argument("--allow-dirty", action="store_true", help="Run even when serverless_analyzer has uncommitted changes. The PDF is marked DRAFT.")
     ap.add_argument("--allow-partial", action="store_true", help="Keep going when a sizing step fails. The PDF is DRAFT and shows no saving.")
     ap.add_argument("--allow-nearest-region", action="store_true", help="When the provider default is also absent, price the nearest same-provider region. A region that is not listed is otherwise priced as AWS us-east-1, Azure eastus, or GCP us-east1. Integrity still fails.")
+    ap.add_argument("--proxy-days", type=int, default=7, help="Consolidation only: complete UTC days of service proxy request logs to read for Search QPS, complexity and hour shares (default 7)")
+    ap.add_argument("--search-notebook", action="store_true", help="Price Search with the es3-estimator notebook library instead of the Search estimator sheet (the default)")
     args = ap.parse_args(argv)
     if not 1 <= int(args.lookback_days) <= 365:
         ap.error("--lookback-days must be from 1 to 365")

@@ -823,7 +823,9 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
     snapshot = 0.0
     blended_bytes = 0.0       # store with no configured retention, priced at the 30-day default
     index_days_sum = 0.0
+    index_age_bytes = 0.0     # sum of age * store, so a larger index carries more of the written month
     index_count = 0
+    docs_total = 0.0          # primary documents in the same indices the local store counts
     for ix, body in stats.items():
         store = ((body.get("primaries") or {}).get("store") or {})
         measured = quoted_index_bytes(ix, store)
@@ -835,6 +837,7 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         if nbytes <= 0:
             continue
         local += nbytes
+        docs_total += float(((body.get("primaries") or {}).get("docs") or {}).get("count") or 0)
         info = explain.get(ix) or {}
         age = delete_age.get(info.get("policy")) if info.get("managed") else None
         if age is None:
@@ -850,6 +853,7 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         else:
             by_age[round(age, 3)] += nbytes
         index_days_sum += float(age)
+        index_age_bytes += float(age) * nbytes
         index_count += 1
         if age is not None and ingest_kind(series_of.get(ix) or ix, index_mode.get(ix)) == "metrics":
             metrics_age_bytes += age * nbytes
@@ -883,6 +887,8 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         "retention_days": round(days, 3) if days else None,
         "retention_index_count": index_count,
         "retention_index_days_sum": round(index_days_sum, 3),
+        "retention_index_age_bytes": index_age_bytes,
+        "retention_index_bytes": local,
         # Size-weighted delete age of the metrics indices alone, for the TSDS retention row.
         "retention_days_metrics": round(metrics_age_bytes / metrics_bytes, 3) if metrics_bytes > 0 else None,
         "retention_basis": basis,
@@ -894,6 +900,9 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         "retention_assumed_share": None if assumed_share is None else round(assumed_share, 6),
         "retention_label": _retention_label(parts, basis),
         "store_gb": round(local / 1e9, 2),
+        # Local primary store bytes and primary documents, for the average document size of Search ingest.
+        "store_bytes": int(local),
+        "docs_count": int(docs_total),
         "dataset_gb": round((dataset + snapshot) / 1e9, 2),
         "snapshot_gb": round(((dataset - local) + snapshot) / 1e9, 2),
         # logs + metrics + traces is bulk_gb_day. k8s_logs is the part of logs from Kubernetes.

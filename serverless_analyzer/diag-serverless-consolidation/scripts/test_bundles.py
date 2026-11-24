@@ -21,7 +21,7 @@ sys.path.insert(0, str(K360))
 from admin_diags import _user_index, analyze_bundle, quoted_index_bytes  # noqa: E402
 from consolidation import build_consolidation  # noqa: E402
 from diag_account import _sheet_months, apply_diagnostics  # noqa: E402
-from diag_inputs import index_retention_months, summarize, whole_months  # noqa: E402
+from diag_inputs import index_retention_basis, index_retention_months, summarize, whole_months  # noqa: E402
 from quote_checks import echo_gate, integrity_score  # noqa: E402
 from size_serverless import _sheet_retention, push_cells  # noqa: E402
 
@@ -105,13 +105,15 @@ class RetentionTests(unittest.TestCase):
             {"name": "a", "bulk_gb_day": 10, "retention_days": 0, "store_gb": 1},
             {"name": "b", "bulk_gb_day": 10, "retention_days": 30.416, "store_gb": 1},
         ])
-        self.assertEqual(mixed["months_written"], 12)
+        # No index counts: the measured delete age sets the month, and an unmeasured row stays out of it.
+        self.assertEqual(mixed["months_written"], 1)
         self.assertEqual(mixed["retention_unmeasured"], [{"name": "a", "bulk_gb_day": 10.0}])
+        # Nothing measured at all: the 30-day default, 1 month. Never 12.
         empty = summarize([{"name": "a", "bulk_gb_day": 5, "retention_days": None, "store_gb": 1}])
-        self.assertEqual(empty["months_written"], 12)
-        self.assertEqual(empty["observability_cells"]["G11_retention_months"], 12)
+        self.assertEqual(empty["months_written"], 1)
+        self.assertEqual(empty["observability_cells"]["G11_retention_months"], 1)
         subday = summarize([{"name": "a", "bulk_gb_day": 2, "retention_days": 0.042, "store_gb": 1}])
-        self.assertEqual(subday["months_written"], 12)
+        self.assertEqual(subday["months_written"], 1)
         self.assertEqual(subday["retention_unmeasured"], [])
         year = summarize([{"name": "a", "bulk_gb_day": 10, "retention_days": 365, "store_gb": 1}])
         self.assertEqual(year["months_written"], 12)
@@ -166,6 +168,78 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(held["sizing"]["consolidated"]["observability"]["retention_months"], 2)
         self.assertIsNone(held["meta"].get("retention_index_count"))
 
+    def test_index_average_is_weighted_by_store(self):
+        # 1,000 small indexes at 15 days (1 GB total) and 10 large ones at 365 days (999 GB total).
+        # One vote each would be 18.5 days, 1 month. By store it is about 364 days, 12 months.
+        rows = [
+            {"retention_index_count": 1000, "retention_index_days_sum": 15 * 1000,
+             "retention_index_age_bytes": 15 * 1e9, "retention_index_bytes": 1e9},
+            {"retention_index_count": 10, "retention_index_days_sum": 365 * 10,
+             "retention_index_age_bytes": 365 * 999e9, "retention_index_bytes": 999e9},
+        ]
+        self.assertEqual(index_retention_months(rows), 12)
+        # A row from an older bundle has no store weight, so the whole mean falls back to one vote per index.
+        rows[1] = {"retention_index_count": 10, "retention_index_days_sum": 365 * 10}
+        self.assertEqual(index_retention_months(rows), 1)
+
+    def test_a_row_with_no_local_store_does_not_turn_the_weighting_off(self):
+        # An all-searchable-snapshot cluster carries the store fields at zero bytes. It has no weight to
+        # give, and the account stays store-weighted on the cluster that does.
+        rows = [
+            {"retention_index_count": 1000, "retention_index_days_sum": 15 * 1000,
+             "retention_index_age_bytes": 0.0, "retention_index_bytes": 0.0},
+            {"retention_index_count": 10, "retention_index_days_sum": 365 * 10,
+             "retention_index_age_bytes": 365 * 999e9, "retention_index_bytes": 999e9},
+        ]
+        days, weighting, legacy = index_retention_basis(rows)
+        self.assertEqual((weighting, legacy), ("store_weighted", 0))
+        self.assertAlmostEqual(days, 365.0, places=3)
+        self.assertEqual(index_retention_months(rows), 12)  # 365 days is 12 months
+
+    def test_the_basis_names_why_the_mean_is_unweighted(self):
+        legacy_row = {"retention_index_count": 10, "retention_index_days_sum": 3650}
+        days, weighting, legacy = index_retention_basis([
+            {"retention_index_count": 1000, "retention_index_days_sum": 15000,
+             "retention_index_age_bytes": 15e9, "retention_index_bytes": 1e9},
+            legacy_row,
+        ])
+        self.assertEqual((weighting, legacy), ("per_index", 1))
+        self.assertAlmostEqual(days, 18650 / 1010, places=3)
+        # Every row at zero store: nothing to weight by, and none of them is a legacy row.
+        zero = {"retention_index_count": 4, "retention_index_days_sum": 180,
+                "retention_index_age_bytes": 0.0, "retention_index_bytes": 0.0}
+        self.assertEqual(index_retention_basis([zero])[1:], ("per_index", 0))
+        self.assertEqual(index_retention_basis([{"retention_days": 45}]), (None, None, 0))
+
+    def test_the_account_note_and_limit_say_when_the_mean_is_not_store_weighted(self):
+        acc = {
+            "deployments": {"active": {"month": "2026-10", "names": ["alpha", "beta"], "partial": False}},
+            "solutions": {"by_deployment": [
+                {"name": "alpha", "platform": "ech", "solution": "observability", "gb": 100, "ecu": 1},
+                {"name": "beta", "platform": "ech", "solution": "security", "gb": 20, "ecu": 1},
+            ], "totals": {"observability": {}, "security": {}, "search": {}}},
+            "sizing": {"consolidated": {"observability": {}, "security": {}, "search": {}}},
+            "storage": {"by_deployment": []},
+        }
+        rows = [
+            {"name": "alpha", "bulk_gb_day": 10, "retention_days": 15, "store_gb": 5,
+             "retention_index_count": 1000, "retention_index_days_sum": 15000,
+             "retention_index_age_bytes": 15e9, "retention_index_bytes": 1e9},
+            {"name": "beta", "bulk_gb_day": 2, "retention_days": 365, "store_gb": 4,
+             "retention_index_count": 10, "retention_index_days_sum": 3650},
+        ]
+        out = apply_diagnostics(acc, rows)
+        self.assertEqual(out["meta"]["retention_index_weighting"], "per_index")
+        notes = out["sizing"]["notes"]
+        self.assertTrue(any("not store-weighted" in n for n in notes))
+        self.assertFalse(any(n.startswith("Store-weighted retention") for n in notes))
+        codes = [r["code"] for r in out["sizing"]["diagnostics"]["estimation_limits"]]
+        self.assertIn("retention_unweighted", codes)
+        rows[1].update({"retention_index_age_bytes": 365 * 4e9, "retention_index_bytes": 4e9})
+        again = apply_diagnostics(acc, rows)
+        self.assertEqual(again["meta"]["retention_index_weighting"], "store_weighted")
+        self.assertNotIn("retention_unweighted", [r["code"] for r in again["sizing"]["diagnostics"]["estimation_limits"]])
+
     def test_account_weight_uses_measured_rows_only(self):
         acc = {
             "deployments": {"active": {"month": "2026-10", "names": ["alpha", "beta", "gamma"], "partial": False}},
@@ -190,7 +264,7 @@ class RetentionTests(unittest.TestCase):
         observability = out["sizing"]["consolidated"]["observability"]
         search = out["sizing"]["consolidated"]["search"]
         security = out["sizing"]["consolidated"]["security"]
-        self.assertEqual(observability["retention_months"], 12)   # no index counts: stay at 12, not the measured age
+        self.assertEqual(observability["retention_months"], 1)   # no index counts: the measured age (0.042 days) rounds up to 1
         self.assertEqual(observability["stored_gb"], 9.0)
         self.assertEqual(out["sizing"]["diagnostics"]["retention_unmeasured"], [
             {"name": "beta", "bulk_gb_day": 10.0},
@@ -202,8 +276,9 @@ class RetentionTests(unittest.TestCase):
         rows[0]["retention_days"] = None
         bare = apply_diagnostics(acc, rows)
         block = bare["sizing"]["consolidated"]["observability"]
-        # A one-year estimate does not need a measured age: bulk with none is still written at 12 months.
-        self.assertEqual(block["retention_months"], 12)
+        # No retention can be ascertained: bulk with no measured age is written at the 30-day default, 1 month.
+        self.assertEqual(block["retention_months"], 1)
+        self.assertEqual(bare["meta"]["retention_month_basis"], "fallback_30d")
         self.assertNotIn("retention_months_measured", block)
         self.assertFalse(block["retention_unmeasured"])
 
@@ -629,12 +704,13 @@ class MeasuredMixTests(unittest.TestCase):
         blk = apply_diagnostics(acc, [row])["sizing"]["consolidated"]["observability"]
         self.assertEqual((blk["logs_gb_day"], blk["metrics_gb_day"], blk["traces_gb_day"]), (70.0, 25.0, 5.0))
         self.assertEqual((blk["k8s_logs_share"], blk["mix_basis"]), (0.1, "measured"))
-        self.assertEqual((blk["retention_months"], blk["retention_months_metrics"]), (12, 12))   # every estimate is one year, measured ages aside
+        # No index was counted, so the measured 30-day delete age is the month. TSDS metrics take the same month.
+        self.assertEqual((blk["retention_months"], blk["retention_months_metrics"]), (1, 1))
         old = apply_diagnostics(acc, [{"name": "a", "bulk_gb_day": 100.0, "store_gb": 50, "retention_days": 30}])
         blk = old["sizing"]["consolidated"]["observability"]
         self.assertIsNone(blk["mix_basis"])
         self.assertIn("not given a split", " ".join(old["sizing"]["notes"]))
-        self.assertEqual(blk["retention_months"], 12)
+        self.assertEqual(blk["retention_months"], 1)
 
     def test_metered_basis_writes_option_1_and_leaves_option_2_at_zero(self):
         from size_serverless import observability_input_cells

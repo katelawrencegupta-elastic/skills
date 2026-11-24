@@ -435,7 +435,9 @@ class PreflightTests(unittest.TestCase):
     def test_the_virtualenvs_are_checked(self):
         rows = self._rows()
         self.assertIn("Sheets venv", rows)
-        self.assertIn("es3 estimator", rows)
+        # Search is priced on the Search estimator sheet. The es3 notebook is checked only for --search-notebook.
+        self.assertNotIn("es3 estimator", rows)
+        self.assertIn("es3 estimator", self._rows(search_notebook=True))
 
     def test_print_preflight_reports_failure(self):
         import contextlib
@@ -917,13 +919,20 @@ class PhaseGuardTests(unittest.TestCase):
         self.assertNotIn("warning", row)
         self.assertIn("--retention-days", row["detail"])
 
-    def test_the_12_month_fallback_warns_and_does_not_fail_the_quote(self):
-        row = self._retention_month(index_count=None)
+    def test_the_30_day_fallback_warns_and_does_not_fail_the_quote(self):
+        row = self._retention_month(index_count=None, months=1, basis="fallback_30d")
         self.assertTrue(row["passed"])
         self.assertTrue(row["warning"])
         self.assertEqual(row["score"], 0.0)
-        self.assertIn("12-month default", row["detail"])
+        self.assertIn("30-day default (1 month)", row["detail"])
         self.assertIn("still produced", row["detail"])
+
+    def test_a_measured_delete_age_without_index_counts_is_a_measured_month(self):
+        row = self._retention_month(index_count=None, months=4, basis="measured_age")
+        self.assertTrue(row["passed"])
+        self.assertEqual(row["score"], 1.0)
+        self.assertNotIn("warning", row)
+        self.assertIn("delete age the bundles measured", row["detail"])
 
     def test_the_retention_month_is_not_applicable_without_bulk_or_on_the_k360_backup(self):
         self.assertIsNone(self._retention_month(has_bulk=False)["passed"])
@@ -939,15 +948,36 @@ class PhaseGuardTests(unittest.TestCase):
             "sizing": {"consolidated": {}},
             "storage": {},
         }
-        # A bundle parsed before the index fields existed: bulk, but no index retention count.
-        rows = [{"name": "A", "bulk_gb_day": 5.0, "store_gb": 10.0, "retention_days": 30.0,
+        # Bulk, but no index retention count and no measured delete age: nothing to ascertain retention from.
+        rows = [{"name": "A", "bulk_gb_day": 5.0, "store_gb": 10.0, "retention_days": None,
                  "bulk_mix": {"logs": 5.0, "k8s_logs": 0.0, "metrics": 0.0, "traces": 0.0}}]
         out = apply_diagnostics(acc, rows)
         limits = (out["sizing"].get("diagnostics") or {}).get("estimation_limits") or []
         hit = next(row for row in limits if row.get("code") == "retention_month_fallback")
         self.assertEqual(hit["severity"], "high")
-        self.assertEqual(hit["months"], 12)
-        self.assertTrue(any("12-month default" in str(note) for note in out["sizing"].get("notes") or []))
+        self.assertEqual((hit["months"], hit["days"]), (1, 30.0))
+        self.assertEqual(out["meta"]["estimate_months"], 1)
+        self.assertEqual(out["meta"]["retention_month_basis"], "fallback_30d")
+        self.assertEqual(out["sizing"]["consolidated"]["observability"]["retention_months"], 1)
+        self.assertTrue(any("30-day default" in str(note) for note in out["sizing"].get("notes") or []))
+
+    def test_a_measured_delete_age_is_used_when_no_index_was_counted(self):
+        from diag_account import apply_diagnostics
+        acc = {
+            "meta": {},
+            "solutions": {"by_deployment": [{"name": "A", "solution": "observability", "gb": 10.0, "ecu": 100.0}]},
+            "sizing": {"consolidated": {}},
+            "storage": {},
+        }
+        # A bundle parsed before the index fields existed: bulk and a measured delete age, no index count.
+        rows = [{"name": "A", "bulk_gb_day": 5.0, "store_gb": 10.0, "retention_days": 120.0,
+                 "bulk_mix": {"logs": 5.0, "k8s_logs": 0.0, "metrics": 0.0, "traces": 0.0}}]
+        out = apply_diagnostics(acc, rows)
+        limits = (out["sizing"].get("diagnostics") or {}).get("estimation_limits") or []
+        self.assertFalse(any(row.get("code") == "retention_month_fallback" for row in limits))
+        self.assertEqual(out["meta"]["retention_month_basis"], "measured_age")
+        self.assertEqual(out["meta"]["estimate_months"], 4)
+        self.assertEqual(out["sizing"]["consolidated"]["observability"]["retention_months"], 4)
 
     def test_a_counted_index_average_raises_no_fallback_limit(self):
         from diag_account import apply_diagnostics

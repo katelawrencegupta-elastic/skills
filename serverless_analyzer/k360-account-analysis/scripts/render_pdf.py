@@ -365,6 +365,19 @@ def caption(text: str) -> str:
     return f"<div class='cap'>{esc(text)}</div>"
 
 
+def search_on_notebook(acc: dict) -> bool:
+    """True only when the run priced Search with --search-notebook. The Search estimator sheet is the default."""
+    est = (((acc.get("sizing") or {}).get("estimators") or {}).get("search")) or {}
+    return est.get("search_path") == "notebook"
+
+
+def search_source_text(acc: dict) -> str:
+    """How the report names the Search price, from the engine the run used."""
+    if search_on_notebook(acc):
+        return "the es3 notebook's performant total"
+    return "the performant total (G110) on the Search estimator sheet"
+
+
 def estimator_label(text) -> str:
     """Plain name for a pricing source. Internal keys such as es3-estimator stay in the data."""
     low = str(text or "").strip().lower()
@@ -496,7 +509,7 @@ def _axis_lines(cat: str) -> list[str]:
 
 def bar_chart(categories: list[str], series: list[tuple[str, list[float]]], *, stacked: bool = False, width: int = 640, height: int = 230,
               ref: tuple[float, str] | None = None, show_values: bool = False, prefix: str = "", colors: list[str] | None = None, exact_values: bool = False,
-              sublabels: list[str] | None = None) -> str:
+              sublabels: list[str] | None = None, flat: bool = False) -> str:
     colors = colors or PALETTE
     dx, dy = 9.0, 6.0
     wrapped = [_axis_lines(c) for c in categories]
@@ -523,12 +536,12 @@ def bar_chart(categories: list[str], series: list[tuple[str, list[float]]], *, s
     slot = w / n
     groups = 1 if stacked else max(len(series), 1)
     bw = slot * 0.72 / groups
-    depth = min(dx, max(4.0, bw * 0.28))
+    depth = 0.0 if flat else min(dx, max(4.0, bw * 0.28))
     rise = depth * dy / dx
     for i, cat in enumerate(categories):
         x0 = pl + slot * i + slot * 0.12
         if stacked:
-            face = max(slot * 0.58 - depth, 8)
+            face = max(slot * (0.62 if flat else 0.58) - depth, 8)
             base = 0.0
             drawn: list[tuple[float, float, float, str, bool]] = []
             for j, (_, vals) in enumerate(series):
@@ -543,7 +556,13 @@ def bar_chart(categories: list[str], series: list[tuple[str, list[float]]], *, s
                 y, bh, v, fill, _ = drawn[-1]
                 drawn[-1] = (y, bh, v, fill, True)
             for y, bh, _v, fill, cap in drawn:
-                out.append(_vbar3d(x0, y, face, bh, fill, dx=depth, dy=rise, cap=cap))
+                if flat:
+                    out.append(f"<rect x='{x0:.1f}' y='{y:.1f}' width='{face:.1f}' height='{max(bh, 0.5):.1f}' fill='{fill}' stroke='#FFFFFF' stroke-width='1.5'/>")
+                    if bh >= 17 and face >= 56:
+                        ink = "#343741" if fill.upper() in ("#C9CED6", "#48A0FF", "#F5A700", "#00BFB3") else "#FFFFFF"
+                        out.append(f"<text x='{x0 + face / 2:.1f}' y='{y + bh / 2 + 4:.1f}' text-anchor='middle' fill='{ink}' font-size='11' font-weight='600'>{lab(_v)}</text>")
+                else:
+                    out.append(_vbar3d(x0, y, face, bh, fill, dx=depth, dy=rise, cap=cap))
             if show_values and base:
                 out.append(f"<text x='{x0 + face / 2:.1f}' y='{pt + h - h * base / vmax - rise - 4:.1f}' text-anchor='middle' fill='#343741' font-weight='700'>{lab(base)}</text>")
             lx = x0 + face / 2
@@ -2323,7 +2342,9 @@ def search_power_section(acc: dict, *, new_page: bool = True) -> str:
             ["success" if str(p.get("Search Power Setting")) == "performant" else None for p in profiles],
         )
         body += bullets([
-            "On-demand, performant, and high availability are the three search-power settings. High availability is the notebook's third band: it keeps the most search capacity ready.",
+            "On-demand, performant, and high availability are the three search-power settings, read from "
+            + ("the es3 notebook" if search_on_notebook(acc) else "columns F, G and H of the Search estimator sheet")
+            + ". High availability keeps the most search capacity ready.",
             f"The bars use {stored_bit}, the measured query rate, and Premium support. They are not added to the Observability ingest quote.",
             "Y: dollars per month. X: search power.",
         ])
@@ -2466,7 +2487,7 @@ def _quote_window_rows(acc: dict) -> list[list]:
         elif name == "security":
             formula = "Security monthly is the E74 read-back. Quoted only when parsed E73 is 0."
         elif name == "search":
-            formula = "Search monthly is the es3 performant read-back."
+            formula = f"Search monthly is {search_source_text(acc)}."
         else:
             formula = "Estimator read-back."
         rows.append([f"{name.title()} monthly", formula, "Sheet read-back. Not recomputed here.", _formula_money(quote.get("total_mo"))])
@@ -3957,8 +3978,8 @@ def render_consolidation_html(acc: dict) -> str:
             f"Last {len(costs)} months of ECH spend vs. the {est_months}-month serverless estimate"
         )
         B.append(f"<h3>{heading}</h3>" + bar_chart(
-            m_cats, m_series, stacked=True, width=940, height=168, show_values=True, prefix="$", exact_values=True,
-            colors=chart_colors_m, sublabels=subs_m) + rate_label)
+            m_cats, m_series, stacked=True, width=940, height=250, show_values=True, prefix="$", exact_values=True,
+            colors=chart_colors_m, sublabels=subs_m, flat=True) + rate_label)
         if has_stay or has_grey:
             # The stack amounts go in a small table. Long sublabels under the bars ran into each other.
             head = ["Month", "Compared / serverless"] + (["Stays on ECH"] if has_stay else []) + (["Unvalidated"] if has_grey else []) + ["Total"]
@@ -4573,7 +4594,7 @@ def render_consolidation_html(acc: dict) -> str:
                     + bullets([
                         f"The headline was not matched to this sheet. The dominant solution is {dom_key}.",
                         "Quote the Observability sheet for that slice.",
-                        "Quote the es3-estimator performant figure for Search, not the storage-floor model.",
+                        f"Quote {search_source_text(acc)} for Search, not the storage-floor model.",
                         "Cells written: " + written,
                     ]) + "</div>")
         else:

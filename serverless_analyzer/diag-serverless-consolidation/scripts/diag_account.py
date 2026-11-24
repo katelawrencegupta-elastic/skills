@@ -24,7 +24,8 @@ import json
 import re
 from pathlib import Path
 
-from diag_inputs import ESTIMATE_MONTHS, index_retention_months, whole_months
+from diag_inputs import ESTIMATE_MONTHS, index_retention_basis, index_retention_months, retention_fallback_months, whole_months, written_retention_months
+from constants import RETENTION_FALLBACK_DAYS
 
 from constants import DAYS_PER_MONTH, RETENTION_ASSUMED_MAX_SHARE
 from serverless_regions import serverless_supports, us_alternative
@@ -125,17 +126,43 @@ def _rollup_solutions(out: dict, clamped_notes: list[str]) -> None:
     totals = (out.get("solutions") or {}).get("totals") or {}
     explicit_days = (out.get("meta") or {}).get("retention_days")
     index_months = None if explicit_days else index_retention_months(ech)
+    fallback_months = None
+    if explicit_days:
+        out.setdefault("meta", {})["retention_month_basis"] = "retention_days"
+    elif index_months is not None:
+        out.setdefault("meta", {})["retention_month_basis"] = "index_average"
+    else:
+        # No index was counted. Use the delete age the bundles did measure, and only when no
+        # retention could be ascertained at all, the 30-day default. Never a 12-month assumption.
+        fallback_months, basis = written_retention_months(
+            [{"retention_days": d.get("retention_days"), "daily_raw_gb": d.get("daily_raw_gb")} for d in ech]
+        )
+        meta = out.setdefault("meta", {})
+        meta["estimate_months"] = fallback_months
+        meta["retention_month_basis"] = basis
     if index_months is not None:
         count = sum(int(d.get("retention_index_count") or 0) for d in ech)
-        days = sum(float(d.get("retention_index_days_sum") or 0) for d in ech) / count
+        days, weighting, legacy = index_retention_basis(ech)
+        days = days or 0.0
         meta = out.setdefault("meta", {})
         meta["estimate_months"] = index_months
         meta["retention_index_days"] = round(days, 3)
         meta["retention_index_count"] = count
+        meta["retention_index_weighting"] = weighting
         unit = "month" if index_months == 1 else "months"
-        clamped_notes.append(
-            f"Average retention across {count:,} indexes is {days:.1f} days. The estimate prices {index_months} {unit}."
-        )
+        if weighting == "store_weighted":
+            clamped_notes.append(
+                f"Store-weighted retention across {count:,} indexes is {days:.1f} days. The estimate prices {index_months} {unit}."
+            )
+        else:
+            why = (
+                f"{legacy} bundle{'s' if legacy != 1 else ''} had no store weights"
+                if legacy else "no index had local primary store to weight by"
+            )
+            clamped_notes.append(
+                f"Retention is the plain mean across {count:,} indexes, {days:.1f} days, because {why}. "
+                f"It is not store-weighted. The estimate prices {index_months} {unit}."
+            )
     for sol in ("observability", "security", "search"):
         blk = dict(con.get(sol) or {})
         group = [d for d in ech if (d.get("solution") or "search") == sol]
@@ -149,19 +176,16 @@ def _rollup_solutions(out: dict, clamped_notes: list[str]) -> None:
         weight_bulk = sum(rate for rate, _days in weighed)
         weighted = sum(rate * days for rate, days in weighed)
         measured = (weighted / weight_bulk / DAYS_PER_MONTH) if weight_bulk else None
-        # Index average, rounded up, unless --retention-days named a month. Otherwise 12.
+        # Index average, rounded up, unless --retention-days named a month. With no index age, 30 days.
         if explicit_days:
             written_months = int((out.get("meta") or {}).get("estimate_months") or ESTIMATE_MONTHS)
         elif index_months is not None:
             written_months = index_months
         else:
-            written_months = ESTIMATE_MONTHS
+            written_months = fallback_months
         written = written_months if daily != 0 else None
         if index_months is None and measured is not None and abs(written_months - measured) > 0.05:
-            if written_months == ESTIMATE_MONTHS:
-                clamped_notes.append(f"{sol} retention measures {measured:.1f} months. The estimate is a one-year estimate, so {ESTIMATE_MONTHS} is written to the estimator.")
-            else:
-                clamped_notes.append(f"{sol} retention measures {measured:.1f} months. The estimate prices {written_months} months.")
+            clamped_notes.append(f"{sol} retention measures {measured:.1f} months. The estimate prices {written_months} months.")
         blk["deployments"] = len(group)
         # Deployments that were actually sized: a matched bundle, or priced from K360 on request.
         blk["sized_deployments"] = sum(1 for d in group if d.get("ingest_source") == "diagnostics")
@@ -332,6 +356,11 @@ def apply_diagnostics(
             matched += 1
             dep["gb"] = round(float(hit.get("store_gb") or 0), 2)
             dep["daily_raw_gb"] = round(float(hit.get("bulk_gb_day") or 0), 3)
+            # What the Search workload needs from a measured bundle: the deployment id for the proxy logs,
+            # and the store bytes and documents that give the average document size.
+            dep["deployment_id"] = hit.get("id")
+            dep["store_bytes"] = int(hit.get("store_bytes") or 0)
+            dep["docs_count"] = int(hit.get("docs_count") or 0)
             dep.pop("compression_ratio", None)
             dep.pop("compressioncalc_accounted_for", None)
             snapshot_gb += float(hit.get("snapshot_gb") or 0)
@@ -378,6 +407,14 @@ def apply_diagnostics(
             if hit.get("retention_index_count"):
                 dep["retention_index_count"] = int(hit.get("retention_index_count") or 0)
                 dep["retention_index_days_sum"] = float(hit.get("retention_index_days_sum") or 0)
+                # Absent stays absent: a row from a bundle parsed before store weights existed must not
+                # look like a cluster with no local store.
+                if hit.get("retention_index_age_bytes") is not None:
+                    dep["retention_index_age_bytes"] = float(hit.get("retention_index_age_bytes") or 0)
+                    dep["retention_index_bytes"] = float(hit.get("retention_index_bytes") or 0)
+                else:
+                    dep.pop("retention_index_age_bytes", None)
+                    dep.pop("retention_index_bytes", None)
             dep["retention_basis"] = hit.get("retention_basis")
             dep["retention_label"] = hit.get("retention_label")
             dep["ingest_source"] = "diagnostics"
@@ -588,27 +625,39 @@ def apply_diagnostics(
     if unrated and unrated.get("indices"):
         limitations.append({"code": "unrated_ingest", "indices": unrated["indices"], "store_gb": unrated["store_gb"], "severity": "high"})
     # The written month is the index average. With no index counted it falls back to the
-    # 12-month default, and retention sets the estimator's retained-data ladder, so say so.
+    # 30-day default, and retention sets the estimator's retained-data ladder, so say so.
     meta_out = out.get("meta") or {}
     retention_fallback = bool(
-        bulk_sum > 0 and not meta_out.get("retention_days") and not meta_out.get("retention_index_count")
+        bulk_sum > 0 and meta_out.get("retention_month_basis") == "fallback_30d"
     )
     if retention_fallback:
         limitations.append({
             "code": "retention_month_fallback",
-            "months": ESTIMATE_MONTHS,
+            "months": retention_fallback_months(),
+            "days": RETENTION_FALLBACK_DAYS,
             "detail": (
                 f"No index retention age was counted, so every Observability and Security sheet was written at the "
-                f"{ESTIMATE_MONTHS}-month default instead of the average retention across indexes. Retention sets the "
-                "estimator's retained-data ladder, so that month is an assumption, not a measurement."
+                f"{RETENTION_FALLBACK_DAYS:g}-day default ({retention_fallback_months()} month) instead of the average "
+                "retention across indexes. Retention sets the estimator's retained-data ladder, so that month is an "
+                "assumption, not a measurement."
             ),
             "severity": "high",
+        })
+    if meta_out.get("retention_index_weighting") == "per_index":
+        limitations.append({
+            "code": "retention_unweighted",
+            "detail": (
+                f"The written retention month is the plain mean across {meta_out.get('retention_index_count'):,} indexes "
+                f"({meta_out.get('retention_index_days')} days), not weighted by store, so many small short-lived indexes "
+                "count as much as a large long-lived one."
+            ),
+            "severity": "medium",
         })
     coverage["source_precedence"] = source_precedence
     coverage["estimation_limits"] = limitations
     notes = [
         "Ingest GB/day is the write-index sum of index.primaries.bulk.est_bytes_per_day from the Elasticsearch diagnostic bundle. "
-        "The month written to the estimator is the unweighted average retention across indexes with local primary store, rounded up to a whole month. Each index is aged by its ILM delete policy, else its data-stream retention, else 30 days. The size-weighted age stays a record and is not the written month. "
+        "The month written to the estimator is the store-weighted average retention across indexes with local primary store, rounded up to a whole month. Each index is aged by its ILM delete policy, else its data-stream retention, else 30 days. The bulk-weighted delete age stays a record. "
         "Those two are summed by solution and by region. Search disk and the Search ingest-share denominator use diagnostic local store only; K360 stored sizes are excluded from the diagnostic estimate. "
         "Search query rates use exact-window Cloud Tracker index telemetry. ECH ECU stays the K360 bill.",
     ]
@@ -671,8 +720,9 @@ def apply_diagnostics(
         notes.append("No delete policy or data-stream retention was available for some local store; its retention uses the 30-day assumed default.")
     if retention_fallback:
         notes.append(
-            f"No index retention age was counted, so the estimate prices the {ESTIMATE_MONTHS}-month default. "
-            "The written month is normally the unweighted average retention across indexes, rounded up to a whole month."
+            f"No index retention age was counted, so the estimate prices the {RETENTION_FALLBACK_DAYS:g}-day default "
+            f"({retention_fallback_months()} month). "
+            "The written month is normally the store-weighted average retention across indexes, rounded up to a whole month."
         )
     restart_gb = sum(float(r.get("bulk_restart_gb_day") or 0) for r in rows if r.get("name") in used and r.get("name") not in skipped_bundles)
     if restart_gb > 0 and bulk_sum > 0 and restart_gb / bulk_sum > 0.05:

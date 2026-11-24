@@ -236,7 +236,7 @@ def ingest_workloads(workload: dict, assumptions: list[str]) -> list[dict]:
     telemetry = (workload or {}).get("quote_window_telemetry") or {}
     if telemetry.get("status") != "complete":
         raise ValueError(
-            "Search estimate requires Cloud Tracker index telemetry covering the exact billed quote window: "
+            "Search estimate requires measured workload for this project: "
             + str(telemetry.get("reason") or "quote-window telemetry was not verified")
         )
     dps = ingest.get("docs_per_sec")

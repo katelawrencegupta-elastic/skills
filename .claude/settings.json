@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(/opt/homebrew/bin/python3 -m unittest test_diag_quote.RetentionAndRestartTests test_diag_quote.UnmeasuredDeploymentTests)"
+    ]
+  }
+}

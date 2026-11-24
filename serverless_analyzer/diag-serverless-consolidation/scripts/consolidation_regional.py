@@ -11,6 +11,7 @@ from consolidation_scope import (
     BILLING_WINDOW_MIN_SHARE, ESTIMATE_MONTHS, _clear_components, _money, _stash_model,
     e73_blocks_quote, ingest_echo, integrity_score, region_match_how, unpriced_reason,
 )
+from search_inputs import exact_inputs
 
 def es3_estimator_python() -> str:
     """Interpreter the es3 notebook library runs under."""
@@ -60,6 +61,15 @@ def _es3_region(payload: dict, failures: list[dict] | None = None) -> dict | Non
     except json.JSONDecodeError:
         failed("es3_estimator_failed", "the es3 estimator returned output that is not JSON, so a Search region was not re-estimated.")
         return None
+
+
+def search_path(acc: dict) -> str:
+    """'sheet' or 'notebook': the engine every Search figure in this run comes from.
+
+    The size step records it on the Search estimator. Only `--search-notebook` makes it the notebook.
+    """
+    est = (((acc.get("sizing") or {}).get("estimators") or {}).get("search")) or {}
+    return "notebook" if est.get("search_path") == "notebook" else "sheet"
 
 
 def _saved_projects(acc: dict) -> dict:
@@ -117,6 +127,34 @@ def regional_quote(
             "pricing": str(rejected[0].get("own_pricing") or "rejected"),
             "rows": priced,
         }
+    unquoted = [row for row in classified if row.get("kind") == "unquoted"]
+    if unquoted:
+        # A Search region with no sheet read-back is left out and the rest are priced from their own
+        # read-backs. It never takes a stored-GB share of a price it did not get, and it does not
+        # zero the regions that did price.
+        own = [row for row in classified if row.get("kind") == "own"]
+        priced = []
+        for row in classified:
+            item = dict(row)
+            if row.get("kind") == "own":
+                item["monthly"] = row.get("own_monthly")
+                item["monthly_unrounded"] = row.get("own_monthly")
+                item["sizing_monthly"] = row.get("own_monthly")
+                item["pricing"] = row.get("own_pricing") or "sheet read-back"
+                item["annual_year1"] = row.get("own_annual")
+                item["annual_steady_state"] = row.get("own_steady")
+            else:
+                item["monthly"] = None
+                item["monthly_unrounded"] = None
+                item["sizing_monthly"] = None
+                item["annual_year1"] = None
+                item["annual_steady_state"] = None
+                item["pricing"] = row.get("own_pricing") or "not quoted — no read-back"
+            priced.append(item)
+        if not own:
+            return {"mode": "unquoted", "total_mo": 0.0, "total_yr": 0.0, "pricing": None, "rows": priced}
+        total = round(sum(float(p.get("monthly") or 0) for p in priced), 2)
+        return {"mode": "per_region", "total_mo": total, "total_yr": round(total * 12, 2), "pricing": None, "rows": priced}
     complete = bool(classified) and all(row.get("kind") == "own" for row in classified)
     if complete:
         priced = []
@@ -168,6 +206,24 @@ def regional_quote(
     }
 
 
+def _mark_search_unquoted(acc: dict, classified: list[dict]) -> None:
+    """Flag the deployments of a Search region that got no read-back.
+
+    The ECH side of a `priced` comparison reads this flag (`unpriced_reason`), so a region that is not
+    in the quote is not on the ECH side either, and the Priced share check sees it.
+    """
+    names = {
+        str(name)
+        for row in classified if row.get("kind") == "unquoted"
+        for name in (row.get("deployments") or [])
+    }
+    if not names:
+        return
+    for dep in (acc.get("solutions") or {}).get("by_deployment") or []:
+        if isinstance(dep, dict) and str(dep.get("name")) in names:
+            dep["search_unquoted"] = True
+
+
 def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes: list[str]) -> bool:
     """One serverless project per solution per region. Each project uses its own sizing when one was written.
     """
@@ -185,6 +241,7 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
     workload = search_slice.get("workload") or acc.get("workload") or {}
     support = ((acc.get("sizing") or {}).get("support_tier")) or "Premium"
     saved = _saved_projects(acc)
+    search_notebook = search_path(acc) == "notebook"
     store_split = False
     regional_quoted = False
     profile_keys = ("Total $/month", "Provisioned Search VCU/h", "Idle Search VCU/h", "Search $/month", "Ingest $/month", "Storage $/month", "Support $/month")
@@ -218,21 +275,35 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                         "region_match": saved_hit.get("region_match"), "url": saved_hit.get("url"),
                     })
                     continue
-                result = {"readback": saved_rb, "profiles": saved_hit.get("profiles"), "region_match": saved_hit.get("region_match")} if _money(saved_rb.get("monthly_steady_state")) is not None else _es3_region({
-                    "stored_gb": g["stored_gb"],
-                    "org_stored_gb": org_gb,
-                    "provider": group_provider(acc, g.get("deployments"), provider),
-                    "region": g["region"],
-                    "support_tier": support,
-                    "workload": workload,
-                }, es3_failures)
+                if _money(saved_rb.get("monthly_steady_state")) is not None:
+                    result = {"readback": saved_rb, "profiles": saved_hit.get("profiles"), "region_match": saved_hit.get("region_match")}
+                elif search_notebook:
+                    result = _es3_region({
+                        "stored_gb": g["stored_gb"],
+                        "org_stored_gb": exact_inputs(workload, g["region"], g["stored_gb"], org_gb)[1],
+                        "provider": group_provider(acc, g.get("deployments"), provider),
+                        "region": g["region"],
+                        "support_tier": support,
+                        "workload": exact_inputs(workload, g["region"], g["stored_gb"], org_gb)[0],
+                    }, es3_failures)
+                else:
+                    # The Search estimator sheet is the only Search price. A region with no sheet read-back is
+                    # left unquoted, never re-priced on the notebook library.
+                    result = None
+                    notes.append(f"Search {g['region']} has no read-back from its Search estimator sheet, so that region was not quoted.")
                 rb = (result or {}).get("readback") or {}
                 monthly = _money(rb.get("monthly_steady_state"))
                 classified.append({
                     "region": g["region"], "stored_gb": g["stored_gb"],
                     "retention_months": source_months,
-                    "kind": "own" if monthly is not None else "missing",
-                    "own_monthly": monthly, "own_pricing": "re-estimated performant",
+                    "kind": "own" if monthly is not None else ("missing" if search_notebook else "unquoted"),
+                    "own_monthly": monthly,
+                    "deployments": g.get("deployments"),
+                    "own_pricing": (
+                        "es3 notebook performant" if search_notebook
+                        else "Search sheet performant (G110)" if monthly is not None
+                        else "not quoted — no Search sheet read-back"
+                    ),
                     "own_annual": _money(rb.get("annual_year1")),
                     "own_steady": _money(rb.get("annual_steady_state")),
                     "search_mo": _money(rb.get("search_monthly")),
@@ -322,7 +393,14 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
         )
         blk["by_region"] = quote["rows"]
         blk["regional_mode"] = quote["mode"]
-        if quote["mode"] == "rejected":
+        if sol == "search" and quote["mode"] in ("per_region", "unquoted"):
+            _mark_search_unquoted(acc, classified)
+        if quote["mode"] == "unquoted":
+            blk["pricing"] = "omitted — no Search region had a read-back"
+            blk["total_mo"] = 0.0
+            blk["total_yr"] = 0.0
+            notes.append("Search was left out of the quote because no region had a read-back from its Search estimator sheet.")
+        elif quote["mode"] == "rejected":
             blk["pricing"] = quote["pricing"]
             blk["total_mo"] = 0.0
             blk["total_yr"] = 0.0
@@ -737,9 +815,11 @@ def _integrity(acc: dict, sz: dict, by_solution: dict, quotes: list[dict], headl
             "index_count": (acc.get("meta") or {}).get("retention_index_count"),
             "index_days": (acc.get("meta") or {}).get("retention_index_days"),
             "explicit_days": (acc.get("meta") or {}).get("retention_days"),
+            "basis": (acc.get("meta") or {}).get("retention_month_basis"),
             "has_bulk": float((coverage or {}).get("bulk_gb_day") or 0) > 0,
         },
         "eis": (by_solution.get("search") or {}).get("eis_data_status"),
+        "search_regions": (by_solution.get("search") or {}).get("by_region") or [],
         "solutions": [
             {
                 "solution": sol,

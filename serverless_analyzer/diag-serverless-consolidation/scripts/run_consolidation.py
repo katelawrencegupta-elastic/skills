@@ -256,9 +256,11 @@ def preflight(args, *, network: bool = True) -> list[dict]:
     py = _sheets_py()
     row("Sheets venv", py.is_file(), str(py) if py.is_file() else f"missing at {py} — no estimator copy can be filled (references/setup.md)")
 
-    from consolidation_regional import es3_estimator_missing, es3_estimator_python
-    gone = es3_estimator_missing()
-    row("es3 estimator", gone is None, es3_estimator_python() if gone is None else f"missing at {gone} — Search regions cannot be re-estimated")
+    # Search is priced on the Search estimator sheet. The es3 notebook is needed only for --search-notebook.
+    if getattr(args, "search_notebook", False):
+        from consolidation_regional import es3_estimator_missing, es3_estimator_python
+        gone = es3_estimator_missing()
+        row("es3 estimator", gone is None, es3_estimator_python() if gone is None else f"missing at {gone} — --search-notebook cannot price Search")
 
     reuse = getattr(args, "reuse", None)
     if reuse:
@@ -362,6 +364,8 @@ def _estimator_flags(args) -> list[str]:
         flags.append("--fresh")
     if getattr(args, "allow_nearest_region", False):
         flags.append("--allow-nearest-region")
+    if getattr(args, "search_notebook", False):
+        flags.append("--search-notebook")
     return flags
 
 
@@ -623,10 +627,11 @@ def chat_lines(brief: dict) -> list[str]:
 
     links = brief.get("links") or {}
     shown = [links.get("drive")] if links.get("drive") else []
-    for entry in (links.get("pdfs") or {}).values():
-        if isinstance(entry, dict) and entry.get("drive_url"):
-            shown.append(entry["drive_url"])
-    tail_lines = ["Links: " + " ".join(shown[:2])] if shown else []
+    # The consolidation PDF is the deliverable. The account PDF and the appendix are not linked here.
+    cons_pdf = (links.get("pdfs") or {}).get("consolidation")
+    if isinstance(cons_pdf, dict) and (cons_pdf.get("drive_url") or cons_pdf.get("pdf")):
+        shown.append(cons_pdf.get("drive_url") or cons_pdf.get("pdf"))
+    tail_lines = ["Links: " + " ".join(shown)] if shown else []
 
     limits = [row for row in (brief.get("limits") or []) if isinstance(row, dict)]
     rank = {"high": 0, "medium": 1, "low": 2}
@@ -848,37 +853,22 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
     # account report's usual 21-day workload sample cannot stand in for a
     # different billing window.
     try:
-        org_root = find_skill("k360-org-report", HERE)
-        org_scripts = scripts_dir(org_root)
-        if str(org_scripts) not in sys.path:
-            sys.path.insert(0, str(org_scripts))
-        from fetch_org import es_base_and_key, fetch_workload
+        # Search traffic is read from the service proxy request logs for each region's own Search deployments,
+        # and ingest from the diagnostic bundles, so no workload is scaled by a store share.
+        import search_inputs
 
-        quote_days = int((diag.get("ecu") or {}).get("quote_lookback_days") or 0)
-        labels, _ = billed_series(diag.get("ecu") or {})
-        quote_labels = labels[-quote_days:] if quote_days else []
-        if not quote_labels or len(quote_labels) != quote_days:
-            raise ValueError("the billed quote window has no complete daily date range")
-        avg_doc_bytes = (((diag.get("workload") or {}).get("ingest") or {}).get("avg_doc_bytes"))
-        base, key = es_base_and_key(env)
-        # A large fleet's 90-day index scan is many calls. Each attempt is bounded and a failure
-        # is retried, and only one run at a time fetches so parallel runs do not starve each other.
-        def _fetch_quote_window():
-            return fetch_workload(
-                base, key, org_ids, avg_doc_bytes,
-                telemetry_start=quote_labels[0], telemetry_end=quote_labels[-1],
-            )
-
-        with telemetry_lock((Path(args.artifacts_root) if getattr(args, "artifacts_root", None) else artifacts_root()) / ".telemetry.lock"):
-            fetched = {"value": fetch_with_budget(_fetch_quote_window)}
-        diag["workload"] = fetched["value"]
+        base, key = search_inputs.settings(env)
+        fetched = search_inputs.regional_workloads(diag, base, key, days=int(getattr(args, "proxy_days", 7) or 7))
+        diag["workload"] = fetched
         (diag.get("sizing") or {}).get("consolidated", {}).setdefault("search", {})["workload"] = diag["workload"]
+        for region, why in (fetched.get("errors") or {}).items():
+            note_limit(diag, "search_proxy_workload_missing", f"Search in {region} was left unquoted: {why}")
     except (Exception, SystemExit) as ex:
         failed_workload = diag.setdefault("workload", {})
         failed_workload["quote_window_fetch_error"] = str(ex)
         failed_workload["quote_window_telemetry"] = {
             "status": "incomplete",
-            "reason": f"Cloud Tracker quote-window telemetry fetch failed: {ex}",
+            "reason": f"proxy-log Search workload failed: {ex}",
         }
         (diag.get("sizing") or {}).get("consolidated", {}).setdefault("search", {})["workload"] = failed_workload
     apply_quote_lookback(diag, args.lookback_days)
@@ -891,6 +881,9 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
     extra = ["--sizing-json", "sizing.json", "--force-months", str(written_months)]
     if args.fresh:
         extra.append("--fresh")
+    if getattr(args, "search_notebook", False):
+        # The projects and deployment-plan steps reuse `extra`, so the flag has to ride on it.
+        extra.append("--search-notebook")
     if py.is_file():
         cmd = [str(py), str(HERE / "size_serverless.py"), "--account-json", str(diag_path), *extra]
         if args.xlsx:

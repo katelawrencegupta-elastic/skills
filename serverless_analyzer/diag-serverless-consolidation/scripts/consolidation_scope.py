@@ -154,6 +154,10 @@ def apply_quote_lookback(acc: dict, days: int = 90) -> float:
     ecu["quote_usage_factor"] = round(factor, 6)
     ecu["quote_ingest_factor"] = round(ingest_factor, 6)
     workload = acc.get("workload") or {}
+    if workload.get("source") == "service-proxy-requests":
+        # Proxy-log traffic is measured over its own recent window and says so in quote_window_telemetry.
+        # The billed quote window does not apply to it.
+        return float(ecu["quote_usage_factor"])
     quote_days = ecu.get("quote_lookback_days")
     telemetry_days = int(workload.get("window_days") or 0)
     telemetry_start = workload.get("window_start")
@@ -275,6 +279,8 @@ def unpriced_reason(dep: dict, by_solution: dict, diagnostic: bool) -> str | Non
         return "decommissioned, not in the admin console"
     if src == "active_no_bundle":
         return "no diagnostic bundle"
+    if dep.get("search_unquoted"):
+        return "its Search region had no estimator read-back"
     blk = by_solution.get(sol) or {}
     if "quotable" not in str(blk.get("pricing") or ""):
         return f"{sol.title()} has no accepted estimator read-back"

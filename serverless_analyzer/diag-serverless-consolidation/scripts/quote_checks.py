@@ -316,12 +316,43 @@ def _retention_month_row(retention: dict | None) -> dict:
             "Retention month", 1.0, True,
             f"{months} months is the average retention across indexes, rounded up{measured}.",
         )
+    if retention.get("basis") == "measured_age":
+        return _integrity_row(
+            "Retention month", 1.0, True,
+            f"{months} months is the ingest-weighted delete age the bundles measured, rounded up. "
+            "No per-index count was in the bundles.",
+        )
+    unit = "month" if months == 1 else "months"
     row = _integrity_row(
         "Retention month", 0.0, True,
-        f"No index retention age was counted, so every sheet was written at the {months}-month default "
+        f"No retention could be ascertained, so every sheet was written at the 30-day default ({months} {unit}) "
         "instead of the index average. Retention sets the estimator's retained-data ladder. "
         "The quote is still produced.",
     )
+    row["warning"] = True
+    return row
+
+
+def _search_regions_row(regions: list[dict] | None) -> dict:
+    """Search regions left out of the quote because no Search sheet read-back came back.
+
+    A warning, not a fail: the other regions are priced from their own read-backs, and the Priced
+    share check still fails the quote when the missing region is a large part of the spend.
+    """
+    rows = [r for r in (regions or []) if isinstance(r, dict)]
+    left_out = [r for r in rows if r.get("kind") == "unquoted"]
+    if not rows or not left_out:
+        return _integrity_row("Search regions quoted", None, None, "Every Search region was quoted, or there is one region.")
+    total_gb = sum(float(r.get("stored_gb") or 0) for r in rows)
+    out_gb = sum(float(r.get("stored_gb") or 0) for r in left_out)
+    share = 1.0 - (out_gb / total_gb if total_gb > 0 else 1.0)
+    where = ", ".join(str(r.get("region")) for r in left_out)
+    detail = (
+        f"{len(rows) - len(left_out)} of {len(rows)} Search regions were quoted. {where} had no Search estimator "
+        f"read-back ({out_gb:,.1f} of {total_gb:,.1f} stored GB) and is not in the Search price or the ECH comparison. "
+        "The quote is still produced."
+    )
+    row = _integrity_row("Search regions quoted", share, True, detail)
     row["warning"] = True
     return row
 
@@ -785,7 +816,7 @@ def integrity_score(facts: dict) -> dict:
     The quote passes only when every scored check passes its own bar: 100% of
     the checks, whatever the mean is. One failed check fails the quote. Rate
     window, Counter age, Rated ingest, Region fidelity, Retention basis, and
-    Retention month warn and do not fail the quote: the first two when their
+    Retention month, and Search regions quoted warn and do not fail the quote: the first two when their
     share is above 25%, Rated ingest when unrated store is above 10%, Region
     fidelity when a sheet was written to a substitute region, Retention basis
     when more than 10% of bulk sits at the 30-day assumed age, and Retention
@@ -811,6 +842,7 @@ def integrity_score(facts: dict) -> dict:
         _year_row(list(facts.get("lines") or [])),
         _eis_completeness_row(facts.get("eis")),
         _region_fidelity_row(list(facts.get("written_regions") or [])),
+        _search_regions_row(facts.get("search_regions")),
         _quote_present_row(list(facts.get("solutions") or [])),
         _plan_consistency_row(facts.get("plan_consistency")),
         _share_limit_row("Rate window", coverage, "bulk_short_window_gb_day", RATE_WINDOW_MAX_SHARE, "rated over a short window", blocks_quote=False),

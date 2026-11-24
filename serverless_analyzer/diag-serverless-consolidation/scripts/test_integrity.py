@@ -225,6 +225,7 @@ class ReviewRegressionTests(unittest.TestCase):
         }
         row = {"name": "measured", "store_gb": 12, "bulk_gb_day": 2, "retention_days": 30,
                "retention_days_metrics": 10, "retention_index_count": 40, "retention_index_days_sum": 1200.0,
+               "retention_index_age_bytes": 30 * 12e9, "retention_index_bytes": 12e9,
                "bulk_mix": {"logs": 1.0, "k8s_logs": 0.2, "metrics": 0.5, "traces": 0.5}}
         out = apply_diagnostics(acc, [row])
         dep = out["solutions"]["by_deployment"][0]
@@ -847,6 +848,18 @@ class ReviewRegressionTests(unittest.TestCase):
         grey = sum(u["ecu_mo"] for u in cons["ech_scope"]["unpriced"] if u["reason"] == "no diagnostic bundle")
         after = cons["savings"]["serverless_mo"] + support["stays_on_ech_mo"] + grey
         self.assertIn(f">${after:,.0f}<", cover)
+
+    def test_chat_links_the_consolidation_pdf_not_the_account_pdf(self):
+        from run_consolidation import chat_lines
+        brief = {"savings": {"serverless_mo": 100}, "method": {},
+                 "integrity": {"passed": True, "confidence": {"band": "High", "score": 0.9}},
+                 "links": {"drive": "https://drive/folder", "pdfs": {
+                     "account": {"drive_url": "https://drive/account"},
+                     "consolidation": {"drive_url": "https://drive/consolidation"},
+                     "appendix": {"drive_url": "https://drive/appendix"}}}}
+        links = [line for line in chat_lines(brief) if line.startswith("Links:")][0]
+        self.assertIn("https://drive/consolidation", links)
+        self.assertNotIn("https://drive/account", links)
 
     def test_the_cover_shows_the_share_of_the_bill_that_is_compared(self):
         acc = scope_account(ech_scope="priced", keep_serverless_spend=False)

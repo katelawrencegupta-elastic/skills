@@ -4,7 +4,7 @@ description: >-
   Diagnostic-to-Serverless consolidation report for one Elastic Cloud account.
   Prices Observability and Security from Elasticsearch diagnostic bundles
   (measured bulk GB/day, retention the average across indexes rounded up to a whole month)
-  through the matching estimator read-back, and Search from local store on es3.
+  through the matching estimator read-back, and Search from local store and the service proxy request logs on the Search estimator sheet (the es3 notebook library behind `--search-notebook`).
   Produces one consolidation PDF at that month, with recent ECH spend on page 1,
   a deployment-count plan, per-cluster costs, a raw bulk ingest page, and an appendix.
   Triggers: diag consolidation, diagnostic bundles, serverless consolidation report,
@@ -33,7 +33,7 @@ python <skill>/scripts/run_consolidation.py --org "ORG NAME" \
   --org-id ID1 --org-id ID2 --org-id ID3
 ```
 
-`--exclude-deployment` removes a deployment from billing, bulk, store, counts, the plan, and every estimate. Monitoring-named deployments are excluded unless `--keep-monitoring` is set. Do not pass `--skip-diags`, `--skip-sizing`, or `--k360-ingest` unless the user asked for the K360 backup. `--lookback-days` defaults to 90 and cannot exceed 365. `--ech-scope priced` compares only deployments that received a serverless price. `--unmeasured exclude` leaves an active deployment with no bundle off both sides.
+`--exclude-deployment` removes a deployment from billing, bulk, store, counts, the plan, and every estimate. Monitoring-named deployments are excluded unless `--keep-monitoring` is set. Do not pass `--skip-diags`, `--skip-sizing`, or `--k360-ingest` unless the user asked for the K360 backup. `--lookback-days` defaults to 90 and cannot exceed 365. `--proxy-days` (default 7) sets how many complete UTC days of proxy request logs feed Search QPS, complexity and hour shares. Search needs `PROXY_LOGS_URL` and `PROXY_LOGS_API_KEY` in `.env` or the environment, and a region without proxy traffic is left unquoted. `--ech-scope priced` compares only deployments that received a serverless price. `--unmeasured exclude` leaves an active deployment with no bundle off both sides.
 
 ## Read the brief
 
@@ -49,7 +49,7 @@ When the scope is unavailable, page 1 compares `ech_recent_months_priced` (`comp
 
 ## Chat output contract
 
-`chat_lines` prints at most six bullets. Say "not verified" when the serverless monthly is missing, any integrity check failed, or the run is a draft. Otherwise give the serverless monthly. Then name every failed check. Then the top three `limits` by severity. Then the Drive and PDF links. Do not add a seventh bullet.
+`chat_lines` prints at most six bullets. Say "not verified" when the serverless monthly is missing, any integrity check failed, or the run is a draft. Otherwise give the serverless monthly. Then name every failed check. Then the top three `limits` by severity. Then the Drive folder and the consolidation PDF (not the account PDF or the appendix). Do not add a seventh bullet.
 
 ## Gates
 
@@ -60,17 +60,17 @@ Confirm these from the brief. Do not open the sheet.
 - Search stays on the quote when EIS is incomplete. The cover says Search is quoted without EIS, and inference billed on ECH is context, not a price.
 - A US deployment in a region Elastic Cloud Serverless is not offered in is quoted in the nearest offered region of the same provider, and the cover says the region changed (`region_support.swapped`). A deployment outside the US in such a region is not quoted. Its workload stays on ECH and is out of the comparison, and the cover and `region_support.stays_on_ech` say which deployments, which regions and what they bill. The supported regions are the Serverless regions page, read in `region_support.source_read`. A rejected region drops that whole solution, including Search. A region that is merely not on the estimator list is not rejected: it is priced at that provider's default and flagged, and `region_matches` in the brief says which region each sheet was written to.
 - `integrity.passed` is false when any scored check fails. Do not call a failed quote verified.
-- `integrity.confidence` is a different question: how much of the price was measured. Give the `band` (High, Moderate, Low) beside the monthly, and name `drivers` when it is not High. A quote can pass every check and still be Moderate. Rate window, Counter age, Rated ingest, Region fidelity, Retention basis and Retention month are warnings: they do not fail the quote, and `chat_lines` names them on their own line.
+- `integrity.confidence` is a different question: how much of the price was measured. Give the `band` (High, Moderate, Low) beside the monthly, and name `drivers` when it is not High. A quote can pass every check and still be Moderate. Rate window, Counter age, Rated ingest, Region fidelity, Search regions quoted, Retention basis and Retention month are warnings: they do not fail the quote, and `chat_lines` names them on their own line.
 - `ml_eis_carryover.monthly` is the ML-node ECU billed on ECH, carried to the serverless total as an EIS estimate (1 ECU = $1, before support). It is a placeholder, not an estimator read-back. `status` `incomplete` means none was carried and the serverless total is understated.
 - When the billing window is unstable, the comparison is the latest complete month. Do not call it a 3-month average.
 - When no serverless price came back, show the ECH bill and say there is no comparison.
 - Page 1 states the average retention across indexes and the whole month written to the estimator. That month is the headline.
-- When no index age was counted, the sheets take the 12-month default. The Retention month check warns, `limits` carries `retention_month_fallback`, and the month is an assumption. Say so rather than calling it measured.
+- When no index age was counted, the sheets take the delete age the bundles measured. When no retention can be ascertained at all, they take the 30-day default, written as month 1: the Retention month check warns, `limits` carries `retention_month_fallback`, and the month is an assumption. Say so rather than calling it measured.
 
 ## Hard rules
 
-1. Observability and Security ingest are diagnostic bulk, written as metered. The written month is the unweighted average retention across indexes with local primary store, rounded up to a whole month. Each index is aged by its ILM delete policy, else its data-stream retention, else 30 days. Search disk is not scaled by that month.
-2. The estimator read-back is the dollar: Observability D38, Security E74, Search the es3 performant profile.
+1. Observability and Security ingest are diagnostic bulk, written as metered. The written month is the store-weighted average retention across indexes with local primary store, rounded up to a whole month. Each index is aged by its ILM delete policy, else its data-stream retention, else 30 days. When no index was counted, the month is the ingest-weighted delete age the bundles measured, and when no retention can be ascertained at all, 30 days. Search disk is not scaled by that month.
+2. The estimator read-back is the dollar: Observability D38, Security E74, Search the performant total (G110) on the Search estimator sheet. Every Search figure in the report comes from Search sheet read-backs: the headline, each region, the deployment-count bars and the search-power profiles. `--search-notebook` switches all of them to the es3 notebook library together; the two are never mixed in one run.
 3. Match the estimator to the solution.
 4. One sheet per solution per region, at that month, with no second fleet-wide sheet and no second measured-retention sheet.
 5. Size the last 90 billed days unless `--lookback-days` says otherwise.

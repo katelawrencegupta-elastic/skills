@@ -49,6 +49,8 @@ DEFAULT_O11Y = "1tUdwJbTmd4helFOzEHMi_gpHw7qu_aCgprjlqmHh2hs"  # Observability e
 
 DEFAULT_SECURITY = "1b91Uoa2e4vBrep_7I4RoY_8Mr19poqaUgWl7LqhIOqY"
 
+DEFAULT_SEARCH = "13OdvASrBHTVqfe1VMdp8gXyHrMZ7cPeyvtKMK7A9VpY"  # Search Serverless Ballpark Pricing Estimator v2.3
+
 _SHEET_LABELS = frozenset({
     "Complete", "Essentials", "Enterprise", "Standard", "Premium",
     "Gold", "Platinum", "No", "Yes", "no", "N", "FALSE", "False",
@@ -62,6 +64,8 @@ _FORMULA_PREFIX = "=+-@"
 O11Y_TAB = "Observability Estimator"
 
 SEC_TAB = "Security Estimator"
+
+SEARCH_TAB = "Estimator"
 
 REF_TAB = "Estimator_Reference"
 
@@ -90,6 +94,13 @@ SEC_READBACK = {
     "support_monthly": "E69",
 }
 
+# Search v2.3. Columns F, G and H are on-demand, performant and high availability.
+SEARCH_READBACK = {
+    "region_valid": "C53",
+    **{f"{col}{row}": f"{col}{row}" for col in "FGH" for row in (89, 96, 98, 103, 104, 105, 106, 107, 109, 110)},
+    "F55": "F55", "F62": "F62", "F65": "F65",
+}
+
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
@@ -110,6 +121,10 @@ SEC_ADDON_CELLS = [
 from constants import DAYS_PER_MONTH, HOURS_PER_MONTH
 
 _ALLOW_NEAREST = False
+
+# Set by size_serverless from --search-notebook and --search-id. The regional worker threads read them.
+_SEARCH_NOTEBOOK = False
+_SEARCH_TEMPLATE_ID = DEFAULT_SEARCH
 
 ESTIMATE_FOLDER_NAME = "generated_estimates"
 

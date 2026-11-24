@@ -16,7 +16,7 @@ import json
 import math
 from pathlib import Path
 
-from constants import DAYS_PER_MONTH, ESTIMATE_MONTHS, HOURS_PER_MONTH, SECURITY_EXPANSION
+from constants import DAYS_PER_MONTH, ESTIMATE_MONTHS, HOURS_PER_MONTH, RETENTION_FALLBACK_DAYS, SECURITY_EXPANSION
 # First Observability ingest tier. A deployment under this, priced alone, never
 # leaves the top $/GB band. Pool those rows into one project.
 POOL_UNDER_GB_DAY = 50.0
@@ -45,16 +45,24 @@ def load_rows(path: Path) -> list[dict]:
 
 
 
-def index_retention_months(rows: list[dict]) -> int | None:
-    """Unweighted mean of index retention ages, rounded up to a whole month.
+def index_retention_basis(rows: list[dict]) -> tuple[float | None, str | None, int]:
+    """(days, weighting, unweighted rows): the mean index retention age and how it was weighted.
 
-    Each index with local primary store counts once. Its age is the ILM delete
-    age, else the data-stream retention, else the 30-day default. A deployment
-    carries the day-sum and the count so the mean is across indexes. None when
-    no index was counted.
+    Each index's age is the ILM delete age, else the data-stream retention, else the 30-day
+    default. Weighting by local primary store keeps a swarm of small short-lived indexes from
+    setting the month a large long-lived one is priced at.
+
+    `weighting` is `store_weighted` or `per_index`. A row that carries the store fields but no local
+    primary store (all searchable snapshots, say) has no weight to give and is left out of the
+    weighted mean without turning the weighting off. Only a row from a bundle parsed before store
+    weights existed, with no `retention_index_age_bytes` at all, makes the whole mean one vote per
+    index, and the third value counts those rows so the caller can say so. None when no index was counted.
     """
     total_days = 0.0
     count = 0
+    age_bytes = 0.0
+    nbytes = 0.0
+    legacy = 0
     for row in rows:
         try:
             n = int(row.get("retention_index_count") or 0)
@@ -67,9 +75,69 @@ def index_retention_months(rows: list[dict]) -> int | None:
         except (TypeError, ValueError):
             continue
         count += n
+        if row.get("retention_index_age_bytes") is None:
+            legacy += 1
+            continue
+        try:
+            ab = float(row.get("retention_index_age_bytes") or 0)
+            b = float(row.get("retention_index_bytes") or 0)
+        except (TypeError, ValueError):
+            continue
+        if b > 0:
+            age_bytes += ab
+            nbytes += b
     if count <= 0:
+        return None, None, 0
+    if legacy == 0 and nbytes > 0:
+        return age_bytes / nbytes, "store_weighted", 0
+    return total_days / count, "per_index", legacy
+
+
+def index_retention_days(rows: list[dict]) -> float | None:
+    """Mean index retention age in days. `index_retention_basis` also says how it was weighted."""
+    return index_retention_basis(rows)[0]
+
+
+def index_retention_months(rows: list[dict]) -> int | None:
+    """Store-weighted mean of index retention ages, rounded up to a whole month. None when no index was counted."""
+    days = index_retention_days(rows)
+    if days is None:
         return None
-    return whole_months((total_days / count) / DAYS_PER_MONTH)
+    return whole_months(days / DAYS_PER_MONTH)
+
+
+def written_retention_months(rows: list[dict]) -> tuple[int, str]:
+    """(whole month, basis) for the Observability and Security sheets when no month was named.
+
+    The index average when indexes were counted. Else the ingest-weighted delete age the bundles
+    measured (a bundle parsed before index counts existed carries only that). Else, when no
+    retention could be ascertained at all, the 30-day default.
+    """
+    index = index_retention_months(rows)
+    if index is not None:
+        return index, "index_average"
+    weight = 0.0
+    weighted = 0.0
+    for row in rows:
+        days = _measured_days(row.get("retention_days"))
+        if days is None:
+            continue
+        try:
+            rate = abs(float(row.get("bulk_gb_day", row.get("daily_raw_gb")) or 0))
+        except (TypeError, ValueError):
+            rate = 0.0
+        if rate <= 0:
+            continue
+        weight += rate
+        weighted += rate * days
+    if weight > 0:
+        return whole_months((weighted / weight) / DAYS_PER_MONTH), "measured_age"
+    return retention_fallback_months(), "fallback_30d"
+
+
+def retention_fallback_months() -> int:
+    """The whole month written when no index retention age could be counted: 30 days, so 1."""
+    return whole_months(RETENTION_FALLBACK_DAYS / DAYS_PER_MONTH)
 
 
 def whole_months(months: float) -> int:
@@ -160,9 +228,13 @@ def summarize(rows: list[dict], retention_months: int | None = None, *, basis: s
         weight += rate * days
     days = (weight / weight_bulk) if weight_bulk else None
     months = (days / DAYS_PER_MONTH) if days is not None else None
-    written = ESTIMATE_MONTHS if bulk else None
-    if retention_months is not None and bulk:
-        written = int(min(36, max(1, retention_months)))
+    # The month set by the caller, else the index average, else the 30-day fallback.
+    written = None
+    if bulk:
+        if retention_months is not None:
+            written = int(min(36, max(1, retention_months)))
+        else:
+            written = written_retention_months(rows)[0]
     o11y, _ignored = _cells(o11y_bulk, written if o11y_rows else None, mix, basis)
     _ignored, security = _cells(security_bulk, written if security_rows else None, mix, basis)
     short = [

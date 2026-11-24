@@ -83,7 +83,7 @@ def observability_fill(acc: dict, support: str, region, retention: int, daily: f
     """Observability cells from a measured mix.
 
     A forced month (--force-months) is written to both retention rows. Otherwise
-    TSDS metrics keep their own recorded age. The written month is 12.
+    TSDS metrics keep their own recorded age. The written month is the index average, else the measured delete age, else 30 days.
     """
     retention_metrics = None
     if mix and not forced and mix.get("metrics_retention_days"):
