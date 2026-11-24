@@ -127,6 +127,34 @@ def regional_quote(
             "pricing": str(rejected[0].get("own_pricing") or "rejected"),
             "rows": priced,
         }
+    unquoted = [row for row in classified if row.get("kind") == "unquoted"]
+    if unquoted:
+        # A Search region with no sheet read-back is left out and the rest are priced from their own
+        # read-backs. It never takes a stored-GB share of a price it did not get, and it does not
+        # zero the regions that did price.
+        own = [row for row in classified if row.get("kind") == "own"]
+        priced = []
+        for row in classified:
+            item = dict(row)
+            if row.get("kind") == "own":
+                item["monthly"] = row.get("own_monthly")
+                item["monthly_unrounded"] = row.get("own_monthly")
+                item["sizing_monthly"] = row.get("own_monthly")
+                item["pricing"] = row.get("own_pricing") or "sheet read-back"
+                item["annual_year1"] = row.get("own_annual")
+                item["annual_steady_state"] = row.get("own_steady")
+            else:
+                item["monthly"] = None
+                item["monthly_unrounded"] = None
+                item["sizing_monthly"] = None
+                item["annual_year1"] = None
+                item["annual_steady_state"] = None
+                item["pricing"] = row.get("own_pricing") or "not quoted — no read-back"
+            priced.append(item)
+        if not own:
+            return {"mode": "unquoted", "total_mo": 0.0, "total_yr": 0.0, "pricing": None, "rows": priced}
+        total = round(sum(float(p.get("monthly") or 0) for p in priced), 2)
+        return {"mode": "per_region", "total_mo": total, "total_yr": round(total * 12, 2), "pricing": None, "rows": priced}
     complete = bool(classified) and all(row.get("kind") == "own" for row in classified)
     if complete:
         priced = []
@@ -176,6 +204,24 @@ def regional_quote(
         "pricing": None,
         "rows": priced,
     }
+
+
+def _mark_search_unquoted(acc: dict, classified: list[dict]) -> None:
+    """Flag the deployments of a Search region that got no read-back.
+
+    The ECH side of a `priced` comparison reads this flag (`unpriced_reason`), so a region that is not
+    in the quote is not on the ECH side either, and the Priced share check sees it.
+    """
+    names = {
+        str(name)
+        for row in classified if row.get("kind") == "unquoted"
+        for name in (row.get("deployments") or [])
+    }
+    if not names:
+        return
+    for dep in (acc.get("solutions") or {}).get("by_deployment") or []:
+        if isinstance(dep, dict) and str(dep.get("name")) in names:
+            dep["search_unquoted"] = True
 
 
 def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes: list[str]) -> bool:
@@ -250,9 +296,14 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
                 classified.append({
                     "region": g["region"], "stored_gb": g["stored_gb"],
                     "retention_months": source_months,
-                    "kind": "own" if monthly is not None else "missing",
+                    "kind": "own" if monthly is not None else ("missing" if search_notebook else "unquoted"),
                     "own_monthly": monthly,
-                    "own_pricing": "es3 notebook performant" if search_notebook else "Search sheet performant (G110)",
+                    "deployments": g.get("deployments"),
+                    "own_pricing": (
+                        "es3 notebook performant" if search_notebook
+                        else "Search sheet performant (G110)" if monthly is not None
+                        else "not quoted — no Search sheet read-back"
+                    ),
                     "own_annual": _money(rb.get("annual_year1")),
                     "own_steady": _money(rb.get("annual_steady_state")),
                     "search_mo": _money(rb.get("search_monthly")),
@@ -342,7 +393,14 @@ def _replicate_by_region(acc: dict, by_solution: dict, groups: list[dict], notes
         )
         blk["by_region"] = quote["rows"]
         blk["regional_mode"] = quote["mode"]
-        if quote["mode"] == "rejected":
+        if sol == "search" and quote["mode"] in ("per_region", "unquoted"):
+            _mark_search_unquoted(acc, classified)
+        if quote["mode"] == "unquoted":
+            blk["pricing"] = "omitted — no Search region had a read-back"
+            blk["total_mo"] = 0.0
+            blk["total_yr"] = 0.0
+            notes.append("Search was left out of the quote because no region had a read-back from its Search estimator sheet.")
+        elif quote["mode"] == "rejected":
             blk["pricing"] = quote["pricing"]
             blk["total_mo"] = 0.0
             blk["total_yr"] = 0.0
@@ -761,6 +819,7 @@ def _integrity(acc: dict, sz: dict, by_solution: dict, quotes: list[dict], headl
             "has_bulk": float((coverage or {}).get("bulk_gb_day") or 0) > 0,
         },
         "eis": (by_solution.get("search") or {}).get("eis_data_status"),
+        "search_regions": (by_solution.get("search") or {}).get("by_region") or [],
         "solutions": [
             {
                 "solution": sol,

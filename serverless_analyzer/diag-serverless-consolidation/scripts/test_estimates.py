@@ -25,7 +25,7 @@ from consolidation import (  # noqa: E402
 )
 from diag_account import apply_diagnostics  # noqa: E402
 from quote_checks import (  # noqa: E402
-    TEMPLATE_ANCHORS, addon_off_value, e73_blocks_quote, echo_gate, integrity_score, money,
+    TEMPLATE_ANCHORS, _search_regions_row, addon_off_value, e73_blocks_quote, echo_gate, integrity_score, money,
     template_check, template_version,
 )
 from render_pdf import (  # noqa: E402
@@ -353,6 +353,25 @@ class EstimateFolderTests(unittest.TestCase):
         self.assertEqual(specs[0]["label"], "Ceiling")
         self.assertTrue(specs[0]["reused_headline"])
 
+    def test_unverified_search_telemetry_leaves_search_out_and_keeps_the_plan(self):
+        rows = [
+            {"name": "s1", "solution": "search", "region": "us-east-1", "provider": "aws", "bulk_gb_day": 0, "store_gb": 100, "retention_days": 30},
+            {"name": "s2", "solution": "search", "region": "us-east-1", "provider": "aws", "bulk_gb_day": 0, "store_gb": 50, "retention_days": 30},
+            {"name": "o1", "solution": "observability", "region": "us-east-1", "provider": "aws", "bulk_gb_day": 10, "store_gb": 100, "retention_days": 30, "logs_gb_day": 10},
+            {"name": "o2", "solution": "observability", "region": "us-east-1", "provider": "aws", "bulk_gb_day": 6, "store_gb": 60, "retention_days": 30, "logs_gb_day": 6},
+        ]
+        workload = {"quote_window_telemetry": {"status": "incomplete", "reason": "fetch exceeded 180s"}}
+        specs, jobs, err, _floor = plan_sheet_jobs(
+            rows, run_key="Acme", name_suffix="", force_months=None, o11y_id="o11y", security_id="sec",
+            parent_id="parent", reuse=True, provider="aws", region_name="us-east-1", support="Premium", feature_tier="Complete",
+            workload=workload, search_notebook=True,
+        )
+        self.assertIsNone(err)
+        self.assertFalse([j for j in jobs if j["solution"] == "search"])
+        left_out = [g for sp in specs for g in sp["groups"] if g.get("search_left_out")]
+        self.assertTrue(left_out)
+        self.assertTrue(all(g["monthly"] == 0.0 for g in left_out))
+
     def test_security_plan_uses_the_security_template(self):
         rows = [
             {"name": "a", "solution": "security", "region": "east", "provider": "aws", "bulk_gb_day": 4, "store_gb": 40, "retention_days": 30},
@@ -614,6 +633,70 @@ class RegionalQuoteTests(unittest.TestCase):
         self.assertEqual(by_solution["observability"]["total_mo"], 0.0)
         self.assertEqual(by_solution["observability"]["regional_mode"], "missing")
         self.assertTrue(any("no read-back" in note for note in notes))
+
+    def test_an_unquoted_search_region_is_left_out_and_the_rest_price(self):
+        quote = regional_quote(
+            [
+                {"region": "east", "stored_gb": 10, "kind": "own", "own_monthly": 180, "own_annual": 2160, "own_pricing": "Search sheet performant (G110)"},
+                {"region": "west", "stored_gb": 10, "kind": "own", "own_monthly": 90, "own_annual": 1080, "own_pricing": "Search sheet performant (G110)"},
+                {"region": "north", "stored_gb": 30, "kind": "unquoted", "own_pricing": "not quoted — no Search sheet read-back"},
+            ],
+            1000,
+            solution="search",
+            consolidated_annual=12000,
+        )
+        self.assertEqual(quote["mode"], "per_region")
+        self.assertEqual(quote["total_mo"], 270.0)  # not a stored-GB share of the 1000 consolidated total
+        by = {row["region"]: row for row in quote["rows"]}
+        self.assertIsNone(by["north"]["monthly"])
+        self.assertEqual(by["east"]["monthly"], 180)
+
+    def test_every_search_region_unquoted_omits_search(self):
+        quote = regional_quote(
+            [{"region": "east", "stored_gb": 10, "kind": "unquoted"}, {"region": "west", "stored_gb": 10, "kind": "unquoted"}],
+            1000, solution="search",
+        )
+        self.assertEqual(quote["mode"], "unquoted")
+        self.assertEqual(quote["total_mo"], 0.0)
+
+    def test_a_search_region_without_a_sheet_readback_stays_off_the_ech_side(self):
+        sheet = lambda region, monthly: {
+            "solution": "search", "region": region, "status": "filled",
+            "readback": {"monthly_steady_state": monthly, "annual_year1": monthly * 12, "annual_steady_state": monthly * 12},
+        }
+        acc = {
+            "cloud": {"summary": {}, "by_deployment": [
+                {"name": "s-east", "region": "east"}, {"name": "s-west", "region": "west"}, {"name": "s-north", "region": "north"},
+            ]},
+            "storage": {},
+            "solutions": {"by_deployment": [
+                {"name": "s-east", "solution": "search", "gb": 10}, {"name": "s-west", "solution": "search", "gb": 10},
+                {"name": "s-north", "solution": "search", "gb": 30},
+            ]},
+            "sizing": {"consolidated": {}, "estimators": {"projects": [sheet("east", 180), sheet("west", 90)]}},
+            "workload": {},
+        }
+        by_solution = {"search": {"pricing": "es3-estimator performant (quotable)", "total_mo": 1000, "total_yr": 12000, "stored_gb": 50}}
+        groups = [
+            {"solution": "search", "region": "east", "stored_gb": 10, "daily_raw_gb": 0, "deployments": ["s-east"]},
+            {"solution": "search", "region": "west", "stored_gb": 10, "daily_raw_gb": 0, "deployments": ["s-west"]},
+            {"solution": "search", "region": "north", "stored_gb": 30, "daily_raw_gb": 0, "deployments": ["s-north"]},
+        ]
+        notes: list[str] = []
+        _replicate_by_region(acc, by_solution, groups, notes)
+        search = by_solution["search"]
+        self.assertEqual(search["regional_mode"], "per_region")
+        self.assertEqual(search["total_mo"], 270.0)
+        flags = {d["name"]: d.get("search_unquoted") for d in acc["solutions"]["by_deployment"]}
+        self.assertEqual(flags, {"s-east": None, "s-west": None, "s-north": True})
+        from consolidation_scope import unpriced_reason
+        self.assertIsNone(unpriced_reason(acc["solutions"]["by_deployment"][0], by_solution, True))
+        self.assertIn("no estimator read-back", unpriced_reason(acc["solutions"]["by_deployment"][2], by_solution, True))
+        row = _search_regions_row(search["by_region"])
+        self.assertTrue(row["passed"])
+        self.assertTrue(row["warning"])
+        self.assertAlmostEqual(row["score"], 20 / 50, places=3)
+        self.assertIn("north", row["detail"])
 
     def test_security_readback_under_ten_dollars_stays(self):
         acc = {
@@ -1123,10 +1206,14 @@ class SearchPlanMatchesHeadlineTests(unittest.TestCase):
             self.assertEqual(payload["org_stored_gb"], region_store)
             self.assertEqual(payload["workload"], self.REGIONS[payload["region"]])
 
-    def test_a_region_with_no_proxy_workload_leaves_the_plan_unpriced(self):
+    def test_a_region_with_no_proxy_workload_is_left_out_like_the_headline(self):
         workload = {"regions": {"east": json.loads(json.dumps(self.REGIONS["east"]))}}
-        _specs, _jobs, err, _floor = self._jobs(workload)
-        self.assertIn("west has no measured proxy-log workload", str(err))
+        specs, jobs, err, _floor = self._jobs(workload)
+        self.assertIsNone(err)
+        self.assertEqual({job["payload"]["region"] for job in jobs}, {"east"})
+        left_out = [g for sp in specs for g in sp["groups"] if g.get("search_left_out")]
+        self.assertTrue(left_out)
+        self.assertTrue(all("west has no measured proxy-log workload" in g["search_left_out"] and g["monthly"] == 0.0 for g in left_out))
 
 
 class SearchPlanSeriesTests(unittest.TestCase):

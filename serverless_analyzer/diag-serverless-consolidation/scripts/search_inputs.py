@@ -99,12 +99,18 @@ def regional_workloads(acc: dict, base: str, key: str, *, days: int = proxy_logs
         return out
 
     def merged(band: str) -> dict:
-        rows = [b["search"][band] for b in good]
+        # A region idle in this band adds no QPS or query time, and counts as a 0 hour share.
+        every = [b["search"].get(band) or {} for b in good]
+        rows = [r for r in every if r.get("qps") is not None]
+        share = round(sum(float(r.get("pct_hours_mo") or 0) for r in every) / len(every), 2)
+        if not rows:
+            return {"qps": None, "complexity_ms": None, "complexity": None, "pct_hours_mo": share}
+        slowest = max(float(r.get("complexity_ms") or 0) for r in rows)
         return {
             "qps": round(sum(r["qps"] for r in rows), 4),
-            "complexity_ms": max(r["complexity_ms"] for r in rows),
-            "complexity": proxy_logs.complexity_of(max(r["complexity_ms"] for r in rows)),
-            "pct_hours_mo": round(sum(r["pct_hours_mo"] for r in rows) / len(rows), 2),
+            "complexity_ms": slowest,
+            "complexity": proxy_logs.complexity_of(slowest),
+            "pct_hours_mo": share,
         }
 
     dps = sum(b["ingest"]["docs_per_sec"] for b in good)

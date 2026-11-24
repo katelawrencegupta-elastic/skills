@@ -103,6 +103,28 @@ class WorkloadTests(unittest.TestCase):
         self.assertEqual(peak["pct_hours_mo"] + nonpeak["pct_hours_mo"], 100.0)
         self.assertEqual(wl["search"]["idle_pct_hours_mo"], 0.0)
 
+    def test_a_band_with_no_active_hour_is_idle_not_an_error(self):
+        # Weekday traffic only: every weekend hour is idle, so no non-peak hour carries requests... except
+        # weekday hours outside 13-23 UTC, which are non-peak. Keep traffic inside the peak window only.
+        def peak_only(base, key, query):
+            day = query.split('@timestamp >= "')[1][:10]
+            d = datetime.fromisoformat(day).replace(tzinfo=timezone.utc)
+            cols = [{"name": n} for n in ("hour", "search_requests", "peak_minute_search_qps", "search_latency_p90_ms", "search_latency_p99_ms")]
+            vals = [[(d + timedelta(hours=h)).strftime("%Y-%m-%dT%H:00:00.000Z"), 7200, 3.0, 30.0, 60.0]
+                    for h in range(24) if pl.window_of(d + timedelta(hours=h)) == "peak"]
+            return {"columns": cols, "values": vals}
+
+        now = datetime(2026, 11, 23, 9, tzinfo=timezone.utc)
+        wl = pl.search_workload("https://x", "k", [DEP], days=7, now=now, run=peak_only)
+        peak, nonpeak = wl["search"]["peak"], wl["search"]["nonpeak"]
+        self.assertEqual(peak["qps"], 3.0)
+        self.assertIsNone(nonpeak["qps"])
+        self.assertEqual(nonpeak["pct_hours_mo"], 0.0)
+        self.assertEqual(peak["pct_hours_mo"], 30.0)  # 50 of 168 hours
+        self.assertEqual(wl["search"]["idle_pct_hours_mo"], 70.0)
+        self.assertEqual(wl["sampled_hours"], 50)
+        self.assertEqual(wl["rows_returned"], 50)
+
     def test_no_traffic_is_an_error_not_a_zero_quote(self):
         empty = lambda b, k, q: {"columns": [{"name": "hour"}], "values": []}
         with self.assertRaises(RuntimeError):

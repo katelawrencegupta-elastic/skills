@@ -225,6 +225,7 @@ class ReviewRegressionTests(unittest.TestCase):
         }
         row = {"name": "measured", "store_gb": 12, "bulk_gb_day": 2, "retention_days": 30,
                "retention_days_metrics": 10, "retention_index_count": 40, "retention_index_days_sum": 1200.0,
+               "retention_index_age_bytes": 30 * 12e9, "retention_index_bytes": 12e9,
                "bulk_mix": {"logs": 1.0, "k8s_logs": 0.2, "metrics": 0.5, "traces": 0.5}}
         out = apply_diagnostics(acc, [row])
         dep = out["solutions"]["by_deployment"][0]

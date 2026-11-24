@@ -279,6 +279,8 @@ def unpriced_reason(dep: dict, by_solution: dict, diagnostic: bool) -> str | Non
         return "decommissioned, not in the admin console"
     if src == "active_no_bundle":
         return "no diagnostic bundle"
+    if dep.get("search_unquoted"):
+        return "its Search region had no estimator read-back"
     blk = by_solution.get(sol) or {}
     if "quotable" not in str(blk.get("pricing") or ""):
         return f"{sol.title()} has no accepted estimator read-back"

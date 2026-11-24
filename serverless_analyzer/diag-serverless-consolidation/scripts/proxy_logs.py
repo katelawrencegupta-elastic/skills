@@ -227,11 +227,15 @@ def search_workload(
     if not hours:
         raise RuntimeError("the proxy logs returned no external search or request traffic for these deployments")
     result = summarize(hours, total_hours=days * 24)
-    if "peak" not in result or "non_peak" not in result:
-        raise RuntimeError("the window has hours in only one of peak and non-peak; use a longer window that includes weekdays and weekends")
+    if not result:
+        raise RuntimeError("the proxy logs returned no Search requests in the window for these deployments")
 
     def band(name: str) -> dict:
-        row = result[name]
+        # A band with no active hour is idle, not missing: no QPS, no hour share. The Search sheet and
+        # the es3 library both skip a band whose qps is None and write 0 QPS at a 0 share.
+        row = result.get(name)
+        if row is None:
+            return {"qps": None, "complexity": None, "complexity_ms": None, "pct_hours_mo": 0.0}
         return {
             "qps": float(row["recommended_qps"]),
             "complexity": row["query_complexity"],
@@ -247,7 +251,9 @@ def search_workload(
         "window_start": (today - timedelta(days=days)).strftime("%Y-%m-%d"),
         "window_end": (today - timedelta(days=1)).strftime("%Y-%m-%d"),
         "deployments": list(deployment_ids),
-        "sampled_hours": len(hours),
+        # Hours with requests, the hours the shares count. rows_returned also counts zero-request rows.
+        "sampled_hours": sum(int(row.get("hours") or 0) for row in result.values()),
+        "rows_returned": len(hours),
         "window_hours": days * 24,
         "detail": result,
     }

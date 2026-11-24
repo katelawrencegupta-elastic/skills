@@ -45,20 +45,24 @@ def load_rows(path: Path) -> list[dict]:
 
 
 
-def index_retention_days(rows: list[dict]) -> float | None:
-    """Store-weighted mean of index retention ages, in days.
+def index_retention_basis(rows: list[dict]) -> tuple[float | None, str | None, int]:
+    """(days, weighting, unweighted rows): the mean index retention age and how it was weighted.
 
     Each index's age is the ILM delete age, else the data-stream retention, else the 30-day
     default. Weighting by local primary store keeps a swarm of small short-lived indexes from
-    setting the month a large long-lived one is priced at. A row from a bundle parsed before
-    store weights existed carries only the day-sum and count; when any row lacks the weights
-    the mean falls back to one vote per index. None when no index was counted.
+    setting the month a large long-lived one is priced at.
+
+    `weighting` is `store_weighted` or `per_index`. A row that carries the store fields but no local
+    primary store (all searchable snapshots, say) has no weight to give and is left out of the
+    weighted mean without turning the weighting off. Only a row from a bundle parsed before store
+    weights existed, with no `retention_index_age_bytes` at all, makes the whole mean one vote per
+    index, and the third value counts those rows so the caller can say so. None when no index was counted.
     """
     total_days = 0.0
     count = 0
     age_bytes = 0.0
     nbytes = 0.0
-    weighted = True
+    legacy = 0
     for row in rows:
         try:
             n = int(row.get("retention_index_count") or 0)
@@ -71,21 +75,27 @@ def index_retention_days(rows: list[dict]) -> float | None:
         except (TypeError, ValueError):
             continue
         count += n
+        if row.get("retention_index_age_bytes") is None:
+            legacy += 1
+            continue
         try:
             ab = float(row.get("retention_index_age_bytes") or 0)
             b = float(row.get("retention_index_bytes") or 0)
         except (TypeError, ValueError):
-            ab = b = 0.0
+            continue
         if b > 0:
             age_bytes += ab
             nbytes += b
-        else:
-            weighted = False
     if count <= 0:
-        return None
-    if weighted and nbytes > 0:
-        return age_bytes / nbytes
-    return total_days / count
+        return None, None, 0
+    if legacy == 0 and nbytes > 0:
+        return age_bytes / nbytes, "store_weighted", 0
+    return total_days / count, "per_index", legacy
+
+
+def index_retention_days(rows: list[dict]) -> float | None:
+    """Mean index retention age in days. `index_retention_basis` also says how it was weighted."""
+    return index_retention_basis(rows)[0]
 
 
 def index_retention_months(rows: list[dict]) -> int | None:

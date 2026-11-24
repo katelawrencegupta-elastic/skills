@@ -83,6 +83,28 @@ class WorkloadTests(unittest.TestCase):
         legacy = {"search": {"peak": {"qps": 5}}}
         self.assertEqual(si.exact_inputs(legacy, "us-central1", 1.5, 90.0), (legacy, 90.0))
 
+    def test_a_region_idle_in_one_band_still_merges(self):
+        def run(base, key, query):
+            day = datetime.fromisoformat(query.split('@timestamp >= "')[1][:10]).replace(tzinfo=timezone.utc)
+            cols = [{"name": n} for n in ("hour", "search_requests", "peak_minute_search_qps", "search_latency_p90_ms", "search_latency_p99_ms")]
+            rows = []
+            for h in range(24):
+                hr = day + timedelta(hours=h)
+                peak = pl.window_of(hr) == "peak"
+                if C in query and not peak:
+                    continue  # the EU region only has peak-window traffic
+                rows.append([hr.strftime("%Y-%m-%dT%H:00:00.000Z"), 7200 if peak else 3600, 3.0 if peak else 1.5, 40.0, 80.0])
+            return {"columns": cols, "values": rows}
+
+        a = acc()
+        a["solutions"]["by_deployment"][2]["daily_raw_gb"] = 0.5
+        wl = si.regional_workloads(a, "https://x", "k", days=7, now=self.now, run=run, workers=1)
+        self.assertEqual(wl["regions"]["europe-west1"]["search"]["nonpeak"]["qps"], None)
+        self.assertEqual(wl["quote_window_telemetry"]["status"], "complete")
+        self.assertEqual(wl["search"]["peak"]["qps"], 6.0)           # both regions add
+        self.assertEqual(wl["search"]["nonpeak"]["qps"], 2.0)        # only the US region has it
+        self.assertEqual(wl["search"]["nonpeak"]["pct_hours_mo"], 35.0)  # mean of 70 and 0
+
     def test_every_region_failing_marks_the_org_workload_incomplete(self):
         empty = lambda b, k, q: {"columns": [{"name": "hour"}], "values": []}
         wl = si.regional_workloads(acc(), "https://x", "k", days=1, now=self.now, run=empty, workers=1)

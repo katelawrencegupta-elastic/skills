@@ -21,7 +21,7 @@ sys.path.insert(0, str(K360))
 from admin_diags import _user_index, analyze_bundle, quoted_index_bytes  # noqa: E402
 from consolidation import build_consolidation  # noqa: E402
 from diag_account import _sheet_months, apply_diagnostics  # noqa: E402
-from diag_inputs import index_retention_months, summarize, whole_months  # noqa: E402
+from diag_inputs import index_retention_basis, index_retention_months, summarize, whole_months  # noqa: E402
 from quote_checks import echo_gate, integrity_score  # noqa: E402
 from size_serverless import _sheet_retention, push_cells  # noqa: E402
 
@@ -181,6 +181,64 @@ class RetentionTests(unittest.TestCase):
         # A row from an older bundle has no store weight, so the whole mean falls back to one vote per index.
         rows[1] = {"retention_index_count": 10, "retention_index_days_sum": 365 * 10}
         self.assertEqual(index_retention_months(rows), 1)
+
+    def test_a_row_with_no_local_store_does_not_turn_the_weighting_off(self):
+        # An all-searchable-snapshot cluster carries the store fields at zero bytes. It has no weight to
+        # give, and the account stays store-weighted on the cluster that does.
+        rows = [
+            {"retention_index_count": 1000, "retention_index_days_sum": 15 * 1000,
+             "retention_index_age_bytes": 0.0, "retention_index_bytes": 0.0},
+            {"retention_index_count": 10, "retention_index_days_sum": 365 * 10,
+             "retention_index_age_bytes": 365 * 999e9, "retention_index_bytes": 999e9},
+        ]
+        days, weighting, legacy = index_retention_basis(rows)
+        self.assertEqual((weighting, legacy), ("store_weighted", 0))
+        self.assertAlmostEqual(days, 365.0, places=3)
+        self.assertEqual(index_retention_months(rows), 12)  # 365 days is 12 months
+
+    def test_the_basis_names_why_the_mean_is_unweighted(self):
+        legacy_row = {"retention_index_count": 10, "retention_index_days_sum": 3650}
+        days, weighting, legacy = index_retention_basis([
+            {"retention_index_count": 1000, "retention_index_days_sum": 15000,
+             "retention_index_age_bytes": 15e9, "retention_index_bytes": 1e9},
+            legacy_row,
+        ])
+        self.assertEqual((weighting, legacy), ("per_index", 1))
+        self.assertAlmostEqual(days, 18650 / 1010, places=3)
+        # Every row at zero store: nothing to weight by, and none of them is a legacy row.
+        zero = {"retention_index_count": 4, "retention_index_days_sum": 180,
+                "retention_index_age_bytes": 0.0, "retention_index_bytes": 0.0}
+        self.assertEqual(index_retention_basis([zero])[1:], ("per_index", 0))
+        self.assertEqual(index_retention_basis([{"retention_days": 45}]), (None, None, 0))
+
+    def test_the_account_note_and_limit_say_when_the_mean_is_not_store_weighted(self):
+        acc = {
+            "deployments": {"active": {"month": "2026-10", "names": ["alpha", "beta"], "partial": False}},
+            "solutions": {"by_deployment": [
+                {"name": "alpha", "platform": "ech", "solution": "observability", "gb": 100, "ecu": 1},
+                {"name": "beta", "platform": "ech", "solution": "security", "gb": 20, "ecu": 1},
+            ], "totals": {"observability": {}, "security": {}, "search": {}}},
+            "sizing": {"consolidated": {"observability": {}, "security": {}, "search": {}}},
+            "storage": {"by_deployment": []},
+        }
+        rows = [
+            {"name": "alpha", "bulk_gb_day": 10, "retention_days": 15, "store_gb": 5,
+             "retention_index_count": 1000, "retention_index_days_sum": 15000,
+             "retention_index_age_bytes": 15e9, "retention_index_bytes": 1e9},
+            {"name": "beta", "bulk_gb_day": 2, "retention_days": 365, "store_gb": 4,
+             "retention_index_count": 10, "retention_index_days_sum": 3650},
+        ]
+        out = apply_diagnostics(acc, rows)
+        self.assertEqual(out["meta"]["retention_index_weighting"], "per_index")
+        notes = out["sizing"]["notes"]
+        self.assertTrue(any("not store-weighted" in n for n in notes))
+        self.assertFalse(any(n.startswith("Store-weighted retention") for n in notes))
+        codes = [r["code"] for r in out["sizing"]["diagnostics"]["estimation_limits"]]
+        self.assertIn("retention_unweighted", codes)
+        rows[1].update({"retention_index_age_bytes": 365 * 4e9, "retention_index_bytes": 4e9})
+        again = apply_diagnostics(acc, rows)
+        self.assertEqual(again["meta"]["retention_index_weighting"], "store_weighted")
+        self.assertNotIn("retention_unweighted", [r["code"] for r in again["sizing"]["diagnostics"]["estimation_limits"]])
 
     def test_account_weight_uses_measured_rows_only(self):
         acc = {

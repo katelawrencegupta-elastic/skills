@@ -265,6 +265,16 @@ def assemble_plan_bars(specs: list[dict], fills: list[dict]) -> dict:
                 })
                 continue
             fill = fills[group["sheet"]] if group["sheet"] < len(fills) else {}
+            if (fill.get("error") or fill.get("monthly") is None) and group.get("search_sheet"):
+                # The headline leaves a Search region the estimator will not price out of the total. So does the plan.
+                priced.append({
+                    "names": names,
+                    "monthly": 0.0,
+                    "bulk_gb_day": group.get("bulk_gb_day"),
+                    "months_written": group.get("months_written"),
+                    "search_left_out": str(fill.get("error") or fill.get("unpriced_reason") or "unpriced"),
+                })
+                continue
             if fill.get("error") or fill.get("monthly") is None:
                 gap = True
                 reason = str(fill.get("error") or fill.get("unpriced_reason") or "unpriced")
@@ -303,6 +313,18 @@ def assemble_plan_bars(specs: list[dict], fills: list[dict]) -> dict:
                 row["gap"] = True
         bars.append(row)
     return {"bars": bars}
+
+
+def _search_left_out(summary: dict, reason: str) -> dict:
+    """A Search project with no price stays on the plan at $0, as the headline leaves it out of the total."""
+    return {
+        "sheet": None,
+        "names": summary.get("names") or [],
+        "bulk_gb_day": summary.get("bulk_gb_day") or 0,
+        "months_written": summary.get("months_written"),
+        "monthly": 0.0,
+        "search_left_out": reason,
+    }
 
 
 def _search_payload(group: list[dict], *, workload: dict, region_search_gb: dict, org_gb: float, support: str) -> tuple[dict | None, str | None]:
@@ -367,6 +389,10 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
             region = str(row.get("region") or "")
             region_search_gb[region] = region_search_gb.get(region, 0.0) + float(row.get("store_gb") or 0)
     floor = diag.plan_floor_for_rows(rows)
+    telemetry = (workload or {}).get("quote_window_telemetry")
+    search_unverified = ""
+    if isinstance(telemetry, dict) and telemetry.get("status") != "complete":
+        search_unverified = str(telemetry.get("reason") or "quote-window Search telemetry is not verified")
     for plan in diag.region_feature_plans(rows):
         pct = plan["cut_pct"]
         if pct <= 0 and plan["projects"] <= 1:
@@ -397,6 +423,11 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
                 continue
             solution = str((group[0] if group else {}).get("solution") or "observability")
             if solution == "search":
+                if search_unverified:
+                    # The headline leaves Search out when its quote-window telemetry is not verified.
+                    # The plan does the same, so the other projects still draw the chart.
+                    groups.append(_search_left_out(summary, search_unverified))
+                    continue
                 if search_notebook:
                     money, err = _search_group_price(
                         group,
@@ -407,7 +438,8 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
                         cache=search_cache,
                     )
                     if err:
-                        return [], [], err, floor
+                        groups.append(_search_left_out(summary, err))
+                        continue
                     groups.append({
                         "sheet": None,
                         "names": summary.get("names") or [],
@@ -425,7 +457,8 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
                     org_gb=float(org_gb or 0), support=support,
                 )
                 if err:
-                    return [], [], err, floor
+                    groups.append(_search_left_out(summary, err))
+                    continue
                 group_region = str(group[0].get("region") or "")
                 # The same Search project recurs on every bar its region is not cut on. One sheet prices it.
                 key = (group_region, tuple(sorted(str(row.get("name")) for row in group)))
@@ -445,6 +478,7 @@ def plan_sheet_jobs(rows: list[dict], *, run_key: str, name_suffix: str, force_m
                     })
                 groups.append({
                     "sheet": search_jobs[key],
+                    "search_sheet": True,
                     "names": summary.get("names") or [],
                     "bulk_gb_day": summary.get("bulk_gb_day") or 0,
                     "months_written": summary.get("months_written"),

@@ -24,7 +24,7 @@ import json
 import re
 from pathlib import Path
 
-from diag_inputs import ESTIMATE_MONTHS, index_retention_days, index_retention_months, retention_fallback_months, whole_months, written_retention_months
+from diag_inputs import ESTIMATE_MONTHS, index_retention_basis, index_retention_months, retention_fallback_months, whole_months, written_retention_months
 from constants import RETENTION_FALLBACK_DAYS
 
 from constants import DAYS_PER_MONTH, RETENTION_ASSUMED_MAX_SHARE
@@ -142,15 +142,27 @@ def _rollup_solutions(out: dict, clamped_notes: list[str]) -> None:
         meta["retention_month_basis"] = basis
     if index_months is not None:
         count = sum(int(d.get("retention_index_count") or 0) for d in ech)
-        days = index_retention_days(ech) or 0.0
+        days, weighting, legacy = index_retention_basis(ech)
+        days = days or 0.0
         meta = out.setdefault("meta", {})
         meta["estimate_months"] = index_months
         meta["retention_index_days"] = round(days, 3)
         meta["retention_index_count"] = count
+        meta["retention_index_weighting"] = weighting
         unit = "month" if index_months == 1 else "months"
-        clamped_notes.append(
-            f"Store-weighted retention across {count:,} indexes is {days:.1f} days. The estimate prices {index_months} {unit}."
-        )
+        if weighting == "store_weighted":
+            clamped_notes.append(
+                f"Store-weighted retention across {count:,} indexes is {days:.1f} days. The estimate prices {index_months} {unit}."
+            )
+        else:
+            why = (
+                f"{legacy} bundle{'s' if legacy != 1 else ''} had no store weights"
+                if legacy else "no index had local primary store to weight by"
+            )
+            clamped_notes.append(
+                f"Retention is the plain mean across {count:,} indexes, {days:.1f} days, because {why}. "
+                f"It is not store-weighted. The estimate prices {index_months} {unit}."
+            )
     for sol in ("observability", "security", "search"):
         blk = dict(con.get(sol) or {})
         group = [d for d in ech if (d.get("solution") or "search") == sol]
@@ -395,8 +407,14 @@ def apply_diagnostics(
             if hit.get("retention_index_count"):
                 dep["retention_index_count"] = int(hit.get("retention_index_count") or 0)
                 dep["retention_index_days_sum"] = float(hit.get("retention_index_days_sum") or 0)
-                dep["retention_index_age_bytes"] = float(hit.get("retention_index_age_bytes") or 0)
-                dep["retention_index_bytes"] = float(hit.get("retention_index_bytes") or 0)
+                # Absent stays absent: a row from a bundle parsed before store weights existed must not
+                # look like a cluster with no local store.
+                if hit.get("retention_index_age_bytes") is not None:
+                    dep["retention_index_age_bytes"] = float(hit.get("retention_index_age_bytes") or 0)
+                    dep["retention_index_bytes"] = float(hit.get("retention_index_bytes") or 0)
+                else:
+                    dep.pop("retention_index_age_bytes", None)
+                    dep.pop("retention_index_bytes", None)
             dep["retention_basis"] = hit.get("retention_basis")
             dep["retention_label"] = hit.get("retention_label")
             dep["ingest_source"] = "diagnostics"
@@ -624,6 +642,16 @@ def apply_diagnostics(
                 "assumption, not a measurement."
             ),
             "severity": "high",
+        })
+    if meta_out.get("retention_index_weighting") == "per_index":
+        limitations.append({
+            "code": "retention_unweighted",
+            "detail": (
+                f"The written retention month is the plain mean across {meta_out.get('retention_index_count'):,} indexes "
+                f"({meta_out.get('retention_index_days')} days), not weighted by store, so many small short-lived indexes "
+                "count as much as a large long-lived one."
+            ),
+            "severity": "medium",
         })
     coverage["source_precedence"] = source_precedence
     coverage["estimation_limits"] = limitations
