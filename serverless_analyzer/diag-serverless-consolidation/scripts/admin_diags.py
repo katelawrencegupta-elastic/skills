@@ -362,12 +362,16 @@ def _parse_age(value) -> float | None:
     return n * {"ms": 1 / 86_400_000, "s": 1 / 86_400, "m": 1 / 1_440, "h": 1 / 24, "d": 1}[match.group(2)]
 
 
-def quoted_index_bytes(name: str, store: dict | None) -> dict:
-    """Local bytes are the quote. Searchable-snapshot mounts are reported and left out."""
+def quoted_index_bytes(name: str, store: dict | None, mounted: bool = False) -> dict:
+    """Local bytes are the quote. Searchable-snapshot mounts are reported and left out.
+
+    A `partial-*` index is a partially mounted snapshot. A fully mounted one (`restored-*` by default, any
+    name if the customer chose it) is found by its `index.store.type` of `snapshot`, passed as `mounted`.
+    """
     store = store or {}
     dataset_bytes = int(store.get("total_data_set_size_in_bytes") or store.get("size_in_bytes") or 0)
     local_bytes = int(store.get("size_in_bytes") or 0)
-    if str(name).startswith("partial-"):
+    if mounted or str(name).startswith("partial-"):
         return {"quote": 0, "dataset": 0, "snapshot": dataset_bytes or local_bytes}
     if not _user_index(name) or (local_bytes <= 0 and dataset_bytes <= 0):
         return {"quote": 0, "dataset": 0, "snapshot": 0}
@@ -669,6 +673,10 @@ def series_rates(stats: dict, streams: list, alias: dict, explain: dict, created
 
     stream_name = {names[-1]: ds.get("name") or names[-1] for ds in streams or [] for names in [[(ix or {}).get("index_name") or "" for ix in (ds.get("indices") or [])]] if names and names[-1]}
     for write_name, family in members_of.items():
+        if not _user_index(write_name):
+            # A system data stream (.ds-ilm-history, .fleet-*, .logs-deprecation) is not customer ingest. It was
+            # already out of store and retention, and counting its bulk put it in the logs mix of the quote.
+            continue
         info = explain.get(write_name) or {}
         seconds = _write_phase_sec(info.get("index_creation_date_millis"), info.get("lifecycle_date_millis"), info.get("action"), collection)
         by_fallback = False
@@ -752,6 +760,13 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         alias = _zip_json(archive, "/alias.json") or {}
         recovery = _zip_json(archive, "/recovery.json") or {}
 
+    # A member that is present and empty is a failed capture, not a quiet cluster. With no nodes there is no
+    # collection time, so every write phase is 0 and the bundle would read as 0 GB/day with nothing flagged.
+    if not nodes:
+        raise BundleIncomplete(f"{path.name} lists no nodes in nodes_stats.json")
+    if not stats:
+        raise BundleIncomplete(f"{path.name} lists no indices in the index-stats member")
+
     # When each index's primary shards last started on a node. The bulk counter restarts then.
     counter_start: dict[str, int] = {}
     for name, body in (recovery.items() if isinstance(recovery, dict) else []):
@@ -773,8 +788,12 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
             collection = ts
     created: dict[str, int] = {}
     index_mode: dict[str, str] = {}
+    mounted: set[str] = set()      # fully or partially mounted searchable snapshots: not local store
     for name, meta in ((state.get("metadata") or {}).get("indices") or {}).items():
         settings = ((meta.get("settings") or {}).get("index") or {})
+        store_type = (settings.get("store") or {}).get("type") if isinstance(settings.get("store"), dict) else None
+        if str(store_type or settings.get("store.type") or "").lower() == "snapshot":
+            mounted.add(name)
         if settings.get("mode"):
             index_mode[name] = str(settings.get("mode"))
         raw = settings.get("creation_date")
@@ -826,7 +845,7 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
     docs_total = 0.0          # primary documents in the same indices the local store counts
     for ix, body in stats.items():
         store = ((body.get("primaries") or {}).get("store") or {})
-        measured = quoted_index_bytes(ix, store)
+        measured = quoted_index_bytes(ix, store, mounted=ix in mounted)
         snapshot += measured["snapshot"]
         if measured["dataset"] <= 0 and measured["quote"] <= 0:
             continue

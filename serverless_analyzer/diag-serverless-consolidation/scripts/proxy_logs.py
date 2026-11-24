@@ -66,9 +66,30 @@ def run_esql(base: str, key: str, query: str, timeout: int = REQUEST_TIMEOUT_S) 
     req.add_unredirected_header("Authorization", f"ApiKey {key}")
     try:
         with urllib.request.build_opener(_NoRedirect).open(req, timeout=timeout) as resp:
-            return json.load(resp)["rawResponse"]
+            return raw_response(json.load(resp))
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"proxy logs HTTP {exc.code}: {exc.read(300)!r}") from exc
+
+
+def raw_response(body) -> dict:
+    """The ES|QL result inside Kibana's envelope, or an error that says why it cannot be trusted.
+
+    A result with no `rawResponse` is not an empty day. A partial result (`is_partial`) or one where a
+    cross-cluster search skipped or failed a cluster has undercounted requests, and an undercounted QPS
+    would be quoted as measured. Both raise `RuntimeError`, which `_read_span` retries and, if it keeps
+    happening, reports against the region instead of quoting it.
+    """
+    raw = body.get("rawResponse") if isinstance(body, dict) else None
+    if not isinstance(raw, dict):
+        raise RuntimeError("proxy logs response has no rawResponse")
+    if raw.get("is_partial"):
+        raise RuntimeError("proxy logs returned a partial result (is_partial), so request counts may be low")
+    clusters = raw.get("_clusters") if isinstance(raw.get("_clusters"), dict) else {}
+    short = {name: int(clusters.get(name) or 0) for name in ("skipped", "failed", "partial")}
+    if any(short.values()):
+        said = ", ".join(f"{count} {name}" for name, count in short.items() if count)
+        raise RuntimeError(f"proxy logs searched fewer clusters than asked ({said}), so request counts may be low")
+    return raw
 
 
 def _in_list(ids: list[str]) -> str:
@@ -169,6 +190,9 @@ def summarize(hours: list[dict], total_hours: int | None = None) -> dict:
         p99 = percentile([r["p99"] for r in rows if r["p99"] is not None], 50)
         p95_minute = percentile(peak_minute, 95)
         out[name] = {
+            # The unrounded p90. Complexity is bucketed from this, so the sheet and the library bucket the same
+            # figure `complexity_of` did: 250.4 ms is moderate, not the "250" it displays as.
+            "p90_ms": p90,
             "hours": len(rows),
             "pct_of_hours": round(100.0 * len(rows) / total) if total else 0,
             "recommended_qps": math.ceil(p95_minute) if p95_minute is not None else 0,
@@ -259,7 +283,7 @@ def search_workload(
         return {
             "qps": float(row["recommended_qps"]),
             "complexity": row["query_complexity"],
-            "complexity_ms": float(row["typical_p90_latency_ms"] or 0),
+            "complexity_ms": float(row.get("p90_ms") if row.get("p90_ms") is not None else (row["typical_p90_latency_ms"] or 0)),
             "pct_hours_mo": float(row["pct_of_hours"]),
         }
 

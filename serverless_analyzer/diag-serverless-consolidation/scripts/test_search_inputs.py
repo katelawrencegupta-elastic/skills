@@ -146,3 +146,35 @@ class DeadlineTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 5.0)
         self.assertEqual(set(wl["errors"]), {"us-central1", "europe-west1"})
         self.assertNotIn("search", wl)
+
+
+class ExactInputsFailClosedTests(unittest.TestCase):
+    def _wl(self):
+        return {"regions": {"us-central1": {"search": {"peak": {"qps": 5.0}}, "quote_window_telemetry": {"status": "complete"}}},
+                "search": {"peak": {"qps": 99.0}}, "quote_window_telemetry": {"status": "complete"}}
+
+    def test_a_region_with_no_block_is_not_priced_on_every_regions_traffic(self):
+        # A region-string mismatch used to price this project on the org-wide QPS, summed across all regions.
+        workload, org = si.exact_inputs(self._wl(), "europe-west1", 10.0, 500.0)
+        self.assertEqual(workload["quote_window_telemetry"]["status"], "incomplete")
+        self.assertIn("europe-west1 has no measured proxy-log workload", workload["quote_window_telemetry"]["reason"])
+        self.assertNotIn("search", workload)
+        self.assertEqual(org, 500.0)
+
+    def test_the_search_estimate_then_refuses_it(self):
+        import es3_estimate
+        workload, _org = si.exact_inputs(self._wl(), "europe-west1", 10.0, 500.0)
+        with self.assertRaises(ValueError) as ctx:
+            es3_estimate.ingest_workloads(workload, [])
+        self.assertIn("no measured proxy-log workload", str(ctx.exception))
+
+    def test_a_region_with_a_block_is_unchanged(self):
+        workload, org = si.exact_inputs(self._wl(), "us-central1", 10.0, 500.0)
+        self.assertEqual(workload["search"]["peak"]["qps"], 5.0)
+        self.assertEqual(org, 10.0)
+
+    def test_a_workload_with_no_regions_at_all_keeps_the_org_wide_one_for_the_k360_backup(self):
+        k360 = {"search": {"peak": {"qps": 7.0}}}
+        workload, org = si.exact_inputs(k360, "us-central1", 10.0, 500.0)
+        self.assertEqual(workload, k360)
+        self.assertEqual(org, 500.0)

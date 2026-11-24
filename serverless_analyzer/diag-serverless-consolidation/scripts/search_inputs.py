@@ -148,6 +148,12 @@ def exact_inputs(workload: dict | None, region: str, stored_gb: float, org_gb: f
     """
     block = regional_block(workload, region)
     if block is None:
+        if isinstance((workload or {}).get("regions"), dict):
+            # A proxy-log workload has a block for every Search region it tried. A region with none is a
+            # mismatch (a region string that differs, or a deployment with no id), not a reason to price
+            # this project on every region's traffic added together. Fail closed and say why.
+            reason = f"Search in {region or 'the project'} has no measured proxy-log workload."
+            return {"quote_window_telemetry": {"status": "incomplete", "source": SOURCE, "reason": reason}}, org_gb
         return workload or {}, org_gb
     return block, stored_gb
 

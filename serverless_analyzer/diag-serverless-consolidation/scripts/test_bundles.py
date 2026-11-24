@@ -84,7 +84,7 @@ class StoreTests(unittest.TestCase):
                 "keep": {"policy": {"phases": {"delete": {"min_age": "60d"}}}},
                 "short": {"policy": {"phases": {"delete": {"min_age": "0.042d"}}}},
             },
-            "diag/nodes_stats.json": {"nodes": {}},
+            "diag/nodes_stats.json": {"nodes": {"n1": {"timestamp": COLLECTION_MS}}},   # a capture with no nodes is refused
         }
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "bundle.zip"
@@ -627,7 +627,9 @@ class CompressionCalcTests(unittest.TestCase):
         self.assertNotIn("compressioncalc_accounted_for", row)
         self.assertNotIn("compression_ratio", row)
 
-    def test_system_write_index_stays_in_the_compression_sums(self):
+    def test_a_system_write_index_is_not_customer_bulk(self):
+        # This used to assert 150: the .monitoring stream's 50 GB/day was added to the logs mix. It is cluster-internal
+        # data, already kept out of store and retention, and it is not ingest the customer would send to Serverless.
         created, rolled = _write_phase(1, age_days=3)
         row = _analyze({
             "diag/nodes_stats.json": {"nodes": {"n1": {"timestamp": COLLECTION_MS}}},
@@ -645,7 +647,8 @@ class CompressionCalcTests(unittest.TestCase):
             }},
         })
         self.assertEqual(row["store_gb"], 20.0)
-        self.assertEqual(row["bulk_gb_day"], 150.0)
+        self.assertEqual(row["bulk_gb_day"], 100.0)
+        self.assertEqual(row["bulk_mix"]["logs"], 100.0)
         self.assertNotIn("compressioncalc_accounted_for", row)
         self.assertNotIn("compression_ratio", row)
 
@@ -1010,3 +1013,81 @@ class BulkCellTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BundleTrustTests(unittest.TestCase):
+    """M5, M6 and M7: what is counted as customer data, and what is refused as a failed capture."""
+
+    NODE = {"nodes": {"n1": {"timestamp": COLLECTION_MS}}}
+    IDX = {"indices": {"logs-000001": {"primaries": {"store": {"size_in_bytes": 1_000_000_000}}}}}
+
+    def test_a_capture_with_no_nodes_is_refused_not_read_as_zero_bulk(self):
+        from admin_diags import BundleIncomplete
+        with self.assertRaises(BundleIncomplete) as ctx:
+            _analyze({"diag/nodes_stats.json": {"nodes": {}}, "diag/indices_stats.json": self.IDX})
+        self.assertIn("no nodes", str(ctx.exception))
+
+    def test_a_capture_with_no_indices_is_refused_not_read_as_zero_store(self):
+        from admin_diags import BundleIncomplete
+        with self.assertRaises(BundleIncomplete) as ctx:
+            _analyze({"diag/nodes_stats.json": self.NODE, "diag/indices_stats.json": {"indices": {}}})
+        self.assertIn("no indices", str(ctx.exception))
+
+    def test_a_refused_capture_is_a_missing_bundle_not_a_zero_row(self):
+        from admin_diags import _parse_zip
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "dep__aaa.zip"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("diag/nodes_stats.json", json.dumps({"nodes": {}}))
+                archive.writestr("diag/indices_stats.json", json.dumps(self.IDX))
+            out = _parse_zip((str(path), datetime(2026, 11, 1, tzinfo=timezone.utc).isoformat(), {}))
+        self.assertIn("warn", out)
+        self.assertIn("BundleIncomplete", out["warn"])
+
+    def test_system_data_streams_are_not_customer_bulk_or_part_of_the_mix(self):
+        created, rolled = _write_phase(1, age_days=3)
+        names = [".ds-logs-app-000001", ".ds-ilm-history-7-2026.11.17-000001", ".ds-.fleet-actions-results-000001",
+                 ".ds-.logs-deprecation.elasticsearch-default-000001"]
+        row = _analyze({
+            "diag/nodes_stats.json": self.NODE,
+            "diag/commercial/data_stream.json": {"data_streams": [
+                {"name": "logs-app", "indices": [{"index_name": names[0]}]},
+                {"name": "ilm-history-7", "indices": [{"index_name": names[1]}]},
+                {"name": ".fleet-actions-results", "indices": [{"index_name": names[2]}]},
+                {"name": ".logs-deprecation.elasticsearch-default", "indices": [{"index_name": names[3]}]},
+            ]},
+            "diag/commercial/ilm_explain.json": {"indices": {n: {"index_creation_date_millis": created, "lifecycle_date_millis": rolled} for n in names}},
+            "diag/indices_stats.json": {"indices": {
+                n: {"primaries": {"bulk": {"total_size_in_bytes": 10_000_000_000}, "store": {"size_in_bytes": 1_000_000_000}}} for n in names
+            }},
+        })
+        self.assertEqual(row["bulk_gb_day"], 10.0)                 # only .ds-logs-app, not the three system streams
+        self.assertEqual(row["bulk_mix"]["logs"], 10.0)
+
+    def test_a_fully_mounted_snapshot_is_not_local_store_whatever_it_is_called(self):
+        state = {"metadata": {"indices": {
+            "logs-000001": {"settings": {"index": {"creation_date": "1"}}},
+            "restored-logs-000001": {"settings": {"index": {"store": {"type": "snapshot"}}}},
+            "my-archive": {"settings": {"index": {"store": {"type": "snapshot"}}}},       # a customer-chosen name
+            "restored-by-hand": {"settings": {"index": {"creation_date": "1"}}},          # a normal index that happens to be named so
+        }}}
+        row = _analyze({
+            "diag/nodes_stats.json": self.NODE,
+            "diag/cluster_state.json": state,
+            "diag/indices_stats.json": {"indices": {
+                n: {"primaries": {"store": {"size_in_bytes": 5_000_000_000, "total_data_set_size_in_bytes": 5_000_000_000}}}
+                for n in ("logs-000001", "restored-logs-000001", "my-archive", "restored-by-hand")
+            }},
+        })
+        self.assertEqual(row["store_gb"], 10.0)                    # logs-000001 and restored-by-hand only
+        self.assertGreaterEqual(row["snapshot_gb"], 10.0)          # the two mounts are named as the snapshot gap
+        self.assertEqual(row["retention_index_count"], 0)         # no policy here, so no index is aged, mounts included
+
+    def test_a_flattened_store_type_setting_is_read_too(self):
+        row = _analyze({
+            "diag/nodes_stats.json": self.NODE,
+            "diag/cluster_state.json": {"metadata": {"indices": {"mounted": {"settings": {"index": {"store.type": "snapshot"}}}}}},
+            "diag/indices_stats.json": {"indices": {"mounted": {"primaries": {"store": {"size_in_bytes": 3_000_000_000}}},
+                                                     "real": {"primaries": {"store": {"size_in_bytes": 1_000_000_000}}}}},
+        })
+        self.assertEqual(row["store_gb"], 1.0)
