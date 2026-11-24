@@ -365,14 +365,15 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         search["total_yr"] = 0.0
         search["by_region"] = []
         notes.append(
-            "Search was not quoted because Cloud Tracker index telemetry does not cover the exact billed quote window. "
-            "Rerun once quote-window telemetry is available."
+            "Search was not quoted because its workload could not be read from the service proxy request logs"
+            + (f" ({search_telemetry['reason']})" if search_telemetry.get("reason") else "")
+            + ". Rerun once the proxy logs are reachable."
         )
         limits = sz.setdefault("diagnostics", {}).setdefault("estimation_limits", [])
         if not any(row.get("code") == "search_quote_window_telemetry" for row in limits):
             limits.append({
                 "code": "search_quote_window_telemetry",
-                "detail": (search_telemetry.get("reason") or "exact quote-window index telemetry is missing")
+                "detail": (search_telemetry.get("reason") or "the Search workload could not be read from the service proxy request logs")
                 + " Search has no price, so the serverless total leaves it out. Rerun the quote.",
                 "severity": "high",
             })

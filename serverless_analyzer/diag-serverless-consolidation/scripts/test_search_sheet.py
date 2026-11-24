@@ -178,6 +178,21 @@ class FillTests(unittest.TestCase):
             result = search_sheet.fill_search(object(), "copy-id", payload(**over), OPTIONS)
         return result, pushed
 
+    def test_the_shipped_assumption_describes_the_proxy_log_measure_not_a_day_average(self):
+        proxy = {**WORKLOAD, "source": "service-proxy-requests"}
+        result, _pushed = self.fill(workload=proxy)
+        text = " ".join(result["assumptions"])
+        self.assertIn("95th percentile of per-minute peak QPS", text)
+        self.assertIn("service proxy request logs", text)
+        self.assertNotIn("day averages from index telemetry", text)
+        self.assertNotIn("Cloud Tracker", text)
+
+    def test_a_workload_of_another_source_does_not_claim_the_proxy_logs(self):
+        result, _pushed = self.fill(workload={**WORKLOAD, "source": "k360"})
+        text = " ".join(result["assumptions"])
+        self.assertNotIn("proxy request logs", text)
+        self.assertIn("not peak-second load", text)
+
     def test_writes_the_matched_region_text_and_quotes_performant(self):
         result, pushed = self.fill(provider="azure", region="eastus")
         self.assertEqual(pushed["C5"], "Azure")

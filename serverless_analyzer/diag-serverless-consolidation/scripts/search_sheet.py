@@ -14,7 +14,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from es3_estimate import (
-    PROVIDER_BY_NAME, SUPPORT_BY_TIER, ingest_workloads, scale_search_workload, search_bands, workload_share,
+    PROVIDER_BY_NAME, SUPPORT_BY_TIER, ingest_workloads, scale_search_workload, search_bands, workload_basis_note, workload_share,
 )
 from sheets_io import _execute, assert_not_template, copy_verified, export_xlsx, push_cells, read_cells, trash_file, write_search_sheet
 from sizing_fill import _region_rejected, match_region, region_match_text, run_es3
@@ -171,7 +171,7 @@ def fill_search(sheets, sid: str, payload: dict, region_options_: list[str]) -> 
     """Write one Search copy and read it back. Returns the es3-shaped result."""
     assumptions = [
         "Workload type is text. Vector and time-series profiles are not inferred from K360.",
-        "QPS and query time are day averages from index telemetry, not peak-second load.",
+        workload_basis_note(payload.get("workload")),
         "Performant is the quoted profile. On-demand and high availability are shown beside it.",
         "Priced on the Search Serverless Ballpark Pricing Estimator sheet. Minimum VCU, data out, cross-project search and fast refresh are all off.",
     ]

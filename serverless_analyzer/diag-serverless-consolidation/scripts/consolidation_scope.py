@@ -186,9 +186,9 @@ def apply_quote_lookback(acc: dict, days: int = 90) -> float:
         "telemetry_start": telemetry_start,
         "telemetry_end": telemetry_end,
         "reason": None if exact_window and workload.get("indices_complete", True) else (
-            "Cloud Tracker index telemetry index aggregation was truncated"
+            "the index aggregation behind the Search workload was truncated"
             if workload.get("indices_complete") is False
-            else workload.get("quote_window_fetch_error") or "Cloud Tracker index telemetry lacks complete exact-window QPS, docs/s, or average document size"
+            else workload.get("quote_window_fetch_error") or "the Search workload (QPS, query complexity, docs/s or average document size) is not complete for the quote window"
         ),
     }
     return float(ecu["quote_usage_factor"])

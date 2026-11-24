@@ -227,3 +227,57 @@ class NoRetentionDefaultTests(unittest.TestCase):
         for code in ("retention_month_missing", "retention_unaged"):
             self.assertIn(code, calc)
             self.assertIn(f'"{code}"', emitted)
+
+
+class SearchWorkloadWordingTests(unittest.TestCase):
+    """Search QPS, complexity and hour shares come from the proxy logs, and docs/s from the bundles."""
+
+    FILES = ("es3_estimate.py", "search_sheet.py", "search_inputs.py", "diag_account.py", "consolidation.py",
+             "consolidation_scope.py")
+    RETIRED = ("day averages from index telemetry", "Cloud Tracker index telemetry", "from Cloud Tracker telemetry",
+               "exact-window Cloud Tracker")
+
+    def test_no_user_visible_text_names_cloud_tracker_as_the_search_workload_source(self):
+        for name in self.FILES:
+            text = (HERE / name).read_text()
+            for phrase in self.RETIRED:
+                self.assertNotIn(phrase, text, f"{name} still says {phrase!r}")
+
+    def test_the_basis_note_says_what_was_measured(self):
+        import es3_estimate
+        proxy = es3_estimate.workload_basis_note({"source": es3_estimate.PROXY_SOURCE})
+        self.assertIn("95th percentile", proxy)
+        self.assertIn("median hourly p90", proxy)
+        self.assertIn("not a day average", proxy)
+        other = es3_estimate.workload_basis_note({"source": "k360"})
+        self.assertNotIn("proxy", other)
+        self.assertNotIn("proxy", es3_estimate.workload_basis_note(None))
+
+
+class LimitCodesAreDocumentedTests(unittest.TestCase):
+    """Every limit the scripts record is named in calculations.md, so a reader of a brief can look it up."""
+
+    PATTERNS = (
+        r'"code":\s*"([a-z_0-9]+)"',
+        r'(?:note_limit|warn|stage)\(\s*[A-Za-z_\.]*,?\s*"([a-z_0-9]+)"',
+        r'\bstage\(\s*"([a-z_0-9]+)"',
+    )
+
+    def _emitted(self) -> dict[str, set[str]]:
+        import re
+        found: dict[str, set[str]] = {}
+        for path in sorted(HERE.glob("*.py")):
+            if path.name.startswith("test_") or path.name == "_test_support.py":
+                continue
+            text = path.read_text()
+            for pattern in self.PATTERNS:
+                for match in re.finditer(pattern, text):
+                    found.setdefault(match.group(1), set()).add(path.name)
+        return found
+
+    def test_every_emitted_limit_code_is_in_the_reference(self):
+        doc = (SKILL / "references" / "calculations.md").read_text()
+        emitted = self._emitted()
+        self.assertGreater(len(emitted), 20)                      # the scan found the codes, not nothing
+        missing = {code: sorted(files) for code, files in emitted.items() if f"`{code}`" not in doc}
+        self.assertEqual(missing, {}, "limit codes recorded by the scripts and not named in calculations.md")

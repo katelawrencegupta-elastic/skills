@@ -207,6 +207,25 @@ def search_bands(workload: dict, assumptions: list[str]) -> list[tuple[str | Non
     ]
 
 
+PROXY_SOURCE = "service-proxy-requests"
+
+
+def workload_basis_note(workload: dict | None) -> str:
+    """What the QPS and query time on this estimate are, said as they were measured.
+
+    From the proxy request logs they are near-peak figures: QPS is the 95th percentile of per-minute peak QPS in
+    each window and query time is the median hourly p90. "Day averages" described an older Cloud Tracker read and
+    understated what the sheet is priced on.
+    """
+    if (workload or {}).get("source") == PROXY_SOURCE:
+        return (
+            "QPS is the 95th percentile of per-minute peak QPS in each window (peak is weekdays 13:00 to 23:00 UTC) and "
+            "query time is the median hourly p90, both from the service proxy request logs. That is near-peak load, "
+            "not a day average and not peak-second load."
+        )
+    return "QPS and query time come from the workload block supplied for this estimate. They are not peak-second load."
+
+
 def workload_share(stored_gb: float, org_gb: float) -> float:
     """Share of org-wide index telemetry that belongs to one Search project.
 
@@ -256,7 +275,7 @@ def ingest_workloads(workload: dict, assumptions: list[str]) -> list[dict]:
     dps = ingest.get("docs_per_sec")
     avg = ingest.get("avg_doc_bytes")
     if not dps or not avg or float(dps) <= 0 or float(avg) <= 0:
-        raise ValueError("Search estimate requires measured docs/s and average document size from Cloud Tracker telemetry")
+        raise ValueError("Search estimate requires measured docs/s and average document size from the diagnostic bundles")
     active = ingest.get("active_hours_mo")
     hours = MONTHLY_HOURS if active is None else min(MONTHLY_HOURS, max(0.0, float(active)))
     return [
@@ -271,7 +290,7 @@ def ingest_workloads(workload: dict, assumptions: list[str]) -> list[dict]:
 def build_user_info(payload: dict, pricing: dict, support_matrix: dict) -> tuple[dict, str, list[str]]:
     assumptions: list[str] = [
         "Workload type is text. Vector and time-series profiles are not inferred from K360.",
-        "QPS and query time are day averages from index telemetry, not peak-second load.",
+        workload_basis_note(payload.get("workload")),
         "Performant is the quoted profile. On-demand and high availability are shown beside it.",
     ]
     stored = max(float(payload.get("stored_gb") or 0), 0.0)

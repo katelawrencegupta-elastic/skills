@@ -687,7 +687,8 @@ def apply_diagnostics(
         "Ingest GB/day is the write-index sum of index.primaries.bulk.est_bytes_per_day from the Elasticsearch diagnostic bundle. "
         "The month written to the estimator is the store-weighted average retention across indexes with local primary store, rounded up to a whole month. Each index is aged by its ILM delete policy, else its data-stream retention, else 30 days. The bulk-weighted delete age stays a record. "
         "Those two are summed by solution and by region. Search disk and the Search ingest-share denominator use diagnostic local store only; K360 stored sizes are excluded from the diagnostic estimate. "
-        "Search query rates use exact-window Cloud Tracker index telemetry. ECH ECU stays the K360 bill.",
+        "Search query rates, query complexity and hour shares come from the service proxy request logs, and docs/s and "
+        "document size from these bundles. ECH ECU stays the K360 bill.",
     ]
     if short:
         names = ", ".join(f"{s['name']} ({s['uptime_days']}d)" for s in short[:8])

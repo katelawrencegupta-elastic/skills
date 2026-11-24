@@ -77,6 +77,15 @@ A step that ran degraded is a limit too, not a line on the terminal. `run_consol
 | `es3_estimator_missing` / `es3_estimator_failed` | The es3 interpreter is not installed, or it ran and failed. A Search region went unpriced for an environment reason, and the two are told apart |
 | `consolidation_failed` | Building the consolidation raised; no quote was produced |
 | `ml_node_ecu_unverified` | ML-node ECU was not carried to the serverless total |
+| `missing_diagnostics` | An active deployment has no diagnostic bundle. It adds no ingest and no stored GB, and its bill is out of the comparison |
+| `duplicate_deployment_names` | More than one bundle or deployment carries one name. Bundles, exclusions and billing are matched by name, so one bundle can be counted twice or one dropped. Re-keying on the id is not done |
+| `retention_unmeasured` | Bulk on a deployment with no measured retention age. It is left out of the measured-age record, which does not enter the price |
+| `short_diagnostic_window` | A bundle's nodes were up under two days, so its bulk rate is measured over a short window |
+| `bulk_rate_fallback` | Some bulk was rated without an ILM write phase: a data stream lifecycle, or a dated index written by name |
+| `unrated_ingest` | Some indices took bulk writes and have no rate, so the quote may understate ingest |
+| `diagnostics_unavailable` | The whole diagnostic consolidation raised, so no measured quote was produced |
+| `search_quote_window_telemetry` | Search was left out because its workload could not be read from the proxy request logs at all: no region came back, or `PROXY_LOGS_URL` and `PROXY_LOGS_API_KEY` are missing. `search_proxy_workload_missing` is the per-region form of the same failure |
+| `eis_data_incomplete` | Filtered EIS billing could not be verified for the quote window. No EIS dollar was added, and Search is quoted without it |
 | `retention_month_missing` | No retention could be ascertained, so no month was written and Observability and Security were not quoted. No default stands in for it |
 | `retention_unaged` | Some store has no ILM delete phase and no data-stream retention. It is left out of the retention average, with no default age |
 | `search_proxy_workload_missing` | Search in a region was not priced: the proxy logs returned no external traffic for its Search deployments, the logs could not be read after retries, or the bundles show no bulk or documents. The note names the region and the reason. Other regions still price |
