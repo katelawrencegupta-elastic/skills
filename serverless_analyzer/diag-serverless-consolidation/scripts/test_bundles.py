@@ -1116,3 +1116,159 @@ class BundleTrustTests(unittest.TestCase):
                                                      "real": {"primaries": {"store": {"size_in_bytes": 1_000_000_000}}}}},
         })
         self.assertEqual(row["store_gb"], 1.0)
+
+
+class RolloverLifetimeTests(unittest.TestCase):
+    """ILM min_age and data-stream retention run from rollover, so an index lives for its time in hot plus that age."""
+
+    D = 86_400_000
+    O = 1          # days after the epoch that "day 0" is, so no index is born at millisecond 0, which is falsy
+    NODE = {"nodes": {"n1": {"timestamp": COLLECTION_MS}}}      # 20 days after the epoch: every index is born inside it
+    GB = 1_000_000_000
+
+    def _stats(self, names):
+        return {"indices": {n: {"primaries": {"store": {"size_in_bytes": self.GB}}} for n in names}}
+
+    def _ilm_stream(self, born_days, rolled_days, *, min_age="10d", hot=None):
+        """A data stream under ILM. `born_days` are creation days, oldest first. `rolled_days[i]` is when gen i rolled
+        (None for the write index)."""
+        names = [f".ds-logs-app-{i + 1:06d}" for i in range(len(born_days))]
+        explain = {}
+        for name, born, rolled in zip(names, born_days, rolled_days):
+            explain[name] = {
+                "managed": True, "policy": "p", "phase": "hot", "action": "rollover",
+                "index_creation_date_millis": (born + self.O) * self.D,
+                "lifecycle_date_millis": ((rolled if rolled is not None else born) + self.O) * self.D,
+            }
+        phases = {"delete": {"min_age": min_age}}
+        if hot is not None:
+            phases["hot"] = {"actions": {"rollover": {"max_age": hot}}}
+        return names, {
+            "diag/nodes_stats.json": self.NODE,
+            "diag/commercial/data_stream.json": {"data_streams": [{"name": "logs-app", "indices": [{"index_name": n} for n in names]}]},
+            "diag/commercial/ilm_explain.json": {"indices": explain},
+            "diag/commercial/ilm_policies.json": {"p": {"policy": {"phases": phases}}},
+            "diag/indices_stats.json": self._stats(names),
+        }
+
+    def test_an_ilm_index_lives_for_its_time_in_hot_plus_min_age(self):
+        # Four generations rolling every 5 days under a 10-day delete: each lives 15 days, not 10.
+        _names, files = self._ilm_stream([0, 5, 10, 15], [5, 10, 15, None], min_age="10d")
+        row = _analyze(files)
+        self.assertAlmostEqual(row["retention_days"], 15.0, places=3)
+        self.assertAlmostEqual(row["retention_days_min_age"], 10.0, places=3)
+        self.assertAlmostEqual(row["retention_rollover_days"], 5.0, places=3)
+        self.assertEqual(row["retention_rollover_unknown_bytes"], 0)
+        self.assertEqual(row["retention_index_count"], 4)
+        self.assertAlmostEqual(row["retention_index_days_sum"], 60.0, places=3)        # 4 indexes x 15 days
+        self.assertEqual(row["retention_index_bytes"], 4 * self.GB)
+
+    def test_the_write_index_takes_the_median_of_its_rolled_siblings(self):
+        # Generations rolled after 2 and 8 days. The write index has not rolled: median 5. Lifetimes 12, 18, 15.
+        _names, files = self._ilm_stream([0, 2, 10], [2, 10, None], min_age="10d")
+        row = _analyze(files)
+        self.assertAlmostEqual(row["retention_days"], (12 + 18 + 15) / 3, places=3)
+        self.assertAlmostEqual(row["retention_rollover_days"], (2 + 8 + 5) / 3, places=3)
+
+    def test_a_data_stream_lifecycle_runs_from_rollover_too_and_has_no_ilm_explain(self):
+        names = [f".ds-metrics-app-{i + 1:06d}" for i in range(4)]
+        born = [0, 5, 10, 15]
+        row = _analyze({
+            "diag/nodes_stats.json": self.NODE,
+            "diag/commercial/data_stream.json": {"data_streams": [
+                {"name": "logs-app", "lifecycle": {"enabled": True, "data_retention": "10d"},
+                 "indices": [{"index_name": n} for n in names]}]},
+            "diag/cluster_state.json": {"metadata": {"indices": {n: {"settings": {"index": {"creation_date": str((b + self.O) * self.D)}}} for n, b in zip(names, born)}}},
+            "diag/indices_stats.json": self._stats(names),
+        })
+        # No explain. The next generation's creation is the rollover time: 5 days each, so 10 + 5.
+        self.assertAlmostEqual(row["retention_days"], 15.0, places=3)
+        self.assertAlmostEqual(row["retention_rollover_days"], 5.0, places=3)
+
+    def test_a_lone_write_index_takes_its_policys_rollover_max_age(self):
+        names, files = self._ilm_stream([15], [None], min_age="10d", hot="7d")
+        row = _analyze(files)
+        self.assertAlmostEqual(row["retention_days"], 17.0, places=3)
+        self.assertAlmostEqual(row["retention_rollover_days"], 7.0, places=3)
+        self.assertEqual(row["retention_rollover_unknown_bytes"], 0)
+
+    def test_a_lone_write_index_with_no_cap_adds_nothing_and_says_so(self):
+        names, files = self._ilm_stream([15], [None], min_age="10d")
+        row = _analyze(files)
+        self.assertAlmostEqual(row["retention_days"], 10.0, places=3)            # a floor, not a measurement
+        self.assertAlmostEqual(row["retention_rollover_days"], 0.0, places=3)
+        self.assertEqual(row["retention_rollover_unknown_bytes"], self.GB)
+
+    def test_an_index_outside_a_rollover_series_is_aged_from_creation(self):
+        row = _analyze({
+            "diag/nodes_stats.json": self.NODE,
+            "diag/commercial/ilm_explain.json": {"indices": {"orders": {
+                "managed": True, "policy": "p", "index_creation_date_millis": (2 + self.O) * self.D, "lifecycle_date_millis": (2 + self.O) * self.D}}},
+            "diag/commercial/ilm_policies.json": {"p": {"policy": {"phases": {"delete": {"min_age": "10d"}}}}},
+            "diag/indices_stats.json": self._stats(["orders"]),
+        })
+        self.assertAlmostEqual(row["retention_days"], 10.0, places=3)
+        self.assertAlmostEqual(row["retention_rollover_days"], 0.0, places=3)
+        self.assertEqual(row["retention_rollover_unknown_bytes"], 0)             # it is not a write index of a series
+
+    def test_a_write_alias_series_is_read_the_same_way(self):
+        names = ["app-000001", "app-000002", "app-000003"]
+        born, rolled = [0, 5, 10], [5, 10, None]
+        explain = {n: {"managed": True, "policy": "p", "index_creation_date_millis": (b + self.O) * self.D,
+                       "lifecycle_date_millis": ((r if r is not None else b) + self.O) * self.D} for n, b, r in zip(names, born, rolled)}
+        row = _analyze({
+            "diag/nodes_stats.json": self.NODE,
+            "diag/alias.json": {n: {"aliases": {"app": ({"is_write_index": True} if n == names[-1] else {})}} for n in names},
+            "diag/commercial/ilm_explain.json": {"indices": explain},
+            "diag/commercial/ilm_policies.json": {"p": {"policy": {"phases": {"delete": {"min_age": "10d"}}}}},
+            "diag/indices_stats.json": self._stats(names),
+        })
+        self.assertAlmostEqual(row["retention_days"], 15.0, places=3)
+
+    def test_the_whole_fleet_month_steps_up_because_of_it(self):
+        from diag_inputs import index_retention_months
+        # 85 days of min_age is 2.8 months, so 3. With 10 days in hot it is 95 days, 3.1 months, so 4.
+        _n, no_hot = self._ilm_stream([0], [None], min_age="85d")
+        _n, with_hot = self._ilm_stream([0, 10], [10, None], min_age="85d")
+        self.assertEqual(index_retention_months([_analyze(no_hot)]), 3)
+        self.assertEqual(index_retention_months([_analyze(with_hot)]), 4)
+
+
+class RolloverCoverageTests(unittest.TestCase):
+    """The account says what the rollover time is, how much of it is unmeasured, and what the month would be without it."""
+
+    MIX = {"logs": 5.0, "k8s_logs": 0.0, "metrics": 0.0, "traces": 0.0}
+
+    def _out(self, **row):
+        acc = {"meta": {}, "solutions": {"by_deployment": [{"name": "A", "solution": "observability", "gb": 10.0, "ecu": 100.0}]},
+               "sizing": {"consolidated": {}}, "storage": {}}
+        base = {"name": "A", "id": "a" * 32, "bulk_gb_day": 5.0, "store_gb": 10.0, "retention_days": 15.0, "bulk_mix": self.MIX,
+                "retention_index_count": 4, "retention_index_days_sum": 60.0, "retention_index_age_bytes": 60e9 / 4 * 4,
+                "retention_index_bytes": 4e9, "retention_known_share": 1.0, "retention_basis": "policy"}
+        base.update(row)
+        return apply_diagnostics(acc, [base], {"A"})
+
+    def test_a_fleet_reports_the_rollover_days_and_the_age_without_them(self):
+        out = self._out(retention_rollover_day_bytes=5.0 * 4e9, retention_base_age_bytes=10.0 * 4e9, retention_rollover_unknown_bytes=0.0)
+        cov = out["sizing"]["diagnostics"]
+        self.assertEqual((cov["retention_rollover_days"], cov["retention_days_min_age"], cov["retention_rollover_unknown_share"]), (5.0, 10.0, 0.0))
+        note = " ".join(out["sizing"]["notes"])
+        self.assertIn("time an index sat in hot before it rolled over, 5.0 days", note)
+        self.assertIn("10.0 days", note)
+        self.assertIn("15.0", note)
+        self.assertFalse(any(row["code"] == "retention_rollover_unknown" for row in cov["estimation_limits"]))
+
+    def test_unmeasured_rollover_is_a_limit_sized_by_its_share(self):
+        out = self._out(retention_rollover_day_bytes=0.0, retention_base_age_bytes=10.0 * 4e9, retention_rollover_unknown_bytes=2e9)
+        hit = next(row for row in out["sizing"]["diagnostics"]["estimation_limits"] if row["code"] == "retention_rollover_unknown")
+        self.assertEqual(hit["severity"], "medium")                     # 50% of aged store is over the 10% bar
+        self.assertIn("50%", hit["detail"])
+        small = self._out(retention_rollover_day_bytes=1.0, retention_base_age_bytes=10.0 * 4e9, retention_rollover_unknown_bytes=2e8)
+        low = next(row for row in small["sizing"]["diagnostics"]["estimation_limits"] if row["code"] == "retention_rollover_unknown")
+        self.assertEqual(low["severity"], "low")                        # 5%
+
+    def test_a_bundle_parsed_before_rollover_was_measured_reports_nothing_rather_than_zero(self):
+        cov = self._out()["sizing"]["diagnostics"]
+        self.assertIsNone(cov["retention_rollover_days"])
+        self.assertIsNone(cov["retention_rollover_unknown_share"])
+        self.assertFalse(any(row["code"] == "retention_rollover_unknown" for row in cov["estimation_limits"]))

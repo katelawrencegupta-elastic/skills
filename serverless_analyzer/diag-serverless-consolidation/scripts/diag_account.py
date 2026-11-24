@@ -553,6 +553,15 @@ def apply_diagnostics(
             "share_of_store": round(unrated_store / active_store, 4) if active_store > 0 else None,
             "deployments": unrated_rows[:12],
         }
+    # Time in hot before rollover, which ILM `min_age` and data-stream retention both run from. Absent on a bundle parsed
+    # before it was measured, and then there is nothing to report rather than a zero.
+    measured_rollover = [r for r in active_rows if r.get("retention_rollover_day_bytes") is not None]
+    aged_bytes = sum(float(r.get("retention_index_bytes") or 0) for r in measured_rollover)
+    rollover_days_fleet = min_age_days_fleet = rollover_unknown_share = None
+    if measured_rollover and aged_bytes > 0:
+        rollover_days_fleet = sum(float(r.get("retention_rollover_day_bytes") or 0) for r in measured_rollover) / aged_bytes
+        min_age_days_fleet = sum(float(r.get("retention_base_age_bytes") or 0) for r in measured_rollover) / aged_bytes
+        rollover_unknown_share = sum(float(r.get("retention_rollover_unknown_bytes") or 0) for r in measured_rollover) / aged_bytes
     coverage = {
         "bundles": len(rows),
         "matched": matched,
@@ -595,6 +604,11 @@ def apply_diagnostics(
         # Share of local store with no retention age (no delete phase, no data-stream retention). It is
         # left out of the written month, not given a default.
         "retention_unaged_share": unaged_share,
+        # Store-weighted days the aged store sat in hot before rollover, the same weighted age without it, and the share
+        # of aged store in a write index that had nothing to measure rollover from.
+        "retention_rollover_days": None if rollover_days_fleet is None else round(rollover_days_fleet, 3),
+        "retention_days_min_age": None if min_age_days_fleet is None else round(min_age_days_fleet, 3),
+        "retention_rollover_unknown_share": None if rollover_unknown_share is None else round(rollover_unknown_share, 4),
         "retention_clamped": clamped_notes,
         "active_month": active_info.get("month"),
         "active_month_partial": bool(active_info.get("partial")),
@@ -649,6 +663,16 @@ def apply_diagnostics(
         limitations.append({"code": "missing_diagnostics", "count": fallback, "names": fallback_names[:12], "severity": "high"})
     if no_age:
         limitations.append({"code": "retention_unmeasured", "count": len(no_age), "names": [r["name"] for r in no_age[:12]], "severity": "medium"})
+    if rollover_unknown_share:
+        limitations.append({
+            "code": "retention_rollover_unknown",
+            "detail": (
+                f"{rollover_unknown_share * 100:.0f}% of the store that has a retention age is in a write index with no rolled "
+                "generation to measure its time in hot from and no rollover max_age on its policy, so no rollover time was "
+                "added to it. The month is a floor for that store."
+            ),
+            "severity": "medium" if rollover_unknown_share > RETENTION_UNAGED_MAX_SHARE else "low",
+        })
     if unaged_retention_rows:
         limitations.append({"code": "retention_unaged", "count": len(unaged_retention_rows), "names": [r["name"] for r in unaged_retention_rows[:12]], "severity": "medium"})
     if short:
@@ -752,6 +776,13 @@ def apply_diagnostics(
         )
     elif unaged_retention_rows and not within:
         notes.append("Some local store has no ILM delete phase and no data-stream retention. It is left out of the retention average, with no default age.")
+    if rollover_days_fleet and meta_out.get("retention_month_basis") == "index_average":
+        notes.append(
+            f"Retention counts the time an index sat in hot before it rolled over, {rollover_days_fleet:.1f} days store-weighted. "
+            "An ILM delete min_age and a data stream's retention both run from rollover, so an index lives for that age plus "
+            f"this. The store-weighted age from the policies alone is {min_age_days_fleet:.1f} days and the written average is "
+            f"{(min_age_days_fleet or 0) + rollover_days_fleet:.1f}."
+        )
     if retention_missing:
         notes.append(
             "No retention age could be ascertained for any index, so no month was written and Observability and Security "
