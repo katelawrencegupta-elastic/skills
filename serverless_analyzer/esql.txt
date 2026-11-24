@@ -1,0 +1,81 @@
+FROM service-proxy-requests-*
+| WHERE handling_cluster == “YOUR_HANDLING_CLUSTER”
+ AND request_source == “external”
+ AND user_agent LIKE “USER_AGENT(S)”
+| EVAL
+ minute = DATE_TRUNC(1 minute, @timestamp),
+ hour = DATE_TRUNC(1 hour, @timestamp),
+ is_search = CASE(
+ action == “search” OR
+ request_path LIKE “*/_search*” OR
+ request_path LIKE “*/_msearch*” OR
+ request_path LIKE “*/_count*” OR
+ request_path LIKE “*/_pit*“,
+ 1,
+ 0
+ ),
+ search_latency_ms = CASE(is_search == 1, response_time, null)
+| INLINE STATS
+ search_latency_p90_ms = PERCENTILE(search_latency_ms, 90),
+ search_latency_p99_ms = PERCENTILE(search_latency_ms, 99)
+ BY hour
+| STATS
+ search_requests = SUM(is_search),
+ search_latency_p90_ms = MAX(search_latency_p90_ms),
+ search_latency_p99_ms = MAX(search_latency_p99_ms)
+ BY minute
+| EVAL
+ minute_search_qps = search_requests / 60.0,
+ hour = DATE_TRUNC(1 hour, minute)
+| STATS
+ search_requests = SUM(search_requests),
+ peak_minute_search_qps = MAX(minute_search_qps),
+ search_latency_p90_ms = MAX(search_latency_p90_ms),
+ search_latency_p99_ms = MAX(search_latency_p99_ms)
+ BY hour
+| EVAL
+ avg_search_qps = search_requests / 3600.0,
+ hour_of_day = DATE_EXTRACT(“hour_of_day”, hour),
+ day_of_week = DATE_EXTRACT(“day_of_week”, hour),
+ // Peak window: weekdays (1 = Mon, 7 = Sun), hours in UTC, start inclusive, end exclusive
+ window = CASE(
+ day_of_week <= 5 AND hour_of_day >= 13 AND hour_of_day < 23,
+ “peak”,
+ “non_peak”
+ )
+| STATS
+ hours = COUNT(*),
+ avg_qps = AVG(avg_search_qps),
+ p95_hourly_qps = PERCENTILE(avg_search_qps, 95),
+ p95_peak_minute_qps = PERCENTILE(peak_minute_search_qps, 95),
+ max_peak_minute_qps = MAX(peak_minute_search_qps),
+ typical_p90_latency_ms = PERCENTILE(search_latency_p90_ms, 50),
+ typical_p99_latency_ms = PERCENTILE(search_latency_p99_ms, 50)
+ BY window
+| INLINE STATS total_hours = SUM(hours)
+| EVAL
+ pct_of_hours = ROUND(100.0 * hours / total_hours, 0),
+ recommended_qps = CEIL(p95_peak_minute_qps),
+ query_complexity = CASE(
+ typical_p90_latency_ms <= 250, “simple”,
+ typical_p90_latency_ms <= 500, “moderate”,
+ “complex”
+ ),
+ avg_qps = ROUND(avg_qps, 1),
+ p95_hourly_qps = ROUND(p95_hourly_qps, 1),
+ p95_peak_minute_qps = ROUND(p95_peak_minute_qps, 1),
+ max_peak_minute_qps = ROUND(max_peak_minute_qps, 1),
+ typical_p90_latency_ms = ROUND(typical_p90_latency_ms, 0),
+ typical_p99_latency_ms = ROUND(typical_p99_latency_ms, 0)
+| KEEP
+ window,
+ pct_of_hours,
+ recommended_qps,
+ query_complexity,
+ avg_qps,
+ p95_hourly_qps,
+ p95_peak_minute_qps,
+ max_peak_minute_qps,
+ typical_p90_latency_ms,
+ typical_p99_latency_ms
+| SORT window DESC
