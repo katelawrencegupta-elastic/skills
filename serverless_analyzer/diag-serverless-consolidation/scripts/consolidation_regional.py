@@ -800,7 +800,7 @@ def _integrity(acc: dict, sz: dict, by_solution: dict, quotes: list[dict], headl
             "fallback_names": coverage.get("fallback_names") or [],
             "bulk_gb_day": coverage.get("bulk_gb_day"),
             "retention_policy_bulk_gb_day": coverage.get("retention_policy_bulk_gb_day"),
-            "retention_assumed_max_share": coverage.get("retention_assumed_max_share"),
+            "retention_unaged_max_share": coverage.get("retention_unaged_max_share"),
             "retention_policy_within_threshold_gb_day": coverage.get("retention_policy_within_threshold_gb_day"),
             "bulk_short_window_gb_day": coverage.get("bulk_short_window_gb_day"),
             "bulk_restart_gb_day": coverage.get("bulk_restart_gb_day"),
@@ -811,7 +811,8 @@ def _integrity(acc: dict, sz: dict, by_solution: dict, quotes: list[dict], headl
         # The month written to every Observability and Security sheet, and whether an index
         # average set it. The K360 backup prices an assumed month by design, so it is n/a there.
         "retention_month": None if sz.get("ingest_source") != "diagnostics" else {
-            "months": int((acc.get("meta") or {}).get("estimate_months") or ESTIMATE_MONTHS),
+            # None when no retention could be ascertained: no month was written and nothing stands in for it.
+            "months": None if (acc.get("meta") or {}).get("retention_month_basis") == "unascertained" else int((acc.get("meta") or {}).get("estimate_months") or ESTIMATE_MONTHS),
             "index_count": (acc.get("meta") or {}).get("retention_index_count"),
             "index_days": (acc.get("meta") or {}).get("retention_index_days"),
             "explicit_days": (acc.get("meta") or {}).get("retention_days"),

@@ -196,3 +196,34 @@ class DocLintTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NoRetentionDefaultTests(unittest.TestCase):
+    """A retention month is measured or absent. No default age or month stands in for it."""
+
+    RETIRED_DEFAULT = (
+        "fallback_30d", "retention_month_fallback", "retention_30d_assumed", "retention_blended_share",
+        "retention_assumed_share", "RETENTION_FALLBACK_DAYS", "RETENTION_ASSUMED_MAX_SHARE",
+        "30-day default", "30-day assumed", "30-day assumption",
+    )
+
+    def test_docs_do_not_describe_a_retention_default(self):
+        for doc in DOCS:
+            text = doc.read_text()
+            for phrase in self.RETIRED_DEFAULT:
+                self.assertNotIn(phrase, text, f"{doc.name} still mentions {phrase!r}")
+
+    def test_code_has_no_retention_default_constant_or_age(self):
+        import constants
+        self.assertFalse(hasattr(constants, "RETENTION_FALLBACK_DAYS"))
+        self.assertFalse(hasattr(constants, "RETENTION_ASSUMED_MAX_SHARE"))
+        source = (HERE / "admin_diags.py").read_text()
+        self.assertNotIn("default_age", source)
+        self.assertNotIn("fallback_30d", (HERE / "diag_inputs.py").read_text())
+
+    def test_the_documented_limit_codes_are_the_emitted_ones(self):
+        calc = (SKILL / "references" / "calculations.md").read_text()
+        emitted = (HERE / "diag_account.py").read_text()
+        for code in ("retention_month_missing", "retention_unaged"):
+            self.assertIn(code, calc)
+            self.assertIn(f'"{code}"', emitted)

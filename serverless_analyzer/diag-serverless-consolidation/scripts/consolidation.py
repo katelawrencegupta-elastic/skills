@@ -857,8 +857,8 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
     measured_ages = [float(g["retention_months_measured"]) for g in region_groups if g.get("retention_months_measured") is not None]
     if measured_ages:
         shown = round(sum(measured_ages) / len(measured_ages), 1)
-        written_months = int((acc.get("meta") or {}).get("estimate_months") or ESTIMATE_MONTHS)
-        if not (acc.get("meta") or {}).get("retention_index_count") and abs(shown - written_months) > 0.05:
+        written_months = (acc.get("meta") or {}).get("estimate_months")
+        if written_months is not None and not (acc.get("meta") or {}).get("retention_index_count") and abs(shown - int(written_months)) > 0.05:
             notes.append(f"Retention measured at {shown:g} months; the estimate prices {written_months}.")
     # No "At measured retention" row: the measured-retention copy is retired (SKILL.md hard
     # rule 4, one sheet per solution per region), so nothing prices that month any more.
@@ -903,7 +903,7 @@ def build_consolidation(acc: dict, infra: dict | None) -> dict:
         "savings": savings,
         "ech_recent_months": recent_ech_months(acc),
         "ech_recent_months_priced": priced_months,
-        "estimate_months": int((acc.get("meta") or {}).get("estimate_months") or 12),
+        "estimate_months": None if (acc.get("meta") or {}).get("retention_month_basis") == "unascertained" else int((acc.get("meta") or {}).get("estimate_months") or 12),
         "retention_days": (acc.get("meta") or {}).get("retention_days"),
         "retention_index_days": (acc.get("meta") or {}).get("retention_index_days"),
         "retention_index_count": (acc.get("meta") or {}).get("retention_index_count"),

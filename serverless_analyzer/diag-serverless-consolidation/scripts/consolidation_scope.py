@@ -829,8 +829,10 @@ def _deployment_groups(acc: dict, infra: dict | None, months: float) -> list[dic
                 row["retention_months_measured"] = round((g["retention_weighted"] / g["retention_bulk"]) / DAYS_PER_MONTH, 6)
             if g["daily_raw_gb"]:
                 # Default is one year. --retention-days writes another whole month, measured or not.
+                # With no month ascertained the row carries none, so its sheet is not filled.
                 from diag_inputs import ESTIMATE_MONTHS
-                row["retention_months"] = int((acc.get("meta") or {}).get("estimate_months") or ESTIMATE_MONTHS)
+                if (acc.get("meta") or {}).get("retention_month_basis") != "unascertained":
+                    row["retention_months"] = int((acc.get("meta") or {}).get("estimate_months") or ESTIMATE_MONTHS)
         groups.append(row)
     order = {"search": 0, "observability": 1, "security": 2}
     groups.sort(key=lambda g: (order.get(g["solution"], 9), -g["ech_ecu_mo"]))

@@ -108,10 +108,11 @@ class RetentionTests(unittest.TestCase):
         # No index counts: the measured delete age sets the month, and an unmeasured row stays out of it.
         self.assertEqual(mixed["months_written"], 1)
         self.assertEqual(mixed["retention_unmeasured"], [{"name": "a", "bulk_gb_day": 10.0}])
-        # Nothing measured at all: the 30-day default, 1 month. Never 12.
+        # Nothing measured at all: no month. No default (30 days or 12 months) stands in for it.
         empty = summarize([{"name": "a", "bulk_gb_day": 5, "retention_days": None, "store_gb": 1}])
-        self.assertEqual(empty["months_written"], 1)
-        self.assertEqual(empty["observability_cells"]["G11_retention_months"], 1)
+        self.assertIsNone(empty["months_written"])
+        self.assertNotIn("G11_retention_months", empty["observability_cells"])
+        self.assertNotIn("G12_tsds_retention_months", empty["observability_cells"])
         subday = summarize([{"name": "a", "bulk_gb_day": 2, "retention_days": 0.042, "store_gb": 1}])
         self.assertEqual(subday["months_written"], 1)
         self.assertEqual(subday["retention_unmeasured"], [])
@@ -276,9 +277,10 @@ class RetentionTests(unittest.TestCase):
         rows[0]["retention_days"] = None
         bare = apply_diagnostics(acc, rows)
         block = bare["sizing"]["consolidated"]["observability"]
-        # No retention can be ascertained: bulk with no measured age is written at the 30-day default, 1 month.
-        self.assertEqual(block["retention_months"], 1)
-        self.assertEqual(bare["meta"]["retention_month_basis"], "fallback_30d")
+        # No retention can be ascertained: no month is written, and none is assumed in its place.
+        self.assertNotIn("retention_months", block)
+        self.assertIsNone(bare["meta"]["estimate_months"])
+        self.assertEqual(bare["meta"]["retention_month_basis"], "unascertained")
         self.assertNotIn("retention_months_measured", block)
         self.assertFalse(block["retention_unmeasured"])
 
@@ -491,7 +493,8 @@ class RetentionAndRestartTests(unittest.TestCase):
         state = {"metadata": {"indices": {n: {"settings": {"index": {"creation_date": str(now - int(age * self.DAY))}}} for n, (_st, age, _pol, _b) in indices.items()}}}
         explain = {"indices": {n: {"managed": True, "policy": pol, "index_creation_date_millis": now - int(age * self.DAY), "lifecycle_date_millis": now - int(age * self.DAY), "action": "rollover"}
                                for n, (_st, age, pol, _b) in indices.items() if pol}}
-        pol = {name: {"policy": {"phases": {"delete": {"min_age": f"{days}d"}}}} for name, days in policies.items()}
+        # A policy whose days is None is real but has no delete phase: it never deletes.
+        pol = {name: {"policy": {"phases": ({"delete": {"min_age": f"{days}d"}} if days is not None else {"hot": {}})}} for name, days in policies.items()}
         path = tmp / "a__1.zip"
         with zipfile.ZipFile(path, "w") as z:
             z.writestr("diag/indices_stats.json", json.dumps(stats))
@@ -503,23 +506,38 @@ class RetentionAndRestartTests(unittest.TestCase):
                 z.writestr("diag/recovery.json", json.dumps(recovery))
         return path
 
-    def test_store_with_no_policy_is_blended_in_at_its_own_age(self):
+    def test_store_with_no_policy_is_left_out_of_the_average(self):
         from admin_diags import analyze_bundle
         with tempfile.TemporaryDirectory() as tmp:
             path = self._bundle(Path(tmp), {
-                "kept": (1_000_000_000, 10, "p30", 0),
+                "kept": (1_000_000_000, 10, "p90", 0),
                 "nopolicy": (3_000_000_000, 100, None, 0),
-            }, {"p30": 30})
+            }, {"p90": 90})
             row = analyze_bundle(path, captured=self.CAPTURED)
-        # 1 GB at the 30-day policy and 3 GB at the 30-day default.
-        self.assertAlmostEqual(row["retention_days"], 30.0, places=1)
-        self.assertEqual(row["retention_index_count"], 2)
-        self.assertAlmostEqual(row["retention_index_days_sum"], 60.0, places=3)
-        self.assertEqual(row["retention_basis"], "blended")
+        # 1 GB at the 90-day policy. The 3 GB with no policy has no age: it is not pulled to a default,
+        # it is not counted as an index, and it carries no weight.
+        self.assertAlmostEqual(row["retention_days"], 90.0, places=1)
+        self.assertEqual(row["retention_index_count"], 1)
+        self.assertAlmostEqual(row["retention_index_days_sum"], 90.0, places=3)
+        self.assertEqual(row["retention_basis"], "partial")
         self.assertAlmostEqual(row["retention_known_share"], 0.25, places=3)
-        self.assertIn("assumed", row["retention_label"])
+        self.assertAlmostEqual(row["retention_unaged_share"], 0.75, places=3)
+        self.assertIn("no retention age", row["retention_label"])
 
-    def test_with_no_policy_anywhere_retention_is_the_30_day_default(self):
+    def test_an_ilm_policy_with_no_delete_phase_is_not_read_as_a_month(self):
+        # A managed index whose policy never deletes keeps its data indefinitely. That is not 30 days.
+        from admin_diags import analyze_bundle
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._bundle(Path(tmp), {
+                "forever": (4_000_000_000, 10, "keep", 0),
+                "deleted": (1_000_000_000, 10, "p90", 0),
+            }, {"p90": 90, "keep": None})
+            row = analyze_bundle(path, captured=self.CAPTURED)
+        self.assertAlmostEqual(row["retention_days"], 90.0, places=1)
+        self.assertEqual(row["retention_index_count"], 1)
+        self.assertAlmostEqual(row["retention_unaged_share"], 0.8, places=3)
+
+    def test_with_no_policy_anywhere_there_is_no_retention_and_no_default(self):
         from admin_diags import analyze_bundle
         with tempfile.TemporaryDirectory() as tmp:
             path = self._bundle(Path(tmp), {
@@ -527,10 +545,12 @@ class RetentionAndRestartTests(unittest.TestCase):
                 "tiny-old": (1_000_000, 2000, None, 0),
             }, {})
             row = analyze_bundle(path, captured=self.CAPTURED)
-        self.assertEqual(row["retention_basis"], "assumed")
-        self.assertAlmostEqual(row["retention_days"], 30.0, places=1)
+        self.assertIsNone(row["retention_basis"])
+        self.assertIsNone(row["retention_days"])
+        self.assertIsNone(row["retention_label"])
+        self.assertEqual(row["retention_index_count"], 0)
         self.assertEqual(row["retention_known_share"], 0.0)
-        self.assertIn("assumed", row["retention_label"])
+        self.assertEqual(row["retention_unaged_share"], 1.0)
 
     def test_a_restarted_primary_is_flagged_and_the_quoted_rate_is_unchanged(self):
         from admin_diags import series_rates
@@ -574,10 +594,10 @@ class RetentionAndRestartTests(unittest.TestCase):
         cov = apply_diagnostics(acc, rows, {"a"})["sizing"]["diagnostics"]
         self.assertEqual(cov["bulk_restart_gb_day"], 2.0)
         self.assertEqual(cov["bulk_restart_deployments"], [{"name": "a", "gb_day": 2.0}])
-        self.assertEqual(cov["retention_blended_share"], 0.5)
+        self.assertEqual(cov["retention_unaged_share"], 0.5)
         notes = " ".join(apply_diagnostics(acc, rows, {"a"})["sizing"]["notes"])
         self.assertIn("restarted or moved", notes)
-        self.assertIn("50% of local store has no delete policy", notes)
+        self.assertIn("50% of local store has no ILM delete phase", notes)
         self.assertEqual(cov["bulk_gb_day"], 10.0)             # the quote keeps esdiag's figure
 
 

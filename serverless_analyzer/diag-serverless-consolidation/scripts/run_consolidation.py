@@ -154,9 +154,11 @@ def warn(acc_or_sz: dict | None, code: str, detail: str, severity: str = "high")
         note_limit(acc_or_sz, code, detail, severity)
 
 
-def _retention_label(diagnostic: bool, retention_months: int, retention_days: int | None, *, index_average: bool = False) -> str:
+def _retention_label(diagnostic: bool, retention_months: int | None, retention_days: int | None, *, index_average: bool = False) -> str:
     if not diagnostic:
         return "assumed month"
+    if retention_months is None:
+        return "not ascertained, no month written"
     if index_average:
         unit = "month" if int(retention_months) == 1 else "months"
         return f"index average rounded up to {int(retention_months)} {unit}"
@@ -165,7 +167,7 @@ def _retention_label(diagnostic: bool, retention_months: int, retention_days: in
     return "one year (12 months)"
 
 
-def method_stamp(lookback_days: int, *, diagnostic: bool = True, retention_months: int = 12, retention_days: int | None = None, index_average: bool = False) -> dict:
+def method_stamp(lookback_days: int, *, diagnostic: bool = True, retention_months: int | None = 12, retention_days: int | None = None, index_average: bool = False) -> dict:
     """Which code and which rules produced this run.
 
     Two runs of one customer can only be compared when they carry the same stamp.
@@ -696,6 +698,18 @@ def _money_note(diag_mo, k360_mo) -> str:
     )
 
 
+def _written_months(diag: dict, args) -> int | None:
+    """The month written to the Observability and Security sheets, or None when none could be ascertained.
+
+    `retention_month_basis` `unascertained` means no index had a retention age and no delete age was
+    measured. No default month stands in for that.
+    """
+    meta = diag.get("meta") or {}
+    if meta.get("retention_month_basis") == "unascertained":
+        return None
+    return int(meta.get("estimate_months") or getattr(args, "estimate_months", None) or ESTIMATE_MONTHS)
+
+
 def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args) -> dict | None:
     """Default consolidation: measured ingest and retention from admin-console diagnostics."""
     sz = acc.setdefault("sizing", {})
@@ -836,7 +850,7 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
     diag["sizing"]["quote_options"] = options
     diag.setdefault("meta", {})["method"] = method_stamp(
         args.lookback_days,
-        retention_months=int((diag.get("meta") or {}).get("estimate_months") or ESTIMATE_MONTHS),
+        retention_months=_written_months(diag, args),
         retention_days=(diag.get("meta") or {}).get("retention_days"),
         index_average=bool((diag.get("meta") or {}).get("retention_index_count")),
     )
@@ -876,9 +890,12 @@ def _diagnostics_document(acc: dict, infra: dict, folder: Path, env: dict, args)
     seal_text(diag_path, json.dumps(diag, indent=2))
     py = _sheets_py()
     sizing_ran = False
-    # The written month is the index average rounded up. --retention-days replaces it.
-    written_months = int((diag.get("meta") or {}).get("estimate_months") or getattr(args, "estimate_months", None) or ESTIMATE_MONTHS)
-    extra = ["--sizing-json", "sizing.json", "--force-months", str(written_months)]
+    # The written month is the index average rounded up. --retention-days replaces it. With no month
+    # ascertained none is forced: the sizing step leaves Observability and Security unfilled.
+    written_months = _written_months(diag, args)
+    extra = ["--sizing-json", "sizing.json"]
+    if written_months is not None:
+        extra += ["--force-months", str(written_months)]
     if args.fresh:
         extra.append("--fresh")
     if getattr(args, "search_notebook", False):

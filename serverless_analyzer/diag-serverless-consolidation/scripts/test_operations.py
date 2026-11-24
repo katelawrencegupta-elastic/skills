@@ -819,7 +819,8 @@ class PhaseGuardTests(unittest.TestCase):
         self.assertEqual(row["score"], 0.4)
         self.assertTrue(row["passed"])
         self.assertTrue(row["warning"])
-        self.assertIn("30-day assumed default", row["detail"])
+        self.assertIn("no retention age", row["detail"])
+        self.assertNotIn("30-day", row["detail"])
         recorded = integrity_score({"coverage": {"bulk_gb_day": 10, "retention_policy_bulk_gb_day": 4}})
         self.assertNotIn("Retention basis", [item["check"] for item in recorded["checks"] if item.get("passed") is False])
 
@@ -838,8 +839,8 @@ class PhaseGuardTests(unittest.TestCase):
         self.assertIn("inside the threshold", row["detail"])
 
     def test_one_unconfigured_index_keeps_a_deployment_policy_aged(self):
-        from constants import RETENTION_ASSUMED_MAX_SHARE
-        self.assertEqual(RETENTION_ASSUMED_MAX_SHARE, 0.10)
+        from constants import RETENTION_UNAGED_MAX_SHARE
+        self.assertEqual(RETENTION_UNAGED_MAX_SHARE, 0.10)
         from diag_account import apply_diagnostics
         acc = {
             "meta": {},
@@ -852,40 +853,40 @@ class PhaseGuardTests(unittest.TestCase):
         }
         mix = {"logs": 1.0, "k8s_logs": 0.0, "metrics": 0.0, "traces": 0.0}
         rows = [
-            # 0.3% of store at the 30-day default: inside the threshold, still policy-aged.
+            # 0.3% of store with no retention age: inside the threshold, still policy-aged.
             {"name": "mostly", "bulk_gb_day": 120.0, "store_gb": 100.0, "retention_days": 48.0,
-             "retention_basis": "policy", "retention_known_share": 0.997, "retention_assumed_share": 0.003,
+             "retention_basis": "policy", "retention_known_share": 0.997, "retention_unaged_share": 0.003,
              "retention_index_count": 10, "retention_index_days_sum": 480.0, "bulk_mix": mix},
-            # 40% at the default: past the threshold, contributes nothing.
+            # 40% with no retention age: past the threshold, contributes nothing.
             {"name": "half", "bulk_gb_day": 80.0, "store_gb": 100.0, "retention_days": 35.0,
-             "retention_basis": "blended", "retention_known_share": 0.6, "retention_assumed_share": 0.4,
+             "retention_basis": "partial", "retention_known_share": 0.6, "retention_unaged_share": 0.4,
              "retention_index_count": 10, "retention_index_days_sum": 350.0, "bulk_mix": mix},
         ]
         cov = apply_diagnostics(acc, rows)["sizing"]["diagnostics"]
         self.assertEqual(cov["retention_policy_bulk_gb_day"], 120.0)
         self.assertEqual(cov["retention_policy_within_threshold_gb_day"], 120.0)
-        self.assertEqual(cov["retention_assumed_max_share"], 0.10)
-        named = {row["name"]: row for row in cov["retention_30d_assumed"]}
+        self.assertEqual(cov["retention_unaged_max_share"], 0.10)
+        named = {row["name"]: row for row in cov["retention_unaged"]}
         self.assertTrue(named["mostly"]["within_threshold"])
         self.assertFalse(named["half"]["within_threshold"])
 
     def test_the_bundle_basis_uses_the_ten_percent_threshold(self):
         import admin_diags
-        def basis(known_bytes, assumed_bytes):
-            local = known_bytes + assumed_bytes
+        def basis(known_bytes, unaged_bytes):
+            local = known_bytes + unaged_bytes
             if local <= 0:
                 return None
-            share = assumed_bytes / local
+            share = unaged_bytes / local
             if known_bytes <= 0:
-                return "assumed"
-            if assumed_bytes <= 0 or share <= admin_diags.RETENTION_ASSUMED_MAX_SHARE:
+                return None                            # no aged store: no basis, no days, no default
+            if unaged_bytes <= 0 or share <= admin_diags.RETENTION_UNAGED_MAX_SHARE:
                 return "policy"
-            return "blended"
+            return "partial"
         self.assertEqual(basis(1000, 0), "policy")
-        self.assertEqual(basis(997, 3), "policy")      # KeyBank Production, 0.3% assumed
+        self.assertEqual(basis(997, 3), "policy")      # 0.3% with no retention age
         self.assertEqual(basis(900, 100), "policy")    # exactly at the 10% bar
-        self.assertEqual(basis(899, 101), "blended")
-        self.assertEqual(basis(0, 1000), "assumed")
+        self.assertEqual(basis(899, 101), "partial")
+        self.assertIsNone(basis(0, 1000))
 
     def test_an_alias_with_no_region_recorded_says_so(self):
         from quote_checks import _region_fidelity_row
@@ -919,13 +920,20 @@ class PhaseGuardTests(unittest.TestCase):
         self.assertNotIn("warning", row)
         self.assertIn("--retention-days", row["detail"])
 
-    def test_the_30_day_fallback_warns_and_does_not_fail_the_quote(self):
-        row = self._retention_month(index_count=None, months=1, basis="fallback_30d")
-        self.assertTrue(row["passed"])
+    def test_no_ascertainable_month_scores_zero_and_names_that_nothing_was_assumed(self):
+        row = self._retention_month(index_count=None, months=None, basis="unascertained")
+        self.assertTrue(row["passed"])      # the missing price fails Quote present, not this row
         self.assertTrue(row["warning"])
         self.assertEqual(row["score"], 0.0)
-        self.assertIn("30-day default (1 month)", row["detail"])
-        self.assertIn("still produced", row["detail"])
+        self.assertIn("no default was assumed", row["detail"])
+        self.assertIn("--retention-days", row["detail"])
+        self.assertNotIn("30-day", row["detail"])
+
+    def test_a_written_month_with_no_recorded_basis_is_a_warning(self):
+        row = self._retention_month(index_count=None, months=1, basis=None)
+        self.assertTrue(row["warning"])
+        self.assertEqual(row["score"], 0.0)
+        self.assertIn("basis was not recorded", row["detail"])
 
     def test_a_measured_delete_age_without_index_counts_is_a_measured_month(self):
         row = self._retention_month(index_count=None, months=4, basis="measured_age")
@@ -940,7 +948,7 @@ class PhaseGuardTests(unittest.TestCase):
         row = next(item for item in recorded["checks"] if item["check"] == "Retention month")
         self.assertIsNone(row["passed"])
 
-    def test_the_fallback_month_is_a_limit_and_a_note(self):
+    def test_no_ascertainable_month_is_a_limit_a_note_and_no_written_month(self):
         from diag_account import apply_diagnostics
         acc = {
             "meta": {},
@@ -953,13 +961,67 @@ class PhaseGuardTests(unittest.TestCase):
                  "bulk_mix": {"logs": 5.0, "k8s_logs": 0.0, "metrics": 0.0, "traces": 0.0}}]
         out = apply_diagnostics(acc, rows)
         limits = (out["sizing"].get("diagnostics") or {}).get("estimation_limits") or []
-        hit = next(row for row in limits if row.get("code") == "retention_month_fallback")
+        hit = next(row for row in limits if row.get("code") == "retention_month_missing")
         self.assertEqual(hit["severity"], "high")
-        self.assertEqual((hit["months"], hit["days"]), (1, 30.0))
-        self.assertEqual(out["meta"]["estimate_months"], 1)
-        self.assertEqual(out["meta"]["retention_month_basis"], "fallback_30d")
-        self.assertEqual(out["sizing"]["consolidated"]["observability"]["retention_months"], 1)
-        self.assertTrue(any("30-day default" in str(note) for note in out["sizing"].get("notes") or []))
+        self.assertNotIn("30-day", hit["detail"].replace("No default", ""))
+        self.assertIsNone(out["meta"]["estimate_months"])
+        self.assertEqual(out["meta"]["retention_month_basis"], "unascertained")
+        self.assertNotIn("retention_months", out["sizing"]["consolidated"]["observability"])
+        self.assertFalse(any(row.get("code") == "retention_month_fallback" for row in limits))
+        notes = " ".join(str(note) for note in out["sizing"].get("notes") or [])
+        self.assertIn("no month was written", notes)
+        self.assertIn("--retention-days", notes)
+        self.assertNotIn("30-day default", notes)
+
+    def test_a_named_retention_is_recorded_even_when_it_converts_to_12_months(self):
+        # 12 is also the "unset" value. 335 to 365 days must still be recorded as the override,
+        # or the quote falls back to the index average and ignores what was asked for.
+        import run_consolidation  # noqa: F401  (puts the k360 scripts on the path)
+        from run_account_analysis import apply_retention_override
+        from diag_inputs import whole_months
+        from constants import DAYS_PER_MONTH
+        for days in (14, 60, 335, 365):
+            acc = {"meta": {}}
+            months = whole_months(days / DAYS_PER_MONTH)
+            key = apply_retention_override(acc, "acme_2026-11-24", months, days)
+            self.assertEqual(acc["meta"]["retention_days"], days, days)
+            self.assertEqual(key, f"acme_2026-11-24_{days}d")
+            self.assertEqual(acc["meta"]["run_key"], key)
+            if months == 12:
+                self.assertNotIn("estimate_months", acc["meta"])      # 12 stays the unset value
+            else:
+                self.assertEqual(acc["meta"]["estimate_months"], months)
+        unset = {"meta": {}}
+        self.assertEqual(apply_retention_override(unset, "k", 12, None), "k")
+        self.assertNotIn("retention_days", unset["meta"])
+
+    def test_no_month_is_forced_and_the_sizing_step_skips_the_sheet(self):
+        import argparse
+        import run_consolidation as rc
+        from estimate_paths import _months_for_sheet, estimator_skip
+        args = argparse.Namespace(estimate_months=12)
+        # Nothing ascertainable: the runner has no month to force. It must not fall back to 12.
+        unascertained = {"meta": {"retention_month_basis": "unascertained", "estimate_months": None}}
+        self.assertIsNone(rc._written_months(unascertained, args))
+        # An index average and an explicit --retention-days are still written.
+        self.assertEqual(rc._written_months({"meta": {"retention_month_basis": "index_average", "estimate_months": 4}}, args), 4)
+        # A block with bulk and no month is skipped for retention, even when a month is forced.
+        block = {"has_workload": True, "daily_raw_gb": 5.0}
+        self.assertIsNone(_months_for_sheet(block, None))
+        self.assertIsNone(_months_for_sheet(block, 6))
+        self.assertEqual(estimator_skip(block, None), "retention")
+        self.assertEqual(estimator_skip({**block, "retention_months": 3}, None), None)
+
+    def test_no_month_leaves_the_solution_unquoted_and_the_quote_unverified(self):
+        from quote_checks import integrity_score
+        recorded = integrity_score({
+            "retention_month": {"months": None, "has_bulk": True, "basis": "unascertained"},
+            "solutions": [{"solution": "observability", "has_workload": True, "serverless_mo": 0.0, "direct": False}],
+        })
+        by_name = {row["check"]: row for row in recorded["checks"]}
+        self.assertTrue(by_name["Retention month"]["warning"])
+        self.assertFalse(by_name["Quote present"]["passed"])
+        self.assertFalse(recorded["passed"])
 
     def test_a_measured_delete_age_is_used_when_no_index_was_counted(self):
         from diag_account import apply_diagnostics

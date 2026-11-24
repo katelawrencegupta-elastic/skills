@@ -265,7 +265,7 @@ def consolidation_section(acc: dict) -> list[str]:
     L.append(f"- **Lookback ECU** {n0(e.get('total_lookback'))} from {s(rng.get('start'))} → {s(rng.get('end'))} ({s(e.get('lookback_days'))} d), cloud-tracker-billing. Full-org quote-window bill is {n0(b.get('ech_window_ecu'))} ECU/mo. {comparison} Partial months excluded from the calendar-month average: {', '.join(partial) if partial else 'none'}.")
     if from_diags:
         L.append(f"- **Stored size** {n1(b.get('stored_gb'))} GB on the quote. Matched deployments use the diagnostic primary store. A deployment with no bundle is not sized. GB/day is measured bulk, not stored GB ÷ retention.")
-        L.append(f"- **Retention** {s(b.get('retention_months'))} is the ingest-weighted diagnostic retention written to the estimator (1–36 months); store with no configured retention uses the labeled 30-day default. K360 does not provide a raw ingest total. Stored GB ÷ assumed retention is the separately requested --k360-ingest scenario, not the diagnostic quote.")
+        L.append(f"- **Retention** {s(b.get('retention_months'))} is the ingest-weighted diagnostic retention written to the estimator (1–36 months); store with no ILM delete phase and no data-stream retention is left out of the average, with no default age. When no retention can be ascertained no month is written and Observability and Security are not quoted. K360 does not provide a raw ingest total. Stored GB ÷ assumed retention is the separately requested --k360-ingest scenario, not the diagnostic quote.")
         source_map = (acc.get("sizing") or {}).get("source_precedence") or ((acc.get("sizing") or {}).get("diagnostics") or {}).get("source_precedence") or {}
         diagnostic_fields = source_map.get("diagnostic_authoritative") or []
         tracker_fields = source_map.get("cloud_tracker_authoritative") or []
@@ -274,7 +274,8 @@ def consolidation_section(acc: dict) -> list[str]:
         limit_labels = {
             "missing_diagnostics": "some active deployments have no diagnostic bundle",
             "retention_unmeasured": "retention is unmeasured for some bulk rows",
-            "retention_30d_assumed": "some retention uses the labeled 30-day default",
+            "retention_unaged": "some store has no retention age and is left out of the retention month",
+            "retention_month_missing": "no retention month could be ascertained, so Observability and Security were not quoted",
             "short_diagnostic_window": "some bulk rates came from nodes up for under two days",
             "bulk_rate_fallback": "some bulk rates lack a measured ILM write phase",
             "unrated_ingest": "some indices have writes but no measured ingest rate",

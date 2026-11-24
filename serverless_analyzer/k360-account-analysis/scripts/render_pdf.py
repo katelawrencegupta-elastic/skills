@@ -168,7 +168,8 @@ def _estimation_limit_notes(cov: dict) -> list[str]:
     """Short cover notes for measurement limits recorded by the diagnostic pass."""
     labels = {
         "retention_unmeasured": "Diagnostic retention is missing for some measured bulk; those rows are excluded from the weighted retention month.",
-        "retention_30d_assumed": "Some retained data has no configured policy; the estimator uses the labeled 30-day default.",
+        "retention_unaged": "Some retained data has no ILM delete phase and no data-stream retention; it is left out of the retention month, with no default age assumed.",
+        "retention_month_missing": "No retention age could be ascertained, so no retention month was written and Observability and Security were not quoted.",
         "short_diagnostic_window": "Some diagnostic bulk rates came from nodes up for under two days.",
         "bulk_rate_fallback": "Some bulk rates were estimated without a measured ILM write phase.",
         "unrated_ingest": "Some stored indices took writes but have no measured ingest rate; the quote may understate ingest.",
@@ -2360,7 +2361,7 @@ def search_power_section(acc: dict, *, new_page: bool = True) -> str:
 _INTEGRITY_FORMULA = {
     "Sheet echo": "Mean of the echo and E73 components over every sheet read, fleet or regional. echo component = 1 − min(|echo − written bulk| ÷ tolerance, 1), where the tolerance is 0.1% of the written bulk, at least 0.02 GB/day. A blank echo scores 0. E73 scores 1 when the parsed amount is 0, and 0 when it is blank or the amount is above 0.005.",
     "Bundle coverage": "Matched deployments ÷ active deployments. When the active count is absent, the denominator is matched bundles plus bundles that fell back.",
-    "Retention basis": "Share of bulk with a configured retention policy. Assumed 30-day store is not counted. Informational.",
+    "Retention basis": "Share of bulk with a configured retention policy. Store with no retention age is left out of the month, not given a default. Informational.",
     "Search EIS data": "1 when filtered Search EIS billing for the quote window is complete.",
     "Region fidelity": "1 when every written sheet is an exact or same-number alias match.",
     "Quote present": "1 when every solution with a workload has a serverless monthly price.",
@@ -3398,7 +3399,9 @@ def deployment_plan_body(c: dict, sv: dict, *, alongside: str = "", width: int =
         ech = (float(sv["ech_list_mo"]), "ECH billed cost")
     else:
         ech = None
-    if c.get("retention_set_days") == 30:
+    if "estimate_months" in c and c.get("estimate_months") is None:
+        plan_ret = "No retention month could be ascertained, so Observability and Security are not priced on any bar. Search disk is the measured store."
+    elif c.get("retention_set_days") == 30:
         plan_ret = "Observability on every serverless bar is 30 days, written as 1 month. Search disk is the measured store scaled to 1 month."
     else:
         kept_months = int(c.get("estimate_months") or 12)
@@ -3713,7 +3716,11 @@ def render_consolidation_html(acc: dict) -> str:
     priced_scope = (not scope_unavailable) and scope_row.get("status") == "complete" \
         and scope_row.get("scope") == "priced" and bool(priced_block.get("months"))
     recent = (priced_block.get("months") or []) if (scope_unavailable or priced_scope) else ((c.get("ech_recent_months") or {}).get("months") or [])
-    est_months = int(c.get("estimate_months") or 12)
+    # None means no retention month could be ascertained: none is written and none is assumed.
+    est_months = None if ("estimate_months" in c and c.get("estimate_months") is None) else int(c.get("estimate_months") or 12)
+    ret_label = f"{est_months}-month retention" if est_months is not None else "no retention month"
+    est_adj = f"{est_months}-month" if est_months is not None else "no-retention-month"
+    est_text = f"{est_months} months" if est_months is not None else "no month (none could be ascertained)"
     month_pairs = []
     for row in recent:
         try:
@@ -3771,14 +3778,16 @@ def render_consolidation_html(acc: dict) -> str:
             bits.append("Search at full retention")
         headline += " — " + (", ".join(bits) if bits else "retention 30 days")
     elif scenario == "rounded":
-        if c.get("retention_days") and est_months != 12:
-            headline += f" — {int(c.get('retention_days'))}-day ({est_months}-month) retention estimate"
+        if est_months is None:
+            headline += " — no retention month ascertained, Observability and Security not quoted"
+        elif c.get("retention_days") and est_months != 12:
+            headline += f" — {int(c.get('retention_days'))}-day ({est_adj}) retention estimate"
         elif c.get("retention_index_count"):
-            headline += f" — {est_months}-month retention estimate, the index average rounded up"
+            headline += f" — {ret_label} estimate, the index average rounded up"
         elif est_months == 12:
             headline += " — one-year (12-month retention) estimate"
         else:
-            headline += f" — {est_months}-month retention estimate"
+            headline += f" — {ret_label} estimate"
     if c.get("ingest_basis") == "compressioncalc_accounted_for":
         headline += " — compressioncalc_accounted_for"
     source_bit = " · ingest and retention from Elasticsearch diagnostics" if diag else " · K360 backup: stored GB ÷ assumed retention"
@@ -3849,7 +3858,7 @@ def render_consolidation_html(acc: dict) -> str:
         list_mo = float(sv.get("serverless_mo") or 0)
         ech_c = float(sv.get("ech_contract_mo") or 0)
         ech_stat = "Monthly ECH cost at the contract rate" + (f", {window}" if window else "")
-        svl_stat = f"Estimated monthly serverless cost at list, {est_months}-month retention" + (f", {window}" if window else "")
+        svl_stat = f"Estimated monthly serverless cost at list, {ret_label}" + (f", {window}" if window else "")
         word = _delta_word(sv.get("cost_mo"), neutral=hide_saving_words)
         save_stat = f"Estimated monthly {word} at the contract rate" + (f", {window}" if window else "")
         pct_stat = f"Estimated {word} at the contract rate" + (f", {window}" if window else "")
@@ -3872,12 +3881,12 @@ def render_consolidation_html(acc: dict) -> str:
             if window_unstable:
                 latest_label = month_pairs[-1][0]
                 ech_stat = f"ECH billed cost, {latest_label}"
-                svl_stat = f"Estimated monthly serverless cost, {est_months}-month retention"
+                svl_stat = f"Estimated monthly serverless cost, {ret_label}"
                 save_stat = f"Estimated monthly {word}, {latest_label} versus the estimate"
                 pct_stat = f"Estimated {word}, {latest_label} versus the estimate"
             else:
                 ech_stat = f"Average ECH billed cost, last {len(month_pairs)} complete months"
-                svl_stat = f"Estimated monthly serverless cost, {est_months}-month retention"
+                svl_stat = f"Estimated monthly serverless cost, {ret_label}"
                 save_stat = f"Estimated monthly {word}, {len(month_pairs)}-month average versus the estimate"
                 pct_stat = f"Estimated {word}, {len(month_pairs)}-month average versus the estimate"
             dtone = _delta_tone(cover_delta)
@@ -3895,7 +3904,7 @@ def render_consolidation_html(acc: dict) -> str:
             chart_cats = []
             chart_series = []
         elif cover_delta is None and sv.get("list_mo") is None:
-            svl_stat = f"Estimated monthly serverless cost, {est_months}-month retention" + (f", {window}" if window else "")
+            svl_stat = f"Estimated monthly serverless cost, {ret_label}" + (f", {window}" if window else "")
             stats = [
                 stat(usd(svl_total), svl_stat, "success", tag="estimate", estimate=True),
             ]
@@ -3903,7 +3912,7 @@ def render_consolidation_html(acc: dict) -> str:
             chart_series = [(ech_cat, [0.0, 0.0]), (svl_cat, [0.0, float(svl_total or 0)])]
         else:
             ech_stat = "Monthly ECH billed cost (K360)" + (f", {window}" if window else "")
-            svl_stat = f"Estimated monthly serverless cost, {est_months}-month retention" + (f", {window}" if window else "")
+            svl_stat = f"Estimated monthly serverless cost, {ret_label}" + (f", {window}" if window else "")
             word = _delta_word(sv.get("list_mo"), neutral=hide_saving_words)
             save_stat = f"Estimated monthly {word} versus ECH billed cost" + (f", {window}" if window else "")
             pct_stat = f"Estimated {word} versus ECH billed cost" + (f", {window}" if window else "")
@@ -3938,7 +3947,7 @@ def render_consolidation_html(acc: dict) -> str:
         usd_per_ecu = float(cr.get("implied_usd_per_ecu") or 1) if cover_rate is not None else 1.0
         costs = [(_month_label(r["month"]), float(r["cost"]) * usd_per_ecu) for r in recent]
         avg_cost = sum(v for _m, v in costs) / len(costs)
-        svl_cat = f"Serverless, {est_months}-month estimate"
+        svl_cat = f"Serverless, {est_adj} estimate"
         m_cats = [f"ECH {label}" for label, _v in costs] + [svl_cat]
         m_series = [
             ("ECH billed cost" if cover_rate is None else "ECH at contract rate", [v for _m, v in costs] + [0.0]),
@@ -3973,9 +3982,9 @@ def render_consolidation_html(acc: dict) -> str:
         if has_stay and subs_m:
             subs_m = subs_m[:-1] + [f"{subs_m[-1]} + ECH that stays".strip()]
         heading = (
-            f"Monthly spend: last {len(costs)} months on ECH, and after consolidation (the {est_months}-month serverless estimate plus the ECH that stays)"
+            f"Monthly spend: last {len(costs)} months on ECH, and after consolidation (the {est_adj} serverless estimate plus the ECH that stays)"
             if has_stay else
-            f"Last {len(costs)} months of ECH spend vs. the {est_months}-month serverless estimate"
+            f"Last {len(costs)} months of ECH spend vs. the {est_adj} serverless estimate"
         )
         B.append(f"<h3>{heading}</h3>" + bar_chart(
             m_cats, m_series, stacked=True, width=940, height=250, show_values=True, prefix="$", exact_values=True,
@@ -4007,7 +4016,7 @@ def render_consolidation_html(acc: dict) -> str:
         if window_unstable:
             rows.append([f"Comparison, {costs[-1][0]}", usd(compare_cost), usd(svl_total)])
             rows.append([
-                f"Estimated monthly {_delta_word(diff, neutral=hide_saving_words)}, {costs[-1][0]} vs. the {est_months}-month estimate",
+                f"Estimated monthly {_delta_word(diff, neutral=hide_saving_words)}, {costs[-1][0]} vs. the {est_adj} estimate",
                 _delta_usd(diff),
                 "—",
             ])
@@ -4015,7 +4024,7 @@ def render_consolidation_html(acc: dict) -> str:
         else:
             rows.append([f"{len(costs)}-month average", usd(avg_cost), usd(svl_total)])
             rows.append([
-                f"Estimated monthly {_delta_word(diff, neutral=hide_saving_words)}, average vs. the {est_months}-month estimate",
+                f"Estimated monthly {_delta_word(diff, neutral=hide_saving_words)}, average vs. the {est_adj} estimate",
                 _delta_usd(diff),
                 "—",
             ])
@@ -4024,7 +4033,7 @@ def render_consolidation_html(acc: dict) -> str:
                 if scope_unavailable else ""
             )
         B.append(caption(
-            f"ECH months are complete calendar months of billed cost. The serverless figure is the estimator's monthly price with retention written as {est_months} months"
+            f"ECH months are complete calendar months of billed cost. The serverless figure is the estimator's monthly price with retention written as {est_text}"
             + (
                 f" (the average across {int(c.get('retention_index_count')):,} indexes, rounded up)"
                 if c.get("retention_index_count") and not c.get("retention_days")
@@ -4084,7 +4093,7 @@ def render_consolidation_html(acc: dict) -> str:
             billed_line = (
                 f"Billed: {latest_label} is the comparison because an earlier complete month is under half of it. "
                 "No contract rate is applied. Estimate: the monthly total reported by the serverless spreadsheet or notebook, "
-                f"with retention written as {est_months} months."
+                f"with retention written as {est_text}."
             )
             figure_line = (
                 f"{latest_label} is {usd(month_avg)}/mo. The estimator read-back is {usd(svl_total)}/mo. "
@@ -4093,7 +4102,7 @@ def render_consolidation_html(acc: dict) -> str:
         else:
             billed_line = (
                 f"Billed: the last {len(month_pairs)} complete calendar months of the K360 billing cost field. No contract rate is applied. "
-                f"Estimate: the monthly total reported by the serverless spreadsheet or notebook, with retention written as {est_months} months."
+                f"Estimate: the monthly total reported by the serverless spreadsheet or notebook, with retention written as {est_text}."
             )
             figure_line = (
                 f"The {len(month_pairs)}-month average is {usd(month_avg)}/mo. The estimator read-back is {usd(svl_total)}/mo. "

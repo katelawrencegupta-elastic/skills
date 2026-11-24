@@ -32,7 +32,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from datetime import datetime, timezone
 from pathlib import Path
 
-from constants import RETENTION_ASSUMED_MAX_SHARE
+from constants import RETENTION_UNAGED_MAX_SHARE
 from privacy import seal_dir, seal_file, seal_text
 
 _ADMIN_HOST = "admin.found.no"
@@ -409,14 +409,12 @@ def _zip_json(archive: zipfile.ZipFile, suffix: str):
 def _retention_label(parts: list[dict], basis: str | None) -> str | None:
     if not parts:
         return None
-    if basis == "assumed":
-        return f"{round(parts[0]['days']):,} days assumed"
     if parts[0]["pct"] >= 75:
         n = round(parts[0]["days"])
         label = "1 day" if n == 1 else f"{n:,} days"
     else:
         label = " · ".join(f"{round(p['days'])}d ({p['pct']:.0f}%)" for p in parts[:3])
-    return label + (" (part assumed)" if basis == "blended" else "")
+    return label + (" (part has no retention age)" if basis == "partial" else "")
 
 
 def _write_phase_sec(creation: int | None, lifecycle: int | None, action: str | None, collection: int) -> int:
@@ -821,7 +819,7 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
     local = 0.0
     dataset = 0.0
     snapshot = 0.0
-    blended_bytes = 0.0       # store with no configured retention, priced at the 30-day default
+    unaged_bytes = 0.0        # store with no ILM delete phase and no data-stream retention: no age, no weight
     index_days_sum = 0.0
     index_age_bytes = 0.0     # sum of age * store, so a larger index carries more of the written month
     index_count = 0
@@ -843,15 +841,14 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         if age is None:
             age = ds_age.get(ix)
         if age is None:
-            # No delete policy covers this index. Use the explicit 30-day default rather than
-            # treating historical index age as the customer's retention setting.
+            # Nothing sets this index's retention: no delete phase (an ILM policy that never deletes
+            # keeps data indefinitely, which is not a month) and no data-stream retention. It is left
+            # out of the average and the index count. No default age is invented, and the historical
+            # age of the index is not a retention setting either.
             unknown += nbytes
-            default_age = 30.0
-            blended_bytes += nbytes
-            by_age[default_age] += nbytes
-            age = default_age
-        else:
-            by_age[round(age, 3)] += nbytes
+            unaged_bytes += nbytes
+            continue
+        by_age[round(age, 3)] += nbytes
         index_days_sum += float(age)
         index_age_bytes += float(age) * nbytes
         index_count += 1
@@ -860,26 +857,23 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
             metrics_bytes += nbytes
 
     known = local - unknown                   # store whose age a policy or data stream sets
-    covered = known + blended_bytes           # store that has an age at all
-    weighted = sum(age * nbytes for age, nbytes in by_age.items()) / covered if covered > 0 else None
+    weighted = sum(age * nbytes for age, nbytes in by_age.items()) / known if known > 0 else None
     known_share = (known / local) if local > 0 else None
     parts: list[dict] = []
-    if covered > 0:
+    if known > 0:
         for age, nbytes in sorted(by_age.items(), key=lambda kv: -kv[1]):
-            parts.append({"days": age, "pct": round(100 * nbytes / covered, 1)})
-    # Share of local store priced at the 30-day assumed default. A deployment stays policy-aged
-    # while that share is inside RETENTION_ASSUMED_MAX_SHARE: one stray unconfigured index must
-    # not drop a configured cluster's whole bulk out of the measured-retention total.
-    assumed_share = (blended_bytes / local) if local > 0 else None
+            parts.append({"days": age, "pct": round(100 * nbytes / known, 1)})
+    # Share of local store with no retention age. A deployment stays policy-aged while that share is
+    # inside RETENTION_UNAGED_MAX_SHARE: one stray unconfigured index must not drop a configured
+    # cluster's whole bulk out of the measured-retention total. Past it the row is `partial`, and a
+    # row with no aged store at all has no basis and no retention days.
+    unaged_share = (unaged_bytes / local) if local > 0 else None
     if not weighted:
         basis, days = None, None
-    elif known <= 0:
-        basis, days = "assumed", weighted
-        parts = [{"days": round(weighted, 1), "pct": 100.0, "basis": "assumed"}]
-    elif blended_bytes <= 0 or (assumed_share is not None and assumed_share <= RETENTION_ASSUMED_MAX_SHARE):
+    elif unaged_bytes <= 0 or (unaged_share is not None and unaged_share <= RETENTION_UNAGED_MAX_SHARE):
         basis, days = "policy", weighted
     else:
-        basis, days = "blended", weighted
+        basis, days = "partial", weighted
     return {
         "cluster": health.get("cluster_name"),
         "bulk_gb_day": round(gb_day, 3),
@@ -892,12 +886,12 @@ def analyze_bundle(path: Path, *, captured: datetime) -> dict:
         # Size-weighted delete age of the metrics indices alone, for the TSDS retention row.
         "retention_days_metrics": round(metrics_age_bytes / metrics_bytes, 3) if metrics_bytes > 0 else None,
         "retention_basis": basis,
-        # Share of local store whose age a delete policy or data stream sets. The rest is taken at
-        # the 30-day default (assumed) because no retention policy covers it.
+        # Share of local store whose age a delete policy or data stream sets. The rest has no age
+        # and no weight: it is left out of the retention average.
         "retention_known_share": None if known_share is None else round(known_share, 4),
-        # Store priced at the 30-day default, as a share. Above 0 on a `policy` row means the
-        # row was inside the threshold and still carries an assumption worth naming.
-        "retention_assumed_share": None if assumed_share is None else round(assumed_share, 6),
+        # Store with no retention age, as a share. Above 0 on a `policy` row means the row was inside
+        # the threshold and still has store the average does not cover.
+        "retention_unaged_share": None if unaged_share is None else round(unaged_share, 6),
         "retention_label": _retention_label(parts, basis),
         "store_gb": round(local / 1e9, 2),
         # Local primary store bytes and primary documents, for the average document size of Search ingest.
